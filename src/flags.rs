@@ -1,6 +1,6 @@
 //! Turns Anvil's compiler-neutral settings into each toolchain's command lines and file names.
 
-use crate::platform::Os;
+use crate::platform::{Cpu, Os};
 use crate::profile::{Opt, Profile};
 use crate::toolchain::{Family, Toolchain};
 use anyhow::{bail, Result};
@@ -12,10 +12,28 @@ const WINDOWS_DEFAULT_LIBS: &[&str] = &[
     "kernel32", "user32", "gdi32", "winspool", "shell32", "ole32", "oleaut32", "uuid", "comdlg32", "advapi32",
 ];
 
+// clang records the time stamps of the headers a precompiled header was made from and refuses it once one is touched;
+// Anvil rebuilds it when their content changes, so the stamps are left out
+const NO_PCH_TIMESTAMP: &[&str] = &["-Xclang", "-fno-pch-timestamp"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     C,
     Cxx,
+    /// Objective-C (.m) and Objective-C++ (.mm): clang and gcc only.
+    ObjC,
+    ObjCxx,
+}
+
+/// What kind of Windows program an executable is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gui {
+    /// A console program (the default).
+    Off,
+    /// `gui = true`: a GUI program entered through WinMain, as CMake's WIN32 makes it.
+    WinMain,
+    /// `gui = "main"`: a GUI program with a standard main().
+    Main,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,9 +84,11 @@ pub struct CompileSpec<'a> {
 pub struct LinkSpec<'a> {
     pub profile: &'a Profile,
     pub shared: bool,
-    pub gui: bool,
+    pub gui: Gui,
     /// A program that exports symbols to the modules it loads.
     pub exports: bool,
+    /// A module linking against such a program: its calls into the program resolve when the program loads it.
+    pub uses_program_exports: bool,
     pub objects: &'a [PathBuf],
     pub libs: &'a [String],
     /// Static libraries linked whole.
@@ -103,6 +123,17 @@ impl Arch {
     }
 }
 
+impl Gui {
+    pub fn parse(value: &toml::Value) -> Result<Gui> {
+        Ok(match value {
+            toml::Value::Boolean(false) => Gui::Off,
+            toml::Value::Boolean(true) => Gui::WinMain,
+            toml::Value::String(text) if text == "main" => Gui::Main,
+            other => bail!("gui = {other}: expected true (a GUI program with WinMain), \"main\" (a GUI program with main()) or false"),
+        })
+    }
+}
+
 /// "20", "c++20", "cxx20", "cpp20" -> "c++20"; "gnu++20" stays; C: "17", "c17" -> "c17".
 pub fn normalize_standard(text: &str, language: Language) -> Result<String> {
     let lowered = text.to_ascii_lowercase();
@@ -113,19 +144,33 @@ pub fn normalize_standard(text: &str, language: Language) -> Result<String> {
         .trim_start_matches("gnu++")
         .trim_start_matches('c');
 
-    let valid = match language {
-        Language::Cxx => ["11", "14", "17", "20", "23", "26"].contains(&digits),
-        Language::C => ["89", "90", "99", "11", "17", "18", "23"].contains(&digits),
+    let cxx = matches!(language, Language::Cxx | Language::ObjCxx);
+    let valid = if cxx {
+        ["11", "14", "17", "20", "23", "26"].contains(&digits)
+    } else {
+        ["89", "90", "99", "11", "17", "18", "23"].contains(&digits)
     };
     if !valid {
         bail!("unsupported language standard \"{text}\"");
     }
 
-    Ok(match language {
-        Language::Cxx if lowered.starts_with("gnu") => format!("gnu++{digits}"),
-        Language::Cxx => format!("c++{digits}"),
-        Language::C => format!("c{digits}"),
+    Ok(if !cxx {
+        format!("c{digits}")
+    } else if lowered.starts_with("gnu") {
+        format!("gnu++{digits}")
+    } else {
+        format!("c++{digits}")
     })
+}
+
+/// A line explaining a link failure Anvil recognizes, shown under the linker's output.
+pub fn link_failure_hint(output: &str) -> Option<&'static str> {
+    let unresolved_winmain = output.lines().any(|line| {
+        let unresolved = line.contains("LNK2019") || line.contains("LNK2001") || line.contains("undefined symbol");
+        unresolved && line.contains("WinMain")
+    });
+
+    unresolved_winmain.then_some("gui = true expects WinMain; a program with main() needs gui = \"main\"")
 }
 
 impl Toolchain {
@@ -184,8 +229,8 @@ impl Toolchain {
     /// The compiler program for a language.
     pub fn compiler(&self, language: Language) -> &Path {
         match language {
-            Language::C => &self.cc,
-            Language::Cxx => &self.cxx,
+            Language::C | Language::ObjC => &self.cc,
+            Language::Cxx | Language::ObjCxx => &self.cxx,
         }
     }
 
@@ -221,7 +266,8 @@ impl Toolchain {
         (args, deps)
     }
 
-    /// Precompiled header: the extra arguments that create it (`create`) or use it.
+    /// Precompiled header: the extra arguments that create it (`create`, cl-style toolchains, which make it while
+    /// compiling a stub source; gcc and clang make it with `pch_header_args`) or use it.
     pub fn pch_args(&self, header: &Path, pch_file: &Path, create: bool) -> Vec<String> {
         let header = path_text(header);
         let pch_file_text = path_text(pch_file);
@@ -229,23 +275,17 @@ impl Toolchain {
         match self.family {
             Family::Msvc | Family::ClangCl => {
                 let mode = if create { "/Yc" } else { "/Yu" };
-                vec![format!("{mode}{header}"), format!("/Fp{pch_file_text}"), format!("/FI{header}")]
-            }
-            Family::Clang => {
-                if create {
-                    Vec::new()
-                } else {
-                    vec!["-include-pch".into(), pch_file_text]
+                let mut args = vec![format!("{mode}{header}"), format!("/Fp{pch_file_text}"), format!("/FI{header}")];
+                if create && self.family == Family::ClangCl {
+                    args.extend(NO_PCH_TIMESTAMP.iter().map(|flag| flag.to_string()));
                 }
+                args
             }
+            Family::Clang => vec!["-include-pch".into(), pch_file_text],
             // gcc finds <stub>.gch beside the stub header it is told to include
             Family::Gcc => {
-                if create {
-                    Vec::new()
-                } else {
-                    let stub = pch_file.with_extension("");
-                    vec!["-include".into(), path_text(&stub)]
-                }
+                let stub = pch_file.with_extension("");
+                vec!["-include".into(), path_text(&stub)]
             }
         }
     }
@@ -253,7 +293,9 @@ impl Toolchain {
     /// Arguments compiling a header into a precompiled header (gcc and clang).
     pub fn pch_header_args(&self, spec: &CompileSpec, header: &Path, pch_file: &Path, deps_file: &Path) -> Vec<String> {
         let mut args = self.compile_flags(spec);
-        args.extend(self.pch_args(header, pch_file, true));
+        if self.family == Family::Clang {
+            args.extend(NO_PCH_TIMESTAMP.iter().map(|flag| flag.to_string()));
+        }
 
         let header_language = if spec.language == Language::C { "c-header" } else { "c++-header" };
         args.extend(["-MD".into(), "-MF".into(), path_text(deps_file)]);
@@ -323,6 +365,11 @@ impl Toolchain {
             args.extend(["-O".into(), "coff".into(), "-i".into(), path_text(source), "-o".into(), path_text(output)]);
             args.extend(includes.iter().map(|folder| format!("-I{}", path_text(folder))));
             args.extend(defines.iter().map(|define| format!("-D{define}")));
+
+            // A 64-bit windres writes 64-bit objects unless told otherwise (32-bit builds with -m32)
+            if self.platform.cpu == Cpu::X86 {
+                args.push("--target=pe-i386".into());
+            }
         } else {
             args.push("/nologo".into());
             args.extend(includes.iter().map(|folder| format!("/I{}", path_text(folder))));
@@ -337,14 +384,24 @@ impl Toolchain {
     /// Arguments for assembling one file (program: `self.assembler()`).
     pub fn assemble_args(&self, source: &Path, output: &Path, includes: &[PathBuf], defines: &[String]) -> Vec<String> {
         let mut args = Vec::new();
+        let arm = matches!(self.platform.cpu, Cpu::Arm64 | Cpu::Arm);
 
-        if self.family.is_msvc_style() {
+        if self.family.is_msvc_style() && arm {
+            // armasm64 takes -i and -o, and no definitions (CMake passes it none either)
+            args.push("-nologo".into());
+            for folder in includes {
+                args.extend(["-i".into(), path_text(folder)]);
+            }
+            args.extend(["-o".into(), path_text(output), path_text(source)]);
+        } else if self.family.is_msvc_style() {
             args.extend(["/nologo".into(), "/c".into()]);
             args.extend(includes.iter().map(|folder| format!("/I{}", path_text(folder))));
             args.extend(defines.iter().map(|define| format!("/D{define}")));
             args.push(format!("/Fo{}", path_text(output)));
             args.push(path_text(source));
         } else {
+            // The compiler driver, for the machine built for (-m32, --target)
+            args.extend(self.compile_target_flags.iter().cloned());
             args.push("-c".into());
             args.extend(includes.iter().map(|folder| format!("-I{}", path_text(folder))));
             args.extend(defines.iter().map(|define| format!("-D{define}")));
@@ -361,6 +418,66 @@ impl Toolchain {
         } else {
             "res"
         }
+    }
+
+    /// A raw linker option as the link command takes it: as is for link.exe and lld-link, through the compiler
+    /// driver (`-Wl,`) for clang and gcc.
+    pub fn linker_option(&self, option: &str) -> String {
+        if self.family.is_msvc_style() {
+            option.to_string()
+        } else {
+            format!("-Wl,{option}")
+        }
+    }
+
+    // Profiles
+
+    /// Fits a profile to the toolchain: an error for what it cannot build, and the release C runtime for clang's
+    /// AddressSanitizer on Windows, which has no debug one ("/MDd not allowed with -fsanitize=address").
+    pub fn adapt_profile(&self, profile: &mut Profile) -> Result<()> {
+        if profile.sanitize.is_empty() {
+            return Ok(());
+        }
+
+        if self.family == Family::Gcc && self.targets_windows() {
+            bail!(
+                "profile `{}`: sanitize needs a sanitizer runtime, which MinGW gcc does not have; build it with --toolchain msvc, clang-cl or clang",
+                profile.name
+            );
+        }
+        if self.is_msvc_abi() && self.family != Family::Msvc {
+            profile.debug_runtime = false;
+        }
+
+        Ok(())
+    }
+
+    /// The AddressSanitizer runtime DLLs a sanitized Windows program needs beside it, when the profile asks for
+    /// them: cl's lie beside cl (the debug one too: which one a program uses depends on the MSVC version), clang's in
+    /// its resource folder.
+    pub fn sanitizer_runtime(&self, profile: &Profile) -> Result<Vec<PathBuf>> {
+        if !self.is_msvc_abi() || !profile.sanitize.iter().any(|sanitizer| sanitizer == "address") {
+            return Ok(Vec::new());
+        }
+
+        let architecture = self.asan_architecture();
+        let (folders, names) = match self.family {
+            Family::Msvc => (
+                self.cxx.parent().into_iter().map(Path::to_path_buf).collect(),
+                vec![
+                    format!("clang_rt.asan_dynamic-{architecture}.dll"),
+                    format!("clang_rt.asan_dbg_dynamic-{architecture}.dll"),
+                ],
+            ),
+            _ => (self.clang_runtime_folders(), vec![format!("clang_rt.asan_dynamic-{architecture}.dll")]),
+        };
+
+        let Some(folder) = folders.iter().find(|folder| folder.join(&names[0]).is_file()) else {
+            let searched: Vec<String> = folders.iter().map(|folder| crate::util::slash(folder)).collect();
+            bail!("sanitize: the AddressSanitizer runtime {} is not in {}", names[0], searched.join(", "));
+        };
+
+        Ok(names.iter().map(|name| folder.join(name)).filter(|file| file.is_file()).collect())
     }
 
     fn msvc_compile_flags(&self, spec: &CompileSpec) -> Vec<String> {
@@ -457,6 +574,13 @@ impl Toolchain {
         let windows_clang = self.family == Family::Clang && self.is_msvc_abi();
         let mut flags: Vec<String> = vec![format!("-std={}", spec.standard)];
 
+        // Objective-C sources say so, with the C or C++ standard
+        match spec.language {
+            Language::ObjC => flags.extend(["-x".into(), "objective-c".into()]),
+            Language::ObjCxx => flags.extend(["-x".into(), "objective-c++".into()]),
+            Language::C | Language::Cxx => {}
+        }
+
         // Optimization and debug info
         flags.push(
             match spec.opt {
@@ -482,13 +606,7 @@ impl Toolchain {
 
         // clang on Windows picks the MSVC runtime itself
         if windows_clang {
-            let runtime = match (profile.static_runtime, profile.debug_runtime) {
-                (false, false) => "dll",
-                (false, true) => "dll_dbg",
-                (true, false) => "static",
-                (true, true) => "static_dbg",
-            };
-            flags.push(format!("-fms-runtime-lib={runtime}"));
+            flags.push(clang_ms_runtime_flag(profile));
         }
 
         // Link-time optimization, sanitizers, position independence
@@ -545,8 +663,8 @@ impl Toolchain {
     fn msvc_link_args(&self, spec: &LinkSpec) -> Vec<String> {
         let profile = spec.profile;
 
-        // Unoptimized debug builds relink incrementally, much faster after small changes
-        let incremental = profile.debug && profile.opt == Opt::None && !profile.lto;
+        // Unoptimized debug builds relink incrementally, much faster after small changes (not with ASan: LNK4300)
+        let incremental = profile.debug && profile.opt == Opt::None && !profile.lto && profile.sanitize.is_empty();
         let incremental_flag = if incremental { "/INCREMENTAL" } else { "/INCREMENTAL:NO" };
         let mut args: Vec<String> = vec!["/nologo".into(), incremental_flag.into(), format!("/OUT:{}", path_text(spec.output))];
 
@@ -556,10 +674,8 @@ impl Toolchain {
         }
         if spec.shared {
             args.push("/DLL".into());
-        } else if spec.gui {
-            args.extend(["/SUBSYSTEM:WINDOWS".into(), "/ENTRY:mainCRTStartup".into()]);
         } else {
-            args.push("/SUBSYSTEM:CONSOLE".into());
+            args.extend(msvc_subsystem(spec.gui).iter().map(|option| option.to_string()));
         }
 
         // Debug info and optimization
@@ -571,6 +687,11 @@ impl Toolchain {
         }
         if profile.lto && self.family == Family::Msvc {
             args.push("/LTCG".into());
+        }
+
+        // lld-link gets the AddressSanitizer runtime the clang-cl driver would add (link.exe infers cl's itself)
+        if self.family == Family::ClangCl {
+            args.extend(self.clang_asan_libs(profile));
         }
 
         // Inputs
@@ -592,6 +713,9 @@ impl Toolchain {
     fn gnu_link_args(&self, spec: &LinkSpec) -> Vec<String> {
         let profile = spec.profile;
         let windows_clang = self.family == Family::Clang && self.is_msvc_abi();
+        let linux = self.platform.os == Os::Linux;
+        let macos = self.platform.os == Os::Macos;
+        let file_name = spec.output.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let mut args: Vec<String> = Vec::new();
 
         // Kind of binary, and the import library of a DLL or exporting program on Windows
@@ -606,52 +730,87 @@ impl Toolchain {
             }
         }
 
-        // ELF programs export their symbols to modules through the dynamic symbol table
-        if spec.exports && self.platform.os == Os::Linux {
-            args.push("-rdynamic".into());
+        // A shared library is known by its file name, not its build path, so its users find it beside them (rpath)
+        if spec.shared && linux {
+            args.push(format!("-Wl,-soname,{file_name}"));
         }
-        if spec.gui && self.targets_windows() {
-            args.push(
-                if windows_clang {
-                    "-Wl,/SUBSYSTEM:WINDOWS,/ENTRY:mainCRTStartup"
-                } else {
-                    "-mwindows"
-                }
-                .into(),
-            );
+        if spec.shared && macos {
+            args.push(format!("-Wl,-install_name,@rpath/{file_name}"));
         }
 
-        // Code generation the link must match
+        // ELF programs export their symbols to modules through the dynamic symbol table; a Mach-O module's calls
+        // into the program that loads it are resolved then (ELF allows that by default)
+        if spec.exports && linux {
+            args.push("-rdynamic".into());
+        }
+        if spec.uses_program_exports && macos {
+            args.push("-Wl,-undefined,dynamic_lookup".into());
+        }
+        if self.targets_windows() && !spec.shared {
+            args.extend(self.gnu_subsystem(spec.gui));
+        }
+
+        // Code generation the link must match (the MSVC runtime decides which sanitizer thunk clang links); clang's
+        // LTO links through lld when it is installed
         if profile.debug {
             args.push("-g".into());
         }
+        if windows_clang {
+            args.push(clang_ms_runtime_flag(profile));
+        }
         if profile.lto {
             args.push(if self.family == Family::Clang { "-flto=thin" } else { "-flto=auto" }.into());
+            if self.family == Family::Clang && self.lld {
+                args.push("-fuse-ld=lld".into());
+            }
         }
-        if !profile.sanitize.is_empty() {
-            args.push(format!("-fsanitize={}", profile.sanitize.join(",")));
+        // Sanitizers: on Windows clang's driver links the static C runtime's AddressSanitizer thunk whatever
+        // -fms-runtime-lib says, so it gets the libraries clang-cl would link instead
+        let driver_sanitizers: Vec<&str> = profile
+            .sanitize
+            .iter()
+            .map(String::as_str)
+            .filter(|sanitizer| !(windows_clang && *sanitizer == "address"))
+            .collect();
+        if !driver_sanitizers.is_empty() {
+            args.push(format!("-fsanitize={}", driver_sanitizers.join(",")));
+        }
+        if windows_clang && !profile.sanitize.is_empty() {
+            let asan_libs = self.clang_asan_libs(profile);
+            args.extend(
+                asan_libs
+                    .iter()
+                    .map(|arg| if arg.starts_with('/') { format!("-Wl,{arg}") } else { arg.clone() }),
+            );
+            args.push("-Wl,/INCREMENTAL:NO".into());
         }
         if profile.static_runtime && !windows_clang {
             args.push(if self.targets_windows() { "-static" } else { "-static-libstdc++" }.into());
         }
 
-        // Shared libraries beside the executable are found at run time
-        if self.platform.os == Os::Linux {
+        // Shared libraries beside the binary are found at run time
+        if linux {
             args.push("-Wl,-rpath,$ORIGIN".into());
         }
+        if macos {
+            args.push("-Wl,-rpath,@loader_path".into());
+        }
+
+        // The target's and profile's options go before the inputs, as CMake puts them (-Wl,--as-needed, -Wl,-Bstatic)
+        args.extend(spec.flags.iter().cloned());
 
         args.extend(spec.objects.iter().map(|object| path_text(object)));
         args.extend(spec.lib_dirs.iter().map(|folder| format!("-L{}", path_text(folder))));
 
         // Archives in a group so their order never matters (GNU ld only)
-        let grouped = !windows_clang && self.platform.os != Os::Macos;
+        let grouped = !windows_clang && !macos;
         if grouped {
             args.push("-Wl,--start-group".into());
         }
         if !spec.whole.is_empty() {
             if windows_clang {
                 args.extend(spec.whole.iter().flat_map(|lib| [lib.clone(), format!("-Wl,/WHOLEARCHIVE:{lib}")]));
-            } else if self.platform.os == Os::Macos {
+            } else if macos {
                 args.extend(spec.whole.iter().map(|lib| format!("-Wl,-force_load,{lib}")));
             } else {
                 args.push("-Wl,--whole-archive".into());
@@ -659,8 +818,15 @@ impl Toolchain {
                 args.push("-Wl,--no-whole-archive".into());
             }
         }
+        // A flag's value passes as it is ("-framework", "Cocoa")
+        let mut flag_value = false;
         for lib in spec.libs {
-            args.push(gnu_lib_argument(lib));
+            if flag_value {
+                args.push(lib.clone());
+            } else {
+                args.extend(gnu_lib_arguments(lib));
+            }
+            flag_value = takes_value(lib);
         }
         if self.targets_windows() {
             args.extend(WINDOWS_DEFAULT_LIBS.iter().map(|lib| format!("-l{lib}")));
@@ -671,15 +837,87 @@ impl Toolchain {
 
         args.push("-o".into());
         args.push(path_text(spec.output));
-
-        args.extend(spec.flags.iter().cloned());
         args
+    }
+
+    /// A Windows program's subsystem and entry through the compiler driver: MSVC-ABI clang hands link.exe the
+    /// options; MinGW's -mwindows suits WinMain and main() alike (its runtime calls whichever the program has).
+    fn gnu_subsystem(&self, gui: Gui) -> Vec<String> {
+        if self.family == Family::Clang && self.is_msvc_abi() {
+            let options = msvc_subsystem(gui).join(",");
+            vec![format!("-Wl,{options}")]
+        } else if gui != Gui::Off {
+            vec!["-mwindows".into()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Folders a clang's runtime libraries are in: lib/clang/<version>/lib/windows under its LLVM.
+    fn clang_runtime_folders(&self) -> Vec<PathBuf> {
+        let Some(llvm) = self.cxx.parent().and_then(Path::parent) else {
+            return Vec::new();
+        };
+
+        std::fs::read_dir(llvm.join("lib").join("clang"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path().join("lib").join("windows"))
+            .collect()
+    }
+
+    /// The AddressSanitizer libraries `clang-cl -fsanitize=address` links (lld-link and clang's driver get them from
+    /// Anvil): the runtime's import library, and the thunk for the program's C runtime linked whole.
+    fn clang_asan_libs(&self, profile: &Profile) -> Vec<String> {
+        let architecture = self.asan_architecture();
+        let runtime = format!("clang_rt.asan_dynamic-{architecture}.lib");
+        let address = profile.sanitize.iter().any(|sanitizer| sanitizer == "address");
+        let folder = self.clang_runtime_folders().into_iter().find(|folder| folder.join(&runtime).is_file());
+        let Some(folder) = folder.filter(|_| address) else {
+            return Vec::new();
+        };
+
+        let mut args = vec![path_text(&folder.join(runtime))];
+        if profile.static_runtime {
+            args.push(format!(
+                "/WHOLEARCHIVE:{}",
+                path_text(&folder.join(format!("clang_rt.asan_static_runtime_thunk-{architecture}.lib")))
+            ));
+        } else {
+            let underscore = if self.platform.cpu == Cpu::X86 { "_" } else { "" };
+            args.push(format!("/INCLUDE:{underscore}__asan_seh_interceptor"));
+            args.push(format!(
+                "/WHOLEARCHIVE:{}",
+                path_text(&folder.join(format!("clang_rt.asan_dynamic_runtime_thunk-{architecture}.lib")))
+            ));
+        }
+
+        args
+    }
+
+    /// The processor in the sanitizer runtime's file names.
+    fn asan_architecture(&self) -> &'static str {
+        match self.platform.cpu {
+            Cpu::X64 => "x86_64",
+            Cpu::X86 => "i386",
+            Cpu::Arm64 => "aarch64",
+            Cpu::Arm => "armhf",
+        }
     }
 }
 
 /// A path as a command-line argument.
 pub fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+/// A linker flag in `libs` whose value is the next entry (`"-framework", "Cocoa"`).
+pub fn takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "-framework" | "-weak_framework" | "-needed_framework" | "-Xlinker" | "-u" | "-T" | "-L" | "-F" | "-l" | "-z"
+    )
 }
 
 fn msvc_standard_flag(standard: &str, clang_cl: bool) -> Vec<String> {
@@ -710,14 +948,47 @@ fn msvc_lib_name(lib: &str) -> String {
     }
 }
 
-/// "pthread" -> "-lpthread"; paths and flags pass through.
-fn gnu_lib_argument(lib: &str) -> String {
-    let is_path = lib.contains('/') || lib.contains('\\') || lib.ends_with(".a") || lib.ends_with(".so") || lib.ends_with(".lib");
+/// clang's choice of the MSVC runtime library (-fms-runtime-lib), for compiling and linking.
+fn clang_ms_runtime_flag(profile: &Profile) -> String {
+    let runtime = match (profile.static_runtime, profile.debug_runtime) {
+        (false, false) => "dll",
+        (false, true) => "dll_dbg",
+        (true, false) => "static",
+        (true, true) => "static_dbg",
+    };
+    format!("-fms-runtime-lib={runtime}")
+}
 
-    if is_path || lib.starts_with('-') {
-        lib.to_string()
+/// link.exe's subsystem and entry options for a program.
+fn msvc_subsystem(gui: Gui) -> &'static [&'static str] {
+    match gui {
+        Gui::Off => &["/SUBSYSTEM:CONSOLE"],
+        Gui::WinMain => &["/SUBSYSTEM:WINDOWS"],
+        Gui::Main => &["/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"],
+    }
+}
+
+/// "pthread" -> "-lpthread"; "Cocoa.framework" -> "-framework Cocoa" (a path to one also gets its folder searched);
+/// paths and flags pass through.
+fn gnu_lib_arguments(lib: &str) -> Vec<String> {
+    let is_path = lib.contains('/') || lib.contains('\\');
+
+    if let Some(framework_path) = lib.strip_suffix(".framework") {
+        let framework = Path::new(framework_path);
+        let name = framework.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let mut arguments = Vec::new();
+        if is_path {
+            arguments.push(format!("-F{}", path_text(framework.parent().unwrap_or(Path::new(".")))));
+        }
+        arguments.extend(["-framework".to_string(), name]);
+        return arguments;
+    }
+
+    let is_file = is_path || lib.ends_with(".a") || lib.ends_with(".so") || lib.ends_with(".lib") || lib.ends_with(".dylib");
+    if is_file || lib.starts_with('-') {
+        vec![lib.to_string()]
     } else {
-        format!("-l{lib}")
+        vec![format!("-l{lib}")]
     }
 }
 
@@ -738,7 +1009,116 @@ mod tests {
     fn lib_names() {
         assert_eq!(msvc_lib_name("user32"), "user32.lib");
         assert_eq!(msvc_lib_name("C:/x/fmt.lib"), "C:/x/fmt.lib");
-        assert_eq!(gnu_lib_argument("pthread"), "-lpthread");
-        assert_eq!(gnu_lib_argument("/usr/lib/libz.a"), "/usr/lib/libz.a");
+        assert_eq!(gnu_lib_arguments("pthread"), ["-lpthread"]);
+        assert_eq!(gnu_lib_arguments("/usr/lib/libz.a"), ["/usr/lib/libz.a"]);
+        assert_eq!(gnu_lib_arguments("Cocoa.framework"), ["-framework", "Cocoa"]);
+        assert_eq!(gnu_lib_arguments("/opt/sdk/Foo.framework"), ["-F/opt/sdk", "-framework", "Foo"]);
+    }
+
+    fn platform(cpu: Cpu, os: Os) -> crate::platform::Platform {
+        crate::platform::Platform { cpu, os, triple: None }
+    }
+
+    fn link(toolchain: &Toolchain, shared: bool, gui: Gui, uses_program_exports: bool) -> Vec<String> {
+        link_libs(toolchain, shared, gui, uses_program_exports, &["m".to_string()])
+    }
+
+    fn link_libs(toolchain: &Toolchain, shared: bool, gui: Gui, uses_program_exports: bool, libs: &[String]) -> Vec<String> {
+        let profile = Profile::resolve("debug", &Default::default()).unwrap();
+        let spec = LinkSpec {
+            profile: &profile,
+            shared,
+            gui,
+            exports: false,
+            uses_program_exports,
+            objects: &[PathBuf::from("main.o")],
+            libs,
+            whole: &[],
+            lib_dirs: &[],
+            flags: &["-Wl,--as-needed".to_string()],
+            output: Path::new("/out/libplugin.so"),
+            import_lib: None,
+        };
+        toolchain.link_args(&spec)
+    }
+
+    #[test]
+    fn gui_programs() {
+        assert_eq!(Gui::parse(&toml::Value::Boolean(true)).unwrap(), Gui::WinMain);
+        assert_eq!(Gui::parse(&toml::Value::String("main".into())).unwrap(), Gui::Main);
+        assert!(Gui::parse(&toml::Value::String("winmain".into())).is_err());
+
+        let msvc = Toolchain::for_tests(Family::Msvc, platform(Cpu::X64, Os::Windows), true);
+        let winmain = link(&msvc, false, Gui::WinMain, false);
+        assert!(winmain.contains(&"/SUBSYSTEM:WINDOWS".to_string()) && !winmain.iter().any(|arg| arg.starts_with("/ENTRY")));
+        assert!(link(&msvc, false, Gui::Main, false).contains(&"/ENTRY:mainCRTStartup".to_string()));
+
+        let clang = Toolchain::for_tests(Family::Clang, platform(Cpu::X64, Os::Windows), true);
+        assert!(link(&clang, false, Gui::Main, false).contains(&"-Wl,/SUBSYSTEM:WINDOWS,/ENTRY:mainCRTStartup".to_string()));
+        let mingw = Toolchain::for_tests(Family::Gcc, platform(Cpu::X64, Os::Windows), false);
+        assert!(link(&mingw, false, Gui::Main, false).contains(&"-mwindows".to_string()));
+
+        let error = "app.obj : error LNK2019: unresolved external symbol WinMain referenced in function \"int __cdecl invoke_main(void)\"";
+        assert!(link_failure_hint(error).is_some());
+        assert!(link_failure_hint("error LNK2019: unresolved external symbol foo").is_none());
+    }
+
+    #[test]
+    fn shared_libraries_name_themselves() {
+        let linux = Toolchain::for_tests(Family::Gcc, platform(Cpu::X64, Os::Linux), false);
+        let args = link(&linux, true, Gui::Off, false);
+        assert!(args.contains(&"-Wl,-soname,libplugin.so".to_string()));
+        assert!(args.contains(&"-Wl,-rpath,$ORIGIN".to_string()));
+
+        // The target's flags come before the objects and libraries they affect
+        let flag = args.iter().position(|arg| arg == "-Wl,--as-needed").unwrap();
+        assert!(flag < args.iter().position(|arg| arg == "main.o").unwrap());
+        assert!(flag < args.iter().position(|arg| arg == "-lm").unwrap());
+
+        let macos = Toolchain::for_tests(Family::Clang, platform(Cpu::Arm64, Os::Macos), false);
+        let args = link(&macos, true, Gui::Off, true);
+        assert!(args.contains(&"-Wl,-install_name,@rpath/libplugin.so".to_string()));
+        assert!(args.contains(&"-Wl,-rpath,@loader_path".to_string()));
+        assert!(args.contains(&"-Wl,-undefined,dynamic_lookup".to_string()));
+
+        // Frameworks, as a name or a flag and its value
+        let libs = ["Cocoa.framework", "-framework", "Metal"].map(String::from);
+        let args = link_libs(&macos, false, Gui::Off, false, &libs);
+        assert!(args.windows(2).any(|pair| pair == ["-framework", "Cocoa"]));
+        assert!(args.windows(2).any(|pair| pair == ["-framework", "Metal"]));
+    }
+
+    #[test]
+    fn precompiled_headers_ignore_time_stamps() {
+        let clang_cl = Toolchain::for_tests(Family::ClangCl, platform(Cpu::X64, Os::Windows), true);
+        let create = clang_cl.pch_args(Path::new("pch.h"), Path::new("pch.pch"), true);
+        assert!(create.windows(2).any(|pair| pair == ["-Xclang", "-fno-pch-timestamp"]));
+        assert!(!clang_cl
+            .pch_args(Path::new("pch.h"), Path::new("pch.pch"), false)
+            .contains(&"-Xclang".to_string()));
+    }
+
+    #[test]
+    fn assembly() {
+        let mut gcc = Toolchain::for_tests(Family::Gcc, platform(Cpu::X86, Os::Windows), false);
+        gcc.compile_target_flags = vec!["-m32".into()];
+        assert_eq!(gcc.assemble_args(Path::new("a.s"), Path::new("a.o"), &[], &[])[0], "-m32");
+
+        let arm = Toolchain::for_tests(Family::Msvc, platform(Cpu::Arm64, Os::Windows), true);
+        let args = arm.assemble_args(Path::new("a.asm"), Path::new("a.obj"), &[PathBuf::from("inc")], &["X".into()]);
+        assert_eq!(args, ["-nologo", "-i", "inc", "-o", "a.obj", "a.asm"]);
+    }
+
+    #[test]
+    fn mingw_has_no_sanitizers() {
+        let mut profile = Profile::resolve("debug", &Default::default()).unwrap();
+        profile.sanitize = vec!["address".into()];
+
+        let mingw = Toolchain::for_tests(Family::Gcc, platform(Cpu::X64, Os::Windows), false);
+        assert!(mingw.adapt_profile(&mut profile.clone()).is_err());
+
+        let clang_cl = Toolchain::for_tests(Family::ClangCl, platform(Cpu::X64, Os::Windows), true);
+        clang_cl.adapt_profile(&mut profile).unwrap();
+        assert!(!profile.debug_runtime);
     }
 }

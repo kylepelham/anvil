@@ -118,7 +118,7 @@ impl Model {
     pub fn load(options: &LoadOptions) -> Result<Model> {
         let (root, manifest) = locate(&options.start_dir)?;
         let project = manifest.project.clone().unwrap_or_default();
-        let profile = Profile::resolve(&options.profile, &manifest.profile)?;
+        let mut profile = Profile::resolve(&options.profile, &manifest.profile)?;
 
         // The machine to build for: the command line's, the profile's, else this one (always this one for host tools)
         let platform = match options.target.as_deref().or(profile.target.as_deref()) {
@@ -129,6 +129,7 @@ impl Model {
         // Toolchain: command line, then project, then the user's default, then the best installed
         let requested = options.toolchain.clone().or(project.toolchain.clone()).or(Settings::load().toolchain);
         let toolchain = Toolchain::find(requested.as_deref(), &platform)?;
+        toolchain.adapt_profile(&mut profile)?;
 
         // Output folders: a toolchain or a target machine picked on the command line gets its own
         let out_root = util::absolute(&root, Path::new(project.out.as_deref().unwrap_or("out")));
@@ -738,7 +739,7 @@ impl Model {
             target.lib_dirs.push(cuda.lib_dir.clone());
             target.libs.extend(runtime_libs.iter().cloned());
             if dynamic_msvc_runtime {
-                target.link_flags.push("/NODEFAULTLIB:LIBCMT".to_string());
+                target.link_flags.push(self.toolchain.linker_option("/NODEFAULTLIB:LIBCMT"));
             }
         }
 

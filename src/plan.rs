@@ -15,6 +15,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// The longest object file path, as CMake's CMAKE_OBJECT_PATH_MAX on Windows: tools fail past MAX_PATH (260)
+const OBJECT_PATH_MAX: usize = 250;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
     Compile,
@@ -113,6 +116,8 @@ struct LinkInputs {
     files: Vec<PathBuf>,
     after: Vec<usize>,
     runtime_files: Vec<PathBuf>,
+    /// It links against a program's exports (a module the program loads).
+    program_exports: bool,
 }
 
 /// A target's precompiled header: the arguments users add, the file they read, and the action that makes it.
@@ -238,6 +243,27 @@ pub fn plan(model: &Model, host: Option<&Model>, roots: &[usize], color: bool) -
     })
 }
 
+/// The settings `{hash:...}` may appear in: `hash_fields!(target)` borrows them, `hash_fields!(target, mut)` mutably.
+macro_rules! hash_fields {
+    ($target:expr $(, $mutable:tt)?) => {{
+        let target = $target;
+        let mut fields = vec![
+            &$($mutable)? target.defines,
+            &$($mutable)? target.public_defines,
+            &$($mutable)? target.interface_defines,
+            &$($mutable)? target.flags,
+            &$($mutable)? target.public_flags,
+            &$($mutable)? target.interface_flags,
+            &$($mutable)? target.cuda_flags,
+            &$($mutable)? target.link_flags,
+        ];
+        for rule in &$($mutable)? target.file_rules {
+            fields.extend([&$($mutable)? rule.defines, &$($mutable)? rule.flags]);
+        }
+        fields
+    }};
+}
+
 /// Replaces `{hash:...}` in every target's definitions and flags (crate::source_hash), once the model is complete.
 pub fn expand_hashes(model: &mut Model) -> Result<()> {
     let toolchain = &model.toolchain;
@@ -247,7 +273,10 @@ pub fn expand_hashes(model: &mut Model) -> Result<()> {
     let mut expanded = Vec::new();
     let planner = Planner::new(model, false);
     for (index, target) in model.targets.iter().enumerate() {
-        if !hash_fields(target).iter().any(|field| field.iter().any(|text| text.contains(HASH_START))) {
+        if !hash_fields!(target)
+            .iter()
+            .any(|field| field.iter().any(|text| text.contains(HASH_START)))
+        {
             continue;
         }
 
@@ -262,7 +291,7 @@ pub fn expand_hashes(model: &mut Model) -> Result<()> {
         };
 
         let mut copy = target.clone();
-        for field in hash_fields_mut(&mut copy) {
+        for field in hash_fields!(&mut copy, mut) {
             for text in field.iter_mut().filter(|text| text.contains(HASH_START)) {
                 *text = source_hash::expand(text, &inputs).with_context(|| format!("target `{}`", target.name))?;
             }
@@ -274,41 +303,6 @@ pub fn expand_hashes(model: &mut Model) -> Result<()> {
         model.targets[index] = target;
     }
     Ok(())
-}
-
-/// The settings `{hash:...}` may appear in.
-fn hash_fields(target: &Target) -> Vec<&Vec<String>> {
-    let mut fields = vec![
-        &target.defines,
-        &target.public_defines,
-        &target.interface_defines,
-        &target.flags,
-        &target.public_flags,
-        &target.interface_flags,
-        &target.cuda_flags,
-        &target.link_flags,
-    ];
-    for rule in &target.file_rules {
-        fields.extend([&rule.defines, &rule.flags]);
-    }
-    fields
-}
-
-fn hash_fields_mut(target: &mut Target) -> Vec<&mut Vec<String>> {
-    let mut fields = vec![
-        &mut target.defines,
-        &mut target.public_defines,
-        &mut target.interface_defines,
-        &mut target.flags,
-        &mut target.public_flags,
-        &mut target.interface_flags,
-        &mut target.cuda_flags,
-        &mut target.link_flags,
-    ];
-    for rule in &mut target.file_rules {
-        fields.extend([&mut rule.defines, &mut rule.flags]);
-    }
-    fields
 }
 
 /// Programs the build steps of `roots` and everything they need run (`{target:NAME}` of an executable in a step's
@@ -386,11 +380,12 @@ pub fn target_references(words: &[String]) -> Vec<String> {
     names
 }
 
-/// Replaces `{target:NAME}` with each target's artifact path.
 /// What a listed source file is to the build.
 enum SourceKind {
     C,
     Cxx,
+    /// Objective-C and Objective-C++: compiled alone, never batched or given the C++ precompiled header.
+    ObjC,
     Resource,
     Assembly,
     Cuda,
@@ -409,8 +404,10 @@ fn source_kind(source: &Path, family: crate::toolchain::Family) -> Result<Source
         .unwrap_or_default();
 
     let kind = match extension.to_lowercase().as_str() {
-        "c" | "m" => SourceKind::C,
-        "cpp" | "cc" | "cxx" | "c++" | "cp" | "mm" => SourceKind::Cxx,
+        "c" => SourceKind::C,
+        "cpp" | "cc" | "cxx" | "c++" | "cp" => SourceKind::Cxx,
+        "m" | "mm" if !family.is_msvc_style() => SourceKind::ObjC,
+        "m" | "mm" => bail!("{}: Objective-C needs clang or gcc (--toolchain clang)", slash(source)),
         "rc" => SourceKind::Resource,
         "asm" if family.is_msvc_style() => SourceKind::Assembly,
         "s" if !family.is_msvc_style() => SourceKind::Assembly,
@@ -423,13 +420,14 @@ fn source_kind(source: &Path, family: crate::toolchain::Family) -> Result<Source
             slash(source)
         ),
         _ => bail!(
-            "{}: Anvil does not build .{extension} files (it builds C, C++, CUDA, .rc and assembly: .asm with MSVC, .s/.S otherwise; .def and .manifest files go to the link)",
+            "{}: Anvil does not build .{extension} files (it builds C, C++, Objective-C, CUDA, .rc and assembly: .asm with MSVC, .s/.S otherwise; .def and .manifest files go to the link)",
             slash(source)
         ),
     };
     Ok(kind)
 }
 
+/// Replaces `{target:NAME}` with each target's artifact path.
 pub fn substitute_targets(word: &str, model: &Model) -> Result<String> {
     let mut result = word.to_string();
 
@@ -682,7 +680,7 @@ impl<'a> Planner<'a> {
                 SourceKind::Assembly => assembly.push(source.clone()),
                 SourceKind::Cuda => cuda.push(source.clone()),
                 SourceKind::Cxx if !has_rule(source) => plain_cxx.push(source.clone()),
-                SourceKind::Cxx | SourceKind::C => others.push(source.clone()),
+                SourceKind::Cxx | SourceKind::C | SourceKind::ObjC => others.push(source.clone()),
             }
         }
 
@@ -751,12 +749,17 @@ impl<'a> Planner<'a> {
             .extension()
             .map(|extension| extension.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        let language = if extension == "c" { Language::C } else { Language::Cxx };
+        let language = match extension.as_str() {
+            "c" => Language::C,
+            "m" => Language::ObjC,
+            "mm" => Language::ObjCxx,
+            _ => Language::Cxx,
+        };
 
         // The target's settings, borrowed until a file rule adds to them
         let mut settings = FileSettings {
             language,
-            standard: if language == Language::C { &target.c_std } else { &target.std },
+            standard: if matches!(language, Language::C | Language::ObjC) { &target.c_std } else { &target.std },
             opt: profile.opt,
             warnings: target.warnings,
             werror: target.werror,
@@ -800,20 +803,26 @@ impl<'a> Planner<'a> {
         matches!(target.kind, Kind::Static | Kind::Shared | Kind::Object)
     }
 
-    /// Where a source's object goes: its path inside the target (or package, or output folder), mirrored.
+    /// Where a source's object goes: its path inside the target (or package, or output folder), mirrored. A path
+    /// too long for Windows tools becomes `<hash>_<file name>` in the target's folder, as CMake's
+    /// CMAKE_OBJECT_PATH_MAX does.
     fn object_path(&self, target: &Target, source: &Path, extension: &str) -> PathBuf {
         let package_root = &self.model.packages[target.package].root;
+        let name = source.file_name().unwrap_or_default().to_string_lossy();
+        let hashed_name = format!("{:08x}_{name}", util::hash_bytes(slash(source).as_bytes()) as u32);
 
         let relative = util::strip_prefix_ci(source, &target.dir)
             .or_else(|| util::strip_prefix_ci(source, package_root))
             .or_else(|| util::strip_prefix_ci(source, &self.model.out_dir))
             .map(|relative| slash(&relative).replace("../", "__/"))
-            .unwrap_or_else(|| {
-                let name = source.file_name().unwrap_or_default().to_string_lossy();
-                format!("external/{:08x}_{name}", util::hash_bytes(slash(source).as_bytes()) as u32)
-            });
+            .unwrap_or_else(|| format!("external/{hashed_name}"));
 
-        self.object_dir(target).join(format!("{relative}.{extension}"))
+        // Room for the dependency file's extension after it (.json)
+        let object = self.object_dir(target).join(format!("{relative}.{extension}"));
+        if path_text(&object).len() + ".json".len() <= OBJECT_PATH_MAX {
+            return object;
+        }
+        self.object_dir(target).join(format!("{hashed_name}.{extension}"))
     }
 
     fn plan_compile(
@@ -1105,6 +1114,7 @@ impl<'a> Planner<'a> {
             shared,
             gui: target.gui,
             exports: target.exports,
+            uses_program_exports: link.program_exports,
             objects: &objects,
             libs: &link.libs,
             whole: &link.whole,
@@ -1145,11 +1155,12 @@ impl<'a> Planner<'a> {
         self.link_artifact.insert(index, (import_lib.unwrap_or_else(|| output.clone()), action));
         self.artifacts.insert(index, output.clone());
 
-        // Runtime files (DLLs) beside every program
+        // Runtime files (DLLs, the sanitizer's) beside every program
         if target.kind.is_executable() || shared {
             let folder = output.parent().unwrap().to_path_buf();
-            for file in link.runtime_files {
-                self.plan_copy(&file, &folder);
+            let sanitizer_runtime = self.toolchain.sanitizer_runtime(&self.model.profile)?;
+            for file in link.runtime_files.iter().chain(&sanitizer_runtime) {
+                self.plan_copy(file, &folder);
             }
         }
 
@@ -1608,6 +1619,7 @@ impl<'a> Planner<'a> {
                                 link.libs.push(path_text(file));
                                 link.files.push(file.clone());
                             }
+                            link.program_exports |= target.exports;
                             link.after.push(*action);
                         }
                     }
@@ -1629,7 +1641,7 @@ impl<'a> Planner<'a> {
         // Generation steps of anything linked must finish too
         link.after.extend(self.generation_barrier(index));
 
-        dedup_in_order(&mut link.libs, |lib| lib.to_lowercase());
+        dedup_libs(&mut link.libs);
         dedup_in_order(&mut link.lib_dirs, |path| util::path_key(path));
         dedup_in_order(&mut link.runtime_files, |path| util::path_key(path));
 
@@ -1705,7 +1717,7 @@ impl<'a> Planner<'a> {
     /// The command of one file of a target this build does not make, when the file is compiled.
     fn unplanned_action(&self, index: usize, source: &Path, inputs: &CompileInputs) -> Option<Action> {
         match source_kind(source, self.toolchain.family) {
-            Ok(SourceKind::C | SourceKind::Cxx) => Some(self.alone_compile_action(index, source, inputs, None)),
+            Ok(SourceKind::C | SourceKind::Cxx | SourceKind::ObjC) => Some(self.alone_compile_action(index, source, inputs, None)),
             Ok(SourceKind::Resource) => self.resource_action(index, source, inputs).ok(),
             _ => None,
         }
@@ -1875,7 +1887,6 @@ struct FileSettings<'a> {
     flags: Cow<'a, [String]>,
 }
 
-/// One command of a build step, with placeholders for its input already filled in.
 /// When a target's own commands run.
 #[derive(Clone, Copy)]
 enum Stage {
@@ -1883,6 +1894,7 @@ enum Stage {
     PostBuild,
 }
 
+/// One command of a build step, with placeholders for its input already filled in.
 struct RunInvocation {
     input: Option<PathBuf>,
     inputs: Vec<PathBuf>,
@@ -2030,6 +2042,17 @@ fn insert_before_source(args: &mut Vec<String>, extra: &[String], msvc_style: bo
 fn dedup_in_order<T, K: std::hash::Hash + Eq>(items: &mut Vec<T>, key: impl Fn(&T) -> K) {
     let mut seen = HashSet::new();
     items.retain(|item| seen.insert(key(item)));
+}
+
+/// Each library once, in order; flags and their values ("-framework", "Cocoa") stay as they are.
+fn dedup_libs(libs: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    let mut flag_value = false;
+    libs.retain(|lib| {
+        let keep = flag_value || lib.starts_with('-') || seen.insert(lib.to_lowercase());
+        flag_value = crate::flags::takes_value(lib);
+        keep
+    });
 }
 
 #[cfg(test)]

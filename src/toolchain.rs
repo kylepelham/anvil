@@ -1,15 +1,18 @@
 //! Finds compilers. MSVC is located through vswhere and its environment (vcvarsall) is captured once and cached, so
 //! no developer prompt is ever needed. Every detected toolchain is cached and re-validated by file time stamps.
 
-use crate::platform::{Cpu, Os, Platform};
+use crate::platform::{Abi, Cpu, Os, Platform};
 use crate::util::{self, slash};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// Bump when the cached Toolchain layout changes
-const CACHE_VERSION: u32 = 4;
+// Bump when the cached Toolchain layout changes (it is part of the cache file's name, so Anvils of different
+// versions sharing the cache folder do not overwrite each other's detections)
+const CACHE_VERSION: u32 = 5;
+
+const PROBE_SOURCE: &str = "int main() { return 0; }\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Family {
@@ -46,10 +49,23 @@ pub struct Toolchain {
     /// Visual Studio folder, when the toolchain came from one.
     pub visual_studio: Option<PathBuf>,
 
+    /// clang: LLVM's linker is installed, so LTO builds link with it (GNU ld would need the LLVMgold plugin).
+    pub lld: bool,
+
+    /// Windows programs with the MSVC ABI (cl, clang-cl, clang for *-windows-msvc), not MinGW's.
+    msvc_abi: bool,
+
     // Validation of the cache entry: the compiler's time stamp, plus the default MSVC tools version
     cache_version: u32,
     compiler_mtime: i64,
     vc_tools_version: Option<String>,
+}
+
+/// The compiler the CXX (and CC) environment variables name.
+struct NamedCompiler {
+    family: Family,
+    cxx: PathBuf,
+    cc: Option<PathBuf>,
 }
 
 impl Family {
@@ -123,18 +139,17 @@ impl Toolchain {
             String::new()
         };
         if let Some(name) = requested.filter(|name| *name != "auto") {
+            // CXX names the program when it is of the requested family
             let family = Family::parse(name)?;
-            return Toolchain::find_family(family, platform)
+            let named = named_compiler().ok().flatten().filter(|named| named.family == family);
+            return Toolchain::find_named(family, platform, named.as_ref())
                 .with_context(|| format!("toolchain `{name}`{for_platform} was requested but is not usable"));
         }
 
-        // CXX names a compiler explicitly
-        if let Ok(compiler) = std::env::var("CXX") {
-            if let Some(family) = classify_compiler(&compiler) {
-                if let Ok(toolchain) = Toolchain::find_family(family, platform) {
-                    return Ok(toolchain);
-                }
-            }
+        // CXX names a compiler explicitly: that one, or an error
+        if let Some(named) = named_compiler()? {
+            return Toolchain::find_named(named.family, platform, Some(&named))
+                .with_context(|| format!("CXX={} is set but cannot build{for_platform}", slash(&named.cxx)));
         }
 
         let mut failures = Vec::new();
@@ -153,28 +168,7 @@ impl Toolchain {
 
     /// One family for one platform, from the cache when it is still valid.
     pub fn find_family(family: Family, platform: &Platform) -> Result<Toolchain> {
-        let suffix = if platform.is_cross() {
-            format!("-{}", platform.name())
-        } else {
-            String::new()
-        };
-        let cache_file = util::user_data_dir().join(format!("toolchain-{}{suffix}.json", family.name()));
-
-        if let Some(cached) = Toolchain::load_cached(&cache_file) {
-            return Ok(cached);
-        }
-
-        let toolchain = match family {
-            Family::Msvc => detect_msvc(platform)?,
-            Family::ClangCl => detect_clang_cl(platform)?,
-            Family::Clang => detect_clang(platform)?,
-            Family::Gcc => detect_gcc(platform)?,
-        };
-
-        // A cache that cannot be written only costs the next run a detection
-        let _ = util::write_atomic(&cache_file, serde_json::to_string_pretty(&toolchain)?.as_bytes());
-
-        Ok(toolchain)
+        Toolchain::find_named(family, platform, None)
     }
 
     /// Every toolchain that can be found, for `anvil toolchains`.
@@ -193,6 +187,7 @@ impl Toolchain {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
+        let _ = std::fs::remove_dir_all(util::user_data_dir().join("gcc-probe"));
     }
 
     /// A hash of everything about the toolchain that changes what it produces.
@@ -216,12 +211,56 @@ impl Toolchain {
 
     /// Windows binaries with the MSVC ABI: .lib archives, .pdb files, the MSVC runtime.
     pub fn is_msvc_abi(&self) -> bool {
-        self.platform.os == Os::Windows && self.family != Family::Gcc
+        self.platform.os == Os::Windows && self.msvc_abi
     }
 
     /// Builds programs for Windows.
     pub fn targets_windows(&self) -> bool {
         self.platform.os == Os::Windows
+    }
+
+    /// A family for a platform, with CXX's program when it names one; from the cache when it is still valid.
+    fn find_named(family: Family, platform: &Platform, named: Option<&NamedCompiler>) -> Result<Toolchain> {
+        // A Windows ABI the family cannot build (clang builds both)
+        let triple = platform.triple.as_deref().unwrap_or_default();
+        match (family, platform.abi()) {
+            (Family::Msvc | Family::ClangCl, Some(Abi::Gnu)) => {
+                bail!("{} builds MSVC-ABI programs, not MinGW ones ({triple}): use gcc or clang", family.name())
+            }
+            (Family::Gcc, Some(Abi::Msvc)) => {
+                bail!("gcc builds MinGW programs, not MSVC-ABI ones ({triple}): use msvc, clang-cl or clang")
+            }
+            _ => {}
+        }
+
+        // One cache file per family, machine and named compiler
+        let mut suffix = if platform.is_cross() {
+            format!("-{}", platform.name())
+        } else {
+            String::new()
+        };
+        if let Some(named) = named {
+            let programs = format!("{}|{}", slash(&named.cxx), named.cc.as_deref().map(slash).unwrap_or_default());
+            suffix.push_str(&format!("-{:08x}", util::hash_bytes(programs.as_bytes()) as u32));
+        }
+        let cache_name = format!("toolchain-{}{suffix}.v{CACHE_VERSION}.json", family.name());
+        let cache_file = util::user_data_dir().join(cache_name);
+
+        if let Some(cached) = Toolchain::load_cached(&cache_file) {
+            return Ok(cached);
+        }
+
+        let toolchain = match family {
+            Family::Msvc => detect_msvc(platform)?,
+            Family::ClangCl => detect_clang_cl(platform, named)?,
+            Family::Clang => detect_clang(platform, named)?,
+            Family::Gcc => detect_gcc(platform, named)?,
+        };
+
+        // A cache that cannot be written only costs the next run a detection
+        let _ = util::write_atomic(&cache_file, serde_json::to_string_pretty(&toolchain)?.as_bytes());
+
+        Ok(toolchain)
     }
 
     fn load_cached(cache_file: &Path) -> Option<Toolchain> {
@@ -259,6 +298,52 @@ pub fn classify_compiler(compiler: &str) -> Option<Family> {
     } else {
         None
     }
+}
+
+/// The compiler CXX names (CC naming the C one), when CXX is set: an error when it is not a usable program.
+fn named_compiler() -> Result<Option<NamedCompiler>> {
+    let Some(text) = std::env::var("CXX").ok().filter(|text| !text.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let cxx = resolve_program(&text).with_context(|| format!("CXX={text}: no such program (on PATH or as a path)"))?;
+    let family = classify_compiler(&text).with_context(|| format!("CXX={text}: not a compiler Anvil knows (cl, clang-cl, clang++, g++ or c++)"))?;
+
+    // g++ and c++ may be clang (macOS has no gcc behind them)
+    let family = if family == Family::Gcc && reports_clang(&cxx) {
+        Family::Clang
+    } else {
+        family
+    };
+
+    let cc = match std::env::var("CC").ok().filter(|text| !text.trim().is_empty()) {
+        Some(text) => Some(resolve_program(&text).with_context(|| format!("CC={text}: no such program (on PATH or as a path)"))?),
+        None => None,
+    };
+
+    Ok(Some(NamedCompiler { family, cxx, cc }))
+}
+
+/// A program by name (on PATH) or path, made absolute.
+fn resolve_program(text: &str) -> Option<PathBuf> {
+    let text = text.trim();
+    let found = util::which(text).or_else(|| if cfg!(windows) { util::which(&format!("{text}.exe")) } else { None })?;
+    let current_dir = std::env::current_dir().ok()?;
+
+    Some(util::absolute(&current_dir, &found))
+}
+
+/// Does a generic compiler name (c++, and on macOS g++ too) stand for clang (`--version`)?
+fn reports_clang(compiler: &Path) -> bool {
+    let stem = compiler.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
+    let generic = matches!(stem.as_str(), "c++" | "cc") || (cfg!(target_os = "macos") && matches!(stem.as_str(), "g++" | "gcc"));
+    if !generic {
+        return false;
+    }
+
+    Command::new(compiler)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("clang"))
 }
 
 /// The newest Visual Studio with the C++ tools, through vswhere (or the developer prompt's VSINSTALLDIR).
@@ -324,11 +409,13 @@ fn detect_msvc(platform: &Platform) -> Result<Toolchain> {
         compiler_mtime: util::mtime(&cl).unwrap_or(0),
         vc_tools_version: visual_studio.as_deref().and_then(read_vc_tools_version),
         visual_studio,
+        lld: false,
+        msvc_abi: true,
         cache_version: CACHE_VERSION,
     })
 }
 
-fn detect_clang_cl(platform: &Platform) -> Result<Toolchain> {
+fn detect_clang_cl(platform: &Platform, named: Option<&NamedCompiler>) -> Result<Toolchain> {
     if !cfg!(windows) || platform.os != Os::Windows {
         bail!("clang-cl builds Windows programs on Windows only");
     }
@@ -337,8 +424,11 @@ fn detect_clang_cl(platform: &Platform) -> Result<Toolchain> {
     let (environment, visual_studio) = msvc_environment(platform.cpu)?;
     let search_path = environment_value(&environment, "PATH").unwrap_or_default();
 
-    let clang_cl = find_llvm_tool("clang-cl", visual_studio.as_deref())
-        .context("clang-cl.exe not found (install the \"C++ Clang tools\" VS component or LLVM)")?;
+    let clang_cl = match named {
+        Some(named) => named.cxx.clone(),
+        None => find_llvm_tool("clang-cl", visual_studio.as_deref())
+            .context("clang-cl.exe not found (install the \"C++ Clang tools\" VS component or LLVM)")?,
+    };
     let llvm_bin = clang_cl.parent().unwrap().to_path_buf();
 
     // LLVM's linker and archiver beside it, else Microsoft's
@@ -377,17 +467,31 @@ fn detect_clang_cl(platform: &Platform) -> Result<Toolchain> {
         compiler_mtime: util::mtime(&clang_cl).unwrap_or(0),
         vc_tools_version: visual_studio.as_deref().and_then(read_vc_tools_version),
         visual_studio,
+        lld: llvm_bin.join("lld-link.exe").is_file(),
+        msvc_abi: true,
         cache_version: CACHE_VERSION,
     })
 }
 
-fn detect_clang(platform: &Platform) -> Result<Toolchain> {
+fn detect_clang(platform: &Platform, named: Option<&NamedCompiler>) -> Result<Toolchain> {
     let visual_studio = if cfg!(windows) { find_visual_studio() } else { None };
-    let clang = find_llvm_tool("clang++", visual_studio.as_deref()).context("clang++ not found")?;
+    let clang = match named {
+        Some(named) => named.cxx.clone(),
+        None => find_llvm_tool("clang++", visual_studio.as_deref()).context("clang++ not found")?,
+    };
     let bin = clang.parent().unwrap().to_path_buf();
 
-    // Building Windows programs on Windows, clang targets the MSVC ABI and needs Visual Studio's environment
-    let (environment, system_dirs) = if cfg!(windows) && platform.os == Os::Windows {
+    // Windows programs get the ABI the target names, else clang's own default (MSVC's, or MinGW's for an MSYS2 clang)
+    let default_target = clang_default_target(&clang).unwrap_or_default();
+    let default_msvc_abi = default_target.contains("msvc") || (default_target.is_empty() && cfg!(windows));
+    let msvc_abi = platform.os == Os::Windows
+        && match platform.abi() {
+            Some(abi) => abi == Abi::Msvc,
+            None => default_msvc_abi,
+        };
+
+    // The MSVC ABI on Windows needs Visual Studio's environment
+    let (environment, system_dirs) = if cfg!(windows) && msvc_abi {
         let (environment, _) = msvc_environment(platform.cpu)?;
         let system_dirs = msvc_system_dirs(&environment);
         (environment, system_dirs)
@@ -395,7 +499,10 @@ fn detect_clang(platform: &Platform) -> Result<Toolchain> {
         (Vec::new(), unix_system_dirs(&clang))
     };
 
-    let clang_c = existing(bin.join(exe("clang"))).unwrap_or_else(|| clang.clone());
+    let clang_c = named
+        .and_then(|named| named.cc.clone())
+        .or_else(|| existing(bin.join(sibling_program(&clang, "clang"))))
+        .unwrap_or_else(|| clang.clone());
     let archiver = existing(bin.join(exe("llvm-ar")))
         .or_else(|| util::which("ar"))
         .context("no archiver (llvm-ar or ar) found")?;
@@ -405,11 +512,16 @@ fn detect_clang(platform: &Platform) -> Result<Toolchain> {
         None
     };
 
+    // LLVM's linker, where clang looks for it (beside its real program, or on PATH); macOS's ld64 does LTO itself
+    let lld_name = if msvc_abi { "lld-link" } else { "ld.lld" };
+    let real_bin = std::fs::canonicalize(&clang).ok().and_then(|real| real.parent().map(Path::to_path_buf));
+    let lld = platform.os != Os::Macos && (real_bin.is_some_and(|folder| folder.join(exe(lld_name)).is_file()) || util::which(lld_name).is_some());
+
     let version = clang_version(&clang, &environment).unwrap_or_else(|| "unknown".into());
 
     // One clang builds for every processor and system it was built with: --target picks
-    let target_flags = if platform.is_cross() {
-        vec![format!("--target={}", platform.clang_triple(cfg!(windows) && platform.os == Os::Windows))]
+    let target_flags = if platform.is_cross() || msvc_abi != default_msvc_abi {
+        vec![format!("--target={}", platform.clang_triple(msvc_abi))]
     } else {
         Vec::new()
     };
@@ -430,44 +542,59 @@ fn detect_clang(platform: &Platform) -> Result<Toolchain> {
         compiler_mtime: util::mtime(&clang).unwrap_or(0),
         vc_tools_version: None,
         visual_studio: None,
+        lld,
+        msvc_abi,
         cache_version: CACHE_VERSION,
     })
 }
 
-fn detect_gcc(platform: &Platform) -> Result<Toolchain> {
+fn detect_gcc(platform: &Platform, named: Option<&NamedCompiler>) -> Result<Toolchain> {
     let host = Platform::host();
 
-    // A cross gcc is its own program (aarch64-linux-gnu-g++); a 32-bit build on the same system is -m32
-    let (prefix, target_flags) = if !platform.is_cross() {
-        (String::new(), Vec::new())
-    } else if util::which(&format!("{}g++", platform.gnu_prefix())).is_some() {
-        (platform.gnu_prefix(), Vec::new())
-    } else if platform.os == host.os && platform.cpu == Cpu::X86 && host.cpu == Cpu::X64 {
-        (String::new(), vec!["-m32".to_string()])
-    } else {
-        bail!(
-            "no {}g++ on PATH (install the cross compiler for {})",
-            platform.gnu_prefix(),
-            platform.name()
-        );
+    // The program: CXX's, a cross gcc named for the target (aarch64-linux-gnu-g++), else the plain g++
+    let cross_name = format!("{}g++", platform.gnu_prefix());
+    let same_machine = platform.cpu == host.cpu && platform.os == host.os;
+    let gxx = match named {
+        Some(named) => named.cxx.clone(),
+        None => match util::which(&cross_name).filter(|_| !same_machine) {
+            Some(cross) => cross,
+            None => util::which("g++").context("g++ not found on PATH")?,
+        },
     };
 
-    let gxx = util::which(&format!("{prefix}g++")).with_context(|| format!("{prefix}g++ not found on PATH"))?;
-    let bin = gxx.parent().unwrap().to_path_buf();
+    // It builds for its own machine; a 64-bit gcc builds 32-bit programs of its system with -m32, when it can
+    let machine = gcc_output(&gxx, "-dumpmachine").with_context(|| format!("running {}", slash(&gxx)))?;
+    let builds_for = Platform::parse(&machine).ok();
+    let target_flags = match builds_for {
+        Some(builds_for) if builds_for.cpu == platform.cpu && builds_for.os == platform.os => Vec::new(),
+        Some(builds_for) if builds_for.os == platform.os && builds_for.cpu == Cpu::X64 && platform.cpu == Cpu::X86 => {
+            check_m32(&gxx)?;
+            vec!["-m32".to_string()]
+        }
+        _ => bail!(
+            "{} builds programs for {machine}, not {}: put the cross compiler for it ({cross_name}) on PATH, or name it in CXX",
+            slash(&gxx),
+            platform.name()
+        ),
+    };
 
-    let gcc = existing(bin.join(exe(&format!("{prefix}gcc")))).unwrap_or_else(|| gxx.clone());
-    let archiver = existing(bin.join(exe(&format!("{prefix}gcc-ar"))))
-        .or_else(|| existing(bin.join(exe(&format!("{prefix}ar")))))
-        .with_context(|| format!("{prefix}ar not found beside {prefix}g++"))?;
+    // Its C compiler, archiver and resource compiler beside it, named alike (gcc-12 for g++-12)
+    let bin = gxx.parent().unwrap().to_path_buf();
+    let gcc = named
+        .and_then(|named| named.cc.clone())
+        .or_else(|| existing(bin.join(sibling_program(&gxx, "gcc"))))
+        .unwrap_or_else(|| gxx.clone());
+    let archiver = existing(bin.join(sibling_program(&gxx, "gcc-ar")))
+        .or_else(|| existing(bin.join(sibling_program(&gxx, "ar"))))
+        .or_else(|| existing(bin.join(exe("ar"))))
+        .with_context(|| format!("no archiver (gcc-ar or ar) beside {}", slash(&gxx)))?;
     let resource_compiler = if platform.os == Os::Windows {
-        existing(bin.join(exe(&format!("{prefix}windres"))))
+        existing(bin.join(sibling_program(&gxx, "windres"))).or_else(|| existing(bin.join(exe("windres"))))
     } else {
         None
     };
 
-    // Version
-    let output = Command::new(&gxx).arg("-dumpfullversion").output().context("running g++")?;
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let version = gcc_output(&gxx, "-dumpfullversion").unwrap_or_default();
 
     Ok(Toolchain {
         family: Family::Gcc,
@@ -485,8 +612,86 @@ fn detect_gcc(platform: &Platform) -> Result<Toolchain> {
         compiler_mtime: util::mtime(&gxx).unwrap_or(0),
         vc_tools_version: None,
         visual_studio: None,
+        lld: false,
+        msvc_abi: false,
         cache_version: CACHE_VERSION,
     })
+}
+
+/// A gcc's one-line answer to a query (`-dumpmachine`, `-dumpfullversion`).
+fn gcc_output(gxx: &Path, query: &str) -> Result<String> {
+    let output = Command::new(gxx).arg(query).output()?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || text.is_empty() {
+        bail!("{} {query} printed nothing", slash(gxx));
+    }
+
+    Ok(text)
+}
+
+/// Does this gcc build and link a 32-bit program with -m32 (a multilib gcc)? Probed once per gcc: a working one
+/// ends up in the toolchain cache, a failure is remembered beside the probe.
+fn check_m32(gxx: &Path) -> Result<()> {
+    let probe_folder = util::user_data_dir().join("gcc-probe");
+    let identity = format!("{}|{}", slash(gxx), util::mtime(gxx).unwrap_or(0));
+    let failure_file = probe_folder.join(format!("m32-{:016x}.failed", util::hash_bytes(identity.as_bytes())));
+    if let Ok(reason) = std::fs::read_to_string(&failure_file) {
+        bail!("{reason}");
+    }
+
+    std::fs::create_dir_all(&probe_folder)?;
+    std::fs::write(probe_folder.join("probe.cpp"), PROBE_SOURCE)?;
+
+    let output = Command::new(gxx)
+        .arg("-m32")
+        .arg(probe_folder.join("probe.cpp"))
+        .arg("-o")
+        .arg(probe_folder.join(exe("probe32")))
+        .output()
+        .with_context(|| format!("running {}", slash(gxx)))?;
+    if !output.status.success() {
+        // The line saying what failed, not ld's "skipping incompatible" notes before it
+        let error = String::from_utf8_lossy(&output.stderr);
+        let reason = error
+            .lines()
+            .find(|line| line.contains("cannot find") || line.contains("error"))
+            .or_else(|| error.lines().last())
+            .unwrap_or_default()
+            .trim();
+        let message = format!(
+            "{} cannot build 32-bit programs (-m32 failed: {reason}); install a multilib gcc (gcc-multilib) or an i686 cross compiler",
+            slash(gxx)
+        );
+        let _ = std::fs::write(&failure_file, &message);
+        bail!("{message}");
+    }
+
+    Ok(())
+}
+
+/// The file name of a program named like `compiler` ("g++-12" -> "gcc-12", "aarch64-linux-gnu-g++" ->
+/// "aarch64-linux-gnu-ar", "clang++-18" -> "clang-18").
+fn sibling_program(compiler: &Path, tool: &str) -> String {
+    let stem = compiler.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
+
+    let name = ["clang++", "g++", "c++"]
+        .iter()
+        .find_map(|driver| stem.split_once(driver))
+        .map(|(prefix, suffix)| {
+            // Binutils carry no version suffix
+            let suffix = if tool == "ar" || tool == "windres" { "" } else { suffix };
+            format!("{prefix}{tool}{suffix}")
+        })
+        .unwrap_or_else(|| tool.to_string());
+
+    exe(&name)
+}
+
+/// The triple a clang builds for by default (x86_64-pc-windows-msvc, x86_64-w64-windows-gnu).
+fn clang_default_target(clang: &Path) -> Option<String> {
+    let output = Command::new(clang).arg("-dumpmachine").output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !text.is_empty()).then_some(text)
 }
 
 /// The environment of a Visual Studio developer prompt building for `cpu`: the current one when we are in one for
@@ -677,6 +882,33 @@ fn unix_system_dirs(compiler: &Path) -> Vec<String> {
 }
 
 #[cfg(test)]
+impl Toolchain {
+    /// A toolchain for command-line tests: `family` building for `platform`, with made-up programs.
+    pub fn for_tests(family: Family, platform: Platform, msvc_abi: bool) -> Toolchain {
+        Toolchain {
+            family,
+            version: "1".into(),
+            platform,
+            compile_target_flags: Vec::new(),
+            link_target_flags: Vec::new(),
+            cxx: PathBuf::from("/bin/c++"),
+            cc: PathBuf::from("/bin/cc"),
+            linker: PathBuf::from("/bin/c++"),
+            archiver: PathBuf::from("/bin/ar"),
+            resource_compiler: None,
+            env: Vec::new(),
+            system_dirs: Vec::new(),
+            visual_studio: None,
+            lld: false,
+            msvc_abi,
+            cache_version: CACHE_VERSION,
+            compiler_mtime: 0,
+            vc_tools_version: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -686,5 +918,17 @@ mod tests {
         assert_eq!(classify_compiler("/usr/bin/clang++-19"), Some(Family::Clang));
         assert_eq!(classify_compiler("clang-cl.exe"), Some(Family::ClangCl));
         assert_eq!(classify_compiler("x86_64-w64-mingw32-g++"), Some(Family::Gcc));
+    }
+
+    #[test]
+    fn sibling_programs() {
+        assert_eq!(sibling_program(Path::new("/usr/bin/g++-12"), "gcc"), exe("gcc-12"));
+        assert_eq!(sibling_program(Path::new("/usr/bin/g++-12"), "gcc-ar"), exe("gcc-ar-12"));
+        assert_eq!(
+            sibling_program(Path::new("/usr/bin/aarch64-linux-gnu-g++"), "ar"),
+            exe("aarch64-linux-gnu-ar")
+        );
+        assert_eq!(sibling_program(Path::new("/usr/bin/clang++-18"), "clang"), exe("clang-18"));
+        assert_eq!(sibling_program(Path::new("C:/LLVM/bin/clang++.exe"), "clang"), exe("clang"));
     }
 }

@@ -436,7 +436,10 @@ pub fn default_triplet(toolchain: &Toolchain, static_runtime: bool) -> String {
     let architecture = toolchain.platform.cpu.name();
 
     match toolchain.platform.os {
-        Os::Windows if !toolchain.is_msvc_abi() => format!("{architecture}-mingw-dynamic"),
+        Os::Windows if !toolchain.is_msvc_abi() => {
+            let linkage = if static_runtime { "static" } else { "dynamic" };
+            format!("{architecture}-mingw-{linkage}")
+        }
         Os::Windows => {
             let suffix = if static_runtime { "-static" } else { "" };
             format!("{architecture}-windows{suffix}")
