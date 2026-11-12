@@ -1,0 +1,978 @@
+//! What the converter collects from CMake, and the condition logic it uses: CMake's platform and compiler tests and
+//! generator expressions become Anvil conditions (`windows`, `msvc`, `debug`) instead of being decided for one
+//! machine.
+
+use std::path::PathBuf;
+
+/// The result of a condition: decided, or depending on the platform, compiler, profile or an option.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Truth {
+    Known(bool),
+    Depends(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    Exe,
+    Static,
+    Shared,
+    Object,
+    Interface,
+    Custom,
+}
+
+/// A setting with the condition it applies under and whether it passes on to dependents.
+#[derive(Debug, Clone)]
+pub struct Item<T> {
+    pub condition: Option<String>,
+    pub public: bool,
+    pub value: T,
+}
+
+/// A file CMake writes at configure time; `text` is None when the converter cannot know it.
+#[derive(Debug, Clone)]
+pub struct ConfigureWrite {
+    pub location: String,
+    pub path: PathBuf,
+    pub text: Option<String>,
+    pub condition: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub name: String,
+    pub kind: TargetKind,
+    pub dir: PathBuf,
+    pub dir_id: usize,
+    pub condition: Option<String>,
+
+    pub sources: Vec<Item<PathBuf>>,
+    pub includes: Vec<Item<(PathBuf, bool)>>,
+    pub defines: Vec<Item<String>>,
+    /// INTERFACE definitions of a target that compiles: its users' only.
+    pub interface_defines: Vec<Item<String>>,
+    pub options: Vec<Item<String>>,
+    pub links: Vec<Item<String>>,
+    pub link_options: Vec<Item<String>>,
+    pub lib_dirs: Vec<Item<String>>,
+
+    pub std: Option<u32>,
+    /// The standard its dependents need too (a PUBLIC cxx_std_NN).
+    pub public_std: Option<u32>,
+    pub pch: Option<PathBuf>,
+    pub gui: bool,
+    pub output_name: Option<String>,
+    pub depends: Vec<String>,
+    pub notes: Vec<String>,
+    pub imported: bool,
+
+    /// Anvil keys properties set, each under its condition: output-prefix, output-suffix, exports, link-depends.
+    pub settings: Vec<Item<(&'static str, String)>>,
+    /// add_library without a type under an unset BUILD_SHARED_LIBS: shared when this holds.
+    pub shared_condition: Option<String>,
+    /// generate_export_header as Anvil's key: the header's path under its include folder, and the macro.
+    pub export_header: Option<(String, String)>,
+    /// The project's function that created it, if one did: its targets share a preset.
+    pub helper: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Test {
+    pub name: String,
+    pub command: Vec<String>,
+    pub workdir: Option<String>,
+    pub condition: Option<String>,
+    pub properties: TestProperties,
+    /// The project's function that called add_test, if one did: tests from one helper become one [[test]] with cases.
+    pub helper: Option<HelperCall>,
+    /// The foreach loops add_test ran in: each one's variable and item.
+    pub loops: Vec<(String, String)>,
+    /// The CMake directory (add_subdirectory) that added it: its tests.toml.
+    pub dir: PathBuf,
+}
+
+/// A call of one of the project's functions or macros.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HelperCall {
+    pub function: String,
+    pub params: Vec<String>,
+    pub args: Vec<String>,
+}
+
+/// set_tests_properties values Anvil has a key for; the rest become notes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TestProperties {
+    pub will_fail: bool,
+    pub serial: bool,
+    pub timeout: Option<u64>,
+    pub pass_regex: Option<String>,
+    pub fail_regex: Option<String>,
+    pub skip_exit_code: Option<i32>,
+    pub skip_regex: Option<String>,
+    /// Regexes the output must each match, and must not match; the exit code that passes.
+    pub expect: Vec<String>,
+    pub reject: Vec<String>,
+    pub exit_code: Option<i32>,
+    pub env: Vec<(String, String)>,
+    /// DEPENDS, plus the tests that set up the fixtures this one requires.
+    pub after: Vec<String>,
+    pub fixtures_setup: Vec<String>,
+    pub fixtures_required: Vec<String>,
+    pub disabled: bool,
+    pub notes: Vec<String>,
+}
+
+/// generate_export_header: the header CMake would write into the build folder.
+#[derive(Debug, Clone)]
+pub struct ExportHeader {
+    pub target: String,
+    pub base: String,
+    pub macro_name: String,
+    /// Where CMake writes it: `{out}/...` or a full path.
+    pub generated_path: String,
+    pub custom_content: String,
+}
+
+/// add_custom_command(OUTPUT ...): a build step.
+#[derive(Debug, Clone)]
+pub struct CustomCommand {
+    pub outputs: Vec<PathBuf>,
+    pub commands: Vec<Vec<String>>,
+    pub depends: Vec<String>,
+    pub depfile: Option<String>,
+    pub workdir: Option<String>,
+    pub comment: Option<String>,
+    pub condition: Option<String>,
+    pub dir: PathBuf,
+    /// add_custom_target and add_custom_command(TARGET): the target the commands belong to.
+    pub target: Option<String>,
+    /// PRE_BUILD, PRE_LINK or POST_BUILD, for add_custom_command(TARGET).
+    pub stage: Option<String>,
+}
+
+impl Target {
+    /// Puts every item under `condition` too.
+    pub fn qualify_items(&mut self, condition: &Option<String>) {
+        fn qualify<T>(items: &mut [Item<T>], condition: &Option<String>) {
+            for item in items {
+                item.condition = and_optional(condition, &item.condition);
+            }
+        }
+
+        qualify(&mut self.sources, condition);
+        qualify(&mut self.includes, condition);
+        qualify(&mut self.defines, condition);
+        qualify(&mut self.interface_defines, condition);
+        qualify(&mut self.options, condition);
+        qualify(&mut self.links, condition);
+        qualify(&mut self.link_options, condition);
+        qualify(&mut self.lib_dirs, condition);
+        qualify(&mut self.settings, condition);
+    }
+
+    pub fn new(name: &str, kind: TargetKind, dir: PathBuf, dir_id: usize, condition: Option<String>) -> Target {
+        Target {
+            name: name.to_string(),
+            kind,
+            dir,
+            dir_id,
+            condition,
+            sources: Vec::new(),
+            includes: Vec::new(),
+            defines: Vec::new(),
+            interface_defines: Vec::new(),
+            options: Vec::new(),
+            links: Vec::new(),
+            link_options: Vec::new(),
+            lib_dirs: Vec::new(),
+            std: None,
+            public_std: None,
+            pch: None,
+            gui: false,
+            output_name: None,
+            depends: Vec::new(),
+            notes: Vec::new(),
+            imported: false,
+            settings: Vec::new(),
+            shared_condition: None,
+            export_header: None,
+            helper: None,
+        }
+    }
+}
+
+impl Truth {
+    pub fn not(self) -> Truth {
+        match self {
+            Truth::Known(value) => Truth::Known(!value),
+            Truth::Depends(condition) => Truth::Depends(negate(&condition)),
+        }
+    }
+
+    pub fn and(self, other: Truth) -> Truth {
+        match (self, other) {
+            (Truth::Known(false), _) | (_, Truth::Known(false)) => Truth::Known(false),
+            (Truth::Known(true), other) | (other, Truth::Known(true)) => other,
+            (Truth::Depends(left), Truth::Depends(right)) => Truth::Depends(and(&left, &right)),
+        }
+    }
+
+    pub fn or(self, other: Truth) -> Truth {
+        match (self, other) {
+            (Truth::Known(true), _) | (_, Truth::Known(true)) => Truth::Known(true),
+            (Truth::Known(false), other) | (other, Truth::Known(false)) => other,
+            (Truth::Depends(left), Truth::Depends(right)) if left == right => Truth::Depends(left),
+            (Truth::Depends(left), Truth::Depends(right)) => Truth::Depends(format!("{} | {}", group(&left), group(&right))),
+        }
+    }
+}
+
+// Brackets an option's name expanded inside a generator expression's condition (no character the parser splits on)
+const OPTION_MARKER: &str = "\u{1}option-";
+const OPTION_MARKER_END: &str = "\u{2}";
+
+/// `a & b`, skipping duplicates.
+pub fn and(left: &str, right: &str) -> String {
+    if left == right {
+        return left.to_string();
+    }
+    format!("{} & {}", group(left), group(right))
+}
+
+/// Both optional conditions, combined.
+pub fn and_optional(left: &Option<String>, right: &Option<String>) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(and(left, right)),
+        (Some(single), None) | (None, Some(single)) => Some(single.clone()),
+        (None, None) => None,
+    }
+}
+
+pub fn negate(condition: &str) -> String {
+    if let Some(inner) = condition.strip_prefix('!') {
+        if is_atom(inner) {
+            return inner.to_string();
+        }
+    }
+    if is_atom(condition) {
+        format!("!{condition}")
+    } else {
+        format!("!({condition})")
+    }
+}
+
+fn group(condition: &str) -> String {
+    let simple = is_atom(condition.trim_start_matches('!')) || !condition.contains(['&', '|']);
+    if simple {
+        condition.to_string()
+    } else {
+        format!("({condition})")
+    }
+}
+
+fn is_atom(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_-.+".contains(character))
+}
+
+/// Would a condition hold on this machine with this compiler (Windows + MSVC here)? Used to let the host's branch
+/// set variables last, so values computed later match a real configure.
+pub fn holds_on_host(condition: &str, options: &dyn Fn(&str) -> Option<bool>) -> bool {
+    let Ok(parsed) = crate::cond::parse(condition) else { return false };
+
+    let lookup = |atom: &str| -> Option<bool> {
+        Some(match atom {
+            "windows" => cfg!(windows),
+            "linux" => cfg!(target_os = "linux"),
+            "macos" => cfg!(target_os = "macos"),
+            "unix" => cfg!(unix),
+            "msvc" | "cl" => cfg!(windows),
+            "gnu" | "gcc" => !cfg!(windows),
+            "clang" | "clang-cl" | "mingw" | "cross" => false,
+            "x64" => cfg!(target_arch = "x86_64"),
+            "x86" => cfg!(target_arch = "x86"),
+            "arm64" => cfg!(target_arch = "aarch64"),
+            "arm" => cfg!(target_arch = "arm"),
+            "debug" | "release" => atom == "release",
+            "true" => true,
+            "false" => false,
+            other => options(other).unwrap_or(false),
+        })
+    };
+
+    parsed.eval(&lookup).unwrap_or(false)
+}
+
+/// The shortest equivalent of `condition` (a sum of products), assuming `assumption` holds: where the assumption is
+/// false the result may be anything. `(a | b) & (a & c)` given nothing is `a & c`; `windows & x` given `windows` is
+/// `x`. Conditions over too many names to tabulate come back unchanged.
+pub fn simplify(condition: &str, assumption: Option<&str>) -> Truth {
+    let Ok(parsed) = crate::cond::parse(condition) else {
+        return Truth::Depends(condition.to_string());
+    };
+    let assumed = match assumption.map(crate::cond::parse) {
+        Some(Ok(assumed)) => Some(assumed),
+        Some(Err(_)) | None => None,
+    };
+
+    // The names, in order of appearance
+    let mut atoms: Vec<String> = Vec::new();
+    collect_atoms(&parsed, &mut atoms);
+    if let Some(assumed) = &assumed {
+        collect_atoms(assumed, &mut atoms);
+    }
+    if atoms.len() > MAX_SIMPLIFIED_ATOMS {
+        return Truth::Depends(condition.to_string());
+    }
+
+    // The truth table: where it must hold, and where it does not matter (the assumption is false, or the
+    // combination cannot happen, like cl without msvc)
+    let mut required = Vec::new();
+    let mut free = Vec::new();
+    for assignment in 0u32..(1 << atoms.len()) {
+        let lookup = |name: &str| match name {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => atoms.iter().position(|atom| atom == name).map(|index| assignment & (1 << index) != 0),
+        };
+        let applies = assumed.as_ref().map_or(true, |assumed| assumed.eval(&lookup).unwrap_or(true));
+        if !applies || !is_possible(&lookup) {
+            free.push(assignment);
+        } else if parsed.eval(&lookup).unwrap_or(false) {
+            required.push(assignment);
+        }
+    }
+
+    if required.is_empty() {
+        return Truth::Known(false);
+    }
+    if required.len() + free.len() == 1 << atoms.len() {
+        return Truth::Known(true);
+    }
+
+    let cover = minimal_cover(&required, &free, atoms.len() as u32);
+    Truth::Depends(write_sum_of_products(&cover, &atoms))
+}
+
+// Above this many names a truth table is too large to be worth it
+const MAX_SIMPLIFIED_ATOMS: usize = 12;
+
+// Condition words where the first implies the second
+const IMPLICATIONS: &[(&str, &str)] = &[
+    ("cl", "msvc"),
+    ("clang-cl", "msvc"),
+    ("clang-cl", "clang"),
+    ("gcc", "gnu"),
+    ("mingw", "gcc"),
+    ("mingw", "windows"),
+    ("linux", "unix"),
+    ("macos", "unix"),
+];
+
+// Condition words that cannot both hold
+const EXCLUSIONS: &[(&str, &str)] = &[
+    ("windows", "unix"),
+    ("linux", "macos"),
+    ("msvc", "gnu"),
+    ("cl", "clang"),
+    ("gcc", "clang"),
+    ("x64", "arm64"),
+    ("debug", "release"),
+];
+
+/// Can these condition words hold together? Words not in the condition are unknown and allow anything.
+fn is_possible(lookup: &dyn Fn(&str) -> Option<bool>) -> bool {
+    let implied = IMPLICATIONS
+        .iter()
+        .all(|(word, implied)| !(lookup(word) == Some(true) && lookup(implied) == Some(false)));
+    let excluded = EXCLUSIONS
+        .iter()
+        .any(|(left, right)| lookup(left) == Some(true) && lookup(right) == Some(true));
+
+    implied && !excluded
+}
+
+fn collect_atoms(condition: &crate::cond::Cond, atoms: &mut Vec<String>) {
+    use crate::cond::Cond;
+
+    match condition {
+        Cond::Atom(name) if name != "true" && name != "false" => {
+            if !atoms.contains(name) {
+                atoms.push(name.clone());
+            }
+        }
+        Cond::Atom(_) => {}
+        Cond::Not(inner) => collect_atoms(inner, atoms),
+        Cond::And(left, right) | Cond::Or(left, right) => {
+            collect_atoms(left, atoms);
+            collect_atoms(right, atoms);
+        }
+    }
+}
+
+/// Quine-McCluskey: the prime implicants of required + free, then the fewest that cover every required assignment.
+/// An implicant is (value, mask): bits in `mask` may be anything.
+fn minimal_cover(required: &[u32], free: &[u32], width: u32) -> Vec<(u32, u32)> {
+    let mut current: Vec<(u32, u32)> = required.iter().chain(free).map(|assignment| (*assignment, 0)).collect();
+    let mut primes: Vec<(u32, u32)> = Vec::new();
+
+    // Combine implicants that differ in one bit until nothing combines
+    while !current.is_empty() {
+        let mut combined = vec![false; current.len()];
+        let mut next: Vec<(u32, u32)> = Vec::new();
+
+        for first in 0..current.len() {
+            for second in first + 1..current.len() {
+                let (left, right) = (current[first], current[second]);
+                let difference = left.0 ^ right.0;
+                if left.1 == right.1 && difference.count_ones() == 1 {
+                    let merged = (left.0 & !difference, left.1 | difference);
+                    if !next.contains(&merged) {
+                        next.push(merged);
+                    }
+                    combined[first] = true;
+                    combined[second] = true;
+                }
+            }
+        }
+
+        for (index, implicant) in current.iter().enumerate() {
+            if !combined[index] && !primes.contains(implicant) {
+                primes.push(*implicant);
+            }
+        }
+        current = next;
+    }
+
+    // Cover the required assignments: the implicant covering most of the rest, fewest literals on a tie
+    let covers = |implicant: &(u32, u32), assignment: u32| assignment & !implicant.1 == implicant.0;
+    let literal_count = |implicant: &(u32, u32)| width - implicant.1.count_ones();
+    let mut uncovered: Vec<u32> = required.to_vec();
+    let mut cover: Vec<(u32, u32)> = Vec::new();
+
+    // Essential primes: the only cover of some required assignment
+    for assignment in required {
+        let covering: Vec<&(u32, u32)> = primes.iter().filter(|implicant| covers(implicant, *assignment)).collect();
+        if let [only] = covering.as_slice() {
+            if !cover.contains(only) {
+                cover.push(**only);
+            }
+        }
+    }
+    uncovered.retain(|assignment| !cover.iter().any(|implicant| covers(implicant, *assignment)));
+
+    while !uncovered.is_empty() {
+        let best = *primes
+            .iter()
+            .max_by_key(|implicant| {
+                let covered = uncovered.iter().filter(|assignment| covers(implicant, **assignment)).count();
+                (covered, std::cmp::Reverse(literal_count(implicant)))
+            })
+            .unwrap();
+        uncovered.retain(|assignment| !covers(&best, *assignment));
+        cover.push(best);
+    }
+
+    // Shorter terms first, then in the order their names appeared
+    let first_literal = |implicant: &(u32, u32)| (0..width).find(|index| implicant.1 & (1 << index) == 0).unwrap_or(width);
+    cover.sort_by_key(|implicant| (literal_count(implicant), first_literal(implicant)));
+    cover
+}
+
+fn write_sum_of_products(cover: &[(u32, u32)], atoms: &[String]) -> String {
+    let terms: Vec<Vec<String>> = cover
+        .iter()
+        .map(|(value, mask)| {
+            (0..atoms.len())
+                .filter(|index| mask & (1 << index) == 0)
+                .map(|index| {
+                    if value & (1 << index) != 0 {
+                        atoms[index].clone()
+                    } else {
+                        format!("!{}", atoms[index])
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    if terms.len() == 1 {
+        return terms[0].join(" & ");
+    }
+
+    let written: Vec<String> = terms
+        .iter()
+        .map(|literals| {
+            if literals.len() > 1 {
+                format!("({})", literals.join(" & "))
+            } else {
+                literals[0].clone()
+            }
+        })
+        .collect();
+    written.join(" | ")
+}
+
+/// CMake's truth constants: None when the text is not one (then it may be a variable name).
+pub fn constant_truth(text: &str) -> Option<bool> {
+    let upper = text.to_ascii_uppercase();
+    match upper.as_str() {
+        "1" | "ON" | "YES" | "TRUE" | "Y" => Some(true),
+        "0" | "OFF" | "NO" | "FALSE" | "N" | "IGNORE" | "NOTFOUND" | "" => Some(false),
+        _ if upper.ends_with("-NOTFOUND") => Some(false),
+        _ if text.parse::<f64>().is_ok() => Some(text.parse::<f64>().unwrap() != 0.0),
+        _ => None,
+    }
+}
+
+/// A CMake configuration name as an Anvil profile name.
+pub fn profile_name(config: &str) -> String {
+    config.trim().to_lowercase()
+}
+
+/// Splits a value on `;` outside generator expressions, honouring `\;`.
+pub fn split_list(value: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut characters = value.chars().peekable();
+
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' if characters.peek() == Some(&';') => {
+                current.push(';');
+                characters.next();
+            }
+            '$' if characters.peek() == Some(&'<') => {
+                depth += 1;
+                current.push(character);
+            }
+            '>' if depth > 0 => {
+                depth -= 1;
+                current.push(character);
+            }
+            ';' if depth == 0 => items.push(std::mem::take(&mut current)),
+            _ => current.push(character),
+        }
+    }
+    items.push(current);
+
+    items.into_iter().filter(|item| !item.is_empty()).collect()
+}
+
+/// Evaluates generator expressions in one list item: each result is (condition, value). Unknown expressions are
+/// kept and reported.
+pub fn expand_genex(item: &str, unknown: &mut Vec<String>) -> Vec<(Truth, String)> {
+    if !item.contains("$<") {
+        return vec![(Truth::Known(true), item.to_string())];
+    }
+
+    let mut parser = GenexParser {
+        characters: item.chars().collect(),
+        position: 0,
+        unknown,
+    };
+    let parts = parser.sequence(&[]);
+
+    join_alternatives(parts).into_iter().filter(|(_, value)| !value.is_empty()).collect()
+}
+
+struct GenexParser<'a> {
+    characters: Vec<char>,
+    position: usize,
+    unknown: &'a mut Vec<String>,
+}
+
+type Alternatives = Vec<(Truth, String)>;
+
+/// The text of an argument that has one unconditional value.
+fn plain_text(alternatives: &Alternatives) -> Option<&str> {
+    match alternatives.as_slice() {
+        [(Truth::Known(true), text)] => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+// Generator expressions that test something (their value is "1" or "0")
+const CONDITION_EXPRESSIONS: &[&str] = &[
+    "CONFIG",
+    "PLATFORM_ID",
+    "CXX_COMPILER_ID",
+    "C_COMPILER_ID",
+    "CXX_COMPILER_FRONTEND_VARIANT",
+    "C_COMPILER_FRONTEND_VARIANT",
+    "COMPILE_LANGUAGE",
+    "LINK_LANGUAGE",
+    "BOOL",
+    "NOT",
+    "AND",
+    "OR",
+    "STREQUAL",
+    "EQUAL",
+    "TARGET_EXISTS",
+];
+
+impl GenexParser<'_> {
+    /// Text and expressions up to the end, or up to one of `stops` (not consumed).
+    fn sequence(&mut self, stops: &[char]) -> Vec<Alternatives> {
+        let mut parts = Vec::new();
+        let mut text = String::new();
+
+        while let Some(character) = self.peek() {
+            if stops.contains(&character) {
+                break;
+            }
+
+            if self.at_expression() {
+                if !text.is_empty() {
+                    parts.push(vec![(Truth::Known(true), std::mem::take(&mut text))]);
+                }
+                self.position += 2;
+                parts.push(self.expression());
+                continue;
+            }
+
+            text.push(character);
+            self.position += 1;
+        }
+
+        if !text.is_empty() {
+            parts.push(vec![(Truth::Known(true), text)]);
+        }
+        parts
+    }
+
+    /// One `$<...>`, its `$<` already consumed, through its closing `>`.
+    fn expression(&mut self) -> Alternatives {
+        let start = self.position;
+
+        // $<$<cond>:value>: the head is a nested condition
+        if self.at_expression() {
+            self.position += 2;
+            let condition = truth_of(&self.expression());
+            if self.peek() != Some(':') {
+                return self.unknown_expression(start);
+            }
+            self.position += 1;
+
+            let value = join_alternatives(self.sequence(&['>']));
+            self.expect_close();
+            return value
+                .into_iter()
+                .map(|(value_condition, text)| (condition.clone().and(value_condition), text))
+                .collect();
+        }
+
+        let head = self.text_until(&[':', '>']);
+
+        // No argument: $<CONFIG>
+        if self.peek() == Some('>') {
+            self.position += 1;
+            return match head.as_str() {
+                "CONFIG" | "CONFIGURATION" => vec![(Truth::Known(true), "{config}".into())],
+                "SEMICOLON" => vec![(Truth::Known(true), ";".into())],
+                "COMMA" => vec![(Truth::Known(true), ",".into())],
+                "ANGLE-R" => vec![(Truth::Known(true), ">".into())],
+                _ => self.unknown_expression(start),
+            };
+        }
+        self.position += 1;
+
+        match head.as_str() {
+            // $<1:value>, $<0:value>, interface wrappers: the value runs to the closing '>'
+            "1" | "0" | "BUILD_INTERFACE" | "BUILD_LOCAL_INTERFACE" | "INSTALL_INTERFACE" => {
+                let value = join_alternatives(self.sequence(&['>']));
+                self.expect_close();
+                if head == "0" || head == "INSTALL_INTERFACE" {
+                    Vec::new()
+                } else {
+                    value
+                }
+            }
+            "TARGET_FILE" | "TARGET_LINKER_FILE" => {
+                let name = self.text_until(&['>']);
+                self.expect_close();
+                vec![(Truth::Known(true), format!("{{target:{name}}}"))]
+            }
+            "TARGET_FILE_DIR" => {
+                self.text_until(&['>']);
+                self.expect_close();
+                vec![(Truth::Known(true), "{out}".into())]
+            }
+
+            // A target's headers without linking it: Anvil's header-deps
+            "COMPILE_ONLY" => {
+                let name = self.text_until(&['>']);
+                self.expect_close();
+                vec![(Truth::Known(true), format!("{{header-dep:{name}}}"))]
+            }
+            "TARGET_PROPERTY" => {
+                let arguments = self.arguments();
+                match arguments.as_slice() {
+                    [target, property] if plain_text(property) == Some("INTERFACE_INCLUDE_DIRECTORIES") => match plain_text(target) {
+                        Some(name) => vec![(Truth::Known(true), format!("{{header-dep:{name}}}"))],
+                        None => self.unknown_expression(start),
+                    },
+                    _ => self.unknown_expression(start),
+                }
+            }
+            name if CONDITION_EXPRESSIONS.contains(&name) => {
+                let arguments = self.arguments();
+                truth_only(condition_expression(name, &arguments))
+            }
+
+            // $<IF:cond,then,else>
+            "IF" => {
+                let arguments = self.arguments();
+                let [condition, then, otherwise] = arguments.as_slice() else {
+                    return self.unknown_expression(start);
+                };
+                let truth = truth_of(condition);
+
+                let mut results: Alternatives = Vec::new();
+                for (branch_truth, branch) in [(truth.clone(), then), (truth.not(), otherwise)] {
+                    for (value_truth, text) in branch {
+                        let combined = branch_truth.clone().and(value_truth.clone());
+                        if combined != Truth::Known(false) {
+                            results.push((combined, text.clone()));
+                        }
+                    }
+                }
+                results
+            }
+            _ => self.unknown_expression(start),
+        }
+    }
+
+    /// Comma-separated arguments up to the closing `>`, which is consumed.
+    fn arguments(&mut self) -> Vec<Alternatives> {
+        let mut arguments: Vec<Alternatives> = Vec::new();
+
+        loop {
+            arguments.push(join_alternatives(self.sequence(&[',', '>'])));
+            if self.peek() == Some(',') {
+                self.position += 1;
+                continue;
+            }
+            break;
+        }
+        self.expect_close();
+
+        arguments
+    }
+
+    /// Keeps an expression Anvil cannot translate as raw text, and reports it.
+    fn unknown_expression(&mut self, start: usize) -> Alternatives {
+        self.position = start;
+        let mut depth = 1;
+
+        while let Some(character) = self.peek() {
+            if self.at_expression() {
+                depth += 1;
+                self.position += 2;
+                continue;
+            }
+            self.position += 1;
+            if character == '>' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+
+        let raw = format!("$<{}", self.characters[start..self.position].iter().collect::<String>());
+        self.unknown.push(raw.clone());
+        vec![(Truth::Known(true), raw)]
+    }
+
+    fn at_expression(&self) -> bool {
+        self.peek() == Some('$') && self.characters.get(self.position + 1) == Some(&'<')
+    }
+
+    fn expect_close(&mut self) {
+        if self.peek() == Some('>') {
+            self.position += 1;
+        }
+    }
+
+    fn text_until(&mut self, stops: &[char]) -> String {
+        let mut text = String::new();
+        while let Some(character) = self.peek() {
+            if stops.contains(&character) {
+                break;
+            }
+            text.push(character);
+            self.position += 1;
+        }
+        text
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.characters.get(self.position).copied()
+    }
+}
+
+/// The truth of a condition expression from its (already expanded) arguments.
+fn condition_expression(name: &str, arguments: &[Alternatives]) -> Truth {
+    let flat = |index: usize| -> String {
+        arguments
+            .get(index)
+            .and_then(|alternatives| alternatives.first())
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default()
+    };
+
+    match name {
+        "CONFIG" => (0..arguments.len()).fold(Truth::Known(false), |result, index| result.or(Truth::Depends(profile_name(&flat(index))))),
+        "PLATFORM_ID" => (0..arguments.len()).fold(Truth::Known(false), |result, index| result.or(platform_truth(&flat(index)))),
+        "CXX_COMPILER_ID" | "C_COMPILER_ID" => {
+            (0..arguments.len()).fold(Truth::Known(false), |result, index| result.or(compiler_truth(&flat(index))))
+        }
+        "CXX_COMPILER_FRONTEND_VARIANT" | "C_COMPILER_FRONTEND_VARIANT" => Truth::Depends(if flat(0) == "MSVC" { "msvc" } else { "gnu" }.into()),
+        "COMPILE_LANGUAGE" | "LINK_LANGUAGE" => Truth::Known((0..arguments.len()).any(|index| flat(index) == "CXX")),
+        "BOOL" => truth_of(&arguments[0]),
+        "NOT" => truth_of(&arguments[0]).not(),
+        "AND" => arguments.iter().map(truth_of).fold(Truth::Known(true), Truth::and),
+        "OR" => arguments.iter().map(truth_of).fold(Truth::Known(false), Truth::or),
+        "STREQUAL" | "EQUAL" => Truth::Known(flat(0) == flat(1)),
+        _ => Truth::Known(true),
+    }
+}
+
+/// An option's value in a generator expression's condition: the option itself, not its default.
+pub fn option_marker(name: &str) -> String {
+    format!("{OPTION_MARKER}{name}{OPTION_MARKER_END}")
+}
+
+/// A value read as a condition: true where its text is a true constant, or the option it names.
+fn truth_of(alternatives: &Alternatives) -> Truth {
+    alternatives.iter().fold(Truth::Known(false), |result, (condition, text)| {
+        let option = text.strip_prefix(OPTION_MARKER).and_then(|rest| rest.strip_suffix(OPTION_MARKER_END));
+        let text_truth = match option {
+            Some(name) => Truth::Depends(name.to_string()),
+            None => Truth::Known(constant_truth(text).unwrap_or(!text.is_empty())),
+        };
+        result.or(condition.clone().and(text_truth))
+    })
+}
+
+/// A condition used as a value: "1" where it holds, "0" elsewhere.
+fn truth_only(truth: Truth) -> Alternatives {
+    match truth {
+        Truth::Known(true) => vec![(Truth::Known(true), "1".into())],
+        Truth::Known(false) => vec![(Truth::Known(true), "0".into())],
+        depends => vec![(depends.clone(), "1".into()), (depends.not(), "0".into())],
+    }
+}
+
+/// Concatenates parts: their alternatives multiply out.
+fn join_alternatives(parts: Vec<Alternatives>) -> Alternatives {
+    let mut results: Alternatives = vec![(Truth::Known(true), String::new())];
+
+    for part in parts {
+        let mut next = Vec::new();
+        for (condition, prefix) in &results {
+            for (part_condition, text) in &part {
+                let combined = condition.clone().and(part_condition.clone());
+                if combined != Truth::Known(false) {
+                    next.push((combined, format!("{prefix}{text}")));
+                }
+            }
+        }
+        results = next;
+    }
+
+    results
+}
+
+/// CMAKE_SYSTEM_NAME / PLATFORM_ID values.
+pub fn platform_truth(name: &str) -> Truth {
+    match name {
+        "Windows" => Truth::Depends("windows".into()),
+        "Linux" => Truth::Depends("linux".into()),
+        "Darwin" => Truth::Depends("macos".into()),
+        _ => Truth::Known(false),
+    }
+}
+
+/// CMAKE_CXX_COMPILER_ID values (a comma list in generator expressions).
+pub fn compiler_truth(names: &str) -> Truth {
+    names.split(',').fold(Truth::Known(false), |result, name| {
+        let truth = match name {
+            "MSVC" => Truth::Depends("cl".into()),
+            "Clang" | "AppleClang" | "ARMClang" | "IntelLLVM" => Truth::Depends("clang".into()),
+            "GNU" => Truth::Depends("gcc".into()),
+            _ => Truth::Known(false),
+        };
+        result.or(truth)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn genex_conditions() {
+        let mut unknown = Vec::new();
+        assert_eq!(
+            expand_genex("$<$<CONFIG:Debug>:FOO>", &mut unknown),
+            vec![(Truth::Depends("debug".into()), "FOO".into())]
+        );
+        assert_eq!(
+            expand_genex("$<BUILD_INTERFACE:inc>", &mut unknown),
+            vec![(Truth::Known(true), "inc".into())]
+        );
+        assert!(expand_genex("$<INSTALL_INTERFACE:inc>", &mut unknown).is_empty());
+
+        let negated = expand_genex("$<$<NOT:$<CONFIG:Shipping>>:Tracy::TracyClient>", &mut unknown);
+        assert_eq!(negated, vec![(Truth::Depends("!shipping".into()), "Tracy::TracyClient".into())]);
+
+        let platform = expand_genex("$<$<PLATFORM_ID:Windows>:NOMINMAX>", &mut unknown);
+        assert_eq!(platform, vec![(Truth::Depends("windows".into()), "NOMINMAX".into())]);
+
+        let choice = expand_genex("lib/$<IF:$<CONFIG:Debug>,d,r>/x", &mut unknown);
+        assert_eq!(
+            choice,
+            vec![
+                (Truth::Depends("debug".into()), "lib/d/x".into()),
+                (Truth::Depends("!debug".into()), "lib/r/x".into())
+            ]
+        );
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn lists_keep_genex_whole() {
+        assert_eq!(split_list("a;$<$<CONFIG:Debug>:b;c>;d"), vec!["a", "$<$<CONFIG:Debug>:b;c>", "d"]);
+    }
+
+    #[test]
+    fn truth_algebra() {
+        let windows = Truth::Depends("windows".into());
+        assert_eq!(windows.clone().not().not(), windows);
+        assert_eq!(windows.clone().and(Truth::Known(true)), windows);
+        assert_eq!(windows.clone().or(Truth::Known(true)), Truth::Known(true));
+    }
+
+    #[test]
+    fn simplification() {
+        let text = |truth: Truth| match truth {
+            Truth::Depends(condition) => condition,
+            Truth::Known(value) => value.to_string(),
+        };
+
+        assert_eq!(text(simplify("((a | b) | c) & (b & c)", None)), "b & c");
+        assert_eq!(text(simplify("windows & x", Some("windows"))), "x");
+        assert_eq!(text(simplify("windows", Some("windows"))), "true");
+        assert_eq!(text(simplify("a & !a", None)), "false");
+        assert_eq!(text(simplify("(a & b) | (a & !b) | c", None)), "a | c");
+        assert_eq!(text(simplify("(a & b) | (!a & c)", None)), "(a & b) | (!a & c)");
+        assert_eq!(text(simplify("msvc & cl", None)), "cl");
+        assert_eq!(text(simplify("(false) | (msvc)", None)), "msvc");
+        assert_eq!(text(simplify("windows & !unix", None)), "windows");
+    }
+}
