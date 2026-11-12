@@ -71,6 +71,14 @@ pub struct Action {
 
     /// An incremental link's state file (link.exe's .ilk).
     pub incremental_state: Option<PathBuf>,
+
+    /// gcc and clang color their diagnostics: added when the process starts, so the hash and compile_commands.json
+    /// do not depend on the terminal.
+    pub color_diagnostics: bool,
+
+    /// Everything about how the action runs (kind, program, arguments, folder, declared inputs); a change means the
+    /// output is stale. Set once the action is planned.
+    pub command_hash: u64,
 }
 
 pub struct Plan {
@@ -133,21 +141,31 @@ struct Planner<'a> {
 }
 
 impl Action {
-    /// Everything about how the action runs; a change means the output is stale.
-    pub fn command_hash(&self, toolchain_identity: u64) -> u64 {
-        let mut text = format!("{:?}|{}|{toolchain_identity}", self.kind, path_text(&self.program));
+    /// Hashes everything about how the action runs, streamed (no command line text is built).
+    fn compute_command_hash(&self) -> u64 {
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+        let mut field = |bytes: &[u8]| {
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        };
+
+        field(&[self.kind as u8]);
+        field(self.program.as_os_str().as_encoded_bytes());
         for argument in &self.args {
-            text.push('\0');
-            text.push_str(argument);
+            field(argument.as_bytes());
         }
-        if let Some(workdir) = &self.workdir {
-            text.push_str(&format!("|cwd={}", path_text(workdir)));
-        }
-        if let Some(source) = &self.copy_from {
-            text.push_str(&format!("|copy={}", path_text(source)));
+        field(self.workdir.as_deref().unwrap_or(Path::new("")).as_os_str().as_encoded_bytes());
+        field(self.copy_from.as_deref().unwrap_or(Path::new("")).as_os_str().as_encoded_bytes());
+
+        // Declared inputs as a set: a file a pattern newly matches makes the action stale
+        let mut inputs: Vec<&[u8]> = self.inputs.iter().map(|input| input.as_os_str().as_encoded_bytes()).collect();
+        inputs.sort_unstable();
+        field(b"inputs");
+        for input in inputs {
+            field(input);
         }
 
-        util::hash_bytes(text.as_bytes())
+        hasher.digest()
     }
 
     fn new(kind: ActionKind, description: String, program: PathBuf, env: Arc<Vec<(String, String)>>) -> Action {
@@ -169,6 +187,8 @@ impl Action {
             must_create: Vec::new(),
             stamp: false,
             incremental_state: None,
+            color_diagnostics: false,
+            command_hash: 0,
         }
     }
 }
@@ -758,7 +778,6 @@ impl<'a> Planner<'a> {
             system_includes: &settings.system_includes,
             flags: &settings.flags,
             position_independent,
-            color: self.color,
         }
     }
 
@@ -819,6 +838,7 @@ impl<'a> Planner<'a> {
         action.after = after;
         action.response = self.response_style();
         action.echo_line = self.compiler_echo(source);
+        action.color_diagnostics = self.color_diagnostics();
 
         self.compile_commands.push(CompileEntry {
             source: source.to_path_buf(),
@@ -843,6 +863,7 @@ impl<'a> Planner<'a> {
         let mut action = Action::new(ActionKind::Compile, String::new(), program, self.env.clone());
         action.args = args;
         action.outputs = vec![object];
+        action.command_hash = action.compute_command_hash();
         self.compile_commands.push(CompileEntry {
             source: source.to_path_buf(),
             command: CompileCommand::Alone(Box::new(action)),
@@ -860,6 +881,7 @@ impl<'a> Planner<'a> {
         let mut action = Action::new(ActionKind::Precompile, description, self.toolchain.cxx.clone(), self.env.clone());
         action.after = barrier.to_vec();
         action.response = self.response_style();
+        action.color_diagnostics = self.color_diagnostics();
 
         let (file, use_args) = match self.toolchain.family {
             // cl: compile a stub source with /Yc; its object links into the target
@@ -1466,9 +1488,15 @@ impl<'a> Planner<'a> {
         order.push(index);
     }
 
-    fn push(&mut self, action: Action) -> usize {
+    fn push(&mut self, mut action: Action) -> usize {
+        action.command_hash = action.compute_command_hash();
         self.actions.push(action);
         self.actions.len() - 1
+    }
+
+    /// gcc and clang color diagnostics when Anvil's own output is colored (cl-style compilers never do).
+    fn color_diagnostics(&self) -> bool {
+        self.color && !self.toolchain.family.is_msvc_style()
     }
 
     fn response_style(&self) -> ResponseStyle {
@@ -1532,7 +1560,7 @@ impl<'a> Planner<'a> {
         let mut fingerprint = Vec::with_capacity(self.compile_commands.len() * 16);
         for entry in &self.compile_commands {
             fingerprint.extend(util::hash_bytes(path_text(&entry.source).as_bytes()).to_le_bytes());
-            fingerprint.extend(action_of(entry).command_hash(0).to_le_bytes());
+            fingerprint.extend(action_of(entry).command_hash.to_le_bytes());
         }
         let fingerprint = format!("{:016x}", util::hash_bytes(&fingerprint));
         let stamp_file = self.model.out_dir.join(".anvil").join("compile_commands.stamp");

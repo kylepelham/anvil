@@ -1,14 +1,14 @@
-//! Runs a plan: decides what is out of date from the build database (command hashes and input stamps, with
-//! content hashes so a touched-but-unchanged file rebuilds nothing), runs the rest in parallel, and records what
-//! each action read.
+//! Runs a plan: decides what is out of date from the build database (command hashes, output time stamps and input
+//! stamps, with content hashes so a touched-but-unchanged file rebuilds nothing), runs the rest in parallel, and
+//! records what each action read.
 
-use crate::db::{Database, Record, Stamp};
+use crate::db::{Database, Record, Stamp, CHANGED_WHILE_RUNNING};
 use crate::depfile;
 use crate::flags::DepsFormat;
 use crate::plan::{Action, ActionKind, Plan, ResponseStyle};
 use crate::toolchain::Toolchain;
 use crate::ui;
-use crate::util::{self, slash};
+use crate::util;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use std::collections::{HashMap, VecDeque};
@@ -21,6 +21,16 @@ use std::time::{Duration, Instant};
 // Command lines longer than this go through a response file (Windows allows 32767 characters)
 const RESPONSE_FILE_THRESHOLD: usize = 8000;
 
+// The longest command line Windows starts a process with, and the error (ERROR_FILENAME_EXCED_RANGE) past it
+const WINDOWS_COMMAND_LINE_LIMIT: usize = 32767;
+const ERROR_COMMAND_LINE_TOO_LONG: i32 = 206;
+
+// What gcc and clang color their diagnostics with (added when the process starts, see Action::color_diagnostics)
+const COLOR_DIAGNOSTICS: &str = "-fdiagnostics-color=always";
+
+// How many changed arguments --explain shows on each side
+const EXPLAIN_ARGUMENTS: usize = 3;
+
 pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
@@ -30,6 +40,9 @@ pub struct ExecOptions {
     pub verbose: bool,
     pub explain: bool,
     pub low_priority: bool,
+
+    /// The project's root: --explain shows paths relative to it.
+    pub root: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -62,14 +75,29 @@ struct Outcome {
     discovered: Vec<String>,
     started: i64,
     error: Option<String>,
-    // Every input it read with its time stamp and content hash, measured by the worker
-    measured: Vec<(PathBuf, i64, u64)>,
+
+    // Every input it read, and each output's time stamp (None: missing), measured by the worker
+    measured: Vec<Measured>,
+    output_mtimes: Vec<Option<i64>>,
 }
 
-/// Time stamps and content hashes, shared by the scheduler and the workers.
+/// One file an action read, as the worker found it once the action finished.
+struct Measured {
+    key: String,
+    path: PathBuf,
+    mtime: i64,
+    hash: u64,
+
+    // It changed while the action ran, so the action may have read an older version
+    changed_while_running: bool,
+}
+
+/// Time stamps and content hashes by `util::path_key`, shared by the scheduler and the workers.
 struct Stamps {
     mtimes: Mutex<HashMap<String, Option<i64>>>,
-    hashes: Mutex<HashMap<(String, i64), u64>>,
+
+    // Each file's content hash, with the time stamp it was hashed at
+    hashes: Mutex<HashMap<String, (i64, u64)>>,
 }
 
 struct Executor<'a> {
@@ -79,33 +107,53 @@ struct Executor<'a> {
     toolchain_identity: u64,
     system_dirs: Vec<String>,
     options: ExecOptions,
+
+    // Each action's outputs as database path ids
+    output_ids: Vec<Vec<u32>>,
+
+    // By database path id: the time stamp this build found (None: missing), and whether an action makes the file
+    disk_mtimes: Vec<Option<i64>>,
+    produced: Vec<bool>,
+
+    // Actions that ran, and files the build makes that a later action rewrote in place
+    ran: Vec<usize>,
+    rewritten: Vec<u32>,
 }
 
 impl Stamps {
-    fn mtime(&self, path: &Path) -> Option<i64> {
-        let key = util::path_key(path);
-        if let Some(known) = self.mtimes.lock().unwrap().get(&key) {
+    fn mtime(&self, key: &str, path: &Path) -> Option<i64> {
+        if let Some(known) = self.mtimes.lock().unwrap().get(key) {
             return *known;
         }
 
         let mtime = util::mtime(path);
-        self.mtimes.lock().unwrap().insert(key, mtime);
+        self.mtimes.lock().unwrap().insert(key.to_string(), mtime);
         mtime
+    }
+
+    fn set(&self, key: &str, mtime: Option<i64>) {
+        self.mtimes.lock().unwrap().insert(key.to_string(), mtime);
     }
 
     fn forget(&self, path: &Path) {
         self.mtimes.lock().unwrap().remove(&util::path_key(path));
     }
 
-    /// Content hash of a file at a time stamp (each file is hashed once per change).
-    fn hash(&self, path: &Path, mtime: i64) -> u64 {
-        let key = (util::path_key(path), mtime);
-        if let Some(hash) = self.hashes.lock().unwrap().get(&key) {
-            return *hash;
+    /// Content hash of a file at a time stamp (each file is hashed once per change); 0 when it changes while read.
+    fn hash(&self, key: &str, path: &Path, mtime: i64) -> u64 {
+        if let Some((hashed_at, hash)) = self.hashes.lock().unwrap().get(key) {
+            if *hashed_at == mtime {
+                return *hash;
+            }
         }
 
+        // Rewritten while being read: no hash belongs to that time stamp
         let hash = util::hash_file(path).unwrap_or(0);
-        self.hashes.lock().unwrap().insert(key, hash);
+        if util::mtime(path) != Some(mtime) {
+            return 0;
+        }
+
+        self.hashes.lock().unwrap().insert(key.to_string(), (mtime, hash));
         hash
     }
 }
@@ -126,9 +174,14 @@ pub fn execute(plan: &Plan, toolchain: &Toolchain, database_dir: &Path, options:
         toolchain_identity: toolchain.identity(),
         system_dirs: toolchain.system_dirs.clone(),
         options: options.clone(),
+        output_ids: Vec::new(),
+        disk_mtimes: Vec::new(),
+        produced: Vec::new(),
+        ran: Vec::new(),
+        rewritten: Vec::new(),
     };
 
-    executor.warm_caches();
+    executor.stat_known_files();
     let mut summary = executor.run()?;
     executor.database.finish()?;
 
@@ -137,41 +190,62 @@ pub fn execute(plan: &Plan, toolchain: &Toolchain, database_dir: &Path, options:
 }
 
 impl Executor<'_> {
-    /// Stats every recorded input in parallel and seeds the hash cache from the database.
-    fn warm_caches(&mut self) {
-        let mut paths: Vec<String> = Vec::new();
-        for action in &self.plan.actions {
-            paths.extend(action.outputs.iter().map(|output| output.to_string_lossy().into_owned()));
-            if let Some(record) = self.database.get(&action.outputs[0]) {
-                paths.extend(record.inputs.iter().map(|stamp| self.database.path(stamp.path).to_string()));
+    /// Stats every output and every recorded input once, in parallel, into a table by path id.
+    fn stat_known_files(&mut self) {
+        let plan = self.plan;
+
+        // Outputs get ids too, so records, stamps and outputs share one table
+        self.output_ids = plan
+            .actions
+            .iter()
+            .map(|action| {
+                action
+                    .outputs
+                    .iter()
+                    .map(|output| self.database.intern(&output.to_string_lossy()))
+                    .collect()
+            })
+            .collect();
+
+        // The files this build checks: outputs, and what each action's last run read
+        let count = self.database.path_count();
+        let mut wanted = vec![false; count];
+        self.produced = vec![false; count];
+        for output_ids in &self.output_ids {
+            for id in output_ids {
+                wanted[*id as usize] = true;
+                self.produced[*id as usize] = true;
+            }
+            if let Some(record) = self.database.record(output_ids[0]) {
+                for stamp in &record.inputs {
+                    wanted[stamp.path as usize] = true;
+                }
             }
         }
-        paths.sort();
-        paths.dedup();
 
         // Folders holding many of them are listed once; the rest are stat'ed one by one
-        let mut by_folder: HashMap<PathBuf, Vec<&String>> = HashMap::new();
-        for path in &paths {
-            let folder = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
-            by_folder.entry(folder).or_default().push(path);
+        let mut by_folder: HashMap<&Path, Vec<(u32, &Path)>> = HashMap::new();
+        for id in (0..count).filter(|id| wanted[*id]) {
+            let path = Path::new(self.database.path(id as u32));
+            by_folder
+                .entry(path.parent().unwrap_or(Path::new("")))
+                .or_default()
+                .push((id as u32, path));
         }
 
-        let stats: Vec<(String, Option<i64>)> = by_folder
+        let stats: Vec<(u32, Option<i64>)> = by_folder
             .par_iter()
             .flat_map_iter(|(folder, files)| folder_stats(folder, files))
             .collect();
-        self.stamps.mtimes.lock().unwrap().extend(stats);
-
-        let mut hashes = self.stamps.hashes.lock().unwrap();
-        for (path, mtime, hash) in self.database.known_stamps() {
-            if hash != 0 {
-                hashes.insert((util::path_key(Path::new(path)), mtime), hash);
-            }
+        self.disk_mtimes = vec![None; count];
+        for (id, mtime) in stats {
+            self.disk_mtimes[id as usize] = mtime;
         }
     }
 
     fn run(&mut self) -> Result<Summary> {
-        let actions = &self.plan.actions;
+        let plan = self.plan;
+        let actions = &plan.actions;
         let count = actions.len();
 
         // The graph: who waits for whom
@@ -194,170 +268,165 @@ impl Executor<'_> {
         }
         let total = dirty.iter().filter(|dirty| **dirty).count();
 
-        // Workers: twice as many as jobs, so one still stamping what its process read never holds a job back
         let jobs_allowed = self.options.jobs.max(1);
-        let (job_sender, job_receiver) = mpsc::channel::<(usize, Action)>();
+        let (job_sender, job_receiver) = mpsc::channel::<usize>();
         let (report_sender, report_receiver) = mpsc::channel::<Report>();
-        let job_receiver = Arc::new(Mutex::new(job_receiver));
-        let mut workers = Vec::new();
-        for _ in 0..jobs_allowed * 2 {
-            let jobs = job_receiver.clone();
-            let reports = report_sender.clone();
-            let low_priority = self.options.low_priority;
-            let stamps = self.stamps.clone();
-            let system_dirs = self.system_dirs.clone();
+        let job_receiver = Mutex::new(job_receiver);
 
-            // Inputs are stamped here rather than on the scheduler, which would otherwise stall while every core compiles;
-            // the job slot is given back first
-            workers.push(std::thread::spawn(move || {
-                raise_thread_priority();
+        let summary = std::thread::scope(|scope| -> Result<Summary> {
+            // Dropped on any return, which lets the workers go
+            let job_sender = job_sender;
 
-                loop {
-                    let job = jobs.lock().unwrap().recv();
-                    let Ok((index, action)) = job else { break };
+            // Workers: twice as many as jobs, so one still stamping what its process read never holds a job back
+            for _ in 0..jobs_allowed * 2 {
+                let jobs = &job_receiver;
+                let reports = report_sender.clone();
+                let low_priority = self.options.low_priority;
+                let stamps = self.stamps.clone();
+                let system_dirs = self.system_dirs.clone();
 
-                    let mut outcome = run_action(index, &action, low_priority);
-                    let _ = reports.send(Report::ProcessDone);
+                // Inputs are stamped here rather than on the scheduler, which would otherwise stall while every core
+                // compiles; the job slot is given back first
+                scope.spawn(move || {
+                    raise_thread_priority();
 
-                    if outcome.success {
-                        outcome.measured = measure_inputs(&action, &outcome, &stamps, &system_dirs);
-                        hash_objects(&action, &stamps);
-                    }
-                    let _ = reports.send(Report::Finished(outcome));
-                }
-            }));
-        }
-        drop(report_sender);
-
-        raise_thread_priority();
-
-        // Schedule
-        let mut summary = Summary::default();
-        let mut ready: VecDeque<usize> = (0..count).filter(|index| waiting_on[*index] == 0).collect();
-        let mut blocked = vec![false; count];
-        let mut running = 0usize;
-        let mut processes = 0usize;
-        let mut started = 0usize;
-        let mut finished = 0usize;
-        let mut stop = false;
-
-        while finished < count {
-            // Start what we can
-            while !stop && processes < jobs_allowed {
-                let Some(index) = ready.pop_front() else { break };
-
-                if blocked[index] {
-                    finished += 1;
-                    for dependent in &dependents[index] {
-                        blocked[*dependent] = true;
-                        waiting_on[*dependent] -= 1;
-                        if waiting_on[*dependent] == 0 {
-                            ready.push_back(*dependent);
-                        }
-                    }
-                    continue;
-                }
-
-                let reason = match estimates[index].take() {
-                    Some(estimate) if summary.ran == 0 && running == 0 => estimate,
-                    _ => self.out_of_date(index),
-                };
-                match reason {
-                    None => {
-                        summary.up_to_date += 1;
-                        finished += 1;
-                        release(index, &dependents, &mut waiting_on, &mut ready);
-                    }
-                    Some(reason) => {
+                    loop {
+                        let job = jobs.lock().unwrap().recv();
+                        let Ok(index) = job else { break };
                         let action = &actions[index];
-                        if self.options.explain {
-                            ui::print_line(&ui::dim(&format!("  {}: {reason}", action.description)));
-                        }
-                        if self.options.verbose {
-                            ui::print_line(&ui::dim(&command_line(action)));
-                        }
 
-                        started += 1;
-                        ui::progress(started, total.max(started), &action.description);
-                        if !ui::interactive() {
-                            ui::print_line(&format!("[{started}/{}] {}", total.max(started), action.description));
-                        }
+                        let mut outcome = run_action(index, action, low_priority);
+                        let _ = reports.send(Report::ProcessDone);
 
-                        job_sender.send((index, action.clone())).context("worker pool stopped")?;
-                        running += 1;
-                        processes += 1;
+                        if outcome.success {
+                            outcome.output_mtimes = action.outputs.iter().map(|output| util::mtime(output)).collect();
+                            outcome.measured = measure_inputs(action, &outcome, &stamps, &system_dirs);
+                            hash_objects(action, &outcome.output_mtimes, &stamps);
+                        }
+                        let _ = reports.send(Report::Finished(outcome));
+                    }
+                });
+            }
+            drop(report_sender);
+
+            raise_thread_priority();
+
+            // Schedule
+            let mut summary = Summary::default();
+            let mut ready: VecDeque<usize> = (0..count).filter(|index| waiting_on[*index] == 0).collect();
+            let mut blocked = vec![false; count];
+            let mut running = 0usize;
+            let mut processes = 0usize;
+            let mut started = 0usize;
+            let mut finished = 0usize;
+            let mut stop = false;
+
+            while finished < count {
+                // Start what we can
+                while !stop && processes < jobs_allowed {
+                    let Some(index) = ready.pop_front() else { break };
+
+                    if blocked[index] {
+                        finished += 1;
+                        block_dependents(index, &dependents, &mut blocked, &mut waiting_on, &mut ready);
+                        continue;
+                    }
+
+                    let reason = match estimates[index].take() {
+                        Some(estimate) if summary.ran == 0 && running == 0 => estimate,
+                        _ => self.out_of_date(index),
+                    };
+                    match reason {
+                        None => {
+                            summary.up_to_date += 1;
+                            finished += 1;
+                            release(index, &dependents, &mut waiting_on, &mut ready);
+                        }
+                        Some(reason) => {
+                            let action = &actions[index];
+                            if self.options.explain {
+                                ui::print_line(&ui::dim(&format!("  {}: {reason}", action.description)));
+                            }
+                            if self.options.verbose {
+                                ui::print_line(&ui::dim(&command_line(action)));
+                            }
+
+                            started += 1;
+                            ui::progress(started, total.max(started), &action.description);
+                            if !ui::interactive() && !ui::quiet() {
+                                ui::print_line(&format!("[{started}/{}] {}", total.max(started), action.description));
+                            }
+
+                            // Should it fail or stop halfway, nothing it leaves behind may pass for up to date
+                            self.database.forget(self.output_ids[index][0]);
+
+                            job_sender.send(index).context("worker pool stopped")?;
+                            running += 1;
+                            processes += 1;
+                        }
                     }
                 }
-            }
 
-            if finished >= count {
-                break;
-            }
+                if finished >= count {
+                    break;
+                }
 
-            // Everything left is blocked behind a failure or an interruption
-            if running == 0 && (ready.is_empty() || stop) {
-                break;
-            }
-            if running == 0 {
-                continue;
-            }
-
-            // Wait for a process to end (its slot is free), or for its result
-            let outcome = match report_receiver.recv().context("worker pool stopped")? {
-                Report::ProcessDone => {
-                    processes -= 1;
+                // Everything left is blocked behind a failure or an interruption
+                if running == 0 && (ready.is_empty() || stop) {
+                    break;
+                }
+                if running == 0 {
                     continue;
                 }
-                Report::Finished(outcome) => outcome,
-            };
-            running -= 1;
-            finished += 1;
-            let index = outcome.action;
 
-            if outcome.success {
-                self.record(&outcome)?;
-                summary.ran += 1;
-                match actions[index].kind {
-                    ActionKind::Compile | ActionKind::Precompile | ActionKind::Resource | ActionKind::Assemble => summary.compiled += 1,
-                    ActionKind::Link | ActionKind::Archive => summary.linked += 1,
-                    _ => {}
-                }
-                if !outcome.output.trim().is_empty() {
-                    ui::print_block(&outcome.output);
-                }
-                release(index, &dependents, &mut waiting_on, &mut ready);
-            } else {
-                summary.failed += 1;
-                let message = outcome.error.clone().unwrap_or_else(|| format!("{} failed", actions[index].description));
-                ui::error(&message);
-                if !outcome.output.trim().is_empty() {
-                    ui::print_block(&outcome.output);
-                }
+                // Wait for a process to end (its slot is free), or for its result
+                let mut outcome = match report_receiver.recv().context("worker pool stopped")? {
+                    Report::ProcessDone => {
+                        processes -= 1;
+                        continue;
+                    }
+                    Report::Finished(outcome) => outcome,
+                };
+                running -= 1;
+                finished += 1;
+                let index = outcome.action;
 
-                // Its dependents can never run
-                for dependent in &dependents[index] {
-                    blocked[*dependent] = true;
-                    waiting_on[*dependent] -= 1;
-                    if waiting_on[*dependent] == 0 {
-                        ready.push_back(*dependent);
+                if outcome.success {
+                    self.record(&mut outcome);
+                    summary.ran += 1;
+                    match actions[index].kind {
+                        ActionKind::Compile | ActionKind::Precompile | ActionKind::Resource | ActionKind::Assemble => summary.compiled += 1,
+                        ActionKind::Link | ActionKind::Archive => summary.linked += 1,
+                        _ => {}
+                    }
+                    if !outcome.output.trim().is_empty() {
+                        ui::print_block(&outcome.output);
+                    }
+                    release(index, &dependents, &mut waiting_on, &mut ready);
+                } else {
+                    summary.failed += 1;
+                    let message = outcome.error.clone().unwrap_or_else(|| format!("{} failed", actions[index].description));
+                    ui::error(&message);
+                    if !outcome.output.trim().is_empty() {
+                        ui::print_block(&outcome.output);
+                    }
+
+                    // Its dependents can never run
+                    block_dependents(index, &dependents, &mut blocked, &mut waiting_on, &mut ready);
+                    if !self.options.keep_going {
+                        stop = true;
                     }
                 }
-                if !self.options.keep_going {
+
+                if INTERRUPTED.load(Ordering::Relaxed) {
                     stop = true;
                 }
             }
 
-            if INTERRUPTED.load(Ordering::Relaxed) {
-                stop = true;
-            }
-        }
-
-        // Let the workers go
-        drop(job_sender);
-        for worker in workers {
-            let _ = worker.join();
-        }
+            Ok(summary)
+        })?;
         ui::clear_progress();
+        self.restamp_rewritten();
 
         if INTERRUPTED.load(Ordering::Relaxed) {
             self.database.finish()?;
@@ -369,67 +438,213 @@ impl Executor<'_> {
 
     /// Why an action must run, or None when its outputs are up to date.
     fn out_of_date(&mut self, index: usize) -> Option<String> {
-        let action = &self.plan.actions[index];
+        let plan = self.plan;
+        let action = &plan.actions[index];
+        let output_ids = &self.output_ids[index];
 
-        for output in &action.outputs {
-            if self.stamps.mtime(output).is_none() {
+        for (output, id) in action.outputs.iter().zip(output_ids) {
+            if self.disk_mtimes[*id as usize].is_none() {
                 return Some(format!("{} does not exist", file_name(output)));
             }
         }
 
-        let Some(record) = self.database.get(&action.outputs[0]) else {
-            return Some("never built".into());
+        let Some(record) = self.database.record(output_ids[0]) else {
+            return Some("not built yet, or its last run failed or stopped".into());
         };
-        if record.command_hash != action.command_hash(self.toolchain_identity) {
-            return Some("its command changed".into());
+        if record.command_hash != self.record_hash(action) {
+            return Some(match self.options.explain {
+                true => self.command_change(action, record),
+                false => "its command changed".into(),
+            });
         }
 
-        // Every input the last build read
-        let record = record.clone();
-        for stamp in &record.inputs {
-            let path = PathBuf::from(self.database.path(stamp.path));
-            let Some(mtime) = self.stamps.mtime(&path) else {
-                return Some(format!("{} was deleted", slash(&path)));
+        // Outputs as the action left them
+        if record.outputs.len() != output_ids.len() {
+            return Some("its outputs changed".into());
+        }
+        for ((output, id), recorded) in action.outputs.iter().zip(output_ids).zip(&record.outputs) {
+            if self.disk_mtimes[*id as usize] != Some(*recorded) {
+                return Some(format!("{} was modified after it was built", self.display(output)));
+            }
+        }
+
+        // Every input the last build read: a touched one counts only if its content changed
+        let mut touched = Vec::new();
+        for (position, stamp) in record.inputs.iter().enumerate() {
+            let path = Path::new(self.database.path(stamp.path));
+            let Some(mtime) = self.disk_mtime(stamp.path) else {
+                return Some(format!("{} was deleted", self.display(path)));
             };
             if mtime == stamp.mtime {
                 continue;
             }
 
-            // Touched: only a content change counts
-            if stamp.hash == 0 || self.stamps.hash(&path, mtime) != stamp.hash {
-                return Some(format!("{} changed", slash(&path)));
+            if stamp.hash == 0 || self.stamps.hash(&util::path_key(path), path, mtime) != stamp.hash {
+                return Some(format!("{} changed", self.display(path)));
             }
+            touched.push((position, mtime));
+        }
+
+        // Touched but unchanged: keep the new time stamps, so the next build need not read those files again
+        if !touched.is_empty() {
+            let mut record = record.clone();
+            for (position, mtime) in touched {
+                record.inputs[position].mtime = mtime;
+            }
+            self.database.put(output_ids[0], record);
         }
 
         None
     }
 
-    /// Stores what a successful action read, so the next build can tell whether it is stale.
-    fn record(&mut self, outcome: &Outcome) -> Result<()> {
-        let action = &self.plan.actions[outcome.action];
+    /// Stores what a successful action read and wrote, so the next build can tell whether it is stale.
+    fn record(&mut self, outcome: &mut Outcome) {
+        let plan = self.plan;
+        let action = &plan.actions[outcome.action];
+        let output_ids = &self.output_ids[outcome.action];
 
         // Outputs changed on disk
-        for output in &action.outputs {
+        for ((output, id), mtime) in action.outputs.iter().zip(output_ids).zip(&outcome.output_mtimes) {
             self.stamps.forget(output);
+            self.disk_mtimes[*id as usize] = *mtime;
         }
 
+        // What it read. An input that changed meanwhile never matches, unless the build makes it: then this action
+        // rewrote it in place (a post-build step signing a program), and the build's end stamps it as it is then.
         let mut inputs = Vec::with_capacity(outcome.measured.len());
-        for (path, mtime, hash) in &outcome.measured {
-            let id = self.database.intern(&path.to_string_lossy());
+        for measured in outcome.measured.drain(..) {
+            let id = self.database.intern_keyed(measured.key, &measured.path.to_string_lossy());
+            if measured.changed_while_running && self.produced.get(id as usize) == Some(&true) {
+                self.rewritten.push(id);
+            }
+
+            let mtime = if measured.changed_while_running {
+                CHANGED_WHILE_RUNNING
+            } else {
+                measured.mtime
+            };
             inputs.push(Stamp {
                 path: id,
-                mtime: *mtime,
-                hash: *hash,
+                mtime,
+                hash: measured.hash,
             });
         }
 
+        // The command, for --explain to say what changed next time
+        let mut command = Vec::with_capacity(action.args.len() + 1);
+        command.push(self.database.intern_argument(&action.program.to_string_lossy()));
+        for argument in &action.args {
+            command.push(self.database.intern_argument(argument));
+        }
+
         let record = Record {
-            command_hash: action.command_hash(self.toolchain_identity),
+            command_hash: self.record_hash(action),
+            command,
+            outputs: outcome.output_mtimes.iter().map(|mtime| mtime.unwrap_or(CHANGED_WHILE_RUNNING)).collect(),
             inputs,
         };
-        self.database.put(&action.outputs[0], record);
+        self.database.put(output_ids[0], record);
+        self.ran.push(outcome.action);
+    }
 
-        Ok(())
+    /// Files the build makes that a later action rewrote in place: every record this build wrote takes their final
+    /// time stamps and content, so the next build does not take them for edited.
+    fn restamp_rewritten(&mut self) {
+        if self.rewritten.is_empty() {
+            return;
+        }
+
+        let mut finals: HashMap<u32, (i64, u64)> = HashMap::new();
+        for id in &self.rewritten {
+            let path = Path::new(self.database.path(*id));
+            if let Some(mtime) = util::mtime(path) {
+                finals.insert(*id, (mtime, util::hash_file(path).unwrap_or(0)));
+            }
+        }
+
+        for index in &self.ran {
+            let output_ids = &self.output_ids[*index];
+            let Some(record) = self.database.record(output_ids[0]) else { continue };
+            let mut record = record.clone();
+            let mut changed = false;
+
+            for (recorded, id) in record.outputs.iter_mut().zip(output_ids) {
+                if let Some((mtime, _)) = finals.get(id) {
+                    changed |= *recorded != *mtime;
+                    *recorded = *mtime;
+                }
+            }
+            for stamp in &mut record.inputs {
+                if let Some((mtime, hash)) = finals.get(&stamp.path) {
+                    changed |= stamp.mtime != *mtime;
+                    stamp.mtime = *mtime;
+                    stamp.hash = *hash;
+                }
+            }
+
+            if changed {
+                self.database.put(output_ids[0], record);
+            }
+        }
+    }
+
+    /// The time stamp this build found for a path id; ids interned during the build are stat'ed now.
+    fn disk_mtime(&self, id: u32) -> Option<i64> {
+        match self.disk_mtimes.get(id as usize) {
+            Some(mtime) => *mtime,
+            None => util::mtime(Path::new(self.database.path(id))),
+        }
+    }
+
+    /// An action's command hash tied to the toolchain that runs it.
+    fn record_hash(&self, action: &Action) -> u64 {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&action.command_hash.to_le_bytes());
+        bytes[8..].copy_from_slice(&self.toolchain_identity.to_le_bytes());
+        util::hash_bytes(&bytes)
+    }
+
+    /// What changed in an action's command since its record, briefly: "its command changed: -DFOO=1 -> -DFOO=2".
+    fn command_change(&self, action: &Action, record: &Record) -> String {
+        let program = action.program.to_string_lossy();
+        let new: Vec<&str> = std::iter::once(program.as_ref()).chain(action.args.iter().map(String::as_str)).collect();
+        let old: Vec<&str> = record.command.iter().map(|id| self.database.argument(*id)).collect();
+
+        // Same command: something else in the hash changed
+        if old == new {
+            let added = action.inputs.iter().find(|input| {
+                let id = self.database.id(input);
+                !record.inputs.iter().any(|stamp| Some(stamp.path) == id)
+            });
+            return match added {
+                Some(input) => format!("its inputs changed: {} is new", self.display(input)),
+                None => "its inputs, working folder or toolchain changed".into(),
+            };
+        }
+
+        // The differing middle, between what both start and end with
+        let prefix = old.iter().zip(&new).take_while(|(old, new)| old == new).count();
+        let room = old.len().min(new.len()) - prefix;
+        let suffix = old
+            .iter()
+            .rev()
+            .zip(new.iter().rev())
+            .take(room)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let removed = &old[prefix..old.len() - suffix];
+        let added = &new[prefix..new.len() - suffix];
+
+        match (removed.is_empty(), added.is_empty()) {
+            (true, _) => format!("its command changed: added {}", brief_arguments(added)),
+            (_, true) => format!("its command changed: removed {}", brief_arguments(removed)),
+            _ => format!("its command changed: {} -> {}", brief_arguments(removed), brief_arguments(added)),
+        }
+    }
+
+    /// A path for messages: relative to the project when inside it.
+    fn display(&self, path: &Path) -> String {
+        util::rel(path, &self.options.root)
     }
 }
 
@@ -444,6 +659,7 @@ fn run_action(index: usize, action: &Action, low_priority: bool) -> Outcome {
         started,
         error: None,
         measured: Vec::new(),
+        output_mtimes: Vec::new(),
     };
 
     if let Err(error) = prepare_outputs(action) {
@@ -470,6 +686,10 @@ fn run_action(index: usize, action: &Action, low_priority: bool) -> Outcome {
 
     let output = match command.output() {
         Ok(output) => output,
+        Err(error) if error.raw_os_error() == Some(ERROR_COMMAND_LINE_TOO_LONG) => {
+            outcome.error = Some(command_too_long(action));
+            return outcome;
+        }
         Err(error) => {
             outcome.error = Some(format!("{}: could not start {}: {error}", action.description, action.program.display()));
             return outcome;
@@ -477,8 +697,8 @@ fn run_action(index: usize, action: &Action, low_priority: bool) -> Outcome {
     };
 
     // Collect the output, minus the noise
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let mut text = decode_output(&output.stdout);
+    text.push_str(&decode_output(&output.stderr));
     if action.deps == DepsFormat::ShowIncludes {
         let (headers, rest) = depfile::split_show_includes(&text);
         outcome.discovered = headers;
@@ -527,8 +747,8 @@ fn run_action(index: usize, action: &Action, low_priority: bool) -> Outcome {
     outcome
 }
 
-/// Time stamps of files in one folder, keyed by `path_key`: from one listing of the folder when it holds many of them.
-fn folder_stats(folder: &Path, files: &[&String]) -> Vec<(String, Option<i64>)> {
+/// Time stamps of files in one folder, by path id: from one listing of the folder when it holds many of them.
+fn folder_stats(folder: &Path, files: &[(u32, &Path)]) -> Vec<(u32, Option<i64>)> {
     let listing = if files.len() >= LISTED_FOLDER_MIN_FILES {
         util::folder_mtimes(folder)
     } else {
@@ -536,8 +756,7 @@ fn folder_stats(folder: &Path, files: &[&String]) -> Vec<(String, Option<i64>)> 
     };
 
     let mut stats = Vec::with_capacity(files.len());
-    for file in files {
-        let path = Path::new(file.as_str());
+    for (id, path) in files {
         let mtime = match &listing {
             Some(entries) => {
                 let name = path.file_name().map(|name| name.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -545,46 +764,69 @@ fn folder_stats(folder: &Path, files: &[&String]) -> Vec<(String, Option<i64>)> 
             }
             None => util::mtime(path),
         };
-        stats.push((util::path_key(path), mtime));
+        stats.push((*id, mtime));
     }
 
     stats
 }
 
-/// What a successful action read: its declared inputs, then the headers it discovered (minus the toolchain's own),
-/// each with its time stamp and content hash. A file changed since the action started gets hash 0, which never
-/// matches, because the action may have read an older version.
-fn measure_inputs(action: &Action, outcome: &Outcome, stamps: &Stamps, system_dirs: &[String]) -> Vec<(PathBuf, i64, u64)> {
-    let mut paths: Vec<PathBuf> = action.inputs.clone();
+/// What a successful action read: its declared inputs, then the headers it discovered (minus the toolchain's own,
+/// relative ones against its working folder), each with its time stamp and content hash. Declared inputs are stat'ed
+/// afresh, as the action may have rewritten one; a file changed since the action started gets no hash.
+fn measure_inputs(action: &Action, outcome: &Outcome, stamps: &Stamps, system_dirs: &[String]) -> Vec<Measured> {
+    let mut paths: Vec<(String, PathBuf, bool)> = Vec::with_capacity(action.inputs.len() + outcome.discovered.len());
+    for input in &action.inputs {
+        paths.push((util::path_key(input), input.clone(), true));
+    }
+
+    let workdir = action.workdir.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
     for discovered in &outcome.discovered {
-        let key = util::path_key(Path::new(discovered));
+        let path = util::absolute(&workdir, Path::new(discovered));
+        let key = util::path_key(&path);
         if !system_dirs.iter().any(|prefix| key.starts_with(prefix.as_str())) {
-            paths.push(PathBuf::from(discovered));
+            paths.push((key, path, false));
         }
     }
-    paths.sort_by_key(|path| util::path_key(path));
-    paths.dedup_by_key(|path| util::path_key(path));
+
+    // One entry per file, the declared one first (the sort is stable)
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
+    paths.dedup_by(|later, earlier| later.0 == earlier.0);
 
     paths
         .into_iter()
-        .filter_map(|path| {
-            let mtime = stamps.mtime(&path)?;
-            let hash = if mtime > outcome.started { 0 } else { stamps.hash(&path, mtime) };
-            Some((path, mtime, hash))
+        .filter_map(|(key, path, declared)| {
+            let mtime = match declared {
+                true => {
+                    let mtime = util::mtime(&path);
+                    stamps.set(&key, mtime);
+                    mtime?
+                }
+                false => stamps.mtime(&key, &path)?,
+            };
+
+            let changed_while_running = mtime > outcome.started;
+            let hash = if changed_while_running { 0 } else { stamps.hash(&key, &path, mtime) };
+            Some(Measured {
+                key,
+                path,
+                mtime,
+                hash,
+                changed_while_running,
+            })
         })
         .collect()
 }
 
 /// Hashes the objects a compile wrote, while other workers still compile: an archive or link reading hundreds of
 /// them then finds every hash cached instead of reading them one by one at the end of the build.
-fn hash_objects(action: &Action, stamps: &Stamps) {
+fn hash_objects(action: &Action, output_mtimes: &[Option<i64>], stamps: &Stamps) {
     if !matches!(action.kind, ActionKind::Compile | ActionKind::Assemble | ActionKind::Resource) {
         return;
     }
 
-    for output in &action.outputs {
-        if let Some(mtime) = util::mtime(output) {
-            stamps.hash(output, mtime);
+    for (output, mtime) in action.outputs.iter().zip(output_mtimes) {
+        if let Some(mtime) = mtime {
+            stamps.hash(&util::path_key(output), output, *mtime);
         }
     }
 }
@@ -595,13 +837,16 @@ fn build_command(action: &Action, low_priority: bool) -> Result<Command> {
     if let Some(workdir) = &action.workdir {
         command.current_dir(workdir);
     }
+    if action.color_diagnostics {
+        command.arg(COLOR_DIAGNOSTICS);
+    }
 
-    // Long command lines go through a response file
+    // Long command lines go through a response file: on Windows only, where the limit is low (elsewhere it is far
+    // higher, and Apple's ar reads no response files)
     let length: usize = action.args.iter().map(|argument| argument.len() + 3).sum();
-    if action.response != ResponseStyle::Never && length > RESPONSE_FILE_THRESHOLD {
+    if cfg!(windows) && action.response != ResponseStyle::Never && length > RESPONSE_FILE_THRESHOLD {
         let response_file = PathBuf::from(format!("{}.rsp", action.outputs[0].display()));
-        let content: Vec<String> = action.args.iter().map(|argument| quote_response(argument, action.response)).collect();
-        std::fs::write(&response_file, content.join("\n")).context("writing a response file")?;
+        std::fs::write(&response_file, response_file_content(&action.args, action.response)).context("writing a response file")?;
         command.arg(format!("@{}", response_file.display()));
     } else {
         command.args(&action.args);
@@ -609,6 +854,73 @@ fn build_command(action: &Action, low_priority: bool) -> Result<Command> {
 
     set_priority(&mut command, low_priority);
     Ok(command)
+}
+
+/// A response file's bytes. cl, link and lib read an option's argument only from the same line, and non-ASCII text
+/// only as UTF-16: one line, UTF-16 with a byte order mark. gcc takes one argument per line, UTF-8.
+fn response_file_content(args: &[String], style: ResponseStyle) -> Vec<u8> {
+    let quoted: Vec<String> = args.iter().map(|argument| quote_response(argument, style)).collect();
+    if style != ResponseStyle::Msvc {
+        return quoted.join("\n").into_bytes();
+    }
+
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in quoted.join(" ").encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+
+    bytes
+}
+
+/// Windows refused to start the action: its command line is too long. A build step can be split.
+fn command_too_long(action: &Action) -> String {
+    let length = command_line(action).len();
+    let mut message = format!(
+        "{}: its command line is {length} characters, more than Windows allows ({WINDOWS_COMMAND_LINE_LIMIT})",
+        action.description
+    );
+    if action.kind == ActionKind::Run {
+        message.push_str(&format!(
+            "; give the [[run]] step making {} fewer inputs, or run it once per file with `for-each`",
+            file_name(&action.outputs[0])
+        ));
+    }
+
+    message
+}
+
+/// A tool's output as text: UTF-8 when it is, else the console's code page (cl writes file names in it).
+fn decode_output(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => decode_code_page(bytes),
+    }
+}
+
+#[cfg(windows)]
+fn decode_code_page(bytes: &[u8]) -> String {
+    use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
+    use windows_sys::Win32::System::Console::GetConsoleOutputCP;
+
+    // Without a console of ours, each child gets a new one, which starts in the OEM code page
+    let code_page = match unsafe { GetConsoleOutputCP() } {
+        0 => unsafe { GetOEMCP() },
+        code_page => code_page,
+    };
+
+    let length = unsafe { MultiByteToWideChar(code_page, 0, bytes.as_ptr(), bytes.len() as i32, std::ptr::null_mut(), 0) };
+    if length <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut wide = vec![0u16; length as usize];
+    unsafe { MultiByteToWideChar(code_page, 0, bytes.as_ptr(), bytes.len() as i32, wide.as_mut_ptr(), length) };
+
+    String::from_utf16_lossy(&wide)
+}
+
+#[cfg(not(windows))]
+fn decode_code_page(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// Above-normal priority for Anvil's own threads: they sleep almost always, and when one wakes it should not wait
@@ -700,7 +1012,7 @@ fn quote_response(argument: &str, style: ResponseStyle) -> String {
     quoted
 }
 
-/// Removes tool noise: cl's echo of the file name, link's "Creating library" note.
+/// Removes tool noise: cl's echo of the file name, link's "Creating library" note and its /LTCG progress.
 fn clean_output(text: &str, echo_line: Option<&str>) -> String {
     let mut cleaned = String::new();
 
@@ -708,7 +1020,9 @@ fn clean_output(text: &str, echo_line: Option<&str>) -> String {
         let trimmed = line.trim();
         let is_echo =
             echo_line.is_some_and(|echo| trimmed.eq_ignore_ascii_case(echo)) || (trimmed.starts_with("tmpxft_") && trimmed.ends_with(".cudafe1.cpp"));
-        let is_link_chatter = trimmed.starts_with("LINK : ") && trimmed.ends_with("performing full link");
+        let is_link_chatter = (trimmed.starts_with("LINK : ") && trimmed.ends_with("performing full link"))
+            || trimmed == "Generating code"
+            || trimmed == "Finished generating code";
         let is_noise = trimmed.starts_with("Creating library ") || is_link_chatter || trimmed.is_empty();
         if is_echo || is_noise {
             continue;
@@ -762,9 +1076,12 @@ fn guard_incremental_link(action: &Action) {
     }
 }
 
-/// Copies through a temporary file, so a running program holding the old DLL never sees half a file.
+/// Copies through a temporary file, so a running program holding the old DLL never sees half a file. The temporary
+/// name keeps the whole file name, so foo.dll and foo.pdb copied at once never share one.
 fn copy_file(source: &Path, destination: &Path) -> Result<()> {
-    let temporary = destination.with_extension("anvil-tmp");
+    let mut temporary = destination.as_os_str().to_owned();
+    temporary.push(".anvil-tmp");
+    let temporary = PathBuf::from(temporary);
     std::fs::copy(source, &temporary).with_context(|| format!("copying {}", source.display()))?;
 
     if std::fs::rename(&temporary, destination).is_err() {
@@ -782,6 +1099,17 @@ fn release(index: usize, dependents: &[Vec<usize>], waiting_on: &mut [usize], re
         waiting_on[*dependent] -= 1;
         if waiting_on[*dependent] == 0 {
             ready.push_front(*dependent);
+        }
+    }
+}
+
+/// Marks an action's dependents as never able to run; they still pass through the queue, to be counted.
+fn block_dependents(index: usize, dependents: &[Vec<usize>], blocked: &mut [bool], waiting_on: &mut [usize], ready: &mut VecDeque<usize>) {
+    for dependent in &dependents[index] {
+        blocked[*dependent] = true;
+        waiting_on[*dependent] -= 1;
+        if waiting_on[*dependent] == 0 {
+            ready.push_back(*dependent);
         }
     }
 }
@@ -813,7 +1141,26 @@ fn topological_order(actions: &[Action]) -> Vec<usize> {
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| slash(path))
+        .unwrap_or_else(|| util::slash(path))
+}
+
+/// A few arguments for a message, long ones shortened.
+fn brief_arguments(arguments: &[&str]) -> String {
+    const LONGEST: usize = 60;
+
+    let mut words: Vec<String> = arguments
+        .iter()
+        .take(EXPLAIN_ARGUMENTS)
+        .map(|argument| match argument.char_indices().nth(LONGEST) {
+            Some((end, _)) => format!("{}...", &argument[..end]),
+            None => argument.to_string(),
+        })
+        .collect();
+    if arguments.len() > EXPLAIN_ARGUMENTS {
+        words.push(format!("(and {} more)", arguments.len() - EXPLAIN_ARGUMENTS));
+    }
+
+    words.join(" ")
 }
 
 /// A printable command line (for --verbose).
@@ -851,8 +1198,24 @@ mod tests {
     }
 
     #[test]
+    fn msvc_response_files_are_one_utf16_line() {
+        let args = vec!["/sourceDependencies".to_string(), "C:/dé é/a.json".to_string()];
+        let bytes = response_file_content(&args, ResponseStyle::Msvc);
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE]);
+
+        let units: Vec<u16> = bytes[2..].chunks(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), "/sourceDependencies \"C:/dé é/a.json\"");
+    }
+
+    #[test]
     fn cleans_noise() {
-        let text = "main.cpp\nmain.cpp(3): warning C4100\n   Creating library x.lib and object x.exp\n";
+        let text = "main.cpp\nmain.cpp(3): warning C4100\n   Creating library x.lib and object x.exp\nGenerating code\nFinished generating code\n";
         assert_eq!(clean_output(text, Some("main.cpp")), "main.cpp(3): warning C4100\n");
+    }
+
+    #[test]
+    fn briefs_arguments() {
+        assert_eq!(brief_arguments(&["-DFOO=1"]), "-DFOO=1");
+        assert_eq!(brief_arguments(&["a", "b", "c", "d", "e"]), "a b c (and 2 more)");
     }
 }

@@ -60,7 +60,6 @@ pub struct CompileSpec<'a> {
     pub system_includes: &'a [PathBuf],
     pub flags: &'a [String],
     pub position_independent: bool,
-    pub color: bool,
 }
 
 /// Everything that decides how one binary links.
@@ -457,10 +456,6 @@ impl Toolchain {
         let profile = spec.profile;
         let windows_clang = self.family == Family::Clang && self.is_msvc_abi();
         let mut flags: Vec<String> = vec![format!("-std={}", spec.standard)];
-
-        if spec.color {
-            flags.push("-fdiagnostics-color=always".into());
-        }
 
         // Optimization and debug info
         flags.push(
