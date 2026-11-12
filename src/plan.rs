@@ -2,7 +2,7 @@
 //! resource scripts, archives, links, build steps and DLL copies, plus compile_commands.json.
 
 use crate::flags::{path_text, CompileSpec, DepsFormat, Language, LinkSpec};
-use crate::manifest::RunSpec;
+use crate::manifest::{RunSpec, StrOrList};
 use crate::profile::Opt;
 use crate::project::Model;
 use crate::source_hash::{self, HashInputs, HASH_START};
@@ -10,6 +10,7 @@ use crate::targets::{self, Kind, PackageScope, Target};
 use crate::toolchain::{Family, Toolchain};
 use crate::util::{self, slash};
 use anyhow::{bail, Context, Result};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,6 +72,9 @@ pub struct Action {
 
     /// An incremental link's state file (link.exe's .ilk).
     pub incremental_state: Option<PathBuf>,
+
+    /// The arguments go on the command line as written, unquoted (cmd /c's line, on Windows).
+    pub raw_args: bool,
 }
 
 pub struct Plan {
@@ -169,6 +173,7 @@ impl Action {
             must_create: Vec::new(),
             stamp: false,
             incremental_state: None,
+            raw_args: false,
         }
     }
 }
@@ -205,8 +210,7 @@ pub fn plan(model: &Model, host: Option<&Model>, roots: &[usize], color: bool) -
     }
 
     // compile_commands.json covers the whole project, not just what this build makes
-    planner.add_unplanned_compile_commands(&order);
-    planner.write_compile_commands()?;
+    planner.write_compile_commands(&order)?;
     Ok(Plan {
         actions: planner.actions,
         artifacts: planner.artifacts,
@@ -371,6 +375,10 @@ enum SourceKind {
     Cuda,
     /// Listed for IDEs (CMake lists headers with sources); not compiled.
     Header,
+    /// A module-definition file: the exports of the DLL or program it links into.
+    Definition,
+    /// A Windows application manifest, embedded by the link.
+    Manifest,
 }
 
 fn source_kind(source: &Path, family: crate::toolchain::Family) -> Result<SourceKind> {
@@ -387,8 +395,14 @@ fn source_kind(source: &Path, family: crate::toolchain::Family) -> Result<Source
         "s" if !family.is_msvc_style() => SourceKind::Assembly,
         "cu" => SourceKind::Cuda,
         "h" | "hh" | "hpp" | "hxx" | "h++" | "inl" | "inc" | "ipp" | "tpp" => SourceKind::Header,
+        "def" => SourceKind::Definition,
+        "manifest" => SourceKind::Manifest,
+        "cppm" | "ixx" | "ccm" | "cxxm" | "c++m" | "mpp" => bail!(
+            "{}: C++20 modules are not supported yet; take it out of `sources` (its code can go in an ordinary header and source)",
+            slash(source)
+        ),
         _ => bail!(
-            "{}: Anvil does not build .{extension} files (it builds C, C++, CUDA, .rc and assembly: .asm with MSVC, .s/.S otherwise)",
+            "{}: Anvil does not build .{extension} files (it builds C, C++, CUDA, .rc and assembly: .asm with MSVC, .s/.S otherwise; .def and .manifest files go to the link)",
             slash(source)
         ),
     };
@@ -642,7 +656,7 @@ impl<'a> Planner<'a> {
         let mut others = Vec::new();
         for source in sources {
             match source_kind(source, self.toolchain.family)? {
-                SourceKind::Header => {}
+                SourceKind::Header | SourceKind::Definition | SourceKind::Manifest => {}
                 SourceKind::Resource => resources.push(source.clone()),
                 SourceKind::Assembly => assembly.push(source.clone()),
                 SourceKind::Cuda => cuda.push(source.clone()),
@@ -710,7 +724,7 @@ impl<'a> Planner<'a> {
     }
 
     /// The settings one source file compiles with: the target's, with matching file rules applied.
-    fn file_settings(&self, target: &Target, source: &Path, inputs: &CompileInputs) -> FileSettings {
+    fn file_settings<'t>(&self, target: &'t Target, source: &Path, inputs: &'t CompileInputs) -> FileSettings<'t> {
         let profile = &self.model.profile;
         let extension = source
             .extension()
@@ -718,24 +732,24 @@ impl<'a> Planner<'a> {
             .unwrap_or_default();
         let language = if extension == "c" { Language::C } else { Language::Cxx };
 
+        // The target's settings, borrowed until a file rule adds to them
         let mut settings = FileSettings {
             language,
-            standard: if language == Language::C {
-                target.c_std.clone()
-            } else {
-                target.std.clone()
-            },
+            standard: if language == Language::C { &target.c_std } else { &target.std },
             opt: profile.opt,
             warnings: target.warnings,
             werror: target.werror,
             arch: target.arch,
-            defines: inputs.defines.clone(),
-            includes: inputs.includes.clone(),
-            system_includes: inputs.system_includes.clone(),
-            flags: inputs.flags.clone(),
+            defines: Cow::Borrowed(&inputs.defines),
+            includes: &inputs.includes,
+            system_includes: &inputs.system_includes,
+            flags: Cow::Borrowed(&inputs.flags),
         };
 
         // File rules
+        if target.file_rules.is_empty() {
+            return settings;
+        }
         let source_text = slash(source);
         for rule in target.file_rules.iter().filter(|rule| rule.matcher.is_match(&source_text)) {
             apply_file_rule(&mut settings, rule);
@@ -747,15 +761,15 @@ impl<'a> Planner<'a> {
     fn compile_spec<'b>(&'b self, settings: &'b FileSettings, position_independent: bool) -> CompileSpec<'b> {
         CompileSpec {
             language: settings.language,
-            standard: &settings.standard,
+            standard: settings.standard,
             profile: &self.model.profile,
             opt: settings.opt,
             warnings: settings.warnings,
             werror: settings.werror,
             arch: settings.arch,
             defines: &settings.defines,
-            includes: &settings.includes,
-            system_includes: &settings.system_includes,
+            includes: settings.includes,
+            system_includes: settings.system_includes,
             flags: &settings.flags,
             position_independent,
             color: self.color,
@@ -829,6 +843,15 @@ impl<'a> Planner<'a> {
 
     /// A compile_commands.json entry for a file compiled inside a unity batch, as if compiled alone.
     fn add_compile_command(&mut self, index: usize, source: &Path, inputs: &CompileInputs, pch: Option<&PrecompiledHeader>) {
+        let action = self.alone_compile_action(index, source, inputs, pch);
+        self.compile_commands.push(CompileEntry {
+            source: source.to_path_buf(),
+            command: CompileCommand::Alone(Box::new(action)),
+        });
+    }
+
+    /// The command compiling one file by itself, for compile_commands.json only.
+    fn alone_compile_action(&self, index: usize, source: &Path, inputs: &CompileInputs, pch: Option<&PrecompiledHeader>) -> Action {
         let target = &self.model.targets[index];
         let settings = self.file_settings(target, source, inputs);
         let spec = self.compile_spec(&settings, self.position_independent(target));
@@ -843,10 +866,8 @@ impl<'a> Planner<'a> {
         let mut action = Action::new(ActionKind::Compile, String::new(), program, self.env.clone());
         action.args = args;
         action.outputs = vec![object];
-        self.compile_commands.push(CompileEntry {
-            source: source.to_path_buf(),
-            command: CompileCommand::Alone(Box::new(action)),
-        });
+
+        action
     }
 
     fn plan_pch(&mut self, index: usize, header: &Path, inputs: &CompileInputs, barrier: &[usize]) -> Result<PrecompiledHeader> {
@@ -914,6 +935,18 @@ impl<'a> Planner<'a> {
     }
 
     fn plan_resource(&mut self, index: usize, source: &Path, inputs: &CompileInputs, barrier: &[usize]) -> Result<usize> {
+        let mut action = self.resource_action(index, source, inputs)?;
+        action.after = barrier.to_vec();
+
+        self.compile_commands.push(CompileEntry {
+            source: source.to_path_buf(),
+            command: CompileCommand::Planned(self.actions.len()),
+        });
+        Ok(self.push(action))
+    }
+
+    /// Compiling one resource script, without its ordering.
+    fn resource_action(&self, index: usize, source: &Path, inputs: &CompileInputs) -> Result<Action> {
         let target = &self.model.targets[index];
         let compiler = self
             .toolchain
@@ -927,10 +960,9 @@ impl<'a> Planner<'a> {
         action.args = self.toolchain.resource_args(source, &output, &inputs.includes, &inputs.defines);
         action.inputs = vec![source.to_path_buf()];
         action.outputs = vec![output];
-        action.after = barrier.to_vec();
         action.workdir = source.parent().map(|folder| folder.to_path_buf());
 
-        Ok(self.push(action))
+        Ok(action)
     }
 
     /// Assembly: ml64 (armasm64) for .asm with MSVC-style toolchains, the compiler driver for .s and .S otherwise.
@@ -1031,7 +1063,8 @@ impl<'a> Planner<'a> {
         let mut flags = Vec::new();
         let mut referenced_files = Vec::new();
         let mut referenced_actions = Vec::new();
-        for flag in link.flags.iter().chain(&self.model.profile.link_flags) {
+        let profile_link_flags = self.profile_settings(index, &self.model.profile.link_flags);
+        for flag in link.flags.iter().chain(&profile_link_flags) {
             for name in target_references(std::slice::from_ref(flag)) {
                 let referenced = self.model.find_target(&name)?;
                 referenced_files.extend(referenced_file(self.model, &self.model.targets[referenced]));
@@ -1039,6 +1072,11 @@ impl<'a> Planner<'a> {
             }
             flags.push(substitute_targets(flag, self.model)?);
         }
+
+        // Module-definition files and manifests listed with the sources
+        let (source_args, source_files) = self.source_link_args(target)?;
+        flags.extend(source_args);
+
         let spec = LinkSpec {
             profile: &self.model.profile,
             shared,
@@ -1060,6 +1098,7 @@ impl<'a> Planner<'a> {
         action.inputs.extend(link.files.iter().cloned());
         action.inputs.extend(target.link_depends.iter().cloned());
         action.inputs.extend(referenced_files);
+        action.inputs.extend(source_files);
         action.outputs = vec![output.clone()];
         action.after = own_objects.iter().map(|(_, action)| *action).chain(link.after.iter().copied()).collect();
         action.after.extend(referenced_actions);
@@ -1092,6 +1131,39 @@ impl<'a> Planner<'a> {
         }
 
         Ok(())
+    }
+
+    /// Link arguments for the module-definition files and manifests among a target's sources, and those files (their
+    /// change relinks). Windows only; GNU toolchains have no manifest step, so a manifest is left out there.
+    fn source_link_args(&self, target: &Target) -> Result<(Vec<String>, Vec<PathBuf>)> {
+        let mut args = Vec::new();
+        let mut files = Vec::new();
+        if !self.toolchain.targets_windows() {
+            return Ok((args, files));
+        }
+
+        let msvc_style = self.toolchain.family.is_msvc_style();
+        let msvc_abi = self.toolchain.is_msvc_abi();
+        for source in &target.sources {
+            let text = path_text(source);
+            match source_kind(source, self.toolchain.family)? {
+                SourceKind::Definition if msvc_style => args.push(format!("/DEF:{text}")),
+                SourceKind::Definition if msvc_abi => args.push(format!("-Wl,/DEF:{text}")),
+                SourceKind::Definition => args.push(text),
+                SourceKind::Manifest if msvc_style => args.push(format!("/MANIFESTINPUT:{text}")),
+                SourceKind::Manifest if msvc_abi => args.push(format!("-Wl,/MANIFESTINPUT:{text}")),
+                _ => continue,
+            }
+            files.push(source.clone());
+        }
+
+        // Manifests are merged into the one embedded in the binary
+        let has_manifest = args.iter().any(|argument| argument.contains("/MANIFESTINPUT:"));
+        if has_manifest {
+            args.push(if msvc_style { "/MANIFEST:EMBED" } else { "-Wl,/MANIFEST:EMBED" }.to_string());
+        }
+
+        Ok((args, files))
     }
 
     fn plan_copy(&mut self, file: &Path, folder: &Path) {
@@ -1206,6 +1278,13 @@ impl<'a> Planner<'a> {
         let target = &self.model.targets[index];
         let depfile_name = format!("{:016x}.d", util::hash_bytes(slash(&invocation.outputs[0]).as_bytes()));
         let depfile = self.object_dir(target).join("run").join(depfile_name);
+        let workdir = match &run.workdir {
+            Some(workdir) => {
+                let workdir = targets::expand_path_text(workdir, &self.package_scope(index), &target.name)?;
+                util::absolute(&target.dir, Path::new(&workdir))
+            }
+            None => target.dir.clone(),
+        };
 
         // {inputs}, {output}, {outputs}, {depfile}; {target:X} becomes a path and an ordering edge
         let mut words = Vec::new();
@@ -1216,6 +1295,9 @@ impl<'a> Planner<'a> {
                 "{inputs}" => words.extend(invocation.inputs.iter().map(|input| path_text(input))),
                 "{outputs}" => words.extend(invocation.outputs.iter().map(|output| path_text(output))),
                 _ => {
+                    let names_build_files = ["{input}", "{output}", "{depfile}", "{target:"]
+                        .iter()
+                        .any(|placeholder| word.contains(placeholder));
                     let mut word = word
                         .replace("{output}", &path_text(&invocation.outputs[0]))
                         .replace("{depfile}", &path_text(&depfile));
@@ -1239,6 +1321,11 @@ impl<'a> Planner<'a> {
                         }
                         extra_inputs.push(artifact);
                     }
+
+                    // A file of the package the command names (a script it runs) re-runs it when it changes
+                    if !names_build_files {
+                        extra_inputs.extend(self.package_file(index, &workdir, &word, &invocation.outputs));
+                    }
                     words.push(substitute_targets(&word, self.model)?);
                 }
             }
@@ -1251,9 +1338,20 @@ impl<'a> Planner<'a> {
         // The program: through the shell, Anvil itself for `cmake -E`, a path, or a name on PATH
         let anvil = std::env::current_exe().context("finding Anvil's own program")?;
         let (program, args) = if run.shell {
-            let (shell, flag) = if cfg!(windows) { ("cmd.exe", "/c") } else { ("sh", "-c") };
-            let text = crate::cmake_tool::rewrite_shell(&words.join(" "), &anvil);
-            (PathBuf::from(shell), vec![flag.to_string(), text])
+            // A command line runs as written, placeholders filled in; a list's words are quoted as needed
+            let text = match &run.command {
+                StrOrList::Str(line) => self.shell_line(index, line, &invocation, &depfile)?,
+                StrOrList::List(_) => words.iter().map(|word| shell_quote(word)).collect::<Vec<_>>().join(" "),
+            };
+            let text = crate::cmake_tool::rewrite_shell(&text, &anvil);
+
+            // cmd /s /c "...": cmd drops the outer quotes and keeps the rest as is (the arguments go unquoted)
+            if cfg!(windows) {
+                let args = vec!["/d".to_string(), "/s".to_string(), "/c".to_string(), format!("\"{text}\"")];
+                (PathBuf::from("cmd.exe"), args)
+            } else {
+                (PathBuf::from("sh"), vec!["-c".to_string(), text])
+            }
         } else if let Some(cmake_args) = crate::cmake_tool::handled(&words) {
             let mut args = vec![crate::cmake_tool::SUBCOMMAND.to_string()];
             args.extend(cmake_args.iter().cloned());
@@ -1284,18 +1382,73 @@ impl<'a> Planner<'a> {
         action.inputs.extend(extra_inputs);
         action.outputs = invocation.outputs;
         action.after = after;
-        action.workdir = Some(match &run.workdir {
-            Some(workdir) => {
-                let workdir = targets::expand_path_text(workdir, &self.package_scope(index), &target.name)?;
-                util::absolute(&target.dir, Path::new(&workdir))
-            }
-            None => target.dir.clone(),
-        });
+        action.workdir = Some(workdir);
+        action.raw_args = run.shell && cfg!(windows);
         if run.depfile {
             action.deps = DepsFormat::Make(depfile);
         }
 
         Ok(self.push(action))
+    }
+
+    /// The file a word of a step's command names, when it is one of the package's own (not the build's, not one the
+    /// step writes): a script the step runs, a table it reads.
+    fn package_file(&self, index: usize, workdir: &Path, word: &str, outputs: &[PathBuf]) -> Option<PathBuf> {
+        if !word.contains(['/', '\\']) || word.starts_with('-') {
+            return None;
+        }
+
+        let file = util::absolute(workdir, Path::new(word));
+        let root = &self.model.packages[self.model.targets[index].package].root;
+        let in_package = util::strip_prefix_ci(&file, root).is_some() && util::strip_prefix_ci(&file, &self.model.out_root).is_none();
+        let written = outputs.iter().any(|output| util::path_key(output) == util::path_key(&file));
+        if !in_package || written || !file.is_file() {
+            return None;
+        }
+
+        Some(file)
+    }
+
+    /// A `shell = true` command line as written, with its placeholders filled in (see `fill_shell_line`).
+    fn shell_line(&self, index: usize, line: &str, invocation: &RunInvocation, depfile: &Path) -> Result<String> {
+        let target = &self.model.targets[index];
+        let scope = self.package_scope(index);
+        let line = util::expand_env(line)?;
+
+        // The package's placeholders
+        let mut values = Vec::new();
+        for (placeholder, is_path) in SCOPE_PLACEHOLDERS {
+            let value = targets::expand_placeholders(placeholder, &scope, &target.name);
+            values.push(ShellValue::new(placeholder, vec![value], *is_path));
+        }
+
+        // The step's files
+        let paths = |files: &[PathBuf]| files.iter().map(|file| path_text(file)).collect::<Vec<_>>();
+        values.push(ShellValue::new("{inputs}", paths(&invocation.inputs), true));
+        values.push(ShellValue::new("{outputs}", paths(&invocation.outputs), true));
+        values.push(ShellValue::new("{output}", paths(&invocation.outputs[..1]), true));
+        values.push(ShellValue::new("{depfile}", vec![path_text(depfile)], true));
+        if let Some(first) = invocation.inputs.first() {
+            values.push(ShellValue::new("{input}", vec![path_text(first)], true));
+        }
+        if let Some(input) = &invocation.input {
+            let stem = input.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            let filename = input.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            values.push(ShellValue::new("{stem}", vec![stem], false));
+            values.push(ShellValue::new("{filename}", vec![filename], false));
+        }
+
+        // Other targets' files: this machine's build of a program a cross build runs, or the target's file
+        for name in target_references(&[line.clone()]) {
+            let placeholder = format!("{{target:{name}}}");
+            let value = match self.host_tools.get(&name) {
+                Some((program, _)) => path_text(program),
+                None => substitute_targets(&placeholder, self.model)?,
+            };
+            values.push(ShellValue::new(&placeholder, vec![value], true));
+        }
+
+        Ok(fill_shell_line(&line, &values, cfg!(windows)))
     }
 
     /// What `flags` in a target's `{hash:...}` stands for: the arguments its C++ files compile with, without include
@@ -1320,8 +1473,8 @@ impl<'a> Planner<'a> {
         for rule in &target.file_rules {
             let mut rule_settings = settings.clone();
             apply_file_rule(&mut rule_settings, rule);
-            rule_settings.defines.retain(|define| !define.contains(HASH_START));
-            rule_settings.flags.retain(|flag| !flag.contains(HASH_START));
+            rule_settings.defines.to_mut().retain(|define| !define.contains(HASH_START));
+            rule_settings.flags.to_mut().retain(|flag| !flag.contains(HASH_START));
             text.push_str(&format!("\nfiles {}\n{}", rule.patterns.join(","), arguments(&rule_settings)));
         }
 
@@ -1342,7 +1495,7 @@ impl<'a> Planner<'a> {
         }
         inputs.system_includes.extend(target.system_include.iter().cloned());
         inputs.system_includes.extend(target.public_system_include.iter().cloned());
-        inputs.defines.extend(self.model.profile.defines.iter().cloned());
+        inputs.defines.extend(self.profile_settings(index, &self.model.profile.defines));
         inputs.defines.extend(target.defines.iter().cloned());
         inputs.defines.extend(target.public_defines.iter().cloned());
         inputs.flags.extend(target.flags.iter().cloned());
@@ -1356,13 +1509,21 @@ impl<'a> Planner<'a> {
         for dependency in &target.header_deps {
             self.add_exports(*dependency, &mut inputs, &mut visited);
         }
-        inputs.flags.extend(self.model.profile.flags.iter().cloned());
+        inputs.flags.extend(self.profile_settings(index, &self.model.profile.flags));
 
         dedup_in_order(&mut inputs.includes, |path| util::path_key(path));
         dedup_in_order(&mut inputs.system_includes, |path| util::path_key(path));
         dedup_in_order(&mut inputs.defines, |define| define.clone());
 
         inputs
+    }
+
+    /// A profile's definitions or flags with a target's placeholders filled in (`{root}` is its package's).
+    fn profile_settings(&self, index: usize, list: &[String]) -> Vec<String> {
+        let scope = self.package_scope(index);
+        let name = &self.model.targets[index].name;
+
+        list.iter().map(|text| targets::expand_placeholders(text, &scope, name)).collect()
     }
 
     fn add_exports(&self, index: usize, inputs: &mut CompileInputs, visited: &mut HashSet<usize>) {
@@ -1434,6 +1595,9 @@ impl<'a> Planner<'a> {
             // Its system libraries (a package's, linked whole when asked), folders, flags and DLLs
             let whole = target.kind == Kind::External && self.model.targets[index].whole_archive.contains(&dependency);
             if whole { &mut link.whole } else { &mut link.libs }.extend(target.libs.iter().cloned());
+
+            // Prebuilt library files (and packages') relink when they change
+            link.files.extend(target.libs.iter().map(PathBuf::from).filter(|lib| lib.is_absolute()));
             link.lib_dirs.extend(target.lib_dirs.iter().cloned());
             link.flags.extend(target.link_flags.iter().cloned());
             link.runtime_files.extend(target.runtime_files.iter().cloned());
@@ -1494,19 +1658,75 @@ impl<'a> Planner<'a> {
         util::rel(path, &self.model.root)
     }
 
-    /// Entries for the project's own targets this build does not make (tests, targets not asked for).
-    fn add_unplanned_compile_commands(&mut self, planned: &[usize]) {
+    /// The project's own targets this build does not make (tests, targets not asked for): compile_commands.json
+    /// covers their files too.
+    fn unplanned_targets(&self, planned: &[usize]) -> Vec<usize> {
         let model = self.model;
-        for (index, target) in model.targets.iter().enumerate() {
-            let compiles = !matches!(target.kind, Kind::External | Kind::Headers | Kind::Custom);
-            if planned.contains(&index) || !compiles || !model.packages[target.package].member {
+        let planned: HashSet<usize> = planned.iter().copied().collect();
+
+        (0..model.targets.len())
+            .filter(|index| {
+                let target = &model.targets[*index];
+                let compiles = !matches!(target.kind, Kind::External | Kind::Headers | Kind::Custom);
+                compiles && !planned.contains(index) && model.packages[target.package].member
+            })
+            .collect()
+    }
+
+    /// The command of one file of a target this build does not make, when the file is compiled.
+    fn unplanned_action(&self, index: usize, source: &Path, inputs: &CompileInputs) -> Option<Action> {
+        match source_kind(source, self.toolchain.family) {
+            Ok(SourceKind::C | SourceKind::Cxx) => Some(self.alone_compile_action(index, source, inputs, None)),
+            Ok(SourceKind::Resource) => self.resource_action(index, source, inputs).ok(),
+            _ => None,
+        }
+    }
+
+    /// Stands for an unplanned target's entries without making each one: its files, and the command of one file of
+    /// each kind (extension and the file rules that apply), from which the others differ only by their own paths.
+    fn unplanned_fingerprint(&self, index: usize, fingerprint: &mut Vec<u8>) {
+        let target = &self.model.targets[index];
+        let inputs = self.compile_inputs(index);
+
+        let mut kinds_seen = HashSet::new();
+        for source in &target.sources {
+            let mut kind = source
+                .extension()
+                .map(|extension| extension.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            if !target.file_rules.is_empty() {
+                let source_text = slash(source);
+                for (number, rule) in target.file_rules.iter().enumerate() {
+                    if rule.matcher.is_match(&source_text) {
+                        kind.push_str(&format!(",{number}"));
+                    }
+                }
+            }
+            fingerprint.extend(util::hash_bytes(source.as_os_str().as_encoded_bytes()).to_le_bytes());
+            fingerprint.extend(util::hash_bytes(kind.as_bytes()).to_le_bytes());
+
+            // The first file of its kind
+            if !kinds_seen.insert(kind) {
                 continue;
             }
+            if let Some(action) = self.unplanned_action(index, source, &inputs) {
+                fingerprint.extend(entry_hash(source, &action).to_le_bytes());
+            }
+        }
+    }
 
-            let inputs = self.compile_inputs(index);
-            for source in &target.sources {
-                if matches!(source_kind(source, self.toolchain.family), Ok(SourceKind::C | SourceKind::Cxx)) {
-                    self.add_compile_command(index, source, &inputs, None);
+    /// Entries for every file of the targets this build does not make.
+    fn add_unplanned_compile_commands(&mut self, unplanned: &[usize]) {
+        let model = self.model;
+
+        for index in unplanned {
+            let inputs = self.compile_inputs(*index);
+            for source in &model.targets[*index].sources {
+                if let Some(action) = self.unplanned_action(*index, source, &inputs) {
+                    self.compile_commands.push(CompileEntry {
+                        source: source.clone(),
+                        command: CompileCommand::Alone(Box::new(action)),
+                    });
                 }
             }
         }
@@ -1519,20 +1739,23 @@ impl<'a> Planner<'a> {
         }
     }
 
-    /// compile_commands.json in the profile's folder and the output root (for clangd and editors). It is only
-    /// rewritten when a command changed: the commands' hashes, kept beside the build database, say whether one did.
-    fn write_compile_commands(&self) -> Result<()> {
-        let action_of = |entry| self.compile_action(entry);
+    /// compile_commands.json in the profile's folder and the output root (for clangd and editors), covering the targets
+    /// this build does not make too. It is only rewritten when a command changed: a fingerprint of the commands, kept
+    /// beside the build database, says whether one did; the unplanned targets' entries are made only then.
+    fn write_compile_commands(&mut self, planned: &[usize]) -> Result<()> {
+        let unplanned = self.unplanned_targets(planned);
 
         // Unchanged since the last write: nothing to do
         let files = [
             self.model.out_dir.join("compile_commands.json"),
             self.model.out_root.join("compile_commands.json"),
         ];
-        let mut fingerprint = Vec::with_capacity(self.compile_commands.len() * 16);
+        let mut fingerprint = Vec::with_capacity(self.compile_commands.len() * 8);
         for entry in &self.compile_commands {
-            fingerprint.extend(util::hash_bytes(path_text(&entry.source).as_bytes()).to_le_bytes());
-            fingerprint.extend(action_of(entry).command_hash(0).to_le_bytes());
+            fingerprint.extend(entry_hash(&entry.source, self.compile_action(entry)).to_le_bytes());
+        }
+        for index in &unplanned {
+            self.unplanned_fingerprint(*index, &mut fingerprint);
         }
         let fingerprint = format!("{:016x}", util::hash_bytes(&fingerprint));
         let stamp_file = self.model.out_dir.join(".anvil").join("compile_commands.stamp");
@@ -1541,15 +1764,16 @@ impl<'a> Planner<'a> {
             return Ok(());
         }
 
+        self.add_unplanned_compile_commands(&unplanned);
         let entries: Vec<serde_json::Value> = self
             .compile_commands
             .iter()
             .map(|entry| {
-                let action = action_of(entry);
+                let action = self.compile_action(entry);
                 let mut arguments = vec![path_text(&action.program)];
                 arguments.extend(action.args.iter().cloned());
                 serde_json::json!({
-                    "directory": path_text(&self.model.root),
+                    "directory": path_text(action.workdir.as_deref().unwrap_or(&self.model.root)),
                     "file": path_text(&entry.source),
                     "arguments": arguments,
                     "output": path_text(&action.outputs[0]),
@@ -1572,6 +1796,23 @@ struct CompileEntry {
     command: CompileCommand,
 }
 
+/// What a compile_commands.json entry writes, hashed.
+fn entry_hash(source: &Path, action: &Action) -> u64 {
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let workdir = action.workdir.as_deref().unwrap_or(Path::new(""));
+
+    for path in [source, &action.program, &action.outputs[0], workdir] {
+        hasher.update(path.as_os_str().as_encoded_bytes());
+        hasher.update(b"\0");
+    }
+    for argument in &action.args {
+        hasher.update(argument.as_bytes());
+        hasher.update(b"\0");
+    }
+
+    hasher.digest()
+}
+
 enum CompileCommand {
     Planned(usize),
     Alone(Box<Action>),
@@ -1579,26 +1820,30 @@ enum CompileCommand {
 
 /// A file rule's settings on top of the target's.
 fn apply_file_rule(settings: &mut FileSettings, rule: &targets::ResolvedFileRule) {
-    settings.defines.extend(rule.defines.iter().cloned());
-    settings.flags.extend(rule.flags.iter().cloned());
+    if !rule.defines.is_empty() {
+        settings.defines.to_mut().extend(rule.defines.iter().cloned());
+    }
+    if !rule.flags.is_empty() {
+        settings.flags.to_mut().extend(rule.flags.iter().cloned());
+    }
     settings.warnings = rule.warnings.unwrap_or(settings.warnings);
     settings.arch = rule.arch.or(settings.arch);
     settings.opt = rule.opt.unwrap_or(settings.opt);
 }
 
-/// Settings of one source file, owned (CompileSpec borrows from it).
+/// Settings of one source file (CompileSpec borrows from it): the target's, copied only where file rules add to them.
 #[derive(Clone)]
-struct FileSettings {
+struct FileSettings<'a> {
     language: Language,
-    standard: String,
+    standard: &'a str,
     opt: Opt,
     warnings: crate::flags::Warnings,
     werror: bool,
     arch: Option<crate::flags::Arch>,
-    defines: Vec<String>,
-    includes: Vec<PathBuf>,
-    system_includes: Vec<PathBuf>,
-    flags: Vec<String>,
+    defines: Cow<'a, [String]>,
+    includes: &'a [PathBuf],
+    system_includes: &'a [PathBuf],
+    flags: Cow<'a, [String]>,
 }
 
 /// One command of a build step, with placeholders for its input already filled in.
@@ -1616,6 +1861,133 @@ struct RunInvocation {
     words: Vec<String>,
 }
 
+// A package's placeholders a shell command line may hold, and whether each is a path
+const SCOPE_PLACEHOLDERS: &[(&str, bool)] = &[
+    ("{root}", true),
+    ("{out}", true),
+    ("{gen}", true),
+    ("{vcpkg}", true),
+    ("{cxx}", true),
+    ("{cc}", true),
+    ("{name}", false),
+    ("{profile}", false),
+    ("{config}", false),
+    ("{version}", false),
+];
+
+/// What one placeholder of a shell command line stands for: one value, or a list ({inputs}).
+struct ShellValue {
+    placeholder: String,
+    items: Vec<String>,
+    is_path: bool,
+}
+
+impl ShellValue {
+    fn new(placeholder: &str, items: Vec<String>, is_path: bool) -> ShellValue {
+        ShellValue {
+            placeholder: placeholder.to_string(),
+            items,
+            is_path,
+        }
+    }
+}
+
+/// Fills placeholders into a shell command line and keeps the rest as written. A value with a space is quoted (its
+/// whole word, unless the word has quotes of its own); on Windows a path and the rest of its word take backslashes,
+/// since cmd's built-ins read `/` as the start of a switch.
+fn fill_shell_line(line: &str, values: &[ShellValue], windows: bool) -> String {
+    let quote_characters: &[char] = if windows { &['"'] } else { &['"', '\''] };
+    let mut filled = String::with_capacity(line.len());
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+
+    // Split into words at spaces outside quotes; whitespace stays as written
+    for character in line.chars() {
+        match quote {
+            Some(open) if character == open => quote = None,
+            None if quote_characters.contains(&character) => quote = Some(character),
+            None if character.is_whitespace() => {
+                filled.push_str(&fill_shell_word(&std::mem::take(&mut word), values, windows, quote_characters));
+                filled.push(character);
+                continue;
+            }
+            _ => {}
+        }
+        word.push(character);
+    }
+    filled.push_str(&fill_shell_word(&word, values, windows, quote_characters));
+
+    filled
+}
+
+fn fill_shell_word(word: &str, values: &[ShellValue], windows: bool, quote_characters: &[char]) -> String {
+    let has_quotes = word.contains(quote_characters);
+    let mut filled = String::with_capacity(word.len());
+    let mut quote: Option<char> = None;
+    let mut backslashes = false;
+    let mut quote_word = false;
+    let mut rest = word;
+
+    while let Some(character) = rest.chars().next() {
+        // A placeholder: its items, each quoted when it holds a space and is not inside the user's quotes
+        let value = values
+            .iter()
+            .find(|value| character == '{' && rest.starts_with(value.placeholder.as_str()));
+        if let Some(value) = value {
+            let items: Vec<String> = value
+                .items
+                .iter()
+                .map(|item| {
+                    let item = if windows && value.is_path {
+                        item.replace('/', "\\")
+                    } else {
+                        item.clone()
+                    };
+                    let needs_quotes = quote.is_none() && item.contains(char::is_whitespace);
+                    if needs_quotes && (has_quotes || value.items.len() > 1) {
+                        format!("\"{item}\"")
+                    } else {
+                        quote_word |= needs_quotes;
+                        item
+                    }
+                })
+                .collect();
+            filled.push_str(&items.join(" "));
+            backslashes |= windows && value.is_path;
+            rest = &rest[value.placeholder.len()..];
+            continue;
+        }
+
+        match quote {
+            Some(open) if character == open => quote = None,
+            None if quote_characters.contains(&character) => quote = Some(character),
+            _ => {}
+        }
+        // A backslash before a quote would escape it, so that slash stays
+        let before_quote = rest[character.len_utf8()..].starts_with(quote_characters);
+        filled.push(if backslashes && character == '/' && !before_quote {
+            '\\'
+        } else {
+            character
+        });
+        rest = &rest[character.len_utf8()..];
+    }
+
+    if quote_word {
+        return format!("\"{filled}\"");
+    }
+    filled
+}
+
+/// One word of a command list for the shell's line: quoted when it holds a space.
+fn shell_quote(word: &str) -> String {
+    if word.is_empty() || word.contains(char::is_whitespace) {
+        format!("\"{word}\"")
+    } else {
+        word.to_string()
+    }
+}
+
 /// Puts extra arguments before the source-and-output tail of a compile command (cl: before /c).
 fn insert_before_source(args: &mut Vec<String>, extra: &[String], msvc_style: bool) {
     let marker = if msvc_style { "/c" } else { "-c" };
@@ -1629,4 +2001,56 @@ fn insert_before_source(args: &mut Vec<String>, extra: &[String], msvc_style: bo
 fn dedup_in_order<T, K: std::hash::Hash + Eq>(items: &mut Vec<T>, key: impl Fn(&T) -> K) {
     let mut seen = HashSet::new();
     items.retain(|item| seen.insert(key(item)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn values() -> Vec<ShellValue> {
+        vec![
+            ShellValue::new("{root}", vec!["C:/my project".into()], true),
+            ShellValue::new("{out}", vec!["C:/p/out".into()], true),
+            ShellValue::new("{inputs}", vec!["C:/a b/x.txt".into(), "C:/c/y.txt".into()], true),
+            ShellValue::new("{name}", vec!["my app".into()], false),
+        ]
+    }
+
+    #[test]
+    fn fills_shell_lines() {
+        // Windows: quotes kept, values with spaces quoted, paths and the rest of their word with backslashes
+        let line = r#"copy {root}/data/a.txt "{out}/b c.txt" && echo "x  y" {name}/z"#;
+        assert_eq!(
+            fill_shell_line(line, &values(), true),
+            r#"copy "C:\my project\data\a.txt" "C:\p\out\b c.txt" && echo "x  y" "my app/z""#
+        );
+        assert_eq!(fill_shell_line("tool {inputs}", &values(), true), r#"tool "C:\a b\x.txt" C:\c\y.txt"#);
+        assert_eq!(
+            fill_shell_line(r#"tool --in={root}/"q r""#, &values(), true),
+            r#"tool --in="C:\my project"/"q r""#
+        );
+
+        // Elsewhere: slashes stay, single quotes quote too
+        assert_eq!(
+            fill_shell_line("cat '{root}/a' {root}/b", &values(), false),
+            r#"cat 'C:/my project/a' "C:/my project/b""#
+        );
+    }
+
+    #[test]
+    fn quotes_shell_words() {
+        assert_eq!(shell_quote("plain"), "plain");
+        assert_eq!(shell_quote("a b"), "\"a b\"");
+        assert_eq!(shell_quote(""), "\"\"");
+    }
+
+    #[test]
+    fn kinds_of_listed_files() {
+        let kind = |name: &str| source_kind(Path::new(name), Family::Msvc);
+        assert!(matches!(kind("x.def"), Ok(SourceKind::Definition)));
+        assert!(matches!(kind("app.manifest"), Ok(SourceKind::Manifest)));
+        assert!(matches!(kind("x.inl"), Ok(SourceKind::Header)));
+        assert!(kind("m.ixx").err().unwrap().to_string().contains("C++20 modules"));
+        assert!(kind("notes.txt").is_err());
+    }
 }
