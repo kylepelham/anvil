@@ -76,10 +76,34 @@ pub fn expand(table: &toml::Table) -> Result<Vec<toml::Table>> {
             .collect();
     }
 
-    combinations
+    let tests: Vec<toml::Table> = combinations
         .iter()
         .map(|combination| expand_combination(&template, combination))
-        .collect()
+        .collect::<Result<_>>()?;
+
+    // Two tests of one name (and the same `if`) would be indistinguishable: an axis is missing from the name
+    for (position, test) in tests.iter().enumerate() {
+        let twin = tests[..position]
+            .iter()
+            .find(|earlier| earlier.get("name") == test.get("name") && earlier.get("if") == test.get("if"));
+        if twin.is_some() {
+            let name = test.get("name").and_then(|name| name.as_str()).unwrap_or_default();
+            let Some(pattern) = template.get("name").and_then(|name| name.as_str()) else {
+                bail!("[[test]] matrix: two of its entries name their tests `{name}`; test names must be unique");
+            };
+            let missing: Vec<String> = matrix
+                .keys()
+                .filter(|axis| !pattern.contains(&format!("{{{axis}}}")))
+                .map(|axis| format!("{{{axis}}}"))
+                .collect();
+            bail!(
+                "[[test]] `{pattern}`: its matrix makes two tests named `{name}`; put every axis in the name pattern (not in it: {})",
+                missing.join(", ")
+            );
+        }
+    }
+
+    Ok(tests)
 }
 
 fn expand_combination(template: &toml::Table, combination: &[(&str, &toml::Value)]) -> Result<toml::Table> {
@@ -304,5 +328,9 @@ matrix.program = [\"app\"]
         assert!(
             expand_text("name = \"t_{v}\"\ncommand = [\"{v}\"]\nmatrix.v = [{ v = \"a\", timeout = 1 }]\nmatrix.w = [{ timeout = 2 }]\n").is_err()
         );
+
+        // Two tests of one name: an axis left out of the name
+        let error = expand_text("name = \"a_{x}\"\ncommand = [\"{x}\", \"{y}\"]\nmatrix.x = [\"1\"]\nmatrix.y = [\"p\", \"q\"]\n").unwrap_err();
+        assert!(error.to_string().contains("two tests named `a_1`") && error.to_string().contains("{y}"));
     }
 }

@@ -284,8 +284,26 @@ fn touch(file: &Path, create: bool) -> Result<()> {
     Ok(())
 }
 
+/// What `env` does: its variable changes in order (`None` unsets one), and the command it runs with them.
+pub struct EnvCommand<'a> {
+    pub changes: Vec<(String, Option<String>)>,
+    pub command: &'a [String],
+}
+
+impl EnvCommand<'_> {
+    /// Applies the changes to a command, in order.
+    pub fn apply(&self, command: &mut std::process::Command) {
+        for (name, value) in &self.changes {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
+    }
+}
+
 /// env [--unset=NAME | --modify NAME=OPERATION:VALUE | NAME=VALUE]... [--] command [args...], changes applied in order.
-fn run_with_env(rest: &[String]) -> Result<i32> {
+pub fn parse_env(rest: &[String]) -> Result<EnvCommand<'_>> {
     let mut changes: Vec<(String, Option<String>)> = Vec::new();
     let mut command_start = rest.len();
     let mut index = 0;
@@ -312,17 +330,20 @@ fn run_with_env(rest: &[String]) -> Result<i32> {
         index += 1;
     }
 
-    let Some((program, args)) = rest[command_start.min(rest.len())..].split_first() else {
+    Ok(EnvCommand {
+        changes,
+        command: &rest[command_start.min(rest.len())..],
+    })
+}
+
+fn run_with_env(rest: &[String]) -> Result<i32> {
+    let env = parse_env(rest)?;
+    let Some((program, args)) = env.command.split_first() else {
         bail!("env needs a command to run");
     };
     let mut command = std::process::Command::new(program);
     command.args(args);
-    for (name, value) in changes {
-        match value {
-            Some(value) => command.env(name, value),
-            None => command.env_remove(name),
-        };
-    }
+    env.apply(&mut command);
 
     let status = command.status().with_context(|| format!("running {program}"))?;
     Ok(status.code().unwrap_or(1))

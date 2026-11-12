@@ -4,7 +4,7 @@
 
 use crate::cond::CondContext;
 use crate::lockfile::{LockFile, Refresh};
-use crate::manifest::{self, DepSpec, Manifest, TestSpec};
+use crate::manifest::{self, DepSpec, Manifest, StrOrList, TestSpec};
 use crate::platform::Platform;
 use crate::profile::Profile;
 use crate::settings::Settings;
@@ -13,7 +13,7 @@ use crate::toolchain::Toolchain;
 use crate::util::{self, slash};
 use crate::vcpkg::{self, Instance, Request};
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -853,6 +853,9 @@ impl Model {
 
     /// The tests: test targets, [[test]] tables, and the [[test]] tables of every tests.toml in a member package.
     pub fn collect_tests(&mut self) -> Result<()> {
+        // Tests and targets that are declared but off (their `if` is false): `after` may name them
+        let mut switched_off = Vec::new();
+
         // Test targets run their program
         for target in &self.targets {
             let package = &self.packages[target.package];
@@ -860,28 +863,38 @@ impl Model {
                 continue;
             }
 
-            let fill = |text: &String| fill_test_text(text, package, &self.out_dir, &self.vcpkg_dir);
             let mut command = vec![format!("{{target:{}}}", target.name)];
-            command.extend(target.args.iter().map(fill));
-
-            let context = || format!("in [target.{}]", target.name);
-            self.tests.push(TestCase {
+            command.extend(target.args.iter().cloned());
+            let spec = TestSpec {
                 name: target.name.clone(),
-                command,
-                workdir: target.workdir.clone().unwrap_or_else(|| package.root.clone()),
+                command: StrOrList::List(command),
                 timeout: target.timeout,
-                env: target.env.iter().map(|(name, value)| (name.clone(), fill(value))).collect(),
-                will_fail: target.will_fail,
-                after: target.after.clone(),
-                serial: target.serial,
-                pass_regex: compile_test_regex("pass-regex", &target.pass_regex).with_context(context)?,
-                fail_regex: compile_test_regex("fail-regex", &target.fail_regex).with_context(context)?,
+                env: Some(target.env.iter().cloned().collect()),
+                will_fail: Some(target.will_fail),
+                after: Some(target.after.clone()),
+                serial: Some(target.serial),
+                pass_regex: target.pass_regex.clone(),
+                fail_regex: target.fail_regex.clone(),
                 skip_exit_code: target.skip_exit_code,
-                skip_regex: compile_test_regex("skip-regex", &target.skip_regex).with_context(context)?,
-                expect: compile_test_regexes("expect", &target.expect, &fill).with_context(context)?,
-                reject: compile_test_regexes("reject", &target.reject, &fill).with_context(context)?,
+                skip_regex: target.skip_regex.clone(),
+                expect: Some(target.expect.clone()),
+                reject: Some(target.reject.clone()),
                 exit_code: target.exit_code,
-            });
+                ..Default::default()
+            };
+
+            // Its workdir was resolved with its other paths, relative to its folder
+            let workdir = target.workdir.clone().unwrap_or_else(|| package.root.clone());
+            let test = test_case(&spec, workdir, package, &self.out_dir, &self.vcpkg_dir).with_context(|| format!("in [target.{}]", target.name))?;
+            self.tests.push(test);
+        }
+        for package in self.packages.iter().filter(|package| package.member) {
+            let off = package
+                .manifest
+                .target
+                .keys()
+                .filter(|name| !self.targets.iter().any(|target| target.name == **name));
+            switched_off.extend(off.cloned());
         }
 
         // [[test]] tables run any command
@@ -890,27 +903,29 @@ impl Model {
             for file in tests_files(&package.root, &self.out_root) {
                 specs.extend(manifest::load_tests(&file)?);
             }
+
             for spec in &specs {
-                if let Some(test) = test_from_spec(spec, package, &self.out_dir, &self.vcpkg_dir, &self.condition)? {
-                    self.tests.push(test);
+                let context = || format!("in [[test]] `{}`", spec.name);
+                if let Some(condition_text) = &spec.cond {
+                    if !self.condition.test(condition_text).with_context(context)? {
+                        switched_off.push(spec.name.clone());
+                        continue;
+                    }
                 }
+
+                let workdir = match &spec.workdir {
+                    Some(workdir) => {
+                        let filled = fill_test_text(workdir, package, &self.out_dir, &self.vcpkg_dir);
+                        util::absolute(&package.root, Path::new(&util::expand_env(&filled).with_context(context)?))
+                    }
+                    None => package.root.clone(),
+                };
+                self.tests
+                    .push(test_case(spec, workdir, package, &self.out_dir, &self.vcpkg_dir).with_context(context)?);
             }
         }
 
-        // `after` names other tests
-        let names: Vec<&str> = self.tests.iter().map(|test| test.name.as_str()).collect();
-        for test in &self.tests {
-            for name in &test.after {
-                if !names.contains(&name.as_str()) {
-                    let hint = util::suggest(name, names.iter().copied())
-                        .map(|close| format!(" (did you mean `{close}`?)"))
-                        .unwrap_or_default();
-                    bail!("test `{}`: after = [\"{name}\"] names no test{hint}", test.name);
-                }
-            }
-        }
-
-        Ok(())
+        check_tests(&mut self.tests, &switched_off)
     }
 }
 
@@ -1268,21 +1283,12 @@ fn tests_files(root: &Path, out_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn test_from_spec(spec: &TestSpec, package: &Package, out_dir: &Path, vcpkg_dir: &Path, condition: &CondContext) -> Result<Option<TestCase>> {
-    if let Some(condition_text) = &spec.cond {
-        if !condition.test(condition_text)? {
-            return Ok(None);
-        }
-    }
-
+/// One test from its keys, as [[test]] tables and test targets both give them, with its workdir resolved.
+fn test_case(spec: &TestSpec, workdir: PathBuf, package: &Package, out_dir: &Path, vcpkg_dir: &Path) -> Result<TestCase> {
     let fill = |text: &String| fill_test_text(text, package, out_dir, vcpkg_dir);
-    let workdir = match &spec.workdir {
-        Some(workdir) => util::absolute(&package.root, Path::new(&util::expand_env(&fill(workdir))?)),
-        None => package.root.clone(),
-    };
+    let pattern = |key: &str, pattern: &Option<String>| compile_test_regex(key, &pattern.as_ref().map(fill));
 
-    let context = || format!("in [[test]] `{}`", spec.name);
-    Ok(Some(TestCase {
+    Ok(TestCase {
         name: spec.name.clone(),
         command: spec.command.to_command().iter().map(fill).collect(),
         workdir,
@@ -1291,14 +1297,72 @@ fn test_from_spec(spec: &TestSpec, package: &Package, out_dir: &Path, vcpkg_dir:
         will_fail: spec.will_fail.unwrap_or(false),
         after: spec.after.clone().unwrap_or_default(),
         serial: spec.serial.unwrap_or(false),
-        pass_regex: compile_test_regex("pass-regex", &spec.pass_regex).with_context(context)?,
-        fail_regex: compile_test_regex("fail-regex", &spec.fail_regex).with_context(context)?,
+        pass_regex: pattern("pass-regex", &spec.pass_regex)?,
+        fail_regex: pattern("fail-regex", &spec.fail_regex)?,
         skip_exit_code: spec.skip_exit_code,
-        skip_regex: compile_test_regex("skip-regex", &spec.skip_regex).with_context(context)?,
-        expect: compile_test_regexes("expect", spec.expect.as_deref().unwrap_or_default(), &fill).with_context(context)?,
-        reject: compile_test_regexes("reject", spec.reject.as_deref().unwrap_or_default(), &fill).with_context(context)?,
+        skip_regex: pattern("skip-regex", &spec.skip_regex)?,
+        expect: compile_test_regexes("expect", spec.expect.as_deref().unwrap_or_default(), &fill)?,
+        reject: compile_test_regexes("reject", spec.reject.as_deref().unwrap_or_default(), &fill)?,
         exit_code: spec.exit_code,
-    }))
+    })
+}
+
+/// Test names are unique, `after` names a test (one that is off is not waited for), and no tests wait for each
+/// other in a circle.
+fn check_tests(tests: &mut [TestCase], switched_off: &[String]) -> Result<()> {
+    let mut seen = HashSet::new();
+    if let Some(twice) = tests.iter().find(|test| !seen.insert(test.name.as_str())) {
+        bail!("two tests are named `{}`; test names must be unique", twice.name);
+    }
+
+    let names: Vec<String> = tests.iter().map(|test| test.name.clone()).collect();
+    for test in tests.iter_mut() {
+        if let Some(unknown) = test.after.iter().find(|name| !names.contains(name) && !switched_off.contains(name)) {
+            let hint = util::suggest(unknown, names.iter().map(String::as_str))
+                .map(|close| format!(" (did you mean `{close}`?)"))
+                .unwrap_or_default();
+            bail!("test `{}`: after = [\"{unknown}\"] names no test{hint}", test.name);
+        }
+        test.after.retain(|name| names.contains(name));
+    }
+
+    if let Some(circle) = find_after_circle(tests) {
+        bail!("tests wait for each other in a circle: {} (each waits for the next)", circle.join(" -> "));
+    }
+
+    Ok(())
+}
+
+/// A chain of `after` that comes back to its start: the names along it, the first again at the end.
+fn find_after_circle(tests: &[TestCase]) -> Option<Vec<String>> {
+    let index_of: HashMap<&str, usize> = tests.iter().enumerate().map(|(index, test)| (test.name.as_str(), index)).collect();
+    let mut done = vec![false; tests.len()];
+    let mut path = Vec::new();
+
+    (0..tests.len()).find_map(|start| visit_after(start, tests, &index_of, &mut done, &mut path))
+}
+
+fn visit_after(index: usize, tests: &[TestCase], index_of: &HashMap<&str, usize>, done: &mut [bool], path: &mut Vec<usize>) -> Option<Vec<String>> {
+    if done[index] {
+        return None;
+    }
+
+    // Back on the current path: the circle is the path from there
+    if let Some(start) = path.iter().position(|on_path| *on_path == index) {
+        let circle = path[start..].iter().chain([&index]);
+        return Some(circle.map(|on_path| tests[*on_path].name.clone()).collect());
+    }
+
+    path.push(index);
+    for name in &tests[index].after {
+        if let Some(circle) = visit_after(index_of[name.as_str()], tests, index_of, done, path) {
+            return Some(circle);
+        }
+    }
+    path.pop();
+    done[index] = true;
+
+    None
 }
 
 /// Placeholders in test commands, folders and environment values: {root} {out} {profile} {version}.

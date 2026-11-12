@@ -1,12 +1,17 @@
-//! Runs tests in parallel: each in its own process with a timeout, output captured and shown for failures.
+//! Runs tests in parallel: each in its own process tree with a timeout, output captured and shown for failures.
 
+use crate::exec::INTERRUPTED;
+use crate::job::ProcessTree;
 use crate::plan;
 use crate::project::{Model, TestCase};
 use crate::ui;
-use anyhow::Result;
+use crate::util::{self, slash};
+use anyhow::{Context, Result};
 use std::collections::HashSet;
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::io::{PipeReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,32 +20,60 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
 // How often a running test is checked for its timeout
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
-/// What the workers share: tests not started yet, the names of finished ones, and what is running.
+// The tests that failed and have not passed since, one name per line, in the profile's .anvil folder
+const LAST_FAILED_FILE: &str = "last-failed";
+
+// The exit code of a run stopped by Ctrl-C
+const INTERRUPTED_EXIT_CODE: i32 = 130;
+
+pub struct TestOptions {
+    pub jobs: usize,
+    pub show_output: bool,
+    pub junit: Option<PathBuf>,
+}
+
+/// What the workers share: tests not started yet (with their place in the run), the names of finished ones, and
+/// what is running.
 struct Schedule {
-    pending: Vec<TestCase>,
+    pending: Vec<(usize, TestCase)>,
     finished: HashSet<String>,
     running: usize,
     serial_running: bool,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Outcome {
+    Passed,
+    Skipped,
+    Failed,
+    Interrupted,
+}
+
 struct TestResult {
+    index: usize,
     name: String,
-    passed: bool,
-    skipped: bool,
+    outcome: Outcome,
     detail: String,
     output: String,
     elapsed: Duration,
 }
 
 /// Runs the tests; the exit code is 0 when all pass.
-pub fn run_tests(model: &Model, tests: &[TestCase], jobs: usize) -> Result<i32> {
+pub fn run_tests(model: &Model, tests: &[TestCase], options: &TestOptions) -> Result<i32> {
     let started = Instant::now();
     ui::status("Testing", &format!("{} test{}", tests.len(), if tests.len() == 1 { "" } else { "s" }));
+
+    // `after` names a test outside this run: nothing to wait for
+    let selected: HashSet<&str> = tests.iter().map(|test| test.name.as_str()).collect();
+    let mut pending: Vec<(usize, TestCase)> = tests.iter().cloned().enumerate().collect();
+    for (_, test) in &mut pending {
+        test.after.retain(|name| selected.contains(name.as_str()));
+    }
 
     // A shared schedule; each worker takes the next test whose `after` tests are done
     let schedule = Arc::new((
         Mutex::new(Schedule {
-            pending: tests.to_vec(),
+            pending,
             finished: HashSet::new(),
             running: 0,
             serial_running: false,
@@ -50,14 +83,14 @@ pub fn run_tests(model: &Model, tests: &[TestCase], jobs: usize) -> Result<i32> 
     let results = Arc::new(Mutex::new(Vec::new()));
 
     std::thread::scope(|scope| {
-        for _ in 0..jobs.clamp(1, tests.len().max(1)) {
+        for _ in 0..options.jobs.clamp(1, tests.len().max(1)) {
             let schedule = schedule.clone();
             let results = results.clone();
 
             scope.spawn(move || {
-                while let Some(test) = take_next(&schedule, &results) {
-                    let result = run_one(model, &test);
-                    print_result(&result);
+                while let Some((index, test)) = take_next(&schedule) {
+                    let result = run_one(model, index, &test);
+                    print_result(&result, options.show_output);
                     results.lock().unwrap().push(result);
 
                     // Let waiting workers look again
@@ -72,9 +105,11 @@ pub fn run_tests(model: &Model, tests: &[TestCase], jobs: usize) -> Result<i32> 
         }
     });
 
-    // Failures in full, then the tally
-    let results = std::mem::take(&mut *results.lock().unwrap());
-    let failures: Vec<&TestResult> = results.iter().filter(|result| !result.passed).collect();
+    // Failures in full, in the run's order
+    let mut results = std::mem::take(&mut *results.lock().unwrap());
+    results.sort_by_key(|result| result.index);
+    let count = |outcome: Outcome| results.iter().filter(|result| result.outcome == outcome).count();
+    let failures: Vec<&TestResult> = results.iter().filter(|result| result.outcome == Outcome::Failed).collect();
     for failure in &failures {
         ui::print_line(&format!("\n{} {} ({})", ui::bold_red("---- failed:"), failure.name, failure.detail));
         if !failure.output.trim().is_empty() {
@@ -82,10 +117,30 @@ pub fn run_tests(model: &Model, tests: &[TestCase], jobs: usize) -> Result<i32> 
         }
     }
 
-    let passed = results.len() - failures.len();
+    // What failed, for --rerun-failed; the report
+    write_last_failed(model, &results)?;
+    if let Some(path) = &options.junit {
+        write_junit(path, &model.packages[0].name, &results, started.elapsed())?;
+    }
+
+    // The tally
     let seconds = started.elapsed().as_secs_f64();
+    let skipped = match count(Outcome::Skipped) {
+        0 => String::new(),
+        skipped => format!(", {skipped} skipped"),
+    };
+    if INTERRUPTED.load(Ordering::Relaxed) {
+        let passed = count(Outcome::Passed) + count(Outcome::Skipped);
+        let not_run = tests.len() - passed - failures.len();
+        ui::error(&format!(
+            "interrupted: {passed} passed, {} failed, {not_run} stopped or not started",
+            failures.len()
+        ));
+        return Ok(INTERRUPTED_EXIT_CODE);
+    }
+
     if failures.is_empty() {
-        ui::status("Passed", &format!("{passed} of {} in {seconds:.2}s", results.len()));
+        ui::status("Passed", &format!("{} of {} in {seconds:.2}s{skipped}", results.len(), results.len()));
         Ok(0)
     } else {
         let names: Vec<&str> = failures.iter().map(|failure| failure.name.as_str()).collect();
@@ -94,56 +149,54 @@ pub fn run_tests(model: &Model, tests: &[TestCase], jobs: usize) -> Result<i32> 
     }
 }
 
-/// Waits for a test that may start: its `after` tests finished, and no serial test in the way. None when all are taken.
-fn take_next(schedule: &(Mutex<Schedule>, Condvar), results: &Mutex<Vec<TestResult>>) -> Option<TestCase> {
+/// The names of the tests that failed and have not passed since (empty when none did).
+pub fn last_failed(model: &Model) -> Vec<String> {
+    let text = std::fs::read_to_string(last_failed_path(model)).unwrap_or_default();
+    text.lines().filter(|line| !line.is_empty()).map(str::to_string).collect()
+}
+
+/// Waits for a test that may start: its `after` tests finished (they wait in no circle, the project was checked),
+/// and no serial test in the way. None when all are taken, or after Ctrl-C.
+fn take_next(schedule: &(Mutex<Schedule>, Condvar)) -> Option<(usize, TestCase)> {
     let (state, changed) = schedule;
     let mut state = state.lock().unwrap();
 
     loop {
-        if state.pending.is_empty() {
+        if state.pending.is_empty() || INTERRUPTED.load(Ordering::Relaxed) {
             return None;
         }
 
         // The first ready test, in order
-        let ready = state.pending.iter().position(|test| {
+        let ready = state.pending.iter().position(|(_, test)| {
             let waits = test.after.iter().any(|name| !state.finished.contains(name));
             let blocked = state.serial_running || (test.serial && state.running > 0);
             !waits && !blocked
         });
-        if let Some(index) = ready {
-            let test = state.pending.remove(index);
+        if let Some(position) = ready {
+            let (index, test) = state.pending.remove(position);
             state.running += 1;
             state.serial_running = test.serial;
-            return Some(test);
+            return Some((index, test));
         }
 
-        // Nothing can ever start: the rest wait on each other
-        if state.running == 0 {
-            for test in std::mem::take(&mut state.pending) {
-                let result = TestResult {
-                    name: test.name.clone(),
-                    passed: false,
-                    skipped: false,
-                    detail: format!("never ran: after = [{}] waits in a cycle", test.after.join(", ")),
-                    output: String::new(),
-                    elapsed: Duration::ZERO,
-                };
-                print_result(&result);
-                results.lock().unwrap().push(result);
-            }
-            return None;
-        }
-
-        state = changed.wait(state).unwrap();
+        // Wake up now and then to see Ctrl-C
+        state = changed.wait_timeout(state, Duration::from_millis(100)).unwrap().0;
     }
 }
 
-fn run_one(model: &Model, test: &TestCase) -> TestResult {
+/// How a test's program ended.
+enum Ending {
+    Exited(ExitStatus),
+    TimedOut,
+    Interrupted,
+}
+
+fn run_one(model: &Model, index: usize, test: &TestCase) -> TestResult {
     let started = Instant::now();
     let mut result = TestResult {
+        index,
         name: test.name.clone(),
-        passed: false,
-        skipped: false,
+        outcome: Outcome::Failed,
         detail: String::new(),
         output: String::new(),
         elapsed: Duration::ZERO,
@@ -163,91 +216,140 @@ fn run_one(model: &Model, test: &TestCase) -> TestResult {
         }
     };
 
-    // `cmake -E` commands Anvil runs itself, as in build steps
-    let (program, args) = match crate::cmake_tool::handled(&words) {
-        Some(cmake_args) => {
-            let anvil = std::env::current_exe().unwrap_or_else(|_| "anvil".into());
-            let mut args = vec![crate::cmake_tool::SUBCOMMAND.to_string()];
-            args.extend(cmake_args.iter().cloned());
-            (anvil.to_string_lossy().into_owned(), args)
-        }
-        None => (words[0].clone(), words[1..].to_vec()),
-    };
-    let mut command = Command::new(&program);
-    command
-        .args(&args)
-        .current_dir(&test.workdir)
-        .envs(test.env.iter().cloned())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    // A missing folder would only say "could not start"
+    if !test.workdir.is_dir() {
+        result.detail = format!("its workdir {} does not exist", slash(&test.workdir));
+        return result;
+    }
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    let mut command = match test_command(&words, test) {
+        Ok(command) => command,
         Err(error) => {
-            result.detail = format!("could not start {}: {error}", words[0]);
+            result.detail = error;
             return result;
         }
     };
+    command.current_dir(&test.workdir).stdin(Stdio::null());
 
-    // Drain output on threads so a chatty test never blocks on a full pipe
-    let stdout_reader = drain(child.stdout.take());
-    let stderr_reader = drain(child.stderr.take());
+    // Both streams into one pipe, so the output keeps the order the test wrote it in
+    let reader = match output_pipe(&mut command) {
+        Ok(reader) => reader,
+        Err(error) => {
+            result.detail = format!("could not create a pipe for its output: {error}");
+            return result;
+        }
+    };
+    let spawned = ProcessTree::spawn(&mut command);
 
-    // Wait, killing it at the timeout
+    // The command holds the pipe's write ends: reading would never end
+    let program = command.get_program().to_string_lossy().into_owned();
+    drop(command);
+
+    let mut tree = match spawned {
+        Ok(tree) => tree,
+        Err(error) => {
+            result.detail = format!("could not start {program}: {error}");
+            return result;
+        }
+    };
+    let output_reader = drain(reader);
+
+    // Wait, stopping the whole tree at the timeout or Ctrl-C
     let timeout = Duration::from_secs(test.timeout.unwrap_or(DEFAULT_TIMEOUT_SECONDS));
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
+    let ending = loop {
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            break Ending::Interrupted;
+        }
+        match tree.try_wait() {
+            Ok(Some(status)) => break Ending::Exited(status),
+            Ok(None) if started.elapsed() > timeout => break Ending::TimedOut,
             Ok(None) => std::thread::sleep(POLL_INTERVAL),
-            Err(_) => break None,
+            Err(error) => {
+                result.detail = format!("waiting for it failed: {error}");
+                tree.kill();
+                return result;
+            }
         }
     };
 
-    result.output = stdout_reader.join().unwrap_or_default() + &stderr_reader.join().unwrap_or_default();
+    // What it left running ends with it, which also closes the pipe
+    tree.kill();
+    result.output = output_reader.join().unwrap_or_default();
     result.elapsed = started.elapsed();
 
-    let Some(status) = status else {
-        result.detail = format!("timed out after {}s", timeout.as_secs());
-        return result;
+    match ending {
+        Ending::Exited(status) => (result.outcome, result.detail) = judge(test, status, &result.output),
+        Ending::TimedOut => result.detail = format!("timed out after {}s", timeout.as_secs()),
+        Ending::Interrupted => {}
+    }
+
+    // Ctrl-C reaches the test's console too: a test that ended badly then did not fail, it was stopped
+    if INTERRUPTED.load(Ordering::Relaxed) && result.outcome == Outcome::Failed {
+        result.outcome = Outcome::Interrupted;
+        result.detail = "interrupted".into();
+    }
+
+    result
+}
+
+/// The command a test's words run: `cmake -E env` runs its program directly with the variables applied, other
+/// `cmake -E` commands run in Anvil (as in build steps), anything else as written.
+fn test_command(words: &[String], test: &TestCase) -> std::result::Result<Command, String> {
+    let Some(cmake_args) = crate::cmake_tool::handled(words) else {
+        let mut command = Command::new(&words[0]);
+        command.args(&words[1..]).envs(test.env.iter().cloned());
+        return Ok(command);
     };
 
+    if cmake_args[0] == "env" {
+        let env = crate::cmake_tool::parse_env(&cmake_args[1..]).map_err(|error| format!("cmake -E env: {error:#}"))?;
+        let Some((program, args)) = env.command.split_first() else {
+            return Err("cmake -E env has no command to run".into());
+        };
+
+        let mut command = Command::new(program);
+        command.args(args).envs(test.env.iter().cloned());
+        env.apply(&mut command);
+        return Ok(command);
+    }
+
+    let anvil = std::env::current_exe().unwrap_or_else(|_| "anvil".into());
+    let mut command = Command::new(anvil);
+    command.arg(crate::cmake_tool::SUBCOMMAND).args(cmake_args).envs(test.env.iter().cloned());
+    Ok(command)
+}
+
+/// Passed, skipped or failed (and why) by the exit status and output.
+fn judge(test: &TestCase, status: ExitStatus, output: &str) -> (Outcome, String) {
     // The test said it could not run: skipped, which does not fail the run
     let skip_code = test.skip_exit_code.is_some_and(|code| status.code() == Some(code));
-    let skip_output = test.skip_regex.as_ref().is_some_and(|pattern| pattern.is_match(&result.output));
+    let skip_output = test.skip_regex.as_ref().is_some_and(|pattern| pattern.is_match(output));
     if skip_code || skip_output {
-        result.passed = true;
-        result.skipped = true;
-        return result;
+        return (Outcome::Skipped, String::new());
     }
 
     // Exit code, or the pass pattern when there is one (CTest's rule), then the fail pattern
-    let exit_text = status.code().map(|code| code.to_string()).unwrap_or_else(|| "none (crashed)".into());
+    let exit_text = describe_exit(status);
     let exit_code = test.exit_code.unwrap_or(0);
     let (mut passed, mut detail) = match &test.pass_regex {
-        Some(pattern) if pattern.is_match(&result.output) => (true, String::new()),
+        Some(pattern) if pattern.is_match(output) => (true, String::new()),
         Some(pattern) => (false, format!("output does not match pass-regex \"{pattern}\"")),
         None if status.code() == Some(exit_code) => (true, String::new()),
-        None if test.exit_code.is_some() => (false, format!("exit code {exit_text}, expected {exit_code}")),
-        None => (false, format!("exit code {exit_text}")),
+        None if test.exit_code.is_some() => (false, format!("{exit_text}, expected {exit_code}")),
+        None => (false, exit_text.clone()),
     };
 
     // Every expect pattern must match, no reject pattern may
-    if let Some(pattern) = test.expect.iter().find(|pattern| !pattern.is_match(&result.output)).filter(|_| passed) {
+    if let Some(pattern) = test.expect.iter().find(|pattern| !pattern.is_match(output)).filter(|_| passed) {
         passed = false;
         detail = format!("output has no match for expect \"{pattern}\"");
     }
-    let rejected = test.reject.iter().find_map(|pattern| Some((pattern, pattern.find(&result.output)?)));
+    let rejected = test.reject.iter().find_map(|pattern| Some((pattern, pattern.find(output)?)));
     if let Some((pattern, found)) = rejected.filter(|_| passed) {
         passed = false;
         detail = format!("output matches reject \"{pattern}\": \"{}\"", found.as_str());
     }
-    if let Some(pattern) = test.fail_regex.as_ref().filter(|pattern| pattern.is_match(&result.output)) {
+    if let Some(pattern) = test.fail_regex.as_ref().filter(|pattern| pattern.is_match(output)) {
         passed = false;
         detail = format!("output matches fail-regex \"{pattern}\"");
     }
@@ -255,37 +357,214 @@ fn run_one(model: &Model, test: &TestCase) -> TestResult {
     // will-fail turns it around
     if test.will_fail {
         detail = if passed {
-            format!("passed, but will-fail is set (exit code {exit_text})")
+            format!("passed, but will-fail is set ({exit_text})")
         } else {
             String::new()
         };
         passed = !passed;
     }
 
-    result.passed = passed;
-    result.detail = detail;
-
-    result
+    (if passed { Outcome::Passed } else { Outcome::Failed }, detail)
 }
 
-fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(mut pipe) = pipe {
-            let mut bytes = Vec::new();
-            let _ = pipe.read_to_end(&mut bytes);
-            text = String::from_utf8_lossy(&bytes).into_owned();
+/// "exit code 3", or how it crashed: "exit code 0xC0000005: access violation", "killed by SIGSEGV: segmentation
+/// fault".
+fn describe_exit(status: ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return match signal_name(signal) {
+                Some((name, meaning)) => format!("killed by {name}: {meaning}"),
+                None => format!("killed by signal {signal}"),
+            };
         }
-        text
+    }
+
+    match status.code() {
+        // Windows reports a crash as an NTSTATUS, negative as an i32
+        Some(code) if code < 0 => {
+            let status = code as u32;
+            match crash_name(status) {
+                Some(name) => format!("exit code 0x{status:08X}: {name}"),
+                None => format!("exit code 0x{status:08X}"),
+            }
+        }
+        Some(code) => format!("exit code {code}"),
+        None => "no exit code".into(),
+    }
+}
+
+/// What a Windows crash status means.
+fn crash_name(status: u32) -> Option<&'static str> {
+    Some(match status {
+        0x80000003 => "breakpoint",
+        0xC0000005 => "access violation",
+        0xC0000017 => "out of memory",
+        0xC000001D => "illegal instruction",
+        0xC000007B => "bad image: a DLL or program built for another processor",
+        0xC000008E => "floating-point division by zero",
+        0xC0000094 => "integer division by zero",
+        0xC0000095 => "integer overflow",
+        0xC0000096 => "privileged instruction",
+        0xC00000FD => "stack overflow",
+        0xC0000135 => "DLL not found: one it needs is not beside it or on PATH",
+        0xC0000139 => "DLL entry point not found",
+        0xC0000142 => "DLL initialization failed",
+        0xC000013A => "Ctrl-C",
+        0xC0000374 => "heap corruption",
+        0xC0000409 => "fast fail: abort(), std::terminate or a buffer overrun check",
+        0xC0000420 => "assertion failure",
+        0xC0000602 => "fail fast",
+        0xE06D7363 => "unhandled C++ exception",
+        _ => return None,
     })
 }
 
-fn print_result(result: &TestResult) {
-    let verdict = match (result.passed, result.skipped) {
-        (_, true) => ui::dim("skipped"),
-        (true, false) => ui::bold_green("ok"),
-        (false, false) => ui::bold_red("FAILED"),
+#[cfg(unix)]
+fn signal_name(signal: i32) -> Option<(&'static str, &'static str)> {
+    Some(match signal {
+        libc::SIGABRT => ("SIGABRT", "abort"),
+        libc::SIGBUS => ("SIGBUS", "bus error"),
+        libc::SIGFPE => ("SIGFPE", "arithmetic error"),
+        libc::SIGILL => ("SIGILL", "illegal instruction"),
+        libc::SIGINT => ("SIGINT", "interrupted"),
+        libc::SIGKILL => ("SIGKILL", "killed"),
+        libc::SIGPIPE => ("SIGPIPE", "broken pipe"),
+        libc::SIGSEGV => ("SIGSEGV", "segmentation fault"),
+        libc::SIGTERM => ("SIGTERM", "terminated"),
+        libc::SIGTRAP => ("SIGTRAP", "trap"),
+        _ => return None,
+    })
+}
+
+/// Gives the command one pipe for stdout and stderr; the end to read.
+fn output_pipe(command: &mut Command) -> std::io::Result<PipeReader> {
+    let (reader, writer) = std::io::pipe()?;
+    command.stdout(writer.try_clone()?).stderr(writer);
+    Ok(reader)
+}
+
+fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
+/// One line per test, and with --show-output a passing test's output under it.
+fn print_result(result: &TestResult, show_output: bool) {
+    let verdict = match result.outcome {
+        Outcome::Passed => ui::bold_green("ok"),
+        Outcome::Skipped => ui::dim("skipped"),
+        Outcome::Failed => ui::bold_red("FAILED"),
+        Outcome::Interrupted => ui::dim("interrupted"),
     };
     let time = ui::dim(&format!("({:.2}s)", result.elapsed.as_secs_f64()));
-    ui::print_line(&format!("  test {} ... {verdict} {time}", result.name));
+    let mut text = format!("  test {} ... {verdict} {time}\n", result.name);
+
+    let passed = matches!(result.outcome, Outcome::Passed | Outcome::Skipped);
+    if show_output && passed && !result.output.trim().is_empty() {
+        text.push_str(&result.output);
+    }
+    ui::print_block(&text);
+}
+
+fn last_failed_path(model: &Model) -> PathBuf {
+    model.out_dir.join(".anvil").join(LAST_FAILED_FILE)
+}
+
+/// The last failures, less the tests that passed now, plus those that failed now.
+fn write_last_failed(model: &Model, results: &[TestResult]) -> Result<()> {
+    let mut names = last_failed(model);
+    names.retain(|name| {
+        !results
+            .iter()
+            .any(|result| result.name == *name && matches!(result.outcome, Outcome::Passed | Outcome::Skipped))
+    });
+    for result in results.iter().filter(|result| result.outcome == Outcome::Failed) {
+        if !names.contains(&result.name) {
+            names.push(result.name.clone());
+        }
+    }
+
+    let path = last_failed_path(model);
+    if names.is_empty() && !path.exists() {
+        return Ok(());
+    }
+    let text: String = names.iter().map(|name| format!("{name}\n")).collect();
+    util::write_atomic(&path, text.as_bytes())
+}
+
+/// A JUnit XML report: one testsuite for the project, a testcase per test that ran.
+fn write_junit(path: &Path, project: &str, results: &[TestResult], elapsed: Duration) -> Result<()> {
+    let count = |outcome: Outcome| results.iter().filter(|result| result.outcome == outcome).count();
+    let project = xml_escape(project);
+    let totals = format!(
+        "tests=\"{}\" failures=\"{}\" errors=\"{}\" skipped=\"{}\" time=\"{:.3}\"",
+        results.len(),
+        count(Outcome::Failed),
+        count(Outcome::Interrupted),
+        count(Outcome::Skipped),
+        elapsed.as_secs_f64()
+    );
+
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    xml.push_str(&format!("<testsuites {totals}>\n"));
+    xml.push_str(&format!("  <testsuite name=\"{project}\" {totals}>\n"));
+    for result in results {
+        let opening = format!(
+            "    <testcase name=\"{}\" classname=\"{project}\" time=\"{:.3}\"",
+            xml_escape(&result.name),
+            result.elapsed.as_secs_f64()
+        );
+        let message = xml_escape(&result.detail);
+        match result.outcome {
+            Outcome::Passed => xml.push_str(&format!("{opening}/>\n")),
+            Outcome::Skipped => xml.push_str(&format!("{opening}>\n      <skipped/>\n    </testcase>\n")),
+            Outcome::Failed => xml.push_str(&format!(
+                "{opening}>\n      <failure message=\"{message}\">{}</failure>\n    </testcase>\n",
+                xml_escape(&result.output)
+            )),
+            Outcome::Interrupted => xml.push_str(&format!("{opening}>\n      <error message=\"{message}\"/>\n    </testcase>\n")),
+        }
+    }
+    xml.push_str("  </testsuite>\n</testsuites>\n");
+
+    util::write_atomic(path, xml.as_bytes()).with_context(|| format!("writing the JUnit report {}", slash(path)))
+}
+
+/// Text for an XML attribute or element; characters XML cannot hold (most control characters) are left out.
+fn xml_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\t' | '\n' | '\r' => escaped.push(character),
+            character if character.is_control() => {}
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_crashes() {
+        assert_eq!(crash_name(0xC0000005), Some("access violation"));
+        assert!(crash_name(0xC0000135).unwrap().starts_with("DLL not found"));
+        assert_eq!(crash_name(0x00000003), None);
+    }
+
+    #[test]
+    fn escapes_xml() {
+        assert_eq!(xml_escape("a<b> & \"c\"\u{1b}[0m\n"), "a&lt;b&gt; &amp; &quot;c&quot;[0m\n");
+    }
 }
