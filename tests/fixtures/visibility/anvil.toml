@@ -1,0 +1,14 @@
+[project]
+name = "visibility"
+
+[target.core]
+kind = "lib"
+dir = "core"
+defines = ["CORE_OWN"]
+public.defines = ["CORE_PUBLIC"]
+interface.defines = ["CORE_INTERFACE"]
+
+[target.app]
+kind = "exe"
+dir = "app"
+deps = ["core"]

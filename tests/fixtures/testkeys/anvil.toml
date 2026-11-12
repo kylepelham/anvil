@@ -1,0 +1,72 @@
+[project]
+name = "testkeys"
+
+[target.tool]
+kind = "exe"
+
+[[test]]
+name = "ok_print"
+command = ["{target:tool}", "print", "hello world"]
+expect = ["hello", "w.rld"]
+reject = ["goodbye"]
+
+[[test]]
+name = "ok_exit_code"
+command = ["{target:tool}", "exit", "3", "three"]
+exit-code = 3
+expect = ["three"]
+
+[[test]]
+name = "ok_will_fail"
+command = ["{target:tool}", "exit", "1", "boom"]
+will-fail = true
+
+[[test]]
+name = "ok_first"
+command = ["{target:tool}", "touch", "{out}/first.done", "300"]
+
+[[test]]
+name = "ok_second"
+command = ["{target:tool}", "exists", "{out}/first.done"]
+after = ["ok_first"]
+
+[[test]]
+name = "ok_serial"
+command = ["{target:tool}", "hold", "{out}/serial.lock", "400"]
+serial = true
+
+[[test]]
+name = "ok_probe_1"
+command = ["{target:tool}", "probe", "{out}/serial.lock", "400"]
+
+[[test]]
+name = "ok_probe_2"
+command = ["{target:tool}", "probe", "{out}/serial.lock", "400"]
+
+[[test]]
+name = "ok_probe_3"
+command = ["{target:tool}", "probe", "{out}/serial.lock", "400"]
+
+[[test]]
+name = "bad_expect"
+command = ["{target:tool}", "print", "hello"]
+expect = ["goodbye"]
+
+[[test]]
+name = "bad_reject"
+command = ["{target:tool}", "print", "an ERROR here"]
+reject = ["ERROR"]
+
+[[test]]
+name = "bad_exit"
+command = ["{target:tool}", "exit", "2", "two"]
+
+[[test]]
+name = "bad_will_fail"
+command = ["{target:tool}", "print", "fine"]
+will-fail = true
+
+[[test]]
+name = "slow_timeout"
+command = ["{target:tool}", "sleep", "30000"]
+timeout = 1

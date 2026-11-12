@@ -1,0 +1,11 @@
+[project]
+name = "feature"
+
+[options]
+fast = false
+
+[target.app]
+kind = "exe"
+
+[target.app.when.fast]
+defines = ["FAST_PATH"]

@@ -1,0 +1,6 @@
+[project]
+name = "typo"
+
+[target.app]
+kind = "exe"
+linkflags = ["/DEBUG"]

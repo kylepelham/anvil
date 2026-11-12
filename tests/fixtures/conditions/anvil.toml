@@ -1,0 +1,11 @@
+[project]
+name = "conditions"
+
+[target.app]
+kind = "exe"
+
+[target.app.when.windows]
+sources = ["src/win/*.c"]
+
+[target.app.when.linux]
+sources = ["src/linux/*.c"]

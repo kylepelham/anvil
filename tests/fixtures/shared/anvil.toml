@@ -1,0 +1,12 @@
+[project]
+name = "shared"
+
+[target.mylib]
+kind = "shared"
+dir = "mylib"
+export-header = "mylib/export.h"
+
+[target.app]
+kind = "exe"
+sources = ["app/main.c"]
+deps = ["mylib"]

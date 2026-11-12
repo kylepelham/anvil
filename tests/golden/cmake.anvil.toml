@@ -1,0 +1,26 @@
+# Converted from CMakeLists.txt by `anvil convert`. Review the TODO comments, then delete them.
+
+[project]
+name = "calc"
+
+[options]
+CALC_FAST = { default = false, description = "Use the fast path" }
+
+[target.calc]
+kind = "lib"
+sources = ["lib/calc.c"]
+
+[target.calc.public]
+include = ["lib"]
+
+[target.calc.when.CALC_FAST]
+defines = ["CALC_FAST"]
+
+[target.calc_app]
+kind = "exe"
+deps = ["calc"]
+
+[[test]]
+name = "calc_runs"
+command = "{target:calc_app} 2 3"
+pass-regex = "sum 5"

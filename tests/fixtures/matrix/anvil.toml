@@ -1,0 +1,10 @@
+[project]
+name = "matrix"
+
+[target.app]
+kind = "exe"
+
+[[test]]
+name = "root_test"
+command = ["{target:app}", "root"]
+expect = ["root"]

@@ -1,0 +1,6 @@
+[[test]]
+name = "m_{size}_{mode}"
+command = ["{target:app}", "{size}", "{mode}"]
+matrix.size = ["small", "large"]
+matrix.mode = ["fast", { mode = "slow", expect = ["slow"] }]
+expect = ["^{size} {mode}"]

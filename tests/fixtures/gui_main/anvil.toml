@@ -1,0 +1,6 @@
+[project]
+name = "gui_main"
+
+[target.app]
+kind = "exe"
+gui = "main"
