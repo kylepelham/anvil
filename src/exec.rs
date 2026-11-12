@@ -488,6 +488,9 @@ fn run_action(index: usize, action: &Action, low_priority: bool) -> Outcome {
     outcome.success = output.status.success();
 
     if !outcome.success {
+        if let Some(hint) = crate::flags::link_failure_hint(&outcome.output).filter(|_| action.kind == ActionKind::Link) {
+            outcome.output.push_str(&format!("\nhint: {hint}\n"));
+        }
         return outcome;
     }
 

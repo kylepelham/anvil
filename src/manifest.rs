@@ -166,8 +166,8 @@ pub struct TargetSpec {
     pub cuda_flags: Option<Vec<String>>,
     pub std: Option<String>,
     pub c_std: Option<String>,
-    /// Windows GUI executable (no console; main() still works).
-    pub gui: Option<bool>,
+    /// Windows GUI program: true for one entered through WinMain (CMake's WIN32), "main" for one with main().
+    pub gui: Option<toml::Value>,
     pub output_name: Option<String>,
     /// Replace the platform's file name prefix ("lib") and extension (".dll", ".so", ".exe").
     pub output_prefix: Option<String>,

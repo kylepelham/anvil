@@ -19,6 +19,13 @@ pub enum Os {
     Macos,
 }
 
+/// The binary interface of Windows programs: Visual Studio's, or MinGW's (GNU).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Abi {
+    Msvc,
+    Gnu,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Platform {
     pub cpu: Cpu,
@@ -119,10 +126,25 @@ impl Platform {
         })
     }
 
-    /// Not the machine Anvil runs on.
+    /// Not the machine Anvil runs on: another processor or system, or MinGW programs on Windows (whose default is
+    /// the MSVC ABI).
     pub fn is_cross(&self) -> bool {
         let host = Platform::host();
-        self.cpu != host.cpu || self.os != host.os
+        self.cpu != host.cpu || self.os != host.os || self.other_abi()
+    }
+
+    /// The Windows ABI the triple names (`-msvc`, `-mingw32`, `-gnu`), if it names one.
+    pub fn abi(&self) -> Option<Abi> {
+        let triple = self.triple.as_deref()?.to_ascii_lowercase();
+        if self.os != Os::Windows {
+            None
+        } else if triple.contains("msvc") {
+            Some(Abi::Msvc)
+        } else if triple.contains("mingw") || triple.contains("gnu") || triple.contains("cygwin") {
+            Some(Abi::Gnu)
+        } else {
+            None
+        }
     }
 
     /// Programs built for this platform start on the host: the same system, and a processor it runs (x64 Windows
@@ -141,10 +163,10 @@ impl Platform {
         }
     }
 
-    /// The name output folders and messages use: the processor, or the whole triple for another system.
+    /// The name output folders and messages use: the processor, or the whole triple for another system or ABI.
     pub fn name(&self) -> String {
         match &self.triple {
-            Some(triple) if self.os != Platform::host().os => triple.clone(),
+            Some(triple) if self.os != Platform::host().os || self.other_abi() => triple.clone(),
             _ => self.cpu.name().to_string(),
         }
     }
@@ -168,6 +190,11 @@ impl Platform {
     /// The prefix of a GNU cross toolchain's programs ("aarch64-linux-gnu-" for aarch64-linux-gnu-g++).
     pub fn gnu_prefix(&self) -> String {
         format!("{}-", self.clang_triple(false))
+    }
+
+    /// MinGW programs asked for on Windows.
+    fn other_abi(&self) -> bool {
+        Platform::host().os == Os::Windows && self.abi() == Some(Abi::Gnu)
     }
 }
 
@@ -199,5 +226,20 @@ mod tests {
         };
         assert_eq!(x86.clang_triple(true), "i686-pc-windows-msvc");
         assert_eq!(x86.clang_triple(false), "i686-w64-mingw32");
+    }
+
+    #[test]
+    fn abis() {
+        let mingw = Platform::parse("x86_64-w64-mingw32").unwrap();
+        assert_eq!(mingw.abi(), Some(Abi::Gnu));
+        assert_eq!(Platform::parse("aarch64-pc-windows-msvc").unwrap().abi(), Some(Abi::Msvc));
+        assert_eq!(Platform::parse("aarch64-linux-gnu").unwrap().abi(), None);
+
+        // MinGW programs are another machine's to Windows (MSVC by default), and get their own folder
+        if cfg!(all(windows, target_arch = "x86_64")) {
+            assert!(mingw.is_cross());
+            assert_eq!(mingw.name(), "x86_64-w64-mingw32");
+            assert!(!Platform::parse("x86_64-pc-windows-msvc").unwrap().is_cross());
+        }
     }
 }

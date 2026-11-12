@@ -40,6 +40,9 @@ impl Cuda {
         if toolchain.platform.is_cross() {
             bail!("CUDA files cannot be cross-built (building for {})", toolchain.platform.name());
         }
+        if toolchain.targets_windows() && !toolchain.is_msvc_abi() {
+            bail!("CUDA on Windows needs the MSVC ABI (nvcc takes no MinGW compiler): build with --toolchain msvc, clang-cl or clang");
+        }
 
         let nvcc =
             find_nvcc().context("this project has CUDA (.cu) files, but nvcc was not found: install the CUDA toolkit, or set CUDA_PATH to it")?;
@@ -283,7 +286,7 @@ fn choose_host_compiler(nvcc: &Path, toolchain: &Toolchain) -> Result<(PathBuf, 
     }
 
     bail!(
-        "nvcc ({}) accepts none of the installed Visual Studio compilers; install the Visual Studio version its CUDA          release supports (CUDA 12 and 13: Visual Studio 2022) or a newer CUDA toolkit",
+        "nvcc ({}) accepts none of the installed Visual Studio compilers; install the Visual Studio version its CUDA release supports (CUDA 12 and 13: Visual Studio 2022) or a newer CUDA toolkit",
         slash(nvcc)
     )
 }

@@ -701,7 +701,7 @@ impl Emitter {
         if let Some(standard) = self.effective_standard(&target.name, &mut Vec::new()) {
             converted.blocks.set(None, "std", Value::Text(format!("c++{standard}")));
         }
-        if target.gui {
+        if target.gui && converted.blocks.get(&None, "gui").is_none() {
             converted.blocks.set(None, "gui", Value::Bool(true));
         }
         if target.imported {
@@ -1048,8 +1048,13 @@ impl Emitter {
     fn convert_link_flag(&self, flag: &str, condition: Option<String>, blocks: &mut Blocks) {
         let upper = flag.to_uppercase();
 
+        // A GUI program entered through main() (WIN32 with /ENTRY:mainCRTStartup) is gui = "main", else gui = true
         if upper == "/SUBSYSTEM:WINDOWS" || flag == "-mwindows" || flag == "-Wl,--subsystem,windows" {
-            blocks.set(condition, "gui", Value::Bool(true));
+            if blocks.get(&condition, "gui").is_none() {
+                blocks.set(condition, "gui", Value::Bool(true));
+            }
+        } else if upper == "/ENTRY:MAINCRTSTARTUP" {
+            blocks.set(condition, "gui", Value::Text("main".into()));
         } else if upper.starts_with("/ENTRY:") || DROPPED_LINK_FLAGS.iter().any(|dropped| dropped.eq_ignore_ascii_case(flag)) {
         } else if let Some(library) = flag.strip_prefix("-l") {
             blocks.push(condition, "libs", library.to_string());

@@ -2,7 +2,7 @@
 //! globs expanded; paths made absolute.
 
 use crate::cond::CondContext;
-use crate::flags::{normalize_standard, Arch, Language, Warnings};
+use crate::flags::{normalize_standard, Arch, Gui, Language, Warnings};
 use crate::manifest::{self, ExportHeaderSpec, FileRule, RunSpec, StepSpec, TargetSpec};
 use crate::profile::Opt;
 use crate::util::{self, slash};
@@ -91,7 +91,7 @@ pub struct Target {
     pub arch: Option<Arch>,
     pub cuda_arch: Vec<String>,
     pub cuda_flags: Vec<String>,
-    pub gui: bool,
+    pub gui: Gui,
     pub exports: bool,
     pub link_depends: Vec<PathBuf>,
 
@@ -194,7 +194,7 @@ struct Accumulated {
     cuda_flags: Vec<String>,
     std: Option<String>,
     c_std: Option<String>,
-    gui: Option<bool>,
+    gui: Option<toml::Value>,
     exports: Option<bool>,
     export_header: Option<ExportHeaderSpec>,
     output_prefix: Option<String>,
@@ -315,7 +315,7 @@ impl Target {
             arch: None,
             cuda_arch: Vec::new(),
             cuda_flags: Vec::new(),
-            gui: false,
+            gui: Gui::Off,
             exports: false,
             link_depends: Vec::new(),
             output_prefix: None,
@@ -581,7 +581,7 @@ impl Target {
         self.arch = settings.arch.as_deref().map(Arch::parse).transpose()?;
 
         // Output
-        self.gui = settings.gui.unwrap_or(false);
+        self.gui = settings.gui.as_ref().map(Gui::parse).transpose()?.unwrap_or(Gui::Off);
         self.exports = settings.exports.unwrap_or(false);
         self.output_prefix = settings.output_prefix;
         self.output_name = settings.output_name.unwrap_or_else(|| self.name.clone());
@@ -922,10 +922,11 @@ fn is_main_file(path: &Path) -> bool {
     path.file_stem().is_some_and(|stem| stem == "main")
 }
 
-/// A lib entry: a name ("user32") stays; a path (has a slash or an extension) becomes absolute.
+/// A lib entry: a name ("user32", "Cocoa.framework") stays; a path (has a slash or an extension) becomes absolute.
 fn expand_lib(lib: &str, dir: &Path, scope: &PackageScope, target_name: &str) -> Result<String> {
     let expanded = expand_path_text(lib, scope, target_name)?;
-    let is_path = expanded.contains('/') || expanded.contains('\\') || Path::new(&expanded).extension().is_some();
+    let separators = expanded.contains('/') || expanded.contains('\\');
+    let is_path = separators || (Path::new(&expanded).extension().is_some() && !expanded.ends_with(".framework"));
 
     if is_path && !expanded.starts_with('-') {
         Ok(slash(&util::absolute(dir, Path::new(&expanded))))
