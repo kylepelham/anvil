@@ -11,6 +11,7 @@ mod depfile;
 mod exec;
 mod export_header;
 mod flags;
+mod job;
 mod lockfile;
 mod manifest;
 mod plan;
@@ -81,11 +82,11 @@ enum CommandLine {
         args: Vec<String>,
     },
 
-    /// Build and run the tests.
+    /// Build and run the tests; arguments after `--` go to every test's program.
     #[command(visible_alias = "t")]
     Test {
-        /// Only tests whose name contains this.
-        filter: Option<String>,
+        #[command(flatten)]
+        test: TestArgs,
 
         #[command(flatten)]
         build: BuildArgs,
@@ -211,6 +212,31 @@ enum VcpkgCommand {
     Search { term: String },
 }
 
+#[derive(Args)]
+pub struct TestArgs {
+    /// Only tests whose name contains this.
+    pub filter: Option<String>,
+
+    /// Print the tests that would run, without building or running them.
+    #[arg(long)]
+    pub list: bool,
+
+    /// Run only the tests that failed last time (and have not passed since).
+    #[arg(long)]
+    pub rerun_failed: bool,
+
+    /// Print the output of passing tests too.
+    #[arg(long)]
+    pub show_output: bool,
+
+    /// Write a JUnit XML report to this file.
+    #[arg(long, value_name = "FILE")]
+    pub junit: Option<PathBuf>,
+
+    #[arg(last = true)]
+    pub args: Vec<String>,
+}
+
 #[derive(Args, Clone, Default)]
 pub struct BuildArgs {
     /// Build with the release profile.
@@ -274,6 +300,9 @@ fn main() {
         std::process::exit(cmake_tool::run(args));
     }
 
+    // Whoever kills Anvil stops what it started too
+    job::contain_self();
+
     let start_dir = cli.dir.clone().unwrap_or_else(|| PathBuf::from("."));
     let command = cli.command.unwrap_or(CommandLine::Build {
         targets: Vec::new(),
@@ -284,7 +313,7 @@ fn main() {
     let result = match command {
         CommandLine::Build { targets, all, build } => commands::build(&start_dir, &build, &targets, all).map(|_| 0),
         CommandLine::Run { target, build, args } => commands::run(&start_dir, &build, target.as_deref(), &args),
-        CommandLine::Test { filter, build } => commands::test(&start_dir, &build, filter.as_deref()),
+        CommandLine::Test { test, build } => commands::test(&start_dir, &build, &test),
         CommandLine::Clean { release, profile, all } => commands::clean(&start_dir, release, profile.as_deref(), all).map(|_| 0),
         CommandLine::New { name, lib } => scaffold::new_project(&start_dir, &name, lib).map(|_| 0),
         CommandLine::Init => scaffold::init(&start_dir).map(|_| 0),
@@ -301,6 +330,7 @@ fn main() {
         CommandLine::CmakeE { args } => Ok(cmake_tool::run(&args)),
     };
 
+    job::release();
     match result {
         Ok(code) => std::process::exit(code),
         Err(error) => {

@@ -223,8 +223,15 @@ fn touch(file: &Path, create: bool) -> Result<()> {
     Ok(())
 }
 
+/// What `env` does: the variables it unsets, those it sets, and the command it runs with them.
+pub struct EnvCommand<'a> {
+    pub unset: Vec<String>,
+    pub set: Vec<(String, String)>,
+    pub command: &'a [String],
+}
+
 /// env [--unset=NAME]... [NAME=VALUE]... [--] command [args...]
-fn run_with_env(rest: &[String]) -> Result<i32> {
+pub fn parse_env(rest: &[String]) -> EnvCommand<'_> {
     let mut command_start = rest.len();
     let mut unset = Vec::new();
     let mut set = Vec::new();
@@ -242,15 +249,24 @@ fn run_with_env(rest: &[String]) -> Result<i32> {
         }
     }
 
-    let Some((program, args)) = rest[command_start.min(rest.len())..].split_first() else {
+    EnvCommand {
+        unset,
+        set,
+        command: &rest[command_start.min(rest.len())..],
+    }
+}
+
+fn run_with_env(rest: &[String]) -> Result<i32> {
+    let env = parse_env(rest);
+    let Some((program, args)) = env.command.split_first() else {
         bail!("env needs a command to run");
     };
     let mut command = std::process::Command::new(program);
     command.args(args);
-    for name in unset {
+    for name in env.unset {
         command.env_remove(name);
     }
-    command.envs(set);
+    command.envs(env.set);
 
     let status = command.status().with_context(|| format!("running {program}"))?;
     Ok(status.code().unwrap_or(1))

@@ -11,7 +11,7 @@ use crate::toolchain::{Family, Toolchain};
 use crate::ui;
 use crate::util::{self, slash};
 use crate::vcpkg::Instance;
-use crate::{BuildArgs, VcpkgCommand};
+use crate::{BuildArgs, TestArgs, VcpkgCommand};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -55,15 +55,28 @@ pub fn run(start_dir: &Path, build: &BuildArgs, name: Option<&str>, args: &[Stri
     Ok(status.code().unwrap_or(1))
 }
 
-pub fn test(start_dir: &Path, build: &BuildArgs, filter: Option<&str>) -> Result<i32> {
+pub fn test(start_dir: &Path, build: &BuildArgs, options: &TestArgs) -> Result<i32> {
     let mut model = load_model(start_dir, build)?;
     model.collect_tests()?;
-    let tests: Vec<_> = model
+
+    // The tests asked for, and with --rerun-failed only those that failed last time
+    let filter = options.filter.as_deref();
+    let failed = if options.rerun_failed {
+        crate::testrun::last_failed(&model)
+    } else {
+        Vec::new()
+    };
+    let mut tests: Vec<_> = model
         .tests
         .iter()
         .filter(|test| filter.is_none_or(|filter| test.name.contains(filter)))
+        .filter(|test| !options.rerun_failed || failed.contains(&test.name))
         .cloned()
         .collect();
+    if tests.is_empty() && options.rerun_failed {
+        ui::status("Testing", "nothing: no test failed last time");
+        return Ok(0);
+    }
     if tests.is_empty() {
         let hint = if model.tests.is_empty() {
             " (add files under tests/, a kind = \"test\" target, or [[test]] tables)"
@@ -72,7 +85,19 @@ pub fn test(start_dir: &Path, build: &BuildArgs, filter: Option<&str>) -> Result
         };
         bail!("no tests to run{hint}");
     }
+
+    if options.list {
+        for test in &tests {
+            println!("{}", test.name);
+        }
+        return Ok(0);
+    }
     check_runs_here(&model, "test")?;
+
+    // Arguments after `--` go to every test's program
+    for test in &mut tests {
+        test.command.extend(options.args.iter().cloned());
+    }
 
     // Build every program the tests use
     let mut roots = Vec::new();
@@ -95,7 +120,12 @@ pub fn test(start_dir: &Path, build: &BuildArgs, filter: Option<&str>) -> Result
     } else {
         build_roots(model, build, &roots)?
     };
-    crate::testrun::run_tests(&model, &tests, jobs(build))
+    let options = crate::testrun::TestOptions {
+        jobs: jobs(build),
+        show_output: options.show_output,
+        junit: options.junit.clone(),
+    };
+    crate::testrun::run_tests(&model, &tests, &options)
 }
 
 pub fn clean(start_dir: &Path, release: bool, profile: Option<&str>, all: bool) -> Result<()> {
