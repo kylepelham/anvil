@@ -603,12 +603,29 @@ fn build_command(action: &Action, low_priority: bool) -> Result<Command> {
         let content: Vec<String> = action.args.iter().map(|argument| quote_response(argument, action.response)).collect();
         std::fs::write(&response_file, content.join("\n")).context("writing a response file")?;
         command.arg(format!("@{}", response_file.display()));
+    } else if action.raw_args {
+        add_raw_args(&mut command, &action.args);
     } else {
         command.args(&action.args);
     }
 
     set_priority(&mut command, low_priority);
     Ok(command)
+}
+
+/// Arguments exactly as written: cmd.exe reads its own command line, not as programs split it.
+#[cfg(windows)]
+fn add_raw_args(command: &mut Command, args: &[String]) {
+    use std::os::windows::process::CommandExt;
+
+    for argument in args {
+        command.raw_arg(argument);
+    }
+}
+
+#[cfg(not(windows))]
+fn add_raw_args(command: &mut Command, args: &[String]) {
+    command.args(args);
 }
 
 /// Above-normal priority for Anvil's own threads: they sleep almost always, and when one wakes it should not wait
@@ -825,7 +842,11 @@ pub fn command_line(action: &Action) -> String {
     let mut line = quote_for_display(&action.program.to_string_lossy());
     for argument in &action.args {
         line.push(' ');
-        line.push_str(&quote_for_display(argument));
+        if action.raw_args {
+            line.push_str(argument);
+        } else {
+            line.push_str(&quote_for_display(argument));
+        }
     }
     line
 }

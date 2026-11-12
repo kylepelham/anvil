@@ -616,7 +616,7 @@ impl Target {
         self.file_rules = settings
             .file_rules
             .iter()
-            .filter_map(|rule| resolve_file_rule(rule, &dir, scope).transpose())
+            .filter_map(|rule| resolve_file_rule(rule, &dir, scope, &self.name).transpose())
             .collect::<Result<_>>()?;
         self.runs = settings.runs;
         self.pre_build = settings.pre_build;
@@ -934,7 +934,7 @@ fn expand_lib(lib: &str, dir: &Path, scope: &PackageScope, target_name: &str) ->
     }
 }
 
-fn resolve_file_rule(rule: &FileRule, dir: &Path, scope: &PackageScope) -> Result<Option<ResolvedFileRule>> {
+fn resolve_file_rule(rule: &FileRule, dir: &Path, scope: &PackageScope, target_name: &str) -> Result<Option<ResolvedFileRule>> {
     if let Some(condition) = &rule.cond {
         if !scope.condition.test(condition)? {
             return Ok(None);
@@ -948,11 +948,15 @@ fn resolve_file_rule(rule: &FileRule, dir: &Path, scope: &PackageScope) -> Resul
         builder.add(compile_glob(&absolute_pattern).with_context(|| format!("bad file pattern \"{pattern}\""))?);
     }
 
+    // Definitions and flags may name folders, as the target's do
+    let placeholders =
+        |list: &Option<Vec<String>>| -> Vec<String> { list.iter().flatten().map(|text| expand_placeholders(text, scope, target_name)).collect() };
+
     Ok(Some(ResolvedFileRule {
         patterns: rule.patterns.to_vec(),
         matcher: builder.build()?,
-        defines: rule.defines.clone().unwrap_or_default(),
-        flags: rule.flags.clone().unwrap_or_default(),
+        defines: placeholders(&rule.defines),
+        flags: placeholders(&rule.flags),
         warnings: rule.warnings.as_deref().map(Warnings::parse).transpose()?,
         arch: rule.arch.as_deref().map(Arch::parse).transpose()?,
         opt: rule.opt.as_ref().map(Opt::parse).transpose()?,
