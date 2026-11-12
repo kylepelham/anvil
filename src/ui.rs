@@ -37,6 +37,10 @@ pub fn interactive() -> bool {
     INTERACTIVE.load(Ordering::Relaxed)
 }
 
+pub fn quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
+
 /// "   Compiling foo": a right-aligned green verb, then the message.
 pub fn status(verb: &str, message: &str) {
     if QUIET.load(Ordering::Relaxed) {

@@ -28,6 +28,15 @@ const COMMANDS: &[&str] = &[
     "env",
     "compare_files",
     "cat",
+    "chdir",
+    "sleep",
+    "create_symlink",
+    "md5sum",
+    "sha1sum",
+    "sha224sum",
+    "sha256sum",
+    "sha384sum",
+    "sha512sum",
 ];
 
 /// `cmake -E <command> ...` with a command Anvil runs itself: the words after `-E`.
@@ -85,12 +94,19 @@ fn run_command(args: &[String]) -> Result<i32> {
                 std::fs::create_dir_all(folder).with_context(|| format!("creating {folder}"))?;
             }
         }
-        "remove" => remove(rest.iter().filter(|word| *word != "-f"), false)?,
+        "remove" => return remove(rest.iter().filter(|word| *word != "-f"), false, true),
         "rm" => {
-            let recursive = rest.iter().any(|word| word.starts_with('-') && word.contains(['r', 'R']));
-            remove(rest.iter().filter(|word| !word.starts_with('-')), recursive)?;
+            let options: Vec<&String> = rest.iter().take_while(|word| word.starts_with('-') && *word != "--").collect();
+            let recursive = options.iter().any(|word| word.contains(['r', 'R']));
+            let force = options.iter().any(|word| word.contains('f'));
+
+            let mut paths = &rest[options.len()..];
+            if paths.first().is_some_and(|word| word == "--") {
+                paths = &paths[1..];
+            }
+            return remove(paths.iter(), recursive, force);
         }
-        "remove_directory" => remove(rest.iter(), true)?,
+        "remove_directory" => return remove(rest.iter(), true, true),
         "rename" => {
             let [from, to] = rest else { bail!("rename takes two paths") };
             std::fs::rename(from, to).with_context(|| format!("renaming {from} to {to}"))?;
@@ -112,6 +128,40 @@ fn run_command(args: &[String]) -> Result<i32> {
                 std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
             }
         }
+        "chdir" => {
+            let [folder, program, args @ ..] = rest else {
+                bail!("chdir takes a folder and a command")
+            };
+            if !Path::new(folder).is_dir() {
+                bail!("the folder {folder} does not exist");
+            }
+            let status = std::process::Command::new(program)
+                .args(args)
+                .current_dir(folder)
+                .status()
+                .with_context(|| format!("running {program}"))?;
+            return Ok(status.code().unwrap_or(1));
+        }
+        "sleep" => {
+            if rest.is_empty() {
+                bail!("sleep takes a number of seconds");
+            }
+            for seconds in rest {
+                let seconds: f64 = seconds
+                    .parse()
+                    .ok()
+                    .filter(|seconds: &f64| *seconds >= 0.0)
+                    .with_context(|| format!("`{seconds}` is not a number of seconds"))?;
+                std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+            }
+        }
+        "create_symlink" => {
+            let [target, link] = rest else {
+                bail!("create_symlink takes the existing path and the link to create")
+            };
+            create_symlink(Path::new(target), Path::new(link))?;
+        }
+        "md5sum" | "sha1sum" | "sha224sum" | "sha256sum" | "sha384sum" | "sha512sum" => return print_hashes(command, rest),
         other => bail!("`{other}` is not a command Anvil runs (it is passed to cmake)"),
     }
 
@@ -184,11 +234,18 @@ fn copy_one(source: &Path, target: &Path, only_if_different: bool) -> Result<()>
     Ok(())
 }
 
-/// Removes files (and with `recursive`, folders); what does not exist is no error.
-fn remove<'a>(paths: impl Iterator<Item = &'a String>, recursive: bool) -> Result<()> {
+/// Removes files (and with `recursive`, folders). As in CMake, a missing one is an error only without `force`, and the
+/// rest are still removed.
+fn remove<'a>(paths: impl Iterator<Item = &'a String>, recursive: bool, force: bool) -> Result<i32> {
+    let mut code = 0;
+
     for path in paths {
         let path = Path::new(path);
-        let result = if path.is_dir() && recursive {
+        let is_symlink = path.symlink_metadata().is_ok_and(|metadata| metadata.file_type().is_symlink());
+        let result = if is_symlink {
+            // The link itself, never what it points to (a link to a folder is a folder to Windows)
+            std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path))
+        } else if path.is_dir() && recursive {
             std::fs::remove_dir_all(path)
         } else if path.is_dir() {
             bail!("{} is a folder (use rm -r)", path.display());
@@ -197,14 +254,18 @@ fn remove<'a>(paths: impl Iterator<Item = &'a String>, recursive: bool) -> Resul
         };
 
         match result {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                return Err(error).with_context(|| format!("removing {}", path.display()));
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !force {
+                    eprintln!("cmake -E rm: {} does not exist (rm -f allows that)", path.display());
+                    code = 1;
+                }
             }
-            _ => {}
+            Err(error) => return Err(error).with_context(|| format!("removing {}", path.display())),
+            Ok(()) => {}
         }
     }
 
-    Ok(())
+    Ok(code)
 }
 
 fn touch(file: &Path, create: bool) -> Result<()> {
@@ -223,23 +284,32 @@ fn touch(file: &Path, create: bool) -> Result<()> {
     Ok(())
 }
 
-/// env [--unset=NAME]... [NAME=VALUE]... [--] command [args...]
+/// env [--unset=NAME | --modify NAME=OPERATION:VALUE | NAME=VALUE]... [--] command [args...], changes applied in order.
 fn run_with_env(rest: &[String]) -> Result<i32> {
+    let mut changes: Vec<(String, Option<String>)> = Vec::new();
     let mut command_start = rest.len();
-    let mut unset = Vec::new();
-    let mut set = Vec::new();
-    for (index, word) in rest.iter().enumerate() {
-        if let Some(name) = word.strip_prefix("--unset=") {
-            unset.push(name.to_string());
-        } else if word == "--" {
+    let mut index = 0;
+
+    while index < rest.len() {
+        let word = &rest[index];
+        if word == "--" {
             command_start = index + 1;
             break;
+        } else if let Some(name) = word.strip_prefix("--unset=") {
+            set_variable(&mut changes, name, None);
+        } else if word == "--modify" {
+            let change = rest.get(index + 1).context("--modify needs NAME=OPERATION:VALUE")?;
+            modify_variable(&mut changes, change)?;
+            index += 1;
+        } else if word.starts_with("--") {
+            bail!("unknown option `{word}` (env takes --unset=NAME, --modify NAME=OPERATION:VALUE and NAME=VALUE)");
         } else if let Some((name, value)) = word.split_once('=').filter(|(name, _)| !name.is_empty() && !name.contains(['/', '\\'])) {
-            set.push((name.to_string(), value.to_string()));
+            set_variable(&mut changes, name, Some(value.to_string()));
         } else {
             command_start = index;
             break;
         }
+        index += 1;
     }
 
     let Some((program, args)) = rest[command_start.min(rest.len())..].split_first() else {
@@ -247,25 +317,162 @@ fn run_with_env(rest: &[String]) -> Result<i32> {
     };
     let mut command = std::process::Command::new(program);
     command.args(args);
-    for name in unset {
-        command.env_remove(name);
+    for (name, value) in changes {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
     }
-    command.envs(set);
 
     let status = command.status().with_context(|| format!("running {program}"))?;
     Ok(status.code().unwrap_or(1))
 }
 
-/// 0 when the files are the same, 1 when they differ, 2 when one cannot be read.
+/// One `--modify NAME=OPERATION:VALUE`, against the value earlier changes left.
+fn modify_variable(changes: &mut Vec<(String, Option<String>)>, change: &str) -> Result<()> {
+    let Some((name, operation_value)) = change.split_once('=').filter(|(name, _)| !name.is_empty()) else {
+        bail!("--modify {change}: expected NAME=OPERATION:VALUE");
+    };
+    let (operation, value) = operation_value.split_once(':').unwrap_or((operation_value, ""));
+
+    let current = variable(changes, name).unwrap_or_default();
+    let list_separator = if cfg!(windows) { ";" } else { ":" };
+    let joined = |first: &str, separator: &str, second: &str| match (first.is_empty(), second.is_empty()) {
+        (true, _) => second.to_string(),
+        (_, true) => first.to_string(),
+        _ => format!("{first}{separator}{second}"),
+    };
+
+    let new_value = match operation {
+        "reset" => {
+            changes.retain(|(changed, _)| !same_variable(changed, name));
+            return Ok(());
+        }
+        "set" => Some(value.to_string()),
+        "unset" => None,
+        "string_append" => Some(format!("{current}{value}")),
+        "string_prepend" => Some(format!("{value}{current}")),
+        "path_list_append" => Some(joined(&current, list_separator, value)),
+        "path_list_prepend" => Some(joined(value, list_separator, &current)),
+        "cmake_list_append" => Some(joined(&current, ";", value)),
+        "cmake_list_prepend" => Some(joined(value, ";", &current)),
+        other => bail!(
+            "--modify {change}: unknown operation `{other}` (reset, set, unset, string_append, string_prepend, path_list_append, \
+             path_list_prepend, cmake_list_append or cmake_list_prepend)"
+        ),
+    };
+    set_variable(changes, name, new_value);
+
+    Ok(())
+}
+
+/// A variable's value with the changes so far applied.
+fn variable(changes: &[(String, Option<String>)], name: &str) -> Option<String> {
+    match changes.iter().rev().find(|(changed, _)| same_variable(changed, name)) {
+        Some((_, value)) => value.clone(),
+        None => std::env::var(name).ok(),
+    }
+}
+
+fn set_variable(changes: &mut Vec<(String, Option<String>)>, name: &str, value: Option<String>) {
+    changes.retain(|(changed, _)| !same_variable(changed, name));
+    changes.push((name.to_string(), value));
+}
+
+/// Environment variable names ignore case on Windows.
+fn same_variable(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+/// create_symlink: replaces what `link` names. Windows allows symbolic links only in Developer Mode or to
+/// administrators, and a link to a folder must say so.
+fn create_symlink(target: &Path, link: &Path) -> Result<()> {
+    if link.symlink_metadata().is_ok() {
+        let _ = std::fs::remove_file(link).or_else(|_| std::fs::remove_dir(link));
+    }
+
+    #[cfg(windows)]
+    let result = {
+        let resolved = link.parent().unwrap_or(Path::new("")).join(target);
+        if resolved.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+    };
+    #[cfg(not(windows))]
+    let result = std::os::unix::fs::symlink(target, link);
+
+    result.with_context(|| {
+        let hint = if cfg!(windows) {
+            " (Windows allows them in Developer Mode or for administrators)"
+        } else {
+            ""
+        };
+        format!("creating the symbolic link {} -> {}{hint}", link.display(), target.display())
+    })
+}
+
+/// md5sum, sha256sum and the like: "<hash>  <file>" per file. A file that cannot be read is reported, and makes the
+/// result 1 once the rest are done.
+fn print_hashes(command: &str, files: &[String]) -> Result<i32> {
+    if files.is_empty() {
+        bail!("{command} takes files");
+    }
+
+    let mut code = 0;
+    for file in files {
+        if Path::new(file).is_dir() {
+            eprintln!("cmake -E {command}: {file} is a folder");
+            code = 1;
+            continue;
+        }
+
+        match std::fs::read(file) {
+            Ok(bytes) => println!("{}  {file}", hex_digest(command, &bytes)),
+            Err(error) => {
+                eprintln!("cmake -E {command}: {file}: {error}");
+                code = 1;
+            }
+        }
+    }
+
+    Ok(code)
+}
+
+fn hex_digest(command: &str, bytes: &[u8]) -> String {
+    use sha2::Digest;
+
+    let digest = match command {
+        "md5sum" => md5::Md5::digest(bytes).to_vec(),
+        "sha1sum" => sha1::Sha1::digest(bytes).to_vec(),
+        "sha224sum" => sha2::Sha224::digest(bytes).to_vec(),
+        "sha256sum" => sha2::Sha256::digest(bytes).to_vec(),
+        "sha384sum" => sha2::Sha384::digest(bytes).to_vec(),
+        _ => sha2::Sha512::digest(bytes).to_vec(),
+    };
+
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// 0 when the files are the same, 1 when they differ or one cannot be read (as CMake 4 does), 2 for extra arguments.
 fn compare_files(rest: &[String]) -> Result<i32> {
     let ignore_eol = rest.iter().any(|word| word == "--ignore-eol");
     let files: Vec<&String> = rest.iter().filter(|word| !word.starts_with("--")).collect();
+    if files.len() > 2 {
+        eprintln!("cmake -E compare_files: takes two files, not {}", files.len());
+        return Ok(2);
+    }
     let [first, second] = files.as_slice() else {
         bail!("compare_files takes two files")
     };
 
     let (Ok(first), Ok(second)) = (std::fs::read(first), std::fs::read(second)) else {
-        return Ok(2);
+        return Ok(1);
     };
     let same = if ignore_eol {
         let lines = |bytes: &[u8]| String::from_utf8_lossy(bytes).lines().map(str::to_string).collect::<Vec<_>>();
@@ -321,8 +528,40 @@ mod tests {
         assert_eq!(run(&words(&format!("touch {}", path("e")))), 0);
         assert_eq!(run(&words(&format!("rm -rf {} {}", path("d"), path("missing")))), 0);
         assert!(!folder.join("d").exists());
+        assert_eq!(run(&words(&format!("rm {}", path("missing")))), 1);
+        assert_eq!(run(&words(&format!("remove {}", path("missing")))), 0);
+        assert_eq!(run(&words(&format!("compare_files {} {}", path("c"), path("missing")))), 1);
         assert_eq!(run(&words("false")), 1);
 
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn modifies_variables() {
+        let mut changes = Vec::new();
+        set_variable(&mut changes, "ANVIL_TEST_A", Some("a".into()));
+        modify_variable(&mut changes, "ANVIL_TEST_A=string_append:b").unwrap();
+        modify_variable(&mut changes, "ANVIL_TEST_A=cmake_list_prepend:x").unwrap();
+        assert_eq!(variable(&changes, "ANVIL_TEST_A").as_deref(), Some("x;ab"));
+
+        modify_variable(&mut changes, "ANVIL_TEST_B=path_list_append:y").unwrap();
+        assert_eq!(variable(&changes, "ANVIL_TEST_B").as_deref(), Some("y"));
+        modify_variable(&mut changes, "ANVIL_TEST_B=unset:").unwrap();
+        assert_eq!(variable(&changes, "ANVIL_TEST_B"), None);
+        modify_variable(&mut changes, "ANVIL_TEST_A=reset:").unwrap();
+        assert_eq!(variable(&changes, "ANVIL_TEST_A"), None);
+
+        assert!(modify_variable(&mut changes, "ANVIL_TEST_A=bad:x").is_err());
+        assert!(modify_variable(&mut changes, "ANVIL_TEST_A").is_err());
+    }
+
+    #[test]
+    fn hashes_like_cmake() {
+        assert_eq!(
+            hex_digest("sha256sum", b"hi\n"),
+            "98ea6e4f216f2fb4b69fff9b3a44842c38686ca685f3f55dc48c5d3fb1107be4"
+        );
+        assert_eq!(hex_digest("md5sum", b"hi\n"), "764efa883dda1e11db47671c4a3bbd9e");
+        assert_eq!(hex_digest("sha1sum", b"hi\n"), "55ca6286e3e4f4fba5d0448333fa99fc5a404a73");
     }
 }

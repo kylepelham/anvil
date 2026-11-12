@@ -409,6 +409,7 @@ fn build_roots(model: Model, build: &BuildArgs, roots: &[usize]) -> Result<(Mode
         verbose: build.verbose,
         explain: build.explain,
         low_priority: build.low_priority,
+        root: model.root.clone(),
     };
     let summary = exec::execute(&plan, &model.toolchain, &model.out_dir.join(".anvil"), &options)?;
 
