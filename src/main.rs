@@ -24,6 +24,7 @@ mod source_hash;
 mod targets;
 mod test_cases;
 mod testrun;
+mod timings;
 mod toolchain;
 mod ui;
 mod util;
@@ -271,6 +272,10 @@ pub struct BuildArgs {
     /// Say why each action runs.
     #[arg(long)]
     pub explain: bool,
+
+    /// After the build, print the slowest actions and the time per kind of action.
+    #[arg(long)]
+    pub timings: bool,
 
     /// msvc, clang-cl, clang or gcc (default: the project's, else the best installed).
     #[arg(long, value_name = "NAME")]

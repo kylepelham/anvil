@@ -6,6 +6,7 @@ use crate::db::{Database, Record, Stamp, CHANGED_WHILE_RUNNING};
 use crate::depfile;
 use crate::flags::DepsFormat;
 use crate::plan::{Action, ActionKind, Plan, ResponseStyle};
+use crate::timings::{self, Timing};
 use crate::toolchain::Toolchain;
 use crate::ui;
 use crate::util;
@@ -53,6 +54,9 @@ pub struct Summary {
     pub compiled: usize,
     pub linked: usize,
     pub elapsed: Duration,
+
+    /// The actions that ran, with their times and lanes, in the order they finished.
+    pub timings: Vec<Timing>,
 }
 
 // Two seconds in file-time ticks (100 ns): inputs this close to an incremental link's last run defeat its time check
@@ -61,10 +65,10 @@ const INCREMENTAL_TIME_GRAIN: i64 = 20_000_000;
 // A folder with at least this many files to check is listed rather than stat'ed file by file
 const LISTED_FOLDER_MIN_FILES: usize = 8;
 
-/// What a worker tells the scheduler: its process ended, then the action's result.
+/// What a worker tells the scheduler: its process ended (its lane is free), then the action's result.
 enum Report {
-    ProcessDone,
-    Finished(Outcome),
+    ProcessDone(usize),
+    Finished(Outcome, Timing),
 }
 
 /// What a worker reports back for one action.
@@ -118,6 +122,10 @@ struct Executor<'a> {
     // Actions that ran, and files the build makes that a later action rewrote in place
     ran: Vec<usize>,
     rewritten: Vec<u32>,
+
+    // When the build started, and the times of the actions that ran (failed ones too)
+    started: Instant,
+    timings: Vec<Timing>,
 }
 
 impl Stamps {
@@ -179,13 +187,25 @@ pub fn execute(plan: &Plan, toolchain: &Toolchain, database_dir: &Path, options:
         produced: Vec::new(),
         ran: Vec::new(),
         rewritten: Vec::new(),
+        started,
+        timings: Vec::new(),
     };
 
     executor.stat_known_files();
-    let mut summary = executor.run()?;
+    let result = executor.run();
+
+    // The trace of what ran, also when the build failed or was interrupted; a build that ran nothing keeps the last
+    if !executor.timings.is_empty() {
+        if let Err(error) = timings::write_trace(&database_dir.join(timings::TRACE_FILE), &executor.timings) {
+            ui::warn(&format!("could not write the build trace: {error:#}"));
+        }
+    }
+
+    let mut summary = result?;
     executor.database.finish()?;
 
     summary.elapsed = started.elapsed();
+    summary.timings = std::mem::take(&mut executor.timings);
     Ok(summary)
 }
 
@@ -269,9 +289,10 @@ impl Executor<'_> {
         let total = dirty.iter().filter(|dirty| **dirty).count();
 
         let jobs_allowed = self.options.jobs.max(1);
-        let (job_sender, job_receiver) = mpsc::channel::<usize>();
+        let (job_sender, job_receiver) = mpsc::channel::<(usize, usize)>();
         let (report_sender, report_receiver) = mpsc::channel::<Report>();
         let job_receiver = Mutex::new(job_receiver);
+        let build_started = self.started;
 
         let summary = std::thread::scope(|scope| -> Result<Summary> {
             // Dropped on any return, which lets the workers go
@@ -292,18 +313,27 @@ impl Executor<'_> {
 
                     loop {
                         let job = jobs.lock().unwrap().recv();
-                        let Ok(index) = job else { break };
+                        let Ok((index, lane)) = job else { break };
                         let action = &actions[index];
 
+                        let process_started = build_started.elapsed();
                         let mut outcome = run_action(index, action, low_priority);
-                        let _ = reports.send(Report::ProcessDone);
+                        let timing = Timing {
+                            description: action.description.clone(),
+                            kind: action.kind,
+                            lane,
+                            start: process_started,
+                            end: build_started.elapsed(),
+                            failed: !outcome.success,
+                        };
+                        let _ = reports.send(Report::ProcessDone(lane));
 
                         if outcome.success {
                             outcome.output_mtimes = action.outputs.iter().map(|output| util::mtime(output)).collect();
                             outcome.measured = measure_inputs(action, &outcome, &stamps, &system_dirs);
                             hash_objects(action, &outcome.output_mtimes, &stamps);
                         }
-                        let _ = reports.send(Report::Finished(outcome));
+                        let _ = reports.send(Report::Finished(outcome, timing));
                     }
                 });
             }
@@ -320,6 +350,9 @@ impl Executor<'_> {
             let mut started = 0usize;
             let mut finished = 0usize;
             let mut stop = false;
+
+            // Which job lanes have a process: each action runs on the lowest free one, for the trace
+            let mut lanes_busy = vec![false; jobs_allowed];
 
             while finished < count {
                 // Start what we can
@@ -360,7 +393,9 @@ impl Executor<'_> {
                             // Should it fail or stop halfway, nothing it leaves behind may pass for up to date
                             self.database.forget(self.output_ids[index][0]);
 
-                            job_sender.send(index).context("worker pool stopped")?;
+                            let lane = lanes_busy.iter().position(|busy| !busy).expect("a lane is free below the job limit");
+                            lanes_busy[lane] = true;
+                            job_sender.send((index, lane + 1)).context("worker pool stopped")?;
                             running += 1;
                             processes += 1;
                         }
@@ -381,11 +416,15 @@ impl Executor<'_> {
 
                 // Wait for a process to end (its slot is free), or for its result
                 let mut outcome = match report_receiver.recv().context("worker pool stopped")? {
-                    Report::ProcessDone => {
+                    Report::ProcessDone(lane) => {
+                        lanes_busy[lane - 1] = false;
                         processes -= 1;
                         continue;
                     }
-                    Report::Finished(outcome) => outcome,
+                    Report::Finished(outcome, timing) => {
+                        self.timings.push(timing);
+                        outcome
+                    }
                 };
                 running -= 1;
                 finished += 1;
