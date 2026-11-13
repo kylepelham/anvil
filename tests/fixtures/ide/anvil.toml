@@ -1,0 +1,30 @@
+[project]
+name = "idegame"
+default-run = "game"
+
+[target.core]
+kind = "lib"
+dir = "core"
+public.defines = ["CORE_LEVEL=2"]
+
+[target.game]
+kind = "exe"
+deps = ["core"]
+
+[target.tool]
+kind = "exe"
+dir = "tool"
+gui = "main"
+default = false
+
+[target.unit]
+kind = "test"
+sources = ["tests/unit.c"]
+deps = ["core"]
+args = ["--fast"]
+env = { UNIT_PROFILE = "{profile}" }
+
+[[test]]
+name = "smoke"
+command = ["{target:game}", "--smoke"]
+expect = ["game 2"]

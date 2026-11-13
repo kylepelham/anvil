@@ -63,19 +63,12 @@ pub fn print(tests: bool) -> Result<()> {
 
 /// `anvil schema --install`: writes both schemas to the user's data folder, and says how to point an editor at them.
 pub fn install() -> Result<()> {
-    let folder = util::user_data_dir();
-    let manifest_file = folder.join(MANIFEST_SCHEMA_FILE);
-    let tests_file = folder.join(TESTS_SCHEMA_FILE);
-
-    // Write both
-    for (file, schema) in [(&manifest_file, manifest_schema()), (&tests_file, tests_schema())] {
-        util::write_atomic(file, serde_json::to_string_pretty(&schema)?.as_bytes())?;
-        crate::ui::status("Wrote", &slash(file));
+    let (manifest_url, tests_url) = install_files()?;
+    for file in [MANIFEST_SCHEMA_FILE, TESTS_SCHEMA_FILE] {
+        crate::ui::status("Wrote", &slash(&util::user_data_dir().join(file)));
     }
 
     // How to use them
-    let manifest_url = file_url(&manifest_file);
-    let tests_url = file_url(&tests_file);
     println!("VS Code (Even Better TOML), in settings.json:");
     println!("    \"evenBetterToml.schema.associations\": {{");
     println!("        \".*/anvil\\\\.toml$\": \"{manifest_url}\",");
@@ -86,6 +79,23 @@ pub fn install() -> Result<()> {
     println!("Run `anvil schema --install` again after updating Anvil.");
 
     Ok(())
+}
+
+/// Writes both schemas to the user's data folder (each only when it changed), and returns their URLs: anvil.toml's,
+/// then tests.toml's.
+pub fn install_files() -> Result<(String, String)> {
+    let folder = util::user_data_dir();
+    let manifest_file = folder.join(MANIFEST_SCHEMA_FILE);
+    let tests_file = folder.join(TESTS_SCHEMA_FILE);
+
+    for (file, schema) in [(&manifest_file, manifest_schema()), (&tests_file, tests_schema())] {
+        let text = serde_json::to_string_pretty(&schema)?;
+        if std::fs::read_to_string(file).ok().as_deref() != Some(text.as_str()) {
+            util::write_atomic(file, text.as_bytes())?;
+        }
+    }
+
+    Ok((file_url(&manifest_file), file_url(&tests_file)))
 }
 
 /// The schema of anvil.toml.

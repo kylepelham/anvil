@@ -712,7 +712,7 @@ impl Model {
     }
 
     /// A target's name for messages: `package/target` outside the root package.
-    fn qualified_name(&self, index: usize) -> String {
+    pub fn qualified_name(&self, index: usize) -> String {
         let target = &self.targets[index];
         match target.package {
             0 => target.name.clone(),
@@ -1780,30 +1780,7 @@ impl Model {
                 continue;
             }
 
-            let mut command = vec![format!("{{target:{}}}", self.qualified_name(index))];
-            command.extend(target.args.iter().cloned());
-            let spec = TestSpec {
-                name: target.name.clone(),
-                command: StrOrList::List(command),
-                timeout: target.timeout,
-                env: Some(target.env.iter().cloned().collect()),
-                will_fail: Some(target.will_fail),
-                after: Some(target.after.clone()),
-                serial: Some(target.serial),
-                pass_regex: target.pass_regex.clone(),
-                fail_regex: target.fail_regex.clone(),
-                skip_exit_code: target.skip_exit_code,
-                skip_regex: target.skip_regex.clone(),
-                expect: Some(target.expect.clone()),
-                reject: Some(target.reject.clone()),
-                exit_code: target.exit_code,
-                ..Default::default()
-            };
-
-            // Its workdir was resolved with its other paths, relative to its folder
-            let workdir = target.workdir.clone().unwrap_or_else(|| package.root.clone());
-            let test = test_case(&spec, workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name)
-                .with_context(|| format!("in [target.{}]", target.name))?;
+            let test = self.target_test(index)?;
             self.tests.push(test);
             origins.push(TestOrigin {
                 package: target.package,
@@ -1869,6 +1846,36 @@ impl Model {
 
         let package_names: Vec<&str> = self.packages.iter().map(|package| package.name.as_str()).collect();
         check_tests(&mut self.tests, &origins, &package_names, &switched_off)
+    }
+
+    /// The test a `kind = "test"` target is: its program with its `args`, `env` and `workdir`.
+    pub fn target_test(&self, index: usize) -> Result<TestCase> {
+        let target = &self.targets[index];
+        let package = &self.packages[target.package];
+
+        let mut command = vec![format!("{{target:{}}}", self.qualified_name(index))];
+        command.extend(target.args.iter().cloned());
+        let spec = TestSpec {
+            name: target.name.clone(),
+            command: StrOrList::List(command),
+            timeout: target.timeout,
+            env: Some(target.env.iter().cloned().collect()),
+            will_fail: Some(target.will_fail),
+            after: Some(target.after.clone()),
+            serial: Some(target.serial),
+            pass_regex: target.pass_regex.clone(),
+            fail_regex: target.fail_regex.clone(),
+            skip_exit_code: target.skip_exit_code,
+            skip_regex: target.skip_regex.clone(),
+            expect: Some(target.expect.clone()),
+            reject: Some(target.reject.clone()),
+            exit_code: target.exit_code,
+            ..Default::default()
+        };
+
+        // Its workdir was resolved with its other paths, relative to its folder
+        let workdir = target.workdir.clone().unwrap_or_else(|| package.root.clone());
+        test_case(&spec, workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name).with_context(|| format!("in [target.{}]", target.name))
     }
 }
 
@@ -2670,7 +2677,7 @@ fn visit_after(index: usize, tests: &[TestCase], index_of: &HashMap<&str, usize>
 }
 
 /// {root}, {out}, {profile}, {config}, {version} and {vcpkg} in a test's or written file's text.
-fn fill_test_text(text: &str, package: &Package, out_dir: &Path, vcpkg_dir: &Path, profile: &str) -> String {
+pub fn fill_test_text(text: &str, package: &Package, out_dir: &Path, vcpkg_dir: &Path, profile: &str) -> String {
     if !text.contains('{') {
         return text.to_string();
     }
