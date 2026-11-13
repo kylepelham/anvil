@@ -39,6 +39,20 @@ const IGNORED_COMMANDS: &[&str] = &[
     "install_targets",
 ];
 
+// Commands whose arguments CMake joins into one list before it reads generator expressions
+const LIST_COMMANDS: &[&str] = &[
+    "add_executable",
+    "add_library",
+    "set_property",
+    "include_directories",
+    "add_compile_definitions",
+    "add_definitions",
+    "add_compile_options",
+    "link_libraries",
+    "add_link_options",
+    "link_directories",
+];
+
 // Commands the converter handles itself, even when the project defines a function of the same name (CPM.cmake does)
 const INTERCEPTED_COMMANDS: &[&str] = &[
     "cpmaddpackage",
@@ -255,15 +269,21 @@ impl Interpreter {
         if !INTERCEPTED_COMMANDS.contains(&name) {
             if let Some(function) = self.functions.get(name).cloned() {
                 let args = self.evaluate_args(&command.args);
-                self.call_function(function, args)?;
-                return Ok(Flow::Normal);
+                return self.call_function(function, args);
             }
         }
         if IGNORED_COMMANDS.contains(&name) {
             return Ok(Flow::Normal);
         }
 
-        let args = self.evaluate_args(&command.args);
+        let mut args = self.evaluate_args(&command.args);
+
+        // Commands that read their arguments as one list: a generator expression the parser cut at whitespace is one
+        // item again
+        if name.starts_with("target_") || LIST_COMMANDS.contains(&name) {
+            args = model::join_genex_fragments(args);
+        }
+
         match name {
             // Control flow
             "return" => return Ok(Flow::Return(Truth::Known(true))),
@@ -392,7 +412,8 @@ impl Interpreter {
 
         if values.last().map(String::as_str) == Some("PARENT_SCOPE") {
             match &values[..values.len() - 1] {
-                [] => self.unset_in(self.scopes.len().saturating_sub(2), name),
+                [] if self.scopes.len() >= 2 => self.unset_in(self.scopes.len() - 2, name),
+                [] => {}
                 values => self.set_parent_variable(name, &values.join(";")),
             }
             return;
@@ -439,7 +460,7 @@ impl Interpreter {
 
     fn command_list(&mut self, command: &Command, args: &[String]) {
         let [operation, variable, rest @ ..] = args else { return };
-        let mut items = model::split_list(&self.get_variable(variable).unwrap_or_default());
+        let mut items = model::list_elements(&self.get_variable(variable).unwrap_or_default());
 
         match operation.as_str() {
             "LENGTH" => {
@@ -808,7 +829,10 @@ impl Interpreter {
                         .unwrap_or_default();
                     self.set_variable(output, &matched);
                     if let Some(captures) = captures {
-                        self.set_match_variables(&captures);
+                        let groups: Vec<String> = (0..captures.len())
+                            .map(|index| captures.get(index).map(|found| found.as_str().to_string()).unwrap_or_default())
+                            .collect();
+                        self.set_match_variables(&groups);
                     }
                 } else {
                     let matches: Vec<&str> = pattern.find_iter(&input).map(|found| found.as_str()).collect();
@@ -826,12 +850,13 @@ impl Interpreter {
         }
     }
 
-    fn set_match_variables(&mut self, captures: &regex::Captures) {
+    /// CMAKE_MATCH_<n> from a match's groups (none when it did not match), as string(REGEX) and if(MATCHES) do.
+    pub(super) fn set_match_variables(&mut self, groups: &[String]) {
         for index in 0..10 {
-            let value = captures.get(index).map(|found| found.as_str().to_string()).unwrap_or_default();
+            let value = groups.get(index).cloned().unwrap_or_default();
             self.set_variable(&format!("CMAKE_MATCH_{index}"), &value);
         }
-        self.set_variable("CMAKE_MATCH_COUNT", &(captures.len() - 1).to_string());
+        self.set_variable("CMAKE_MATCH_COUNT", &groups.len().saturating_sub(1).to_string());
     }
 
     /// string(JSON out [ERROR_VARIABLE err] GET|LENGTH|TYPE|MEMBER json path...).
@@ -928,7 +953,7 @@ impl Interpreter {
     }
 
     fn compile_regex(&mut self, command: &Command, pattern: &str) -> Option<regex::Regex> {
-        match regex::Regex::new(pattern) {
+        match regex::Regex::new(&super::check_script::anvil_regex(pattern)) {
             Ok(compiled) => Some(compiled),
             Err(_) => {
                 self.warn(command, &format!("regular expression `{pattern}` is not supported"));

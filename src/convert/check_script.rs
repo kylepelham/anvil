@@ -208,7 +208,7 @@ const ALLOWED_COMMANDS: &[&str] = &[
 ];
 
 /// A CMake regex in Anvil's (Rust's) syntax: braces are literal in CMake, and `.` matches line ends too.
-fn anvil_regex(cmake: &str) -> String {
+pub(super) fn anvil_regex(cmake: &str) -> String {
     let mut converted = String::new();
     let mut characters = cmake.chars();
     while let Some(character) = characters.next() {

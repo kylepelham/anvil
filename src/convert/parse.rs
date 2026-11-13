@@ -60,6 +60,9 @@ pub fn parse_file(path: &Path) -> Result<Vec<Node>> {
     let text = std::fs::read_to_string(path).map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?;
     let file = Rc::new(path.to_path_buf());
 
+    // Windows line ends and a byte order mark are not part of the language
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text).replace("\r\n", "\n");
+
     let commands = Lexer {
         characters: text.chars().collect(),
         position: 0,
@@ -227,16 +230,16 @@ impl Lexer<'_> {
         Ok(Arg { text, kind: ArgKind::Quoted })
     }
 
+    /// An unquoted argument ends at whitespace, even inside `$<...>`: CMake splits `$<$<C>:a b>` in two, and the
+    /// interpreter joins the parts again as CMake's `;` list.
     fn unquoted(&mut self) -> Arg {
         let mut text = String::new();
-        let mut genex_depth = 0;
 
         while let Some(character) = self.peek() {
-            // Inside $<...> anything but a newline belongs to the argument
-            if character == '\n' || (genex_depth == 0 && (character.is_whitespace() || character == '(' || character == ')' || character == '#')) {
+            if character.is_whitespace() || character == '(' || character == ')' || character == '#' {
                 break;
             }
-            if genex_depth == 0 && character == '"' && text.is_empty() {
+            if character == '"' && text.is_empty() {
                 break;
             }
 
@@ -260,12 +263,6 @@ impl Lexer<'_> {
                     }
                 }
                 continue;
-            }
-
-            if character == '$' && self.peek_at(1) == Some('<') {
-                genex_depth += 1;
-            } else if character == '>' && genex_depth > 0 {
-                genex_depth -= 1;
             }
 
             text.push(character);
@@ -399,8 +396,18 @@ mod tests {
         let Node::Command(command) = &nodes[0] else { panic!() };
 
         let texts: Vec<&str> = command.args.iter().map(|arg| arg.text.as_str()).collect();
-        assert_eq!(texts, vec!["x", "STATIC", "a b.cpp", "raw ${x}", "$<$<CONFIG:Debug>:y z>", "c.cpp"]);
+        assert_eq!(texts, vec!["x", "STATIC", "a b.cpp", "raw ${x}", "$<$<CONFIG:Debug>:y", "z>", "c.cpp"]);
         assert_eq!(command.args[2].kind, ArgKind::Quoted);
+    }
+
+    #[test]
+    fn windows_line_ends() {
+        let nodes = parse("\u{feff}set(a \"x\\\r\ny\" [[\r\nraw]])\r\nset(b c)\r\n");
+        assert_eq!(nodes.len(), 2);
+        let Node::Command(command) = &nodes[0] else { panic!() };
+
+        let texts: Vec<&str> = command.args.iter().map(|arg| arg.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "xy", "raw"]);
     }
 
     #[test]

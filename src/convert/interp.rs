@@ -17,6 +17,39 @@ const MAX_DEPTH: usize = 64;
 // A while() that loops this often is assumed not to terminate in conversion
 const MAX_WHILE_ITERATIONS: usize = 10_000;
 
+// Words that commands read as keywords: a branch that sets a variable to one chooses how a command runs, and keeps
+// no list item
+const COMMAND_KEYWORDS: &[&str] = &[
+    "SYSTEM",
+    "BEFORE",
+    "AFTER",
+    "PUBLIC",
+    "PRIVATE",
+    "INTERFACE",
+    "LINK_PUBLIC",
+    "LINK_PRIVATE",
+    "STATIC",
+    "SHARED",
+    "MODULE",
+    "OBJECT",
+    "IMPORTED",
+    "GLOBAL",
+    "ALIAS",
+    "EXCLUDE_FROM_ALL",
+    "WIN32",
+    "MACOSX_BUNDLE",
+    "ALL",
+    "OPTIONAL",
+    "REQUIRED",
+    "QUIET",
+    "CONFIG",
+    "COMPONENTS",
+    "VERBATIM",
+    "debug",
+    "optimized",
+    "general",
+];
+
 // A scope's value for a variable it unset
 const UNSET: &str = "\u{1}unset";
 
@@ -56,6 +89,35 @@ pub enum Flow {
     Return(Truth),
     Break,
     Continue,
+}
+
+/// Variables and functions as they were before a branch this machine does not take.
+struct VariableState {
+    scopes: Vec<HashMap<String, String>>,
+    cache: HashMap<String, String>,
+    functions: HashMap<String, Rc<Function>>,
+    overridden_options: HashSet<String>,
+}
+
+/// Items a branch this machine does not take appended to a list, kept under the branch's condition.
+struct AppendedItems {
+    variable: String,
+    condition: String,
+    before: Vec<String>,
+    items: Vec<String>,
+}
+
+impl VariableState {
+    fn get_variable(&self, name: &str) -> Option<String> {
+        for scope in self.scopes.iter().rev() {
+            match scope.get(name) {
+                Some(value) if value == UNSET => break,
+                Some(value) => return Some(value.clone()),
+                None => {}
+            }
+        }
+        self.cache.get(name).cloned()
+    }
 }
 
 pub struct Interpreter {
@@ -181,9 +243,12 @@ impl Interpreter {
     }
 
     pub fn set_parent_variable(&mut self, name: &str, value: &str) {
+        // The top scope has no parent: CMake does nothing
         let count = self.scopes.len();
-        let index = if count >= 2 { count - 2 } else { 0 };
-        self.scopes[index].insert(name.to_string(), value.to_string());
+        if count < 2 {
+            return;
+        }
+        self.scopes[count - 2].insert(name.to_string(), value.to_string());
     }
 
     /// Unsets a variable in the current scope: the scopes below no longer show through, as in CMake, where a
@@ -257,20 +322,27 @@ impl Interpreter {
         for arg in args {
             match arg.kind {
                 ArgKind::Bracket => values.push(arg.text.clone()),
-                ArgKind::Quoted => values.push(unescape(&self.expand(&arg.text))),
-                ArgKind::Unquoted => {
-                    let expanded = self.expand(&arg.text);
-                    values.extend(model::split_list(&expanded).iter().map(|item| unescape(item)));
-                }
+                ArgKind::Quoted => values.push(self.expand_argument(&arg.text)),
+                ArgKind::Unquoted => values.extend(model::split_list(&self.expand_argument(&arg.text))),
             }
         }
 
         values
     }
 
-    /// Replaces ${VAR}, $ENV{VAR} and $CACHE{VAR} references (nested ones too).
+    /// Replaces ${VAR}, $ENV{VAR} and $CACHE{VAR} references (nested ones too); escapes stay as written.
     pub fn expand(&self, text: &str) -> String {
-        if !text.contains('$') {
+        self.expand_text(text, false)
+    }
+
+    /// An argument's text with its escape sequences read (`\;` stays, for lists) and its references replaced by
+    /// their values as they are.
+    fn expand_argument(&self, text: &str) -> String {
+        self.expand_text(text, true)
+    }
+
+    fn expand_text(&self, text: &str, escapes: bool) -> String {
+        if !text.contains('$') && !(escapes && text.contains('\\')) {
             return text.to_string();
         }
 
@@ -281,10 +353,24 @@ impl Interpreter {
         while position < characters.len() {
             let character = characters[position];
 
-            // Escapes pass through untouched (\${ is not a reference)
+            // Escapes (\${ is not a reference)
             if character == '\\' && position + 1 < characters.len() {
-                output.push(character);
-                output.push(characters[position + 1]);
+                let escaped = characters[position + 1];
+                match escaped {
+                    _ if !escapes => {
+                        output.push(character);
+                        output.push(escaped);
+                    }
+                    'n' => output.push('\n'),
+                    't' => output.push('\t'),
+                    'r' => output.push('\r'),
+                    ';' => output.push_str("\\;"),
+                    _ if escaped.is_ascii_alphanumeric() => {
+                        output.push(character);
+                        output.push(escaped);
+                    }
+                    _ => output.push(escaped),
+                }
                 position += 2;
                 continue;
             }
@@ -306,14 +392,21 @@ impl Interpreter {
                         let inner: String = characters[position + skip..end].iter().collect();
                         let name = self.expand(&inner);
                         let option_condition = kind == "var" && in_genex_condition(&output) && self.option_truth(&name).is_some();
-                        let value = match kind {
+                        let mut value = match kind {
                             // An option read as a generator expression's condition stays the option
                             _ if option_condition => model::option_marker(&name),
                             "env" => std::env::var(&name).unwrap_or_default(),
                             "cache" => self.cache.get(&name).cloned().unwrap_or_default(),
                             _ => self.get_variable(&name).unwrap_or_default(),
                         };
-                        output.push_str(&value);
+
+                        // So does a platform value
+                        if let Some(symbol) = value.strip_prefix(SYMBOL_PREFIX) {
+                            if in_genex_test(&output) {
+                                value = model::symbol_marker(symbol);
+                            }
+                        }
+                        output.push_str(&self.resolve_conditional_items(value));
                         position = end + 1;
                         continue;
                     }
@@ -373,11 +466,11 @@ impl Interpreter {
         Ok(flow)
     }
 
-    /// Calls a user function or macro.
-    pub fn call_function(&mut self, function: Rc<Function>, args: Vec<String>) -> Result<()> {
+    /// Calls a user function or macro. A macro's return(), break() and continue() act in its caller.
+    pub fn call_function(&mut self, function: Rc<Function>, args: Vec<String>) -> Result<Flow> {
         if self.depth >= MAX_DEPTH {
             self.warnings.push("function calls nested too deeply; stopped".into());
-            return Ok(());
+            return Ok(Flow::Normal);
         }
         self.depth += 1;
 
@@ -412,14 +505,14 @@ impl Interpreter {
             self.scopes.push(bindings.into_iter().collect());
             let result = self.run_block(&function.body);
             self.scopes.pop();
-            result
+            result.map(|_| Flow::Normal)
         };
         self.calls_ran_process.pop();
         self.call_stack.pop();
-        result?;
+        let flow = result?;
 
         self.depth -= 1;
-        Ok(())
+        Ok(flow)
     }
 
     /// Runs another CMake file in the current scope (include()).
@@ -430,6 +523,7 @@ impl Interpreter {
 
         let nodes = parse::parse_file(file)?;
         let previous_list_dir = self.get_variable("CMAKE_CURRENT_LIST_DIR");
+        let previous_list_file = self.get_variable("CMAKE_CURRENT_LIST_FILE");
         self.set_variable("CMAKE_CURRENT_LIST_DIR", &slash(file.parent().unwrap()));
         self.set_variable("CMAKE_CURRENT_LIST_FILE", &slash(file));
         self.list_files.push(file.to_path_buf());
@@ -439,8 +533,14 @@ impl Interpreter {
         self.depth -= 1;
 
         self.list_files.pop();
-        if let Some(previous) = previous_list_dir {
-            self.set_variable("CMAKE_CURRENT_LIST_DIR", &previous);
+        for (name, previous) in [
+            ("CMAKE_CURRENT_LIST_DIR", previous_list_dir),
+            ("CMAKE_CURRENT_LIST_FILE", previous_list_file),
+        ] {
+            match previous {
+                Some(previous) => self.set_variable(name, &previous),
+                None => self.unset_variable(name),
+            }
         }
         result.map(|_| ())
     }
@@ -459,6 +559,7 @@ impl Interpreter {
         self.scopes.push(HashMap::new());
         self.set_variable("CMAKE_CURRENT_SOURCE_DIR", &slash(dir));
         self.set_variable("CMAKE_CURRENT_LIST_DIR", &slash(dir));
+        self.set_variable("CMAKE_CURRENT_LIST_FILE", &slash(&file));
         let relative = util::rel(dir, &self.root);
         self.set_variable("CMAKE_CURRENT_BINARY_DIR", &format!("{{out}}/{relative}"));
         self.list_files.push(file);
@@ -487,14 +588,13 @@ impl Interpreter {
         for arg in args {
             match arg.kind {
                 ArgKind::Unquoted => {
-                    let expanded = self.expand(&arg.text);
-                    let items = model::split_list(&expanded);
+                    let items = model::split_list(&self.expand_argument(&arg.text));
                     if items.is_empty() {
                         tokens.push((String::new(), false));
                     }
-                    tokens.extend(items.into_iter().map(|item| (unescape(&item), false)));
+                    tokens.extend(items.into_iter().map(|item| (item, false)));
                 }
-                ArgKind::Quoted => tokens.push((unescape(&self.expand(&arg.text)), true)),
+                ArgKind::Quoted => tokens.push((self.expand_argument(&arg.text), true)),
                 ArgKind::Bracket => tokens.push((arg.text.clone(), true)),
             }
         }
@@ -507,7 +607,15 @@ impl Interpreter {
                 tokens.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join(" ")
             ));
         }
-        truth
+
+        // A test that cannot hold anywhere (`cl & gcc`), or holds everywhere, is known
+        match &truth {
+            Truth::Depends(condition) => match model::simplify(condition, None) {
+                known @ Truth::Known(_) => known,
+                Truth::Depends(_) => truth,
+            },
+            Truth::Known(_) => truth,
+        }
     }
 
     /// Does this target exist (a real one, an alias, or one a found package provides)?
@@ -568,6 +676,7 @@ impl Interpreter {
         for name in ["CMAKE_BINARY_DIR", "CMAKE_CURRENT_BINARY_DIR", "PROJECT_BINARY_DIR"] {
             self.set_variable(name, "{out}");
         }
+        self.set_variable("CMAKE_CURRENT_LIST_FILE", &format!("{root}/CMakeLists.txt"));
 
         // Fixed facts of a 64-bit build with a modern compiler
         let fixed = [
@@ -616,10 +725,14 @@ impl Interpreter {
             "CMAKE_C_COMPILER_ARCHITECTURE_ID",
             "CMAKE_BUILD_TYPE",
             "CMAKE_CXX_COMPILER_FRONTEND_VARIANT",
+            "CMAKE_C_COMPILER_FRONTEND_VARIANT",
             "CMAKE_CXX_SIMULATE_ID",
+            "CMAKE_C_SIMULATE_ID",
             "CMAKE_CXX_COMPILER_VERSION",
             "CMAKE_C_COMPILER_VERSION",
             "MSVC_VERSION",
+            "CMAKE_COMPILER_IS_GNUCXX",
+            "CMAKE_COMPILER_IS_GNUCC",
             "CMAKE_GENERATOR",
         ] {
             self.set_variable(name, &format!("{SYMBOL_PREFIX}{name}"));
@@ -672,12 +785,17 @@ impl Interpreter {
             chosen.push((taken.not(), body));
         }
 
-        // This machine's branch runs last, so the variables it sets win
+        // Only this machine's branch sets variables: the others run from the state before the if() (their targets and
+        // settings are recorded under their conditions), then their variables are put back. Items they appended to a
+        // list stay in it, under their condition.
         let options = self.option_defaults();
-        chosen.sort_by_key(|(truth, _)| match truth {
+        let on_host = |truth: &Truth| match truth {
             Truth::Depends(condition) => model::holds_on_host(condition, &|name| options.get(name).copied()),
             Truth::Known(_) => true,
-        });
+        };
+        chosen.sort_by_key(|(truth, _)| on_host(truth));
+        let before = chosen.iter().any(|(truth, _)| !on_host(truth)).then(|| self.variable_state());
+        let mut appended: Vec<AppendedItems> = Vec::new();
 
         let mut flow = Flow::Normal;
         for (truth, body) in chosen {
@@ -691,6 +809,11 @@ impl Interpreter {
                 }
             };
 
+            if let (Some(before), Truth::Depends(condition), false) = (&before, &truth, on_host(&truth)) {
+                appended.extend(self.appended_items(before, condition));
+                self.restore_variable_state(before);
+            }
+
             flow = match (flow, branch_flow, truth) {
                 (Flow::Return(previous), Flow::Return(inner), truth) => Flow::Return(previous.or(truth.and(inner))),
                 (_, Flow::Return(inner), truth) => Flow::Return(truth.and(inner)),
@@ -701,7 +824,108 @@ impl Interpreter {
             };
         }
 
+        for appended in appended {
+            self.keep_appended_items(appended);
+        }
         Ok(flow)
+    }
+
+    /// A value with its conditional items (from branches this machine does not take) decided where the conditions
+    /// being run under settle them: inside `if(OPT)`, an item an earlier `if(OPT)` appended is plain again.
+    fn resolve_conditional_items(&self, value: String) -> String {
+        let Some(current) = self.current_condition() else { return value };
+        if !value.contains("$<$<BOOL:") {
+            return value;
+        }
+
+        let mut items = Vec::new();
+        for item in model::list_elements(&value) {
+            match model::split_conditional_item(&item).map(|(condition, text)| (model::simplify(&condition, Some(&current)), text)) {
+                Some((Truth::Known(true), text)) => items.push(text.to_string()),
+                Some((Truth::Known(false), _)) => {}
+                _ => items.push(item),
+            }
+        }
+        items.join(";")
+    }
+
+    /// The variables and functions, to run a branch this machine does not take and undo what it set.
+    fn variable_state(&self) -> VariableState {
+        VariableState {
+            scopes: self.scopes.clone(),
+            cache: self.cache.clone(),
+            functions: self.functions.clone(),
+            overridden_options: self.overridden_options.clone(),
+        }
+    }
+
+    /// Puts variables back as they were; functions the branch defined stay (calls to them run under its condition).
+    fn restore_variable_state(&mut self, state: &VariableState) {
+        if self.scopes.len() == state.scopes.len() {
+            self.scopes.clone_from(&state.scopes);
+        } else {
+            // A block() left open in the branch: keep the scopes it pushed apart from the rest
+            let count = state.scopes.len().min(self.scopes.len());
+            self.scopes[..count].clone_from_slice(&state.scopes[..count]);
+        }
+        self.cache.clone_from(&state.cache);
+        for (name, function) in &state.functions {
+            self.functions.insert(name.clone(), function.clone());
+        }
+        self.overridden_options.clone_from(&state.overridden_options);
+    }
+
+    /// Lists in the current scope that a branch only appended to: what it appended, under the branch's condition.
+    fn appended_items(&self, before: &VariableState, condition: &str) -> Vec<AppendedItems> {
+        let scope = self.scopes.len() - 1;
+        let mut found = Vec::new();
+
+        for (name, value) in &self.scopes[scope] {
+            // CMake's own variables (flags, module paths) are read at configure time, as are strings built with spaces
+            if value == UNSET || name.starts_with("CMAKE_") {
+                continue;
+            }
+            let previous = before.get_variable(name).unwrap_or_default();
+            if *value == previous {
+                continue;
+            }
+
+            let (old_items, new_items) = (model::list_elements(&previous), model::list_elements(value));
+            let appended = new_items.len() > old_items.len() && new_items.starts_with(&old_items);
+            let is_value = |item: &String| !item.contains(char::is_whitespace) && !COMMAND_KEYWORDS.contains(&item.as_str());
+            if appended && new_items[old_items.len()..].iter().all(is_value) {
+                found.push(AppendedItems {
+                    variable: name.clone(),
+                    condition: condition.to_string(),
+                    before: old_items.clone(),
+                    items: new_items[old_items.len()..].to_vec(),
+                });
+            }
+        }
+
+        found.sort_by(|left, right| left.variable.cmp(&right.variable));
+        found
+    }
+
+    /// Adds a branch's appended items back, each under the branch's condition, where the branch this machine takes
+    /// (if any) left the list as it was or only appended to it too. A list the host's branch set from nothing is
+    /// its own: `if(A) set(X a) else() set(X b) endif()`.
+    fn keep_appended_items(&mut self, appended: AppendedItems) {
+        let current = model::list_elements(&self.get_variable(&appended.variable).unwrap_or_default());
+        let host_appended = current.len() > appended.before.len();
+        if !current.starts_with(&appended.before) || (appended.before.is_empty() && host_appended) {
+            return;
+        }
+
+        let mut items = current;
+        items.extend(
+            appended
+                .items
+                .iter()
+                .filter(|item| !item.is_empty())
+                .map(|item| model::conditional_item(&appended.condition, item)),
+        );
+        self.set_variable(&appended.variable, &items.join(";"));
     }
 
     fn run_foreach(&mut self, args: &[Arg], body: &[Node]) -> Result<Flow> {
@@ -737,19 +961,58 @@ impl Interpreter {
             _ => rest.to_vec(),
         };
 
+        // The loop variable gets its value back afterwards
+        let scope = self.scopes.len() - 1;
+        let previous = self.scopes[scope].get(variable).cloned();
+
+        let options = self.option_defaults();
+        let mut flow = Flow::Normal;
         for item in items {
+            // An item a branch this machine does not take appended: the body runs for it as in that branch
+            let conditional = model::split_conditional_item(&item)
+                .filter(|(condition, _)| !model::holds_on_host(condition, &|name| options.get(name).copied()))
+                .map(|(condition, value)| (condition, value.to_string()));
+            if let Some((condition, value)) = conditional {
+                let before = self.variable_state();
+                self.conditions.push(condition.clone());
+                self.set_variable(variable, &value);
+                self.loops.push((variable.clone(), value));
+                let result = self.run_block(body);
+                self.loops.pop();
+                self.conditions.pop();
+
+                let appended = self.appended_items(&before, &condition);
+                self.restore_variable_state(&before);
+                for appended in appended {
+                    self.keep_appended_items(appended);
+                }
+                if let Flow::Return(inner) = result? {
+                    flow = Flow::Return(Truth::Depends(condition).and(inner));
+                }
+                continue;
+            }
+
             self.set_variable(variable, &item);
             self.loops.push((variable.clone(), item));
-            let flow = self.run_block(body);
+            let result = self.run_block(body);
             self.loops.pop();
-            match flow? {
+            match result? {
                 Flow::Break => break,
-                flow @ Flow::Return(_) => return Ok(flow),
+                returned @ Flow::Return(_) => {
+                    flow = returned;
+                    break;
+                }
                 _ => {}
             }
         }
 
-        Ok(Flow::Normal)
+        if let Some(scope) = self.scopes.get_mut(scope) {
+            match previous {
+                Some(previous) => scope.insert(variable.clone(), previous),
+                None => scope.remove(variable),
+            };
+        }
+        Ok(flow)
     }
 
     fn run_while(&mut self, args: &[Arg], body: &[Node]) -> Result<Flow> {
@@ -867,12 +1130,16 @@ impl Interpreter {
         let truth = match operator {
             "DEFINED" => {
                 let name = operand.trim_start_matches("ENV{").trim_start_matches("CACHE{").trim_end_matches('}');
-                let defined = if operand.starts_with("ENV{") {
-                    std::env::var(name).is_ok()
+                if operand.starts_with("ENV{") {
+                    Truth::Known(std::env::var(name).is_ok())
                 } else {
-                    self.get_variable(name).is_some()
-                };
-                Truth::Known(defined)
+                    match self.get_variable(name) {
+                        // A platform variable is defined where it applies (MSVC with MSVC, ...)
+                        Some(value) if value.starts_with(SYMBOL_PREFIX) => model::symbol_truth(&value[SYMBOL_PREFIX.len()..]),
+                        Some(value) => conditional_value_truth(&value).unwrap_or(Truth::Known(true)),
+                        None => Truth::Known(false),
+                    }
+                }
             }
             "TARGET" => Truth::Known(self.target_exists(&operand)),
             "EXISTS" => Truth::Known(!operand.contains("{out}") && !operand.is_empty() && Path::new(&operand).exists()),
@@ -891,7 +1158,7 @@ impl Interpreter {
 
     pub(super) fn truthiness(&self, text: &str, quoted: bool) -> Truth {
         if let Some(symbol) = text.strip_prefix(SYMBOL_PREFIX) {
-            return symbol_truth(symbol);
+            return model::symbol_truth(symbol);
         }
         if let Some(constant) = model::constant_truth(text) {
             return Truth::Known(constant);
@@ -905,8 +1172,8 @@ impl Interpreter {
             return truth;
         }
         match self.get_variable(text) {
-            Some(value) if value.starts_with(SYMBOL_PREFIX) => symbol_truth(&value[SYMBOL_PREFIX.len()..]),
-            Some(value) => Truth::Known(model::constant_truth(&value).unwrap_or(true)),
+            Some(value) if value.starts_with(SYMBOL_PREFIX) => model::symbol_truth(&value[SYMBOL_PREFIX.len()..]),
+            Some(value) => conditional_value_truth(&value).unwrap_or(Truth::Known(model::constant_truth(&value).unwrap_or(true))),
             None => Truth::Known(false),
         }
     }
@@ -936,6 +1203,20 @@ impl Interpreter {
             }
         }
 
+        // MATCHES sets CMAKE_MATCH_<n>
+        if operator == "MATCHES" {
+            let Ok(pattern) = regex::Regex::new(&super::check_script::anvil_regex(&right_value)) else {
+                return Truth::Known(false);
+            };
+            let captures = pattern.captures(&left_value).map(|captures| {
+                (0..captures.len())
+                    .map(|index| captures.get(index).map(|found| found.as_str().to_string()).unwrap_or_default())
+                    .collect::<Vec<String>>()
+            });
+            self.set_match_variables(captures.as_deref().unwrap_or_default());
+            return Truth::Known(captures.is_some());
+        }
+
         Truth::Known(compare_values(&left_value, operator, &right_value, &|name| self.get_variable(name)))
     }
 
@@ -948,67 +1229,16 @@ impl Interpreter {
     }
 
     fn compare_symbol(&mut self, symbol: &str, operator: &str, other: &str, symbol_on_left: bool) -> Truth {
-        // Version checks: assume a current compiler
-        if symbol.ends_with("_VERSION") {
-            let newer = matches!(operator, "VERSION_GREATER" | "VERSION_GREATER_EQUAL" | "GREATER" | "GREATER_EQUAL");
-            return Truth::Known(if symbol_on_left { newer } else { !newer && operator != "VERSION_EQUAL" });
-        }
-
-        let candidates: Vec<(&str, Truth)> = match symbol {
-            "CMAKE_CXX_COMPILER_ID" | "CMAKE_C_COMPILER_ID" | "CMAKE_CXX_SIMULATE_ID" => ["MSVC", "Clang", "AppleClang", "GNU"]
-                .iter()
-                .map(|id| (*id, model::compiler_truth(id)))
-                .collect(),
-            "CMAKE_SYSTEM_NAME" | "CMAKE_HOST_SYSTEM_NAME" => ["Windows", "Linux", "Darwin"]
-                .iter()
-                .map(|name| (*name, model::platform_truth(name)))
-                .collect(),
-            "CMAKE_BUILD_TYPE" => ["Debug", "Release", "RelWithDebInfo", "MinSizeRel"]
-                .iter()
-                .map(|config| (*config, Truth::Depends(model::profile_name(config))))
-                .collect(),
-            "CMAKE_CXX_COMPILER_FRONTEND_VARIANT" => vec![("MSVC", Truth::Depends("msvc".into())), ("GNU", Truth::Depends("gnu".into()))],
-            "CMAKE_SIZEOF_VOID_P" => vec![("8", Truth::Depends("x64 | arm64".into())), ("4", Truth::Depends("x86 | arm".into()))],
-            "CMAKE_SYSTEM_PROCESSOR" | "CMAKE_CXX_COMPILER_ARCHITECTURE_ID" | "CMAKE_C_COMPILER_ARCHITECTURE_ID" => PROCESSOR_NAMES
-                .iter()
-                .map(|(name, atom)| (*name, Truth::Depends(atom.to_string())))
-                .collect(),
-            "CMAKE_GENERATOR" => vec![("Ninja", Truth::Known(true))],
-            _ => return Truth::Known(false),
-        };
-
         let getter = |name: &str| self.get_variable(name);
-        candidates.into_iter().fold(Truth::Known(false), |result, (candidate, truth)| {
-            let matches = if symbol_on_left {
+        model::symbol_matches(symbol, &|candidate| {
+            if symbol_on_left {
                 compare_values(candidate, operator, other, &getter)
             } else {
                 compare_values(other, operator, candidate, &getter)
-            };
-            if matches {
-                result.or(truth)
-            } else {
-                result
             }
         })
     }
 }
-
-// CMAKE_SYSTEM_PROCESSOR and the MSVC architecture ids, and the condition each means
-const PROCESSOR_NAMES: &[(&str, &str)] = &[
-    ("AMD64", "x64"),
-    ("x86_64", "x64"),
-    ("x64", "x64"),
-    ("X86", "x86"),
-    ("x86", "x86"),
-    ("i386", "x86"),
-    ("i686", "x86"),
-    ("ARM64", "arm64"),
-    ("aarch64", "arm64"),
-    ("arm64", "arm64"),
-    ("ARMV7", "arm"),
-    ("armv7l", "arm"),
-    ("arm", "arm"),
-];
 
 /// A platform symbol's value on this machine, for text that embeds it.
 fn symbol_host_text(symbol: &str) -> &'static str {
@@ -1016,10 +1246,12 @@ fn symbol_host_text(symbol: &str) -> &'static str {
 
     match symbol {
         "WIN32" | "CMAKE_HOST_WIN32" | "MSVC" => on(cfg!(windows)),
+        "CMAKE_COMPILER_IS_GNUCXX" | "CMAKE_COMPILER_IS_GNUCC" => on(!cfg!(windows)),
+        "MSVC_VERSION" if cfg!(windows) => "1950",
         "UNIX" | "CMAKE_HOST_UNIX" => on(cfg!(unix)),
         "LINUX" => on(cfg!(target_os = "linux")),
         "APPLE" | "CMAKE_HOST_APPLE" => on(cfg!(target_os = "macos")),
-        "CMAKE_CXX_COMPILER_ID" | "CMAKE_C_COMPILER_ID" | "CMAKE_CXX_SIMULATE_ID" | "CMAKE_CXX_COMPILER_FRONTEND_VARIANT" => {
+        "CMAKE_CXX_COMPILER_ID" | "CMAKE_C_COMPILER_ID" | "CMAKE_CXX_COMPILER_FRONTEND_VARIANT" | "CMAKE_C_COMPILER_FRONTEND_VARIANT" => {
             if cfg!(windows) {
                 "MSVC"
             } else {
@@ -1064,14 +1296,30 @@ fn symbol_host_text(symbol: &str) -> &'static str {
 /// Is text being expanded at a generator expression's condition: right after `$<BOOL:`, `$<NOT:`, or an argument of
 /// `$<AND:` or `$<OR:`?
 fn in_genex_condition(before: &str) -> bool {
-    if ["$<BOOL:", "$<NOT:", "$<AND:", "$<OR:"].iter().any(|opening| before.ends_with(opening)) {
+    in_genex_argument(before, &["BOOL", "NOT", "AND", "OR"], &["AND", "OR"])
+}
+
+/// Is text being expanded where a generator expression tests a value: a condition as above, either side of
+/// `$<STREQUAL:` or `$<EQUAL:`, the condition of `$<IF:`, or the head of `$<...:value>`?
+fn in_genex_test(before: &str) -> bool {
+    before.ends_with("$<")
+        || in_genex_argument(
+            before,
+            &["BOOL", "NOT", "AND", "OR", "STREQUAL", "EQUAL", "IF"],
+            &["AND", "OR", "STREQUAL", "EQUAL"],
+        )
+}
+
+/// Is text right after `$<NAME:` for a name in `first`, or right after a comma in an expression named in `later`?
+fn in_genex_argument(before: &str, first: &[&str], later: &[&str]) -> bool {
+    if first.iter().any(|name| before.ends_with(&format!("$<{name}:"))) {
         return true;
     }
     if !before.ends_with(',') {
         return false;
     }
 
-    // After a comma: the innermost open expression must be AND or OR
+    // After a comma: the innermost open expression
     let mut depth = 0;
     let characters: Vec<char> = before.chars().collect();
     for index in (0..characters.len()).rev() {
@@ -1080,7 +1328,7 @@ fn in_genex_condition(before: &str) -> bool {
             '<' if index > 0 && characters[index - 1] == '$' => {
                 if depth == 0 {
                     let opened: String = characters[index + 1..].iter().collect();
-                    return opened.starts_with("AND:") || opened.starts_with("OR:");
+                    return later.iter().any(|name| opened.starts_with(&format!("{name}:")));
                 }
                 depth -= 1;
             }
@@ -1090,19 +1338,16 @@ fn in_genex_condition(before: &str) -> bool {
     false
 }
 
-/// The condition a platform symbol stands for.
-fn symbol_truth(symbol: &str) -> Truth {
-    let condition = match symbol {
-        "WIN32" | "CMAKE_HOST_WIN32" => "windows",
-        "UNIX" | "CMAKE_HOST_UNIX" => "unix",
-        "APPLE" | "CMAKE_HOST_APPLE" => "macos",
-        "LINUX" => "linux",
-        "MSVC" => "msvc",
-        "MINGW" => "mingw",
-        "CYGWIN" | "ANDROID" | "IOS" | "EMSCRIPTEN" => return Truth::Known(false),
-        _ => return Truth::Known(true),
-    };
-    Truth::Depends(condition.into())
+/// A value made of conditional items only (a list a branch this machine does not take appended to): where it is
+/// not empty.
+fn conditional_value_truth(value: &str) -> Option<Truth> {
+    let items = model::split_list(value);
+    let conditions: Vec<(String, &str)> = items.iter().map(|item| model::split_conditional_item(item)).collect::<Option<Vec<_>>>()?;
+
+    let truth = conditions.into_iter().fold(Truth::Known(false), |result, (condition, item)| {
+        result.or(Truth::Depends(condition).and(Truth::Known(model::constant_truth(item).unwrap_or(true))))
+    });
+    Some(truth)
 }
 
 fn compare_values(left: &str, operator: &str, right: &str, variable: &dyn Fn(&str) -> Option<String>) -> bool {
@@ -1124,7 +1369,7 @@ fn compare_values(left: &str, operator: &str, right: &str, variable: &dyn Fn(&st
         "VERSION_EQUAL" => compare_versions(left, right) == std::cmp::Ordering::Equal,
         "VERSION_LESS_EQUAL" => compare_versions(left, right) != std::cmp::Ordering::Greater,
         "VERSION_GREATER_EQUAL" => compare_versions(left, right) != std::cmp::Ordering::Less,
-        "MATCHES" => regex::Regex::new(right).map(|pattern| pattern.is_match(left)).unwrap_or(false),
+        "MATCHES" => regex::Regex::new(&super::check_script::anvil_regex(right)).is_ok_and(|pattern| pattern.is_match(left)),
         "IN_LIST" => model::split_list(&variable(right).unwrap_or_default()).iter().any(|item| item == left),
         "PATH_EQUAL" => util::path_key(Path::new(left)) == util::path_key(Path::new(right)),
         _ => false,
@@ -1238,36 +1483,6 @@ fn find_closing_brace(characters: &[char], start: usize) -> Option<usize> {
     None
 }
 
-/// CMake escape sequences to their characters.
-pub fn unescape(text: &str) -> String {
-    if !text.contains('\\') {
-        return text.to_string();
-    }
-
-    let mut output = String::new();
-    let mut characters = text.chars();
-    while let Some(character) = characters.next() {
-        if character != '\\' {
-            output.push(character);
-            continue;
-        }
-
-        match characters.next() {
-            Some('n') => output.push('\n'),
-            Some('t') => output.push('\t'),
-            Some('r') => output.push('\r'),
-            Some(other) if "\\\"$;() #^@[]{}<>".contains(other) => output.push(other),
-            Some(other) => {
-                output.push('\\');
-                output.push(other);
-            }
-            None => output.push('\\'),
-        }
-    }
-
-    output
-}
-
 /// A macro body with ${param}, ${ARGN}, ${ARGV}, ${ARGC} and ${ARGV<n>} replaced in its text.
 fn substitute_macro(body: &[Node], bindings: &[(String, String)]) -> Vec<Node> {
     let substitute = |text: &str| -> String {
@@ -1310,4 +1525,183 @@ fn substitute_macro(body: &[Node], bindings: &[(String, String)]) -> Vec<Node> {
             other => other.clone(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs a CMakeLists.txt in a fresh temporary folder and returns the interpreter.
+    fn run(name: &str, cmake: &str) -> Interpreter {
+        let folder = std::env::temp_dir().join(format!("anvil-interp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("CMakeLists.txt"), cmake).unwrap();
+
+        let mut interpreter = Interpreter::new(&folder);
+        interpreter.run_root().unwrap();
+        let _ = std::fs::remove_dir_all(&folder);
+        interpreter
+    }
+
+    fn variable(interpreter: &Interpreter, name: &str) -> String {
+        interpreter.get_variable(name).unwrap_or_default()
+    }
+
+    #[test]
+    fn only_this_machines_branch_sets_variables() {
+        let cmake = r#"
+option(OPT "o" OFF)
+set(X a)
+if(OPT)
+  set(X b)
+endif()
+if(WIN32)
+  set(Y win)
+else()
+  set(Y other)
+endif()
+if(NOT WIN32)
+  set(Z other)
+else()
+  set(Z win)
+endif()
+set(SOURCES main.c)
+if(UNIX)
+  list(APPEND SOURCES unix.c)
+endif()
+if(OPT)
+  set(OPT_DIR opt/dir)
+endif()
+if(OPT)
+  set(USED "${OPT_DIR}/file")
+endif()
+set(OUTSIDE "${OPT_DIR}")
+"#;
+        let interpreter = run("branches", cmake);
+        let host = if cfg!(windows) { "win" } else { "other" };
+
+        assert_eq!(variable(&interpreter, "X"), "a");
+        assert_eq!(variable(&interpreter, "Y"), host);
+        assert_eq!(variable(&interpreter, "Z"), host);
+
+        // A value an option's branch set is plain inside the same option's branch
+        assert_eq!(
+            model::split_conditional_item(&variable(&interpreter, "USED")),
+            Some(("OPT".to_string(), "opt/dir/file"))
+        );
+        assert_eq!(
+            model::split_conditional_item(&variable(&interpreter, "OUTSIDE")),
+            Some(("OPT".to_string(), "opt/dir"))
+        );
+
+        // The other platform's items stay, under its condition
+        let sources = model::list_elements(&variable(&interpreter, "SOURCES"));
+        assert_eq!(sources[0], "main.c");
+        if cfg!(windows) {
+            assert_eq!(model::split_conditional_item(&sources[1]), Some(("unix".to_string(), "unix.c")));
+        }
+    }
+
+    #[test]
+    fn escapes_are_read_once() {
+        let cmake = r#"
+set(a "x\\ny")
+set(b "${a}")
+set(c "a\\$b")
+set(d "PATH=C:/a\;C:/b")
+set(e "tab\there")
+set(f x\ y)
+"#;
+        let interpreter = run("escapes", cmake);
+
+        assert_eq!(variable(&interpreter, "a"), "x\\ny");
+        assert_eq!(variable(&interpreter, "b"), "x\\ny");
+        assert_eq!(variable(&interpreter, "c"), "a\\$b");
+        assert_eq!(variable(&interpreter, "d"), "PATH=C:/a\\;C:/b");
+        assert_eq!(model::split_list(&variable(&interpreter, "d")), vec!["PATH=C:/a;C:/b"]);
+        assert_eq!(variable(&interpreter, "e"), "tab\there");
+        assert_eq!(variable(&interpreter, "f"), "x y");
+    }
+
+    #[test]
+    fn platform_versions_and_matches() {
+        let cmake = r#"
+set(v "1.2.3")
+if(v MATCHES "^([0-9]+)\\.([0-9]+)")
+  set(MAJOR "${CMAKE_MATCH_1}")
+endif()
+set(text "a\nVERSION 7.")
+string(REGEX MATCH "VERSION (.)\\." found "${text}")
+set(L "a;;b")
+list(LENGTH L length)
+set(i keep)
+foreach(i 1 2)
+endforeach()
+macro(leave)
+  return()
+endmacro()
+function(f)
+  leave()
+  set(AFTER_RETURN 1 PARENT_SCOPE)
+endfunction()
+f()
+set(TOP 1 PARENT_SCOPE)
+"#;
+        let mut interpreter = run("versions", cmake);
+
+        assert_eq!(variable(&interpreter, "MAJOR"), "1");
+        assert_eq!(variable(&interpreter, "CMAKE_MATCH_1"), "7");
+        assert_eq!(variable(&interpreter, "length"), "3");
+        assert_eq!(variable(&interpreter, "i"), "keep");
+        assert!(interpreter.get_variable("AFTER_RETURN").is_none());
+        assert!(interpreter.get_variable("TOP").is_none());
+
+        // Version and DEFINED tests depend on the compiler
+        let condition = |interpreter: &mut Interpreter, text: &str| {
+            let args: Vec<Arg> = text
+                .split(' ')
+                .map(|word| Arg {
+                    text: word.to_string(),
+                    kind: ArgKind::Unquoted,
+                })
+                .collect();
+            interpreter.evaluate_condition(&args)
+        };
+        assert_eq!(
+            condition(&mut interpreter, "MSVC_VERSION GREATER_EQUAL 1910"),
+            Truth::Depends("msvc".into())
+        );
+        assert_eq!(condition(&mut interpreter, "MSVC_VERSION"), Truth::Depends("msvc".into()));
+        assert_eq!(condition(&mut interpreter, "DEFINED MSVC"), Truth::Depends("msvc".into()));
+        assert_eq!(condition(&mut interpreter, "CMAKE_COMPILER_IS_GNUCXX"), Truth::Depends("gcc".into()));
+        assert_eq!(
+            condition(&mut interpreter, "CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9"),
+            Truth::Known(false)
+        );
+        assert_eq!(
+            condition(&mut interpreter, "CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 5"),
+            Truth::Known(true)
+        );
+        assert_eq!(
+            condition(&mut interpreter, "CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19.20"),
+            Truth::Depends("gcc".into())
+        );
+    }
+
+    #[test]
+    fn platform_values_in_generator_expressions_stay_conditions() {
+        let cmake = r#"
+set(a $<$<BOOL:${WIN32}>:ws2_32>)
+set(b $<$<STREQUAL:${CMAKE_CXX_COMPILER_ID},GNU>:-Wshadow>)
+"#;
+        let interpreter = run("genex", cmake);
+        let mut unknown = Vec::new();
+
+        let a = model::expand_genex(&variable(&interpreter, "a"), &mut unknown);
+        assert_eq!(a, vec![(Truth::Depends("windows".into()), "ws2_32".to_string())]);
+        let b = model::expand_genex(&variable(&interpreter, "b"), &mut unknown);
+        assert_eq!(b, vec![(Truth::Depends("gcc".into()), "-Wshadow".to_string())]);
+        assert!(unknown.is_empty());
+    }
 }
