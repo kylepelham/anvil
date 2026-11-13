@@ -37,16 +37,20 @@ const CXX_STANDARDS: &[&str] = &[
 ];
 const C_STANDARDS: &[&str] = &["c17", "c11", "c23", "c99", "c89", "c90", "c18"];
 
+// What crate::project::is_version takes
+const VERSION_PATTERN: &str = r"^[0-9]+(\.[0-9]+){0,3}$";
+
 // Every spelling crate::flags::normalize_standard takes ("20", "cxx20", "GNU++20")
 const CXX_STANDARD_PATTERN: &str = r"^([cC]\+\+)*([cC][xX][xX])*([cC][pP][pP])*([gG][nN][uU]\+\+)*[cC]*(11|14|17|20|23|26)$";
 const C_STANDARD_PATTERN: &str = r"^([cC]\+\+)*([cC][xX][xX])*([cC][pP][pP])*([gG][nN][uU]\+\+)*[cC]*(89|90|99|11|17|18|23)$";
 
-/// The tables that take a target's keys: a target, a when block, and `[defaults]` or a preset.
+/// The tables that take a target's keys: a target, a when block, `[defaults]` or a preset, and a when block of those.
 #[derive(Clone, Copy, PartialEq)]
 enum Table {
     Target,
     When,
     Shared,
+    SharedWhen,
 }
 
 /// `anvil schema`: prints the schema of anvil.toml, or of tests.toml.
@@ -188,6 +192,7 @@ fn definitions() -> Value {
         "target": target_table(Table::Target),
         "when": target_table(Table::When),
         "shared": target_table(Table::Shared),
+        "shared-when": target_table(Table::SharedWhen),
         "dep": dep_value(),
         "test": test_table(),
     })
@@ -197,7 +202,15 @@ fn project_table() -> Value {
     let metadata = "Package metadata, kept for the record: Anvil does not use it.";
     let properties = vec![
         ("name", text("The package's name, and its main target's (no `/` or `\\`).")),
-        ("version", text("The package's version: the {version} placeholder.")),
+        (
+            "version",
+            json!({
+                "type": "string",
+                "pattern": VERSION_PATTERN,
+                "examples": ["0.1.0"],
+                "description": "The package's version, one to four numbers (\"2.1.0\"): the {version} placeholder, and the installed package's.",
+            }),
+        ),
         ("description", text(metadata)),
         ("license", text(metadata)),
         ("authors", texts(metadata)),
@@ -299,12 +312,14 @@ fn profile_table() -> Value {
     table("A build profile.", properties, &[])
 }
 
-/// A target's keys; when blocks leave out what picks and places a target, `[defaults]` and presets `kind` too.
+/// A target's keys; when blocks leave out what picks and places a target, `[defaults]`, presets and their when blocks
+/// `kind` too.
 fn target_table(kind: Table) -> Value {
     let mut properties = Vec::new();
+    let shared = matches!(kind, Table::Shared | Table::SharedWhen);
 
     // What makes and places a target
-    if kind != Table::Shared {
+    if !shared {
         properties.push((
             "kind",
             choice(KINDS, KIND_ALIASES, "exe, lib (static), shared, object, headers, test or custom."),
@@ -411,7 +426,7 @@ fn target_table(kind: Table) -> Value {
             "when",
             map(
                 "Settings that apply when a condition holds: `[target.x.when.\"windows & msvc\"]`.",
-                reference("when"),
+                reference(if shared { "shared-when" } else { "when" }),
             ),
         ),
     ]);
@@ -439,9 +454,14 @@ fn target_table(kind: Table) -> Value {
         Table::Target => "A target: a program, library or test.",
         Table::When => "Settings that apply when the condition holds: a target's keys, but dir, if, default and preset.",
         Table::Shared => "Settings for several targets: a target's keys, but kind, dir, if, default and preset.",
+        Table::SharedWhen => "Settings that apply when the condition holds: a target's keys, but kind, dir, if, default and preset.",
     };
 
-    table(description, properties, &[])
+    // `files` is another name for `file`, so not both
+    let mut schema = table(description, properties, &[]);
+    schema["not"] = json!({ "required": ["file", "files"] });
+
+    schema
 }
 
 fn public_table() -> Value {
@@ -602,7 +622,16 @@ fn test_table() -> Value {
         properties,
         &[],
     );
+
+    // A template's command is its own, or every entry of one axis sets one
+    let axis_with_commands = json!({ "type": "array", "items": { "type": "object", "required": ["command"] } });
     schema["if"] = json!({ "required": ["matrix"] });
+    schema["then"] = json!({
+        "anyOf": [
+            { "required": ["command"] },
+            { "not": { "properties": { "matrix": { "additionalProperties": { "not": axis_with_commands } } } } },
+        ],
+    });
     schema["else"] = json!({ "required": ["name", "command"] });
 
     schema
@@ -629,7 +658,7 @@ fn test_settings() -> Vec<(&'static str, Value)> {
         ("workdir", text("The folder the test runs in.")),
         (
             "timeout",
-            integer("Seconds before the test is stopped and fails (default 600).", 0, u32::MAX as i64),
+            integer("Seconds before the test is stopped and fails (default 600).", 0, i64::MAX),
         ),
         ("env", map("Environment variables the test runs with.", json!({ "type": "string" }))),
         ("will-fail", flag("The test passes when it fails.")),
@@ -667,7 +696,7 @@ fn matrix() -> Value {
     let entry = json!({
         "anyOf": [
             entry_table,
-            { "type": ["string", "integer", "boolean"], "description": "The value of the parameter named after the axis." },
+            { "type": ["string", "integer"], "description": "The value of the parameter named after the axis." },
             { "type": "array", "items": { "type": "string" }, "description": "A list parameter named after the axis." },
         ],
     });
@@ -902,7 +931,8 @@ mod tests {
             assert_same_keys(schema_keys(at(&root, path), &root), manifest_keys(text), &path.join("."));
         }
 
-        // A target has every key; a when block all but those that make and place a target; [defaults] and presets not kind
+        // A target has every key; a when block all but those that make and place a target; [defaults], presets and their
+        // when blocks not kind
         let without = |left_out: &[&str]| {
             target_keys
                 .iter()
@@ -913,9 +943,9 @@ mod tests {
         let placing = ["dir", "if", "default", "preset"];
         assert_same_keys(schema_keys(at(&root, &["target"]), &root), target_keys.clone(), "target");
         assert_same_keys(schema_keys(at(&root, &["target", "when"]), &root), without(&placing), "when");
-        for shared in ["defaults", "preset"] {
-            let keys = schema_keys(at(&root, &[shared]), &root);
-            assert_same_keys(keys, without(&[&placing[..], &["kind"]].concat()), shared);
+        for shared in [&["defaults"][..], &["preset"], &["defaults", "when"], &["preset", "when"]] {
+            let keys = schema_keys(at(&root, shared), &root);
+            assert_same_keys(keys, without(&[&placing[..], &["kind"]].concat()), &shared.join("."));
         }
 
         // [[test]]: the test's keys and the matrix; a matrix entry's test keys are the ones test_cases knows
@@ -1102,6 +1132,40 @@ mod tests {
         for text in wrong {
             assert!(!validate(&root, &as_json(text)).is_empty(), "the schema takes:\n{text}");
         }
+
+        // Values the parser or the model rejects, which the schema must too; and some it takes
+        let rejected = [
+            "[defaults.when.windows]\nkind = \"lib\"\n",
+            "[preset.p.when.windows]\nkind = \"shared\"\n",
+            "[target.a]\nfile = [{ match = \"*.c\" }]\nfiles = [{ match = \"*.c\" }]\n",
+            "[[test]]\nname = \"a_{v}\"\ncommand = \"a\"\nmatrix.v = [true]\n",
+            "[[test]]\nname = \"a_{v}\"\nmatrix.v = [\"x\"]\n",
+            "[project]\nversion = \"v2.1.0\"\n",
+            "[project]\nversion = \"1.2.3.4.5\"\n",
+        ];
+        let accepted = [
+            "[target.t]\nkind = \"test\"\ntimeout = 5000000000\n",
+            "[[test]]\nname = \"a_{v}\"\nmatrix.v = [{ v = \"x\", command = \"a\" }]\n",
+            "[project]\nversion = \"2.1\"\n",
+        ];
+        let condition = crate::cond::CondContext {
+            family: crate::toolchain::Family::Msvc,
+            platform: crate::platform::Platform::host(),
+            profiles: vec!["debug".into()],
+            all_profiles: Vec::new(),
+            options: Default::default(),
+        };
+        for (texts, rejects) in [(&rejected[..], true), (&accepted[..], false)] {
+            for text in texts {
+                // What Model::load checks of each package: the version, then every target table
+                let loads = manifest::parse_str(text).is_ok_and(|manifest| {
+                    let version = manifest.project.as_ref().and_then(|project| project.version.as_deref()).unwrap_or("1");
+                    crate::project::is_version(version) && crate::targets::check_package(&manifest, &condition).is_ok()
+                });
+                assert_eq!(loads, !rejects, "anvil {}:\n{text}", if rejects { "takes" } else { "rejects" });
+                assert_eq!(validate(&root, &as_json(text)).is_empty(), !rejects, "the schema disagrees:\n{text}");
+            }
+        }
         assert!(!validate(&tests_root, &as_json("[project]\nname = \"a\"\n")).is_empty());
     }
 
@@ -1134,6 +1198,11 @@ mod tests {
         if let Some(alternatives) = schema["anyOf"].as_array() {
             if !alternatives.iter().any(fits) {
                 errors.push(format!("{path}: fits none of the alternatives"));
+            }
+        }
+        if let Some(negated) = schema.get("not") {
+            if fits(negated) {
+                errors.push(format!("{path}: fits what `not` excludes"));
             }
         }
         if let Some(condition) = schema.get("if") {
