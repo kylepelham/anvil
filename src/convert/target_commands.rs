@@ -1796,17 +1796,13 @@ impl Interpreter {
         let mut unknown = std::mem::take(&mut self.unknown_genex);
 
         for value in values {
-            for (truth, text) in model::expand_genex(value, &mut unknown, Some(&|name| self.target_exists(name))) {
+            for (truth, item) in model::expand_genex_items(value, &mut unknown, Some(&|name| self.target_exists(name))) {
                 let condition = match truth {
                     Truth::Known(false) => continue,
                     Truth::Known(true) => base.clone(),
                     Truth::Depends(condition) => model::and_optional(&base, &Some(condition)),
                 };
-
-                // An expression can produce a list
-                for item in model::split_list(&text) {
-                    results.push((condition.clone(), item));
-                }
+                results.push((condition, item));
             }
         }
         self.unknown_genex = unknown;

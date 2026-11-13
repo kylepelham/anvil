@@ -1361,11 +1361,6 @@ impl Emitter {
                 .collect();
         }
 
-        // `$<$<cond>:a b>` leaves two items in one
-        if item.contains(' ') && !Path::new(item).exists() {
-            return item.split_whitespace().flat_map(|part| self.classify_link(part, dir)).collect();
-        }
-
         let resolved = self.cmake.resolve_alias(item);
         let lower = item.to_lowercase();
         let has_library_extension = [".lib", ".a", ".so", ".dylib"].iter().any(|extension| lower.ends_with(extension));
@@ -1611,6 +1606,13 @@ impl Emitter {
                     .flatten()
                     .any(|word| word.contains(&format!("$<TARGET_FILE:{name}>")) || self.cmake.resolve_alias(word) == name)
         };
+        // A step that reads a target's properties belongs to it (fmt's module steps read fmt-module's)
+        let by_property = || {
+            self.cmake.targets.values().find(|target| {
+                let reference = format!("$<TARGET_PROPERTY:{},", target.name);
+                command.commands.iter().flatten().any(|word| word.contains(&reference))
+            })
+        };
         let by_folder = || {
             self.cmake
                 .targets
@@ -1618,7 +1620,11 @@ impl Emitter {
                 .find(|target| util::path_key(&target.dir) == util::path_key(&command.dir) && !used_by_step(&target.name))
         };
 
-        by_source.or_else(by_depends).or_else(by_folder).map(|target| target.name.clone())
+        by_source
+            .or_else(by_depends)
+            .or_else(by_property)
+            .or_else(by_folder)
+            .map(|target| target.name.clone())
     }
 
     fn convert_run(&mut self, command: &CustomCommand, owner: &str) -> (RunOut, Option<PathBuf>) {
@@ -2721,7 +2727,7 @@ fn render_target(output: &mut String, name: &str, target: &TargetOut) -> usize {
     }
     let todo_count = render_test_properties(output, &target.test);
     for note in &target.notes {
-        let _ = writeln!(output, "# TODO: {}", comment_text(note));
+        let _ = writeln!(output, "# TODO: {}", comment_text(&super::model::readable(note)));
     }
 
     render_blocks(output, &table, &target.blocks);
@@ -3113,7 +3119,7 @@ fn render_test_properties(output: &mut String, properties: &TestProperties) -> u
     }
 
     for note in &properties.notes {
-        let _ = writeln!(output, "# TODO: {}", comment_text(note));
+        let _ = writeln!(output, "# TODO: {}", comment_text(&super::model::readable(note)));
     }
 
     properties.notes.len()

@@ -274,6 +274,13 @@ impl Truth {
 const OPTION_MARKER: &str = "\u{1}option-";
 const OPTION_MARKER_END: &str = "\u{2}";
 
+// Brackets a platform variable's name (WIN32, CMAKE_CXX_COMPILER_ID, ...) expanded inside a generator expression's
+// condition; it ends as OPTION_MARKER does
+const SYMBOL_MARKER: &str = "\u{1}symbol-";
+
+// Stands for a space inside a marked condition
+const MARKER_SPACE: char = '\u{3}';
+
 /// `a & b`, skipping duplicates.
 pub fn and(left: &str, right: &str) -> String {
     if left == right {
@@ -432,9 +439,17 @@ fn is_possible(lookup: &dyn Fn(&str) -> Option<bool>) -> bool {
         .all(|(word, implied)| !(lookup(word) == Some(true) && lookup(implied) == Some(false)));
     let excluded = EXCLUSIONS
         .iter()
-        .any(|(left, right)| lookup(left) == Some(true) && lookup(right) == Some(true));
+        .any(|(left, right)| holds_with_implications(left, lookup) && holds_with_implications(right, lookup));
 
     implied && !excluded
+}
+
+/// Does a condition word hold, or follow from one that does (`gcc` gives `gnu`, so `cl & gcc` cannot hold)?
+fn holds_with_implications(word: &str, lookup: &dyn Fn(&str) -> Option<bool>) -> bool {
+    lookup(word) == Some(true)
+        || IMPLICATIONS
+            .iter()
+            .any(|(implying, implied)| *implied == word && holds_with_implications(implying, lookup))
 }
 
 fn collect_atoms(condition: &crate::cond::Cond, atoms: &mut Vec<String>) {
@@ -605,6 +620,70 @@ pub fn split_list(value: &str) -> Vec<String> {
     items.into_iter().filter(|item| !item.is_empty()).collect()
 }
 
+/// A list's elements as list() sees them: empty ones kept, `\;` left inside its element ("" is no elements).
+pub fn list_elements(value: &str) -> Vec<String> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut characters = value.chars().peekable();
+
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' if characters.peek() == Some(&';') => {
+                current.push_str("\\;");
+                characters.next();
+            }
+            '$' if characters.peek() == Some(&'<') => {
+                depth += 1;
+                current.push(character);
+            }
+            '>' if depth > 0 => {
+                depth -= 1;
+                current.push(character);
+            }
+            ';' if depth == 0 => items.push(std::mem::take(&mut current)),
+            _ => current.push(character),
+        }
+    }
+    items.push(current);
+    items
+}
+
+/// Words a command received, with a generator expression the parser cut at whitespace joined again as CMake reads
+/// it: `$<$<C>:a` and `b>` are the one list item `$<$<C>:a;b>`.
+pub fn join_genex_fragments(words: Vec<String>) -> Vec<String> {
+    let open_count = |text: &str| {
+        let characters: Vec<char> = text.chars().collect();
+        let mut depth = 0usize;
+        for (index, character) in characters.iter().enumerate() {
+            if *character == '$' && characters.get(index + 1) == Some(&'<') {
+                depth += 1;
+            } else if *character == '>' && depth > 0 {
+                depth -= 1;
+            }
+        }
+        depth
+    };
+
+    let mut joined: Vec<String> = Vec::new();
+    let mut open = false;
+    for word in words {
+        match joined.last_mut() {
+            Some(last) if open => {
+                last.push(';');
+                last.push_str(&word);
+            }
+            _ => joined.push(word),
+        }
+        open = open_count(joined.last().unwrap()) > 0;
+    }
+    joined
+}
+
 /// Evaluates generator expressions in one list item: each result is (condition, value). Unknown expressions are
 /// kept and reported. `target_exists` answers $<TARGET_EXISTS:...> (without it, that expression is unknown).
 pub fn expand_genex(item: &str, unknown: &mut Vec<String>, target_exists: Option<&dyn Fn(&str) -> bool>) -> Vec<(Truth, String)> {
@@ -630,6 +709,31 @@ pub fn expand_genex(item: &str, unknown: &mut Vec<String>, target_exists: Option
     }
 
     results
+}
+
+/// Evaluates generator expressions in one list item and splits the results into items, each with where it applies:
+/// `$<$<C>:a;$<$<D>:b>>` is `a` under C and `b` under C and D.
+pub fn expand_genex_items(item: &str, unknown: &mut Vec<String>, target_exists: Option<&dyn Fn(&str) -> bool>) -> Vec<(Truth, String)> {
+    let mut items: Vec<(Truth, String)> = Vec::new();
+
+    for (truth, text) in expand_genex(item, unknown, target_exists) {
+        for part in split_list(&text) {
+            match items.iter_mut().find(|(_, existing)| *existing == part) {
+                Some((existing, _)) => *existing = existing.clone().or(truth.clone()),
+                None => items.push((truth.clone(), part)),
+            }
+        }
+    }
+
+    // An item that came from several alternatives holds where any of them does
+    for (truth, _) in &mut items {
+        if let Truth::Depends(condition) = truth {
+            if condition.contains('|') {
+                *truth = simplify(condition, None);
+            }
+        }
+    }
+    items
 }
 
 struct GenexParser<'a> {
@@ -737,13 +841,19 @@ impl GenexParser<'_> {
 
             let value = join_alternatives(self.sequence(&['>']));
             self.expect_close();
-            return value
-                .into_iter()
-                .map(|(value_condition, text)| (condition.clone().and(value_condition), text))
-                .collect();
+            return conditional(condition, value);
         }
 
         let head = self.text_until(&[':', '>']);
+
+        // $<${WIN32}:value>: a marked option or platform value as the condition
+        if is_marker(&head) && self.peek() == Some(':') {
+            self.position += 1;
+            let condition = truth_of(&vec![(Truth::Known(true), head)]);
+            let value = join_alternatives(self.sequence(&['>']));
+            self.expect_close();
+            return conditional(condition, value);
+        }
 
         // No argument: $<CONFIG>
         if self.peek() == Some('>') {
@@ -765,7 +875,7 @@ impl GenexParser<'_> {
                 let value = join_alternatives(self.sequence(&['>']));
                 self.expect_close();
                 if head == "0" || head == "INSTALL_INTERFACE" {
-                    Vec::new()
+                    vec![(Truth::Known(true), String::new())]
                 } else {
                     value
                 }
@@ -951,7 +1061,24 @@ fn condition_expression(name: &str, arguments: &[Alternatives], target_exists: O
         "NOT" => truth_of(&arguments[0]).not(),
         "AND" => arguments.iter().map(truth_of).fold(Truth::Known(true), Truth::and),
         "OR" => arguments.iter().map(truth_of).fold(Truth::Known(false), Truth::or),
-        "STREQUAL" | "EQUAL" => Truth::Known(flat(0) == flat(1)),
+        "STREQUAL" | "EQUAL" => {
+            let equal = |left: &str, right: &str| match name {
+                "EQUAL" => left
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .is_some_and(|number| right.trim().parse::<f64>().ok() == Some(number)),
+                _ => left == right,
+            };
+            let (left, right) = (flat(0), flat(1));
+
+            // A platform value: each value it can have, and where it has it
+            match (marked(&left, SYMBOL_MARKER), marked(&right, SYMBOL_MARKER)) {
+                (Some(symbol), _) => symbol_matches(symbol, &|candidate| equal(candidate, &right)),
+                (_, Some(symbol)) => symbol_matches(symbol, &|candidate| equal(&left, candidate)),
+                _ => Truth::Known(equal(&left, &right)),
+            }
+        }
         "TARGET_EXISTS" => Truth::Known(target_exists?(&flat(0))),
         _ => return None,
     })
@@ -1058,13 +1185,50 @@ pub fn without_option_markers(text: &str) -> String {
     result
 }
 
-/// A value read as a condition: true where its text is a true constant, or the option it names.
+/// A platform variable's value in a generator expression's condition: the variable, not this machine's value.
+pub fn symbol_marker(name: &str) -> String {
+    format!("{SYMBOL_MARKER}{name}{OPTION_MARKER_END}")
+}
+
+/// `item` where `condition` holds, as a generator expression the target commands turn into a `when` block.
+pub fn conditional_item(condition: &str, item: &str) -> String {
+    let marker = option_marker(&condition.replace(' ', &MARKER_SPACE.to_string()));
+    format!("$<$<BOOL:{marker}>:{item}>")
+}
+
+/// The condition and item of a conditional_item, or None when the text is not one.
+pub fn split_conditional_item(text: &str) -> Option<(String, &str)> {
+    let rest = text.strip_prefix("$<$<BOOL:")?.strip_prefix(OPTION_MARKER)?;
+    let (condition, rest) = rest.split_once(OPTION_MARKER_END)?;
+    let item = rest.strip_prefix(">:")?.strip_suffix('>')?;
+    Some((condition.replace(MARKER_SPACE, " "), item))
+}
+
+/// Text with its option and platform markers written as the `${NAME}` they stand for, to show in a comment.
+pub fn readable(text: &str) -> String {
+    text.replace(OPTION_MARKER, "${")
+        .replace(SYMBOL_MARKER, "${")
+        .replace(OPTION_MARKER_END, "}")
+        .replace(MARKER_SPACE, " ")
+}
+
+fn marked<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    text.strip_prefix(marker).and_then(|rest| rest.strip_suffix(OPTION_MARKER_END))
+}
+
+fn is_marker(text: &str) -> bool {
+    marked(text, OPTION_MARKER).is_some() || marked(text, SYMBOL_MARKER).is_some()
+}
+
+/// A value read as a condition: true where its text is a true constant, or the option or platform value it names.
 fn truth_of(alternatives: &Alternatives) -> Truth {
     alternatives.iter().fold(Truth::Known(false), |result, (condition, text)| {
-        let option = text.strip_prefix(OPTION_MARKER).and_then(|rest| rest.strip_suffix(OPTION_MARKER_END));
-        let text_truth = match option {
-            Some(name) => Truth::Depends(name.to_string()),
-            None => Truth::Known(constant_truth(text).unwrap_or(!text.is_empty())),
+        let text_truth = if let Some(name) = marked(text, OPTION_MARKER) {
+            Truth::Depends(name.replace(MARKER_SPACE, " "))
+        } else if let Some(symbol) = marked(text, SYMBOL_MARKER) {
+            symbol_truth(symbol)
+        } else {
+            Truth::Known(constant_truth(text).unwrap_or(!text.is_empty()))
         };
         result.or(condition.clone().and(text_truth))
     })
@@ -1077,6 +1241,20 @@ fn truth_only(truth: Truth) -> Alternatives {
         Truth::Known(false) => vec![(Truth::Known(true), "0".into())],
         depends => vec![(depends.clone(), "1".into()), (depends.not(), "0".into())],
     }
+}
+
+/// `$<condition:value>`: the value where the condition holds, and nothing where it does not (so text around it
+/// stays: `a;$<$<C>:b>` is `a` without C).
+fn conditional(condition: Truth, value: Alternatives) -> Alternatives {
+    let mut results: Alternatives = value
+        .into_iter()
+        .map(|(value_condition, text)| (condition.clone().and(value_condition), text))
+        .filter(|(truth, _)| *truth != Truth::Known(false))
+        .collect();
+    if condition != Truth::Known(true) {
+        results.push((condition.not(), String::new()));
+    }
+    results
 }
 
 /// Concatenates parts: their alternatives multiply out.
@@ -1121,6 +1299,95 @@ pub fn compiler_truth(names: &str) -> Truth {
         result.or(truth)
     })
 }
+
+/// The condition a platform variable's value stands for when read as true or false.
+pub fn symbol_truth(symbol: &str) -> Truth {
+    let condition = match symbol {
+        "WIN32" | "CMAKE_HOST_WIN32" => "windows",
+        "UNIX" | "CMAKE_HOST_UNIX" => "unix",
+        "APPLE" | "CMAKE_HOST_APPLE" => "macos",
+        "LINUX" => "linux",
+        "MSVC" | "MSVC_VERSION" => "msvc",
+        "MINGW" => "mingw",
+        "CMAKE_COMPILER_IS_GNUCXX" | "CMAKE_COMPILER_IS_GNUCC" => "gcc",
+        "CMAKE_CXX_SIMULATE_ID" | "CMAKE_C_SIMULATE_ID" => "clang-cl",
+        "CYGWIN" | "ANDROID" | "IOS" | "EMSCRIPTEN" => return Truth::Known(false),
+        _ => return Truth::Known(true),
+    };
+    Truth::Depends(condition.into())
+}
+
+/// The values a platform variable can have, and where it has each; None for one without a table. Compiler versions
+/// are a current compiler of each family.
+pub fn symbol_candidates(symbol: &str) -> Option<Vec<(&'static str, Truth)>> {
+    Some(match symbol {
+        "CMAKE_CXX_COMPILER_ID" | "CMAKE_C_COMPILER_ID" => ["MSVC", "Clang", "AppleClang", "GNU"]
+            .iter()
+            .map(|id| (*id, compiler_truth(id)))
+            .collect(),
+        "CMAKE_SYSTEM_NAME" | "CMAKE_HOST_SYSTEM_NAME" => ["Windows", "Linux", "Darwin"].iter().map(|name| (*name, platform_truth(name))).collect(),
+        "CMAKE_BUILD_TYPE" => ["Debug", "Release", "RelWithDebInfo", "MinSizeRel"]
+            .iter()
+            .map(|config| (*config, Truth::Depends(profile_name(config))))
+            .collect(),
+        "CMAKE_CXX_COMPILER_FRONTEND_VARIANT" | "CMAKE_C_COMPILER_FRONTEND_VARIANT" => {
+            vec![("MSVC", Truth::Depends("msvc".into())), ("GNU", Truth::Depends("gnu".into()))]
+        }
+        "CMAKE_SIZEOF_VOID_P" => vec![("8", Truth::Depends("x64 | arm64".into())), ("4", Truth::Depends("x86 | arm".into()))],
+        "CMAKE_SYSTEM_PROCESSOR" | "CMAKE_CXX_COMPILER_ARCHITECTURE_ID" | "CMAKE_C_COMPILER_ARCHITECTURE_ID" => PROCESSOR_NAMES
+            .iter()
+            .map(|(name, atom)| (*name, Truth::Depends(atom.to_string())))
+            .collect(),
+        "CMAKE_CXX_COMPILER_VERSION" | "CMAKE_C_COMPILER_VERSION" => {
+            COMPILER_VERSIONS.iter().map(|(id, version)| (*version, compiler_truth(id))).collect()
+        }
+        "CMAKE_CXX_SIMULATE_ID" | "CMAKE_C_SIMULATE_ID" => {
+            vec![("MSVC", Truth::Depends("clang-cl".into())), ("", Truth::Depends("!clang-cl".into()))]
+        }
+        "MSVC_VERSION" => vec![("1950", Truth::Depends("msvc".into())), ("", Truth::Depends("!msvc".into()))],
+        "CMAKE_GENERATOR" => vec![("Ninja", Truth::Known(true))],
+        _ => return None,
+    })
+}
+
+/// Where a platform variable's value passes `test` (everywhere when each value it can have does).
+pub fn symbol_matches(symbol: &str, test: &dyn Fn(&str) -> bool) -> Truth {
+    let candidates = symbol_candidates(symbol).unwrap_or_default();
+    if !candidates.is_empty() && candidates.iter().all(|(candidate, _)| test(candidate)) {
+        return Truth::Known(true);
+    }
+
+    candidates.into_iter().fold(
+        Truth::Known(false),
+        |result, (candidate, truth)| {
+            if test(candidate) {
+                result.or(truth)
+            } else {
+                result
+            }
+        },
+    )
+}
+
+// CMAKE_SYSTEM_PROCESSOR and the MSVC architecture ids, and the condition each means
+pub const PROCESSOR_NAMES: &[(&str, &str)] = &[
+    ("AMD64", "x64"),
+    ("x86_64", "x64"),
+    ("x64", "x64"),
+    ("X86", "x86"),
+    ("x86", "x86"),
+    ("i386", "x86"),
+    ("i686", "x86"),
+    ("ARM64", "arm64"),
+    ("aarch64", "arm64"),
+    ("arm64", "arm64"),
+    ("ARMV7", "arm"),
+    ("armv7l", "arm"),
+    ("arm", "arm"),
+];
+
+// A current compiler of each family, for version tests
+const COMPILER_VERSIONS: &[(&str, &str)] = &[("MSVC", "19.50"), ("GNU", "15.1"), ("Clang", "20.1")];
 
 #[cfg(test)]
 mod tests {
@@ -1209,6 +1476,25 @@ mod tests {
     #[test]
     fn lists_keep_genex_whole() {
         assert_eq!(split_list("a;$<$<CONFIG:Debug>:b;c>;d"), vec!["a", "$<$<CONFIG:Debug>:b;c>", "d"]);
+        assert_eq!(list_elements("a;;b\\;c"), vec!["a", "", "b\\;c"]);
+        assert!(list_elements("").is_empty());
+
+        let words = ["PRIVATE", "$<$<CONFIG:Debug>:-g", "-O0>", "-Wall"].map(String::from).to_vec();
+        assert_eq!(join_genex_fragments(words), vec!["PRIVATE", "$<$<CONFIG:Debug>:-g;-O0>", "-Wall"]);
+    }
+
+    #[test]
+    fn nested_conditions_keep_the_outer_items() {
+        let mut unknown = Vec::new();
+        let items = expand_genex_items("$<$<CXX_COMPILER_ID:MSVC>:/W4;$<$<CONFIG:Release>:/WX>>", &mut unknown, None);
+        assert_eq!(
+            items,
+            vec![
+                (Truth::Depends("cl".into()), "/W4".to_string()),
+                (Truth::Depends("cl & release".into()), "/WX".to_string()),
+            ]
+        );
+        assert_eq!(expand_genex("a$<0:b>c", &mut unknown, None), vec![(Truth::Known(true), "ac".to_string())]);
     }
 
     #[test]
@@ -1235,5 +1521,6 @@ mod tests {
         assert_eq!(text(simplify("msvc & cl", None)), "cl");
         assert_eq!(text(simplify("(false) | (msvc)", None)), "msvc");
         assert_eq!(text(simplify("windows & !unix", None)), "windows");
+        assert_eq!(text(simplify("cl & gcc", None)), "false");
     }
 }
