@@ -238,6 +238,30 @@ add_executable(app main.cpp)
     }
 
     #[test]
+    fn a_file_a_when_block_adds_is_not_excluded_from_the_patterns() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(tests CXX)
+option(USE_BUNDLED "" ON)
+file(GLOB_RECURSE SOURCES code/*.cpp)
+list(REMOVE_ITEM SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/code/bundled.cpp)
+if(USE_BUNDLED)
+  list(APPEND SOURCES code/bundled.cpp)
+endif()
+add_executable(app ${SOURCES})
+"#;
+        let mut files = vec![("CMakeLists.txt", cmake), ("code/bundled.cpp", "int bundled() { return 1; }\n")];
+        let names: Vec<String> = (0..8).map(|index| format!("code/file{index}.cpp")).collect();
+        files.extend(names.iter().map(|name| (name.as_str(), "int main() {}\n")));
+        let conversion = convert_files("bundled", &files);
+        let toml = &conversion.toml;
+
+        // Anvil's `!` wins over a when block, so the file would never compile: the when block alone moves it
+        assert!(!toml.contains("!code/bundled.cpp"), "{toml}");
+        assert!(toml.contains("[target.app.when.USE_BUNDLED]\nsources = [\"code/bundled.cpp\"]"), "{toml}");
+    }
+
+    #[test]
     fn markers_never_reach_the_output() {
         let conversion = Conversion {
             toml: "[project]\nname = \"p\"\n\n[target.app]\nkind = \"exe\"\ndefines = [\"SYS_\\u0001SYM:CMAKE_SYSTEM_NAME\"]\n".into(),

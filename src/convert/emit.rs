@@ -1055,7 +1055,8 @@ impl Emitter {
 
     /// File lists as patterns: a folder whose files are all listed becomes `folder/**/*.cpp`; generated files and
     /// stragglers stay as they are. For a target's sources (`owner`), only folders no other target compiles files
-    /// from, since a new file there would land in the wrong target.
+    /// from, since a new file there would land in the wrong target. `excluded_keys` are files a `when` block lists:
+    /// they leave the pattern by themselves, and a `!` would keep them out of that block too.
     fn source_patterns(&self, dir: &Path, files: &[PathBuf], excluded_keys: &HashSet<String>, owner: Option<&str>) -> Vec<String> {
         let mut remaining: IndexMap<String, PathBuf> = files.iter().map(|file| (util::path_key(file), file.clone())).collect();
         let mut patterns = Vec::new();
@@ -1119,7 +1120,7 @@ impl Emitter {
             let folder_text = self.path_text(&folder, dir);
             let folder_prefix = if folder_text == "." { String::new() } else { format!("{folder_text}/") };
             patterns.push(format!("{folder_prefix}**/{}", extension_glob(&extensions)));
-            for path in missing {
+            for path in missing.into_iter().filter(|path| !excluded_keys.contains(&util::path_key(path))) {
                 patterns.push(format!("!{}", self.path_text(path, dir)));
             }
             for key in listed {
@@ -2031,7 +2032,14 @@ impl Emitter {
 
         for (name, target) in &self.targets {
             if empty.contains(name) && !target.notes.is_empty() {
-                let notes = target.notes.join("; ");
+                // A step converted under several conditions notes the same reason for each
+                let mut notes: Vec<&str> = Vec::new();
+                for note in &target.notes {
+                    if !notes.contains(&note.as_str()) {
+                        notes.push(note);
+                    }
+                }
+                let notes = notes.join("; ");
                 self.warnings.push(format!("custom target `{name}` was dropped: {notes}"));
             }
         }
