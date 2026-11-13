@@ -1045,7 +1045,13 @@ impl<'a> Planner<'a> {
         let output = self.object_path(target, source, self.toolchain.resource_output_extension());
         let description = format!("Compiling {}", self.display_path(source));
         let mut action = Action::new(ActionKind::Resource, description, compiler, self.env.clone());
-        action.args = self.toolchain.resource_args(source, &output, &inputs.includes, &inputs.defines);
+
+        // cl defines _DEBUG with the debug C runtime; rc gets it too, as CMake's Debug does
+        let mut defines = inputs.defines.clone();
+        if self.toolchain.is_msvc_abi() && self.model.profile.debug_runtime && !defines.iter().any(|define| define == "_DEBUG") {
+            defines.push("_DEBUG".to_string());
+        }
+        action.args = self.toolchain.resource_args(source, &output, &inputs.includes, &defines);
         action.inputs = vec![source.to_path_buf()];
         action.outputs = vec![output];
         action.workdir = source.parent().map(|folder| folder.to_path_buf());

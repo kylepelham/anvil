@@ -2125,3 +2125,25 @@ fn vcpkg_port_usage_follows_language_and_libraries_gcc() {
     require!("gcc", "vcpkg");
     vcpkg_port_usage(Some("gcc"), "vcpkg_usage_gcc", false);
 }
+
+// 34. A resource script sees _DEBUG with the debug C runtime, as the sources do, and not in release
+
+#[test]
+fn resource_script_sees_debug_with_the_debug_runtime_msvc() {
+    require!("msvc", "windows");
+    let project = Project::empty("rc_debug");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"app\"\n\n[target.app]\nkind = \"exe\"\nsources = [\"src/*.c\", \"src/*.rc\"]\n",
+    );
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+    project.write(
+        "src/app.rc",
+        "#ifdef _DEBUG\nSTRINGTABLE { 1, \"debug\" }\n#else\nSTRINGTABLE { 1, \"release\" }\n#endif\n",
+    );
+
+    project.anvil(&["build", "--toolchain", "msvc"]).success();
+    assert!(project.read("out/compile_commands.json").contains("/D_DEBUG"));
+    project.anvil(&["build", "--release", "--toolchain", "msvc"]).success();
+    assert!(!project.read("out/compile_commands.json").contains("/D_DEBUG"));
+}
