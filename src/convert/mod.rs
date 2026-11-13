@@ -684,6 +684,39 @@ set_tests_properties(t PROPERTIES ENVIRONMENT "A=1;B=3;A=2")
     }
 
     #[test]
+    fn tests_running_programs_by_their_build_path_run_the_targets() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(paths C)
+enable_testing()
+add_subdirectory(tests)
+"#;
+        let tests = r#"
+foreach(name parse_value print_value)
+  add_executable(${name} ${name}.c)
+  add_test(NAME ${name} COMMAND "./${name}")
+endforeach()
+add_executable(runner runner.c)
+add_test(NAME runs COMMAND runner "${CMAKE_CURRENT_BINARY_DIR}/print_value")
+"#;
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("tests/CMakeLists.txt", tests),
+            ("tests/parse_value.c", "int main(void) { return 0; }\n"),
+            ("tests/print_value.c", "int main(void) { return 0; }\n"),
+            ("tests/runner.c", "int main(void) { return 0; }\n"),
+        ];
+        let conversion = convert_files("buildpaths", &files);
+        let toml = &conversion.toml;
+
+        // `./name` from the test's build folder is the program target (here the test itself); a path in a later
+        // word is {target:name}
+        assert!(toml.contains("[target.parse_value]\nkind = \"test\""), "{toml}");
+        assert!(toml.contains(r#"args = ["{target:print_value}"]"#), "{toml}");
+        assert!(!toml.contains("./") && !toml.contains("{out}"), "{toml}");
+    }
+
+    #[test]
     fn checks_and_dependent_options_become_conditions() {
         let cmake = r#"
 cmake_minimum_required(VERSION 3.20)

@@ -218,7 +218,7 @@ fn project_table() -> Value {
             "std",
             cxx_standard("C++ standard: c++17, c++20 (default), c++23, c++26 (also \"20\", \"gnu++20\")."),
         ),
-        ("c-std", c_standard("C standard: c11, c17 (default), c23 (also \"17\", c99, \"gnu17\").")),
+        ("c-std", c_standard("C standard: gnu17 (default: C17 with GNU extensions, as gcc and CMake; /std:c17 with MSVC), c17 (strict ISO: glibc then hides POSIX functions such as strdup), c11, c23 (also \"17\", c99, \"gnu11\").")),
         (
             "toolchain",
             choice(
@@ -378,7 +378,7 @@ fn target_table(kind: Table) -> Value {
         ),
         ("cuda-flags", texts("Extra nvcc options for .cu files.")),
         ("std", cxx_standard("C++ standard of this target: c++17, c++20, c++23, c++26.")),
-        ("c-std", c_standard("C standard of this target: c11, c17, c23.")),
+        ("c-std", c_standard("C standard of this target: gnu17 (default), c17 (strict ISO), c11, c23.")),
         (
             "gui",
             json!({
@@ -392,6 +392,14 @@ fn target_table(kind: Table) -> Value {
         (
             "output-dir",
             text("The folder the target's file goes to (default: {out}, static libraries {out}/lib)."),
+        ),
+        (
+            "version",
+            text("A shared library's version (\"1.2.3\", \"{version}\"): libfoo.so.1.2.3 with the links libfoo.so.1 and libfoo.so (macOS: libfoo.1.2.3.dylib). DLLs and other kinds ignore it."),
+        ),
+        (
+            "soversion",
+            text("A shared library's ABI version (\"1\"): its SONAME libfoo.so.1 (macOS: install name libfoo.1.dylib, compatibility version). Default: `version`."),
         ),
         (
             "exports",

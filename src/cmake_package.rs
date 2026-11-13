@@ -582,6 +582,14 @@ impl Reader {
                     self.add_rpath(library, usage);
                     shared.extend(files.dependent_libraries.iter().cloned());
                 }
+
+                // A static library is C++ unless the package says it is only C
+                if target.kind != "SHARED" && vcpkg_tree::is_static_library(library) {
+                    usage.cxx_libraries |= files
+                        .languages
+                        .as_ref()
+                        .is_none_or(|languages| languages.iter().any(|language| language == "CXX"));
+                }
             }
         }
     }

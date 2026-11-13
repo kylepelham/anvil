@@ -1900,7 +1900,18 @@ impl Emitter {
 
     /// add_test: a program run once becomes a `kind = "test"` target; anything else a [[test]] table.
     fn convert_tests(&mut self) {
-        let tests = self.cmake.tests.clone();
+        let mut tests = self.cmake.tests.clone();
+
+        // A program run by its path in CMake's build folder (`./name` from the test's folder, or
+        // `${CMAKE_CURRENT_BINARY_DIR}/name`) is that target: run as `COMMAND name` when first, else {target:name}
+        for test in &mut tests {
+            let folder = test.workdir.clone().unwrap_or_else(|| self.binary_dir(&test.dir));
+            for (position, word) in test.command.iter_mut().enumerate() {
+                if let Some(name) = self.program_at_path(word, &folder) {
+                    *word = if position == 0 { name } else { format!("{{target:{name}}}") };
+                }
+            }
+        }
 
         // How often each program is used by a test
         let program_of = |command: &[String]| -> Option<String> {
@@ -2039,6 +2050,40 @@ impl Emitter {
         }
 
         relative_path(Path::new(dir), &self.root)
+    }
+
+    /// CMake's build folder of a source folder, as the converter writes it: `{out}/tests`, `{out}` for the root.
+    fn binary_dir(&self, dir: &Path) -> String {
+        match util::rel(dir, &self.root).as_str() {
+            "." => "{out}".to_string(),
+            relative => format!("{{out}}/{relative}"),
+        }
+    }
+
+    /// The program target a path in CMake's build folder names: `./name` (from `folder`) or `{out}/<dir>/name`, the
+    /// folder its target is defined in (where CMake puts programs), with or without `.exe`.
+    fn program_at_path(&self, word: &str, folder: &str) -> Option<String> {
+        let (word_folder, file) = match word.strip_prefix("./") {
+            Some(file) => (folder.trim_end_matches('/').to_string(), file),
+            None if word.starts_with("{out}") => {
+                let (word_folder, file) = word.rsplit_once('/')?;
+                (word_folder.to_string(), file)
+            }
+            None => return None,
+        };
+        let file = file.strip_suffix(".exe").unwrap_or(file);
+        if file.is_empty() || file.contains('/') {
+            return None;
+        }
+
+        self.cmake
+            .targets
+            .values()
+            .find(|target| {
+                let output_name = target.output_name.as_deref().unwrap_or(&target.name);
+                target.kind == TargetKind::Exe && output_name == file && self.binary_dir(&target.dir) == word_folder
+            })
+            .map(|target| target.name.clone())
     }
 
     /// Custom targets that ended up with no run steps do nothing in Anvil.
@@ -2552,8 +2597,16 @@ impl Emitter {
             render_blocks(&mut output, &format!("preset.{}", key(name)), preset);
         }
 
-        // [profile.debug] and [profile.release] with CMAKE_MSVC_RUNTIME_LIBRARY's runtime (the others inherit release's)
-        for (profile, keys) in self.runtime_profiles() {
+        // [profile.debug] and [profile.release] with CMAKE_MSVC_RUNTIME_LIBRARY's runtime and the LTO of
+        // CMAKE_INTERPROCEDURAL_OPTIMIZATION (the others inherit release's)
+        let mut profile_keys = self.runtime_profiles();
+        for profile in self.lto_profiles() {
+            match profile_keys.iter_mut().find(|(name, _)| *name == profile) {
+                Some((_, keys)) => keys.push(("lto", true)),
+                None => profile_keys.push((profile, vec![("lto", true)])),
+            }
+        }
+        for (profile, keys) in profile_keys {
             let _ = writeln!(output, "\n[profile.{profile}]");
             for (key, value) in keys {
                 let _ = writeln!(output, "{key} = {value}");
@@ -2813,6 +2866,41 @@ impl Emitter {
                  have the runtime it picks on this machine with the options' defaults",
                 super::model::readable(&value)
             ));
+        }
+
+        profiles
+    }
+
+    /// The built-in profiles CMAKE_INTERPROCEDURAL_OPTIMIZATION (all configurations) or its _DEBUG and _RELEASE forms
+    /// turn link-time optimization on for. A value depending on an option, or another configuration's, is a warning.
+    fn lto_profiles(&mut self) -> Vec<&'static str> {
+        let mut profiles = Vec::new();
+
+        for suffix in ["", "_DEBUG", "_RELEASE", "_RELWITHDEBINFO", "_MINSIZEREL"] {
+            let variable = format!("CMAKE_INTERPROCEDURAL_OPTIMIZATION{suffix}");
+            let Some(value) = self.cmake.get_variable(&variable).filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            let names: &[&'static str] = match suffix {
+                "" => KNOWN_PROFILES,
+                "_DEBUG" => &["debug"],
+                "_RELEASE" => &["release"],
+                _ => &[],
+            };
+            match super::model::constant_truth(&value) {
+                Some(false) => {}
+                Some(true) if !names.is_empty() => {
+                    for name in names {
+                        if !profiles.contains(name) {
+                            profiles.push(*name);
+                        }
+                    }
+                }
+                _ => self.warnings.push(format!(
+                    "{variable} \"{}\" is not converted: set `lto = true` in the profiles that want link-time optimization",
+                    super::model::readable(&value)
+                )),
+            }
         }
 
         profiles

@@ -64,7 +64,7 @@ pub struct ProjectSpec {
 
     /// C++ standard: "c++17", "c++20" (default), "c++23", "c++26" (also "17", "20" ...).
     pub std: Option<String>,
-    /// C standard: "c11", "c17" (default), "c23".
+    /// C standard: "gnu17" (default), "c17" (strict ISO), "c11", "c23".
     pub c_std: Option<String>,
     /// msvc | clang-cl | clang | gcc. Default: the best one installed.
     pub toolchain: Option<String>,
@@ -183,6 +183,10 @@ pub struct TargetSpec {
     pub output_suffix: Option<String>,
     /// The folder the target's file goes to (default: {out}, static libraries {out}/lib).
     pub output_dir: Option<String>,
+    /// A shared library's version and ABI version: libfoo.so.1.2.3 with the SONAME libfoo.so.1 and the links
+    /// libfoo.so.1 and libfoo.so (macOS: libfoo.1.2.3.dylib); a missing one is the other. Other kinds ignore them.
+    pub version: Option<String>,
+    pub soversion: Option<String>,
     /// A program that exports symbols for the modules it loads: those modules link against it.
     pub exports: Option<bool>,
     /// Write an export macro header for this library: a path under {gen}, or a table with `path` and `macro`.

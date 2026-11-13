@@ -22,7 +22,8 @@ const CONFIGURATION_SUFFIXES: &[(&str, Option<&str>)] = &[
     ("_MINSIZEREL", Some("minsizerel")),
 ];
 
-// Test properties that only label or weigh tests for CTest's scheduler
+// Test properties that only label or weigh tests for CTest's scheduler (TODO: LABELS as test labels, when `anvil test`
+// can pick tests by label)
 const IGNORED_TEST_PROPERTIES: &[&str] = &[
     "LABELS",
     "PROCESSORS",
@@ -31,6 +32,9 @@ const IGNORED_TEST_PROPERTIES: &[&str] = &[
     "TIMEOUT_SIGNAL_NAME",
     "TIMEOUT_SIGNAL_GRACE_PERIOD",
 ];
+
+// Target properties for gcc's and clang's symbol visibility flags (also as CMAKE_ variables that start them)
+const VISIBILITY_PROPERTIES: [&str; 3] = ["C_VISIBILITY_PRESET", "CXX_VISIBILITY_PRESET", "VISIBILITY_INLINES_HIDDEN"];
 
 // Target properties that change nothing Anvil builds: these names (with any _<CONFIG> suffix), an entry ending in `_`
 // is a prefix, one starting with `_` a suffix
@@ -44,8 +48,6 @@ const IGNORED_PROPERTIES: &[&str] = &[
     "INTERPROCEDURAL_OPTIMIZATION",
     "MAP_IMPORTED_CONFIG_",
     "IMPORTED_CONFIGURATIONS",
-    "_VISIBILITY_PRESET",
-    "VISIBILITY_INLINES_HIDDEN",
     "FOLDER",
     "_STANDARD_REQUIRED",
     "_EXTENSIONS",
@@ -313,7 +315,33 @@ impl Interpreter {
         self.target_prefixes.insert(name.to_string(), self.conditions.clone());
         self.targets.insert(name.to_string(), target);
 
+        // CMAKE_<LANG>_VISIBILITY_PRESET and CMAKE_VISIBILITY_INLINES_HIDDEN start the target's properties
+        for property in VISIBILITY_PROPERTIES {
+            if let Some(value) = self.get_variable(&format!("CMAKE_{property}")).filter(|value| !value.is_empty()) {
+                self.set_visibility(name, property, &[value]);
+            }
+        }
+
         self.add_sources(name, sources);
+    }
+
+    /// A visibility property's value under each condition it takes (replacing the earlier value), for
+    /// `visibility_options` once the target's languages are known.
+    fn set_visibility(&mut self, target: &str, property: &'static str, items: &[String]) {
+        let values = match property {
+            "VISIBILITY_INLINES_HIDDEN" => self.conditional_values(Some(target), &[format!("$<$<BOOL:{}>:ON>", items.join(";"))]),
+            _ => self.conditional_values(Some(target), items),
+        };
+
+        let visibility = &mut self.targets.get_mut(target).unwrap().visibility;
+        visibility.retain(|item| item.value.0 != property);
+        for (condition, value) in values.into_iter().filter(|(_, value)| !value.is_empty()) {
+            visibility.push(Item {
+                condition,
+                public: false,
+                value: (property, value),
+            });
+        }
     }
 
     /// A second definition of another kind: the kind becomes conditional. The target keeps the kind this machine
@@ -1125,6 +1153,34 @@ impl Interpreter {
                 let note = "UNITY_BUILD: add `unity = true` to the target for unity builds".to_string();
                 self.targets.get_mut(target).unwrap().notes.push(note);
             }
+            "C_VISIBILITY_PRESET" | "CXX_VISIBILITY_PRESET" | "VISIBILITY_INLINES_HIDDEN" => {
+                let property = VISIBILITY_PROPERTIES.iter().find(|name| **name == base_property).unwrap();
+                self.set_visibility(target, property, &items);
+            }
+            // Anvil links a whole program optimized only per profile (`lto`)
+            optimization
+                if optimization.starts_with("INTERPROCEDURAL_OPTIMIZATION")
+                    && items.iter().any(|item| model::constant_truth(item) != Some(false)) =>
+            {
+                let note = format!("{property}: Anvil has no link-time optimization per target; set `lto = true` in the profiles that want it");
+                self.targets.get_mut(target).unwrap().notes.push(note);
+            }
+            // A shared library's version in its file name and SONAME (libfoo.so.1.2.3, libfoo.so.1); the project's
+            // version as {version}
+            "VERSION" | "SOVERSION" if self.targets[target].kind == TargetKind::Shared || self.targets[target].shared_condition.is_some() => {
+                let key = if base_property == "VERSION" { "version" } else { "soversion" };
+                for (condition, value) in self.conditional_values(Some(target), &items) {
+                    let value = match &self.project_version {
+                        Some(version) if *version == value => "{version}".to_string(),
+                        _ => value,
+                    };
+                    self.targets.get_mut(target).unwrap().settings.push(Item {
+                        condition,
+                        public: false,
+                        value: (key, value),
+                    });
+                }
+            }
             "CUDA_ARCHITECTURES" => {
                 let settings = &mut self.targets.get_mut(target).unwrap().settings;
                 settings.retain(|item| item.value.0 != "cuda-arch");
@@ -1843,6 +1899,11 @@ impl Interpreter {
             target.c_std = target.c_std.max(passed_on);
         }
 
+        // Visibility properties as flags of their language's files
+        for target in self.targets.values_mut() {
+            visibility_options(target);
+        }
+
         self.pass_on_language_settings(project_language);
         for target in self.targets.values_mut() {
             resolve_languages(target, project_language);
@@ -2348,6 +2409,34 @@ fn set_decided<T>(item: &mut Item<T>, truth: Truth) -> bool {
     }
 }
 
+/// A target's visibility properties as gcc's and clang's flags for its files of that language, as CMake passes them
+/// to every compiled target (policy CMP0063): no preset for clang on Windows, and MinGW's form of hidden inlines.
+fn visibility_options(target: &mut Target) {
+    if matches!(target.kind, TargetKind::Interface | TargetKind::Custom) || target.imported {
+        target.visibility.clear();
+        return;
+    }
+
+    for item in std::mem::take(&mut target.visibility) {
+        let (property, value) = item.value;
+        let flags = match property {
+            "C_VISIBILITY_PRESET" => vec![(model::LANGUAGE_C, "!msvc & (gcc | !windows)", format!("-fvisibility={value}"))],
+            "CXX_VISIBILITY_PRESET" => vec![(model::LANGUAGE_CXX, "!msvc & (gcc | !windows)", format!("-fvisibility={value}"))],
+            _ => vec![
+                (model::LANGUAGE_CXX, "!msvc & !mingw", "-fvisibility-inlines-hidden".to_string()),
+                (model::LANGUAGE_CXX, "mingw", "-fno-keep-inline-dllexport".to_string()),
+            ],
+        };
+        for (language, compilers, flag) in flags {
+            target.options.push(Item {
+                condition: model::and_optional(&item.condition, &Some(format!("{language} & {compilers}"))),
+                public: false,
+                value: flag,
+            });
+        }
+    }
+}
+
 /// Decides the COMPILE_LANGUAGE tests in a target's settings. In a target with C and C++ files, a private flag or
 /// definition for one language goes to a rule for that language's files; everything else is decided for the
 /// target's main language (C++ when it has C++ files), as its link and its users are.
@@ -2656,6 +2745,57 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DLATE_CXX_FLAGS")
         );
         assert!(toml.contains(r#"include = ["late"]"#), "{toml}");
         assert!(!toml.contains("LATE_OPTION") && !toml.contains("late_library"), "{toml}");
+    }
+
+    #[test]
+    fn visibility_lto_and_library_versions_convert() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(vis VERSION 2.1.0 LANGUAGES C CXX)
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN YES)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+add_library(core SHARED core.cpp)
+set_target_properties(core PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 2)
+add_library(plain STATIC plain.c)
+set_target_properties(plain PROPERTIES C_VISIBILITY_PRESET hidden SOVERSION 1)
+add_executable(app main.cpp)
+set_target_properties(app PROPERTIES CXX_VISIBILITY_PRESET default VISIBILITY_INLINES_HIDDEN OFF INTERPROCEDURAL_OPTIMIZATION ON)
+"#;
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("core.cpp", "int core;\n"),
+            ("plain.c", "int plain;\n"),
+            ("main.cpp", "int main() {}\n"),
+        ];
+        let toml = convert_files("visibility", &files);
+
+        // The variables start every target's properties, which a target may change; flags for gcc and clang as CMake
+        // passes them (no preset for clang on Windows, MinGW's own hidden inlines)
+        let presets = "when.\"gcc | (!msvc & !windows)\"]\nflags = ";
+        assert!(toml.contains(&format!("[target.core.{presets}[\"-fvisibility=hidden\"]")), "{toml}");
+        assert!(
+            toml.contains("[target.core.when.\"!msvc & !mingw\"]\nflags = [\"-fvisibility-inlines-hidden\"]"),
+            "{toml}"
+        );
+        assert!(
+            toml.contains("[target.core.when.mingw]\nflags = [\"-fno-keep-inline-dllexport\"]"),
+            "{toml}"
+        );
+        assert!(toml.contains(&format!("[target.plain.{presets}[\"-fvisibility=hidden\"]")), "{toml}");
+        assert!(toml.contains(&format!("[target.app.{presets}[\"-fvisibility=default\"]")), "{toml}");
+        assert_eq!(toml.matches("inline").count(), 2, "{toml}");
+
+        // A shared library's version (the project's as {version}); a static library has none
+        assert!(toml.contains("version = \"{version}\"") && toml.contains("soversion = \"2\""), "{toml}");
+        assert_eq!(toml.matches("soversion").count(), 1, "{toml}");
+
+        // CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE is the release profile's LTO; a target's is a note
+        assert!(toml.contains("[profile.release]\nlto = true"), "{toml}");
+        assert!(
+            toml.contains("INTERPROCEDURAL_OPTIMIZATION: Anvil has no link-time optimization per target"),
+            "{toml}"
+        );
     }
 
     #[test]

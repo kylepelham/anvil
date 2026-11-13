@@ -109,6 +109,9 @@ pub struct Target {
     pub output_name: String,
     pub output_suffix: Option<String>,
     pub output_dir: Option<PathBuf>,
+    /// A shared library's version and ABI version (libfoo.so.1.2.3 known as libfoo.so.1); ignored for other kinds.
+    pub version: Option<String>,
+    pub soversion: Option<String>,
 
     // Files copied beside the output (source, path under `dir`), and whether `anvil install` takes it (None: default)
     pub data: Vec<(PathBuf, PathBuf)>,
@@ -134,6 +137,8 @@ pub struct Target {
     pub vcpkg: Option<(String, Option<Vec<String>>)>,
     /// For External targets: the installed CMake package it is (`cmake = "..."`), for `anvil install`'s CMake files.
     pub cmake_package: Option<crate::vcpkg_tree::CmakePackage>,
+    /// For External targets: it links static libraries that may hold C++ code, so its users link as C++.
+    pub cxx_libraries: bool,
 }
 
 /// Per-file settings, with the patterns compiled.
@@ -220,6 +225,8 @@ struct Accumulated {
     output_name: Option<String>,
     output_suffix: Option<String>,
     output_dir: Option<String>,
+    version: Option<String>,
+    soversion: Option<String>,
     data: Vec<String>,
     /// `data` from [defaults] and presets, which only targets that copy files beside their own take.
     shared_data: Vec<String>,
@@ -345,7 +352,7 @@ impl Target {
             whole_archive_names: Vec::new(),
             whole_archive: Vec::new(),
             std: "c++20".into(),
-            c_std: "c17".into(),
+            c_std: "gnu17".into(),
             warnings: Warnings::Default,
             werror: false,
             arch: None,
@@ -358,6 +365,8 @@ impl Target {
             output_name: name.to_string(),
             output_suffix: None,
             output_dir: None,
+            version: None,
+            soversion: None,
             data: Vec::new(),
             install: None,
             args: Vec::new(),
@@ -376,6 +385,7 @@ impl Target {
             exit_code: None,
             vcpkg: None,
             cmake_package: None,
+            cxx_libraries: false,
         }
     }
 
@@ -659,6 +669,14 @@ impl Target {
         self.output_dir = settings
             .output_dir
             .map(|folder| paths(&[folder]).map(|mut list| list.remove(0)))
+            .transpose()?;
+        self.version = settings
+            .version
+            .map(|text| library_version(&text, "version", scope, &self.name))
+            .transpose()?;
+        self.soversion = settings
+            .soversion
+            .map(|text| library_version(&text, "soversion", scope, &self.name))
             .transpose()?;
         self.export_header = settings.export_header.map(|spec| self.resolve_export_header(spec));
         let mut data = settings.data;
@@ -964,6 +982,8 @@ impl Accumulated {
         set_if_some(&mut self.output_name, &spec.output_name);
         set_if_some(&mut self.output_suffix, &spec.output_suffix);
         set_if_some(&mut self.output_dir, &spec.output_dir);
+        set_if_some(&mut self.version, &spec.version);
+        set_if_some(&mut self.soversion, &spec.soversion);
         set_if_some(&mut self.install, &spec.install);
         set_if_some(&mut self.workdir, &spec.workdir);
         set_if_some(&mut self.timeout, &spec.timeout);
@@ -991,6 +1011,20 @@ impl Accumulated {
     }
 }
 
+/// A `version` or `soversion` with its placeholders ({version}): numbers and letters joined by dots ("1.2.3", "1").
+fn library_version(text: &str, key: &str, scope: &PackageScope, target_name: &str) -> Result<String> {
+    let version = expand_placeholders(text, scope, target_name);
+    let valid = !version.is_empty()
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|character| character.is_ascii_alphanumeric()));
+    if !valid {
+        bail!("{key} = \"{text}\": a library version is numbers joined by dots, such as \"1.2.3\" (or \"{{version}}\", the project's)");
+    }
+
+    Ok(version)
+}
+
 /// The source patterns of a when block and those inside it.
 fn collect_sources(spec: &TargetSpec, patterns: &mut Vec<String>) {
     patterns.extend(spec.sources.iter().flatten().cloned());
@@ -1000,7 +1034,8 @@ fn collect_sources(spec: &TargetSpec, patterns: &mut Vec<String>) {
 }
 
 /// Expands globs (`*`, `**`, `{a,b}`) relative to `dir`; `!pattern` removes matches (`!folder` everything in it). A
-/// plain path must exist unless it lies in the output folder (generated). Results are sorted and without duplicates.
+/// plain path must exist unless it lies in the output folder (generated). Results keep the list's order (a glob's
+/// files sorted), without duplicates.
 pub fn expand_patterns(dir: &Path, patterns: &[String], out_root: &Path, check_literals: bool) -> Result<Vec<PathBuf>> {
     expand_pattern_list(dir, patterns, out_root, check_literals, true)
 }
@@ -1029,23 +1064,24 @@ fn expand_pattern_list(dir: &Path, patterns: &[String], out_root: &Path, check_l
             continue;
         }
 
-        let found = walk_glob(dir, pattern, out_root)?;
+        // One glob's files sorted (the walk's order differs between systems)
+        let mut found = walk_glob(dir, pattern, out_root)?;
         if found.is_empty() && warn_empty {
             crate::ui::warn(&format!("\"{pattern}\" matches no files (in {})", slash(dir)));
         }
+        found.sort_by_cached_key(|file| util::path_key(file));
         included.extend(found);
     }
 
-    // Remove exclusions, sort, drop duplicates
+    // Remove exclusions and duplicates, keeping the list's order (it is the link order, which can matter as in CMake)
     if has_excludes {
         let excludes = excludes.build()?;
         included.retain(|file| !excludes.is_match(slash(file)));
     }
-    let mut keyed: Vec<(String, PathBuf)> = included.into_iter().map(|file| (util::path_key(&file), file)).collect();
-    keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-    keyed.dedup_by(|right, left| right.0 == left.0);
+    let mut seen = HashSet::new();
+    included.retain(|file| seen.insert(util::path_key(file)));
 
-    Ok(keyed.into_iter().map(|(_, file)| file).collect())
+    Ok(included)
 }
 
 /// Splits `!` exclusions from a list of patterns: (patterns, exclusions without the `!`).
@@ -1427,6 +1463,16 @@ mod tests {
         assert_eq!(names(&["src/**/*.cpp"]), ["src/a.cpp", "src/b.cpp", "src/old/c.cpp"]);
         assert_eq!(names(&["src/**/*.cpp", "!src/old"]), ["src/a.cpp", "src/b.cpp"]);
         assert_eq!(names(&["src/*.cpp", "!src/b.cpp"]), ["src/a.cpp"]);
+
+        // Listed files keep the list's order (the link order); a glob's are sorted; a repeat keeps its first place
+        assert_eq!(
+            names(&["src/b.cpp", "src/old/c.cpp", "src/a.cpp"]),
+            ["src/b.cpp", "src/old/c.cpp", "src/a.cpp"]
+        );
+        assert_eq!(
+            names(&["src/old/c.cpp", "src/*.cpp", "src/a.cpp"]),
+            ["src/old/c.cpp", "src/a.cpp", "src/b.cpp"]
+        );
 
         // A file listed twice, in another case on Windows, once
         if cfg!(windows) {

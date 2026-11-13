@@ -4510,3 +4510,218 @@ fn cmake_packages_of_the_system_linux() {
     assert_eq!(program_output(&run), "{\"answer\":42}");
     assert!(!project.read("out/compile_commands.json").contains("\"/usr/include\""));
 }
+
+// Link order and link driver: objects link in the order the sources are listed (a glob's sorted), as in CMake; a
+// binary with no C++ in it (nor in the static libraries it links) links through the C compiler; C is GNU C by default
+
+/// The link command `anvil build -v` printed for `output` (a file name such as "app.exe").
+fn link_line(run: &Run, output: &str) -> String {
+    let gnu = |line: &str| line.ends_with(&format!("/{output}")) || line.ends_with(&format!("\\{output}"));
+    let msvc = |line: &str| line.contains("/OUT:") && line.contains(output);
+    run.output()
+        .lines()
+        .find(|line| !line.starts_with('[') && (gnu(line) || msvc(line)))
+        .unwrap_or_else(|| panic!("no link command for {output}\n{}", run.output()))
+        .to_string()
+}
+
+fn link_order_and_driver(toolchain: &str, test: &str) {
+    let project = Project::empty(test);
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"order\"\n\n[target.core]\nkind = \"lib\"\nsources = [\"core/*.cpp\"]\n\n\
+         [target.app]\nkind = \"exe\"\nsources = [\"src/zeta.c\", \"src/main.c\", \"more/*.c\"]\n\n\
+         [target.mixed]\nkind = \"exe\"\nsources = [\"src/main.c\", \"src/zeta.c\", \"more/*.c\"]\ndeps = [\"core\"]\n",
+    );
+    project.write("src/zeta.c", "int zeta(void) { return 1; }\n");
+    project.write("more/beta.c", "int beta(void) { return 2; }\n");
+    project.write("more/alpha.c", "int alpha(void) { return 3; }\n");
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\nint zeta(void); int alpha(void); int beta(void);\n\
+         int main(void) { printf(\"%d\\n\", zeta() + alpha() + beta()); return 0; }\n",
+    );
+    project.write("core/core.cpp", "#include <string>\nstd::string core_name() { return \"core\"; }\n");
+
+    let build = project.anvil(&["build", "-v", "--toolchain", toolchain]);
+    build.success();
+    let exe = if cfg!(windows) { ".exe" } else { "" };
+
+    // The listed order, a glob's files sorted
+    let app = link_line(&build, &format!("app{exe}"));
+    let position = |name: &str| app.find(name).unwrap_or_else(|| panic!("{name} is not linked: {app}"));
+    assert!(
+        position("zeta.c") < position("main.c") && position("main.c") < position("alpha.c"),
+        "{app}"
+    );
+    assert!(position("alpha.c") < position("beta.c"), "{app}");
+
+    // gcc and clang (outside the MSVC ABI) link C through the C compiler, and C++ (a static library's too) through
+    // the C++ one
+    let mixed = link_line(&build, &format!("mixed{exe}"));
+    let driver = |line: &str| match line.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next().unwrap().to_string(),
+        None => line.split(' ').next().unwrap().to_string(),
+    };
+    if toolchain == "gcc" || (toolchain == "clang" && !cfg!(windows)) {
+        assert!(!driver(&app).contains("++"), "{app}");
+        assert!(driver(&mixed).contains("++"), "{mixed}");
+    }
+    if toolchain != "msvc" {
+        assert!(build.output().contains("-std=gnu17"), "{}", build.output());
+    }
+
+    // The same plan next time: nothing relinks
+    project.anvil(&["build", "--toolchain", toolchain]).success().up_to_date();
+    let run = project.anvil(&["run", "app", "--toolchain", toolchain]);
+    run.success();
+    assert_eq!(program_output(&run), "6");
+}
+
+#[test]
+fn link_order_and_driver_gcc() {
+    require!("gcc");
+    link_order_and_driver("gcc", "link_order_gcc");
+}
+
+#[test]
+fn link_order_and_driver_clang() {
+    require!("clang");
+    link_order_and_driver("clang", "link_order_clang");
+}
+
+#[test]
+fn link_order_and_driver_msvc() {
+    require!("msvc");
+    link_order_and_driver("msvc", "link_order_msvc");
+}
+
+// GNU C by default: glibc declares POSIX functions (strdup); strict c17 hides them
+#[test]
+#[cfg(target_os = "linux")]
+fn c_is_gnu_c_unless_strict() {
+    require!("default");
+    let project = Project::empty("gnu_c");
+    project.write("anvil.toml", "[project]\nname = \"posix\"\n\n[defaults]\nwerror = true\n");
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\
+         int main(void) { char *copy = strdup(\"posix\"); puts(copy); free(copy); return 0; }\n",
+    );
+    let run = project.anvil(&["run"]);
+    run.success();
+    assert_eq!(program_output(&run), "posix");
+
+    project.edit("anvil.toml", "werror = true", "werror = true\nc-std = \"c17\"");
+    project.anvil(&["build"]).code(1).contains("strdup");
+}
+
+// A program named like a built-in system dependency it uses links that dependency, not itself
+#[test]
+fn a_target_named_like_a_system_dependency_uses_it() {
+    require!("default");
+    let project = Project::empty("named_threads");
+    project.write("anvil.toml", "[project]\nname = \"threads\"\n\n[deps]\nthreads = \"system\"\n");
+    project.write("src/main.c", "#include <stdio.h>\nint main(void) { puts(\"own name\"); return 0; }\n");
+    let run = project.anvil(&["run"]);
+    run.success();
+    assert_eq!(program_output(&run), "own name");
+
+    // Naming itself without such a dependency is still an error
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"loop\"\n\n[target.loop]\nkind = \"exe\"\nsources = [\"src/main.c\"]\ndeps = [\"loop\"]\n",
+    );
+    project.anvil(&["build"]).code(1).contains("target `loop` depends on itself");
+}
+
+// A header in two public include folders of a library installs once: the one compiling finds first (a generated
+// config header before the one in the sources, as zlib's zconf.h)
+#[test]
+fn a_header_in_two_include_folders_installs_the_first() {
+    require!("default");
+    let project = Project::empty("header_twice");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"twice\"\nversion = \"1.0.0\"\n\n[[write]]\npath = \"{out}/config/config.h\"\ntext = \"#define CONFIGURED 1\\n\"\n\n\
+         [target.cfg]\nkind = \"lib\"\nsources = [\"src/cfg.c\"]\n\n[target.cfg.public]\ninclude = [\"{out}/config\", \"include\"]\n",
+    );
+    project.write("include/config.h", "#define CONFIGURED 0\n");
+    project.write("src/cfg.c", "#include \"config.h\"\nint configured(void) { return CONFIGURED; }\n");
+
+    project.anvil(&["install", "--prefix", "out/prefix"]).success();
+    assert_eq!(project.read("out/prefix/include/config.h"), "#define CONFIGURED 1\n");
+}
+
+// A converted test that runs its program by its path in CMake's build folder (`./name`) runs the program
+#[test]
+fn converted_tests_run_programs_named_by_build_path() {
+    require!("default");
+    let project = Project::empty("convert_build_path");
+    project.write(
+        "CMakeLists.txt",
+        "cmake_minimum_required(VERSION 3.20)\nproject(paths C)\nenable_testing()\nadd_subdirectory(tests)\n",
+    );
+    project.write(
+        "tests/CMakeLists.txt",
+        "foreach(name first_check second_check)\n  add_executable(${name} ${name}.c)\n  add_test(NAME ${name} COMMAND \"./${name}\")\nendforeach()\n",
+    );
+    project.write("tests/first_check.c", "int main(void) { return 0; }\n");
+    project.write("tests/second_check.c", "int main(void) { return 0; }\n");
+
+    project.anvil(&["convert"]).success();
+    project.anvil(&["test"]).success().contains("Passed 2 of 2");
+}
+
+// A shared library with `version` and `soversion` (Linux): libfoo.so.1.2.3 known by its SONAME libfoo.so.1, the links
+// libfoo.so.1 and libfoo.so beside it, built and installed alike; programs load libfoo.so.1
+#[cfg(target_os = "linux")]
+fn versioned_shared_library(toolchain: &str, test: &str) {
+    let project = Project::fixture("shared", test);
+    project.edit(
+        "anvil.toml",
+        "kind = \"shared\"",
+        "kind = \"shared\"\nversion = \"1.2.3\"\nsoversion = \"1\"",
+    );
+
+    let run = project.anvil(&["run", "app", "--toolchain", toolchain]);
+    run.success();
+    assert_eq!(program_output(&run), "answer 42");
+    let program = project.root.join(run.program());
+    let folder = program.parent().unwrap().to_path_buf();
+    assert_eq!(std::fs::read_link(folder.join("libmylib.so")).unwrap(), Path::new("libmylib.so.1"));
+    assert_eq!(std::fs::read_link(folder.join("libmylib.so.1")).unwrap(), Path::new("libmylib.so.1.2.3"));
+    assert!(dynamic_section(&folder.join("libmylib.so.1.2.3")).contains("Library soname: [libmylib.so.1]"));
+    assert!(dynamic_section(&program).contains("Shared library: [libmylib.so.1]"));
+    project.anvil(&["build", "--toolchain", toolchain]).success().up_to_date();
+
+    // Installed as built; the install runs after a move
+    project.anvil(&["install", "--toolchain", toolchain, "--prefix", "out/prefix"]).success();
+    assert_eq!(
+        std::fs::read_link(project.path("out/prefix/lib/libmylib.so")).unwrap(),
+        Path::new("libmylib.so.1")
+    );
+    assert!(project.path("out/prefix/lib/libmylib.so.1.2.3").is_file());
+    std::fs::rename(project.path("out/prefix"), project.path("moved")).unwrap();
+    assert_eq!(run_alone(&project.path("moved/bin/app")), "answer 42");
+
+    // Without the versions the library is one file again
+    project.edit("anvil.toml", "version = \"1.2.3\"\nsoversion = \"1\"\n", "");
+    project.anvil(&["run", "app", "--toolchain", toolchain]).success();
+    assert!(!folder.join("libmylib.so").is_symlink());
+    assert!(dynamic_section(&folder.join("libmylib.so")).contains("Library soname: [libmylib.so]"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn versioned_shared_library_gcc() {
+    require!("gcc");
+    versioned_shared_library("gcc", "versioned_gcc");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn versioned_shared_library_clang() {
+    require!("clang");
+    versioned_shared_library("clang", "versioned_clang");
+}

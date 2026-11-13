@@ -35,6 +35,8 @@ const CXX_EXTENSIONS: &[&str] = &["cpp", "cc", "cxx", "c++", "cp", "cu", "mm"];
 enum Content {
     Copy(PathBuf),
     Text(String),
+    /// A symbolic link to a file of the same folder, by its name (a versioned library's libfoo.so.1).
+    Link(String),
 }
 
 struct InstallFile {
@@ -395,8 +397,25 @@ impl Installer<'_> {
                 Kind::Shared if windows => &bin,
                 _ => &lib,
             };
-            let location = format!("{folder}/{}", file_name(file));
-            self.add(&location, Content::Copy(file.clone()), &owner, &target.name)?;
+            let mut location = format!("{folder}/{}", file_name(file));
+            let version = match target.kind {
+                Kind::Shared => toolchain.library_version(&file_name(file), target.version.as_deref(), target.soversion.as_deref()),
+                _ => None,
+            };
+            match version {
+                // A versioned library: the file, then the links to it its users load (libfoo.so.1) and link (libfoo.so)
+                Some(version) => {
+                    let linked = location.clone();
+                    location = format!("{folder}/{}", version.file);
+                    self.add(&location, Content::Copy(file.with_file_name(&version.file)), &owner, &target.name)?;
+                    if version.soname != version.file {
+                        let soname = format!("{folder}/{}", version.soname);
+                        self.add(&soname, Content::Link(version.file.clone()), &owner, &target.name)?;
+                    }
+                    self.add(&linked, Content::Link(version.soname.clone()), &owner, &target.name)?;
+                }
+                None => self.add(&location, Content::Copy(file.clone()), &owner, &target.name)?,
+            }
 
             // The PDB the link wrote beside a program or DLL
             let pdb = file.with_extension("pdb");
@@ -469,6 +488,7 @@ impl Installer<'_> {
 
         let mut seen = HashSet::new();
         let mut project_folders = Vec::new();
+        let mut installed = HashSet::new();
         for (position, folder) in folders.into_iter().enumerate().filter(|(_, folder)| seen.insert(util::path_key(folder))) {
             // The project's own folders install (a workspace member's may lie beside it), the build's generated ones
             // too; the rest (an SDK's, vcpkg's in the output folder) stays where it is
@@ -511,9 +531,13 @@ impl Installer<'_> {
                     !extension.as_deref().is_some_and(|extension| SOURCE_EXTENSIONS.contains(&extension))
                 };
                 let Ok(relative) = entry.path().strip_prefix(&folder) else { continue };
-                if wanted {
+
+                // A header of an earlier include folder hides one of the same path, as when compiling (zlib's
+                // generated zconf.h before the one in its sources)
+                let destination = format!("include/{}", slash(relative));
+                if wanted && installed.insert(util::path_key(Path::new(&destination))) {
                     let source = Content::Copy(entry.path().to_path_buf());
-                    self.add(&format!("include/{}", slash(relative)), source, &owner, &target.name)?;
+                    self.add(&destination, source, &owner, &target.name)?;
                     library.has_headers = true;
                 }
             }
@@ -710,6 +734,7 @@ impl Installer<'_> {
             let changed = match &file.content {
                 Content::Copy(source) => copy_if_changed(source, &destination)?,
                 Content::Text(text) => util::write_if_changed(&destination, text.as_bytes())?,
+                Content::Link(name) => link_if_changed(name, &destination)?,
             };
             copied += changed as usize;
             entries.push(ManifestEntry {
@@ -740,7 +765,7 @@ impl Installer<'_> {
             .iter()
             .filter_map(|file| match &file.content {
                 Content::Copy(source) => Some(util::path_key(source)),
-                Content::Text(_) => None,
+                Content::Text(_) | Content::Link(_) => None,
             })
             .collect();
         let mut removed = 0;
@@ -837,6 +862,7 @@ fn same_as_installed(content: &Content, destination: &Path) -> bool {
     match content {
         Content::Copy(source) => std::fs::read(source).is_ok_and(|bytes| bytes == existing),
         Content::Text(text) => text.as_bytes() == existing,
+        Content::Link(name) => std::fs::read_link(destination).is_ok_and(|target| target == Path::new(name)),
     }
 }
 
@@ -1589,6 +1615,7 @@ fn same_content(left: &Content, right: &Content) -> bool {
             util::path_key(left) == util::path_key(right) || std::fs::read(left).ok().is_some_and(|bytes| std::fs::read(right).ok() == Some(bytes))
         }
         (Content::Text(left), Content::Text(right)) => left == right,
+        (Content::Link(left), Content::Link(right)) => left == right,
         _ => false,
     }
 }
@@ -1597,6 +1624,7 @@ fn describe(content: &Content) -> String {
     match content {
         Content::Copy(source) => slash(source),
         Content::Text(_) => "a file Anvil writes".to_string(),
+        Content::Link(name) => format!("a link to {name}"),
     }
 }
 
@@ -1610,7 +1638,27 @@ fn copy_if_changed(source: &Path, destination: &Path) -> Result<bool> {
     if let Some(folder) = destination.parent() {
         std::fs::create_dir_all(folder).with_context(|| format!("creating {}", slash(folder)))?;
     }
+    // A link there (a versioned library's, installed before) is not to be written through
+    if destination.symlink_metadata().is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        std::fs::remove_file(destination).with_context(|| format!("removing {}", slash(destination)))?;
+    }
     std::fs::copy(source, destination).with_context(|| format!("copying {} to {}", slash(source), slash(destination)))?;
+
+    Ok(true)
+}
+
+/// Makes `destination` a symbolic link to `name`, a file of its folder, unless it is one already (a copy of the file
+/// where links need a privilege: Windows).
+fn link_if_changed(name: &str, destination: &Path) -> Result<bool> {
+    if std::fs::read_link(destination).is_ok_and(|target| target == Path::new(name)) {
+        return Ok(false);
+    }
+
+    let _ = std::fs::remove_file(destination);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(name, destination).with_context(|| format!("linking {} to {name}", slash(destination)))?;
+    #[cfg(not(unix))]
+    copy_if_changed(&destination.with_file_name(name), destination)?;
 
     Ok(true)
 }

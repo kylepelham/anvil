@@ -758,9 +758,14 @@ fn run_action(index: usize, action: &Action, low_priority: bool) -> Outcome {
         return outcome;
     }
 
-    // Copies need no process
+    // Copies and links need no process
     if let Some(source) = &action.copy_from {
-        match copy_file(source, &action.outputs[0]) {
+        let made = if action.symlink {
+            make_symlink(source, &action.outputs[0])
+        } else {
+            copy_file(source, &action.outputs[0])
+        };
+        match made {
             Ok(()) => outcome.success = true,
             Err(error) => outcome.error = Some(format!("{}: {error:#}", action.description)),
         }
@@ -1290,6 +1295,19 @@ fn copy_file(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A symbolic link at `link` to `file` of the same folder, by its name (where symbolic links need no privilege; a
+/// copy on Windows).
+fn make_symlink(file: &Path, link: &Path) -> Result<()> {
+    let _ = std::fs::remove_file(link);
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(file.file_name().unwrap(), link).with_context(|| format!("linking {} to {}", link.display(), file.display()))?;
+    #[cfg(not(unix))]
+    copy_file(file, link)?;
+
+    Ok(())
+}
+
 /// Marks an action done for its dependents. Those it frees go to the front of the queue, so archives and links
 /// overlap the remaining compiles instead of waiting behind all of them.
 fn release(index: usize, dependents: &[Vec<usize>], waiting_on: &mut [usize], ready: &mut VecDeque<usize>) {
@@ -1364,7 +1382,8 @@ fn brief_arguments(arguments: &[&str]) -> String {
 /// A printable command line (for --verbose).
 pub fn command_line(action: &Action) -> String {
     if let Some(source) = &action.copy_from {
-        return format!("copy {} {}", source.display(), action.outputs[0].display());
+        let verb = if action.symlink { "symlink" } else { "copy" };
+        return format!("{verb} {} {}", source.display(), action.outputs[0].display());
     }
 
     let mut line = quote_for_display(&action.program.to_string_lossy());

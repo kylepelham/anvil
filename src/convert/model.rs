@@ -90,6 +90,9 @@ pub struct Target {
     /// Anvil keys properties set, each under its condition: output-prefix, output-suffix, exports, link-depends;
     /// and single values set only under a condition (pch, std, kind, ...), which override the target's own there.
     pub settings: Vec<Item<(&'static str, String)>>,
+    /// C_VISIBILITY_PRESET, CXX_VISIBILITY_PRESET and VISIBILITY_INLINES_HIDDEN (the property, its value), each under
+    /// its condition: gcc's and clang's flags for that language's files once the target's languages are known.
+    pub visibility: Vec<Item<(&'static str, String)>>,
     /// add_library without a type under an unset BUILD_SHARED_LIBS: shared when this holds.
     pub shared_condition: Option<String>,
     /// DEFINE_SYMBOL: what a shared build defines instead of `<target>_EXPORTS` (empty: nothing).
@@ -196,6 +199,7 @@ impl Target {
         qualify(&mut self.link_options, condition);
         qualify(&mut self.lib_dirs, condition);
         qualify(&mut self.settings, condition);
+        qualify(&mut self.visibility, condition);
     }
 
     /// Calls `visit` with each item's condition.
@@ -215,6 +219,7 @@ impl Target {
         each(&self.link_options, visit);
         each(&self.lib_dirs, visit);
         each(&self.settings, visit);
+        each(&self.visibility, visit);
     }
 
     /// Keeps the items `keep` (which may change their condition) says to.
@@ -234,6 +239,7 @@ impl Target {
         retain(&mut self.link_options, keep);
         retain(&mut self.lib_dirs, keep);
         retain(&mut self.settings, keep);
+        retain(&mut self.visibility, keep);
     }
 
     pub fn new(name: &str, kind: TargetKind, dir: PathBuf, dir_id: usize, condition: Option<String>) -> Target {
@@ -265,6 +271,7 @@ impl Target {
             notes: Vec::new(),
             imported: false,
             settings: Vec::new(),
+            visibility: Vec::new(),
             shared_condition: None,
             define_symbol: None,
             language_rules: Vec::new(),
