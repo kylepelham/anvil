@@ -97,8 +97,8 @@ enum CommandLine {
         build: BuildArgs,
     },
 
-    /// Build, then copy the programs, libraries and public headers into a prefix (bin/, lib/, include/), with CMake
-    /// and pkg-config files for the libraries.
+    /// Build (with the release profile unless -p names another), then copy the programs, libraries and public headers
+    /// into a prefix (bin/, lib/, include/), with CMake and pkg-config files for the libraries.
     Install {
         /// Targets to install (default: every default program and library).
         targets: Vec<String>,

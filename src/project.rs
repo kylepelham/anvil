@@ -360,6 +360,9 @@ impl Model {
 
         // Every table once, whether or not it applies here
         let check = || -> Result<()> {
+            if let Some(version) = manifest.project.as_ref().and_then(|project| project.version.as_deref()) {
+                check_version(version)?;
+            }
             targets::check_package(&manifest, &self.condition)?;
             Profile::check_all(&manifest.profile)?;
             check_deps(&manifest, &self.condition)
@@ -1749,6 +1752,27 @@ fn package_name(root: &Path, manifest: &Manifest) -> String {
 enum FoundPackage {
     Package(usize),
     Placeholder(usize),
+}
+
+/// Whether a version is one to four numbers separated by dots ("2.1.0"), as CMake and package files read it.
+pub fn is_version(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('.').collect();
+    parts.len() <= 4
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|character| character.is_ascii_digit()))
+}
+
+fn check_version(version: &str) -> Result<()> {
+    if is_version(version) {
+        return Ok(());
+    }
+
+    let hint = match version.strip_prefix(['v', 'V']).filter(|rest| is_version(rest)) {
+        Some(rest) => format!(" (\"{rest}\", without the v)"),
+        None => " (\"2.1.0\")".to_string(),
+    };
+    bail!("[project] version = \"{version}\": write one to four numbers separated by dots{hint}");
 }
 
 /// Where a package's errors come from: its anvil.toml, and its name outside the root package.

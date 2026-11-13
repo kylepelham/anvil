@@ -154,8 +154,8 @@ struct Planner<'a> {
     import_libs: HashMap<usize, PathBuf>,
     runtime_files: HashMap<usize, Vec<PathBuf>>,
 
-    // Runtime files already copied into the output folder (by destination)
-    copies: HashSet<String>,
+    // Runtime and data files already copied into the output folder: by destination, the file and whether it is data
+    copies: HashMap<String, (PathBuf, bool)>,
 
     /// A cross build's programs that build steps run, built for this machine: name -> (program, its action).
     host_tools: HashMap<String, (PathBuf, usize)>,
@@ -488,7 +488,7 @@ impl<'a> Planner<'a> {
             artifacts: HashMap::new(),
             import_libs: HashMap::new(),
             runtime_files: HashMap::new(),
-            copies: HashSet::new(),
+            copies: HashMap::new(),
             host_tools: HashMap::new(),
             named_files: Vec::new(),
         }
@@ -1217,14 +1217,14 @@ impl<'a> Planner<'a> {
             let folder = output.parent().unwrap().to_path_buf();
             let sanitizer_runtime = self.toolchain.sanitizer_runtime(&self.model.profile)?;
             for file in link.runtime_files.iter().chain(&sanitizer_runtime) {
-                self.plan_copy(file, &folder);
+                self.plan_copy_to(file, &folder.join(file.file_name().unwrap()), false)?;
             }
             let runtime_files = link.runtime_files.iter().chain(&sanitizer_runtime).cloned().collect();
             self.runtime_files.insert(index, runtime_files);
 
             // Data files, at their path under the target's folder
             for (file, relative) in &target.data {
-                self.plan_copy_to(file, &folder.join(relative));
+                self.plan_copy_to(file, &folder.join(relative), true)?;
             }
         }
 
@@ -1264,15 +1264,24 @@ impl<'a> Planner<'a> {
         Ok((args, files))
     }
 
-    fn plan_copy(&mut self, file: &Path, folder: &Path) {
-        self.plan_copy_to(file, &folder.join(file.file_name().unwrap()));
-    }
-
-    fn plan_copy_to(&mut self, file: &Path, destination: &Path) {
+    /// Copies a runtime or data file into the output folder once; a data file and another file for one destination
+    /// are an error.
+    fn plan_copy_to(&mut self, file: &Path, destination: &Path, data: bool) -> Result<()> {
         let destination = destination.to_path_buf();
-        if !self.copies.insert(util::path_key(&destination)) {
-            return;
+        if let Some((other, other_data)) = self.copies.get(&util::path_key(&destination)) {
+            if (data || *other_data) && util::path_key(other) != util::path_key(file) {
+                let root = &self.model.root;
+                let describe = |path: &Path, data: bool| format!("{} {}", if data { "data file" } else { "runtime file" }, util::rel(path, root));
+                bail!(
+                    "the {} and the {} would both be copied to {}; rename the data file, or move it to a subfolder",
+                    describe(other, *other_data),
+                    describe(file, data),
+                    util::rel(&destination, root)
+                );
+            }
+            return Ok(());
         }
+        self.copies.insert(util::path_key(&destination), (file.to_path_buf(), data));
 
         let shown = util::strip_prefix_ci(&destination, &self.model.out_dir)
             .map(|relative| slash(&relative))
@@ -1283,6 +1292,8 @@ impl<'a> Planner<'a> {
         action.inputs = vec![file.to_path_buf()];
         action.outputs = vec![destination];
         self.push(action);
+
+        Ok(())
     }
 
     /// Build steps: returns the generated files that should be compiled.

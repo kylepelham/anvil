@@ -1629,7 +1629,7 @@ impl Interpreter {
         if is_top_level {
             self.set_variable("CMAKE_PROJECT_NAME", name);
             self.project_name = Some(name.clone());
-            self.project_version = (!version.is_empty()).then_some(version);
+            self.project_version = crate::project::is_version(&version).then_some(version);
         }
     }
 

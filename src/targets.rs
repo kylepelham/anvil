@@ -216,6 +216,8 @@ struct Accumulated {
     output_suffix: Option<String>,
     output_dir: Option<String>,
     data: Vec<String>,
+    /// `data` from [defaults] and presets, which only targets that copy files beside their own take.
+    shared_data: Vec<String>,
     install: Option<bool>,
     file_rules: Vec<FileRule>,
     runs: Vec<RunSpec>,
@@ -243,6 +245,18 @@ enum Table {
     Target,
     When,
     Shared,
+    /// A when block of `[defaults]` or a preset.
+    SharedWhen,
+}
+
+impl Table {
+    /// The table of a when block inside this one.
+    fn when(self) -> Table {
+        match self {
+            Table::Shared | Table::SharedWhen => Table::SharedWhen,
+            _ => Table::When,
+        }
+    }
 }
 
 impl Kind {
@@ -643,7 +657,11 @@ impl Target {
             .map(|folder| paths(&[folder]).map(|mut list| list.remove(0)))
             .transpose()?;
         self.export_header = settings.export_header.map(|spec| self.resolve_export_header(spec));
-        self.data = resolve_data(&settings.data, &dir, scope, &self.name, self.kind)?;
+        let mut data = settings.data;
+        if copies_data(self.kind) {
+            data.splice(0..0, settings.shared_data);
+        }
+        self.data = resolve_data(&data, &dir, scope, &self.name, self.kind)?;
         self.install = settings.install;
 
         // The export header is on the public include path, and exports while the target builds as a shared library
@@ -771,8 +789,8 @@ fn check_spec(spec: &TargetSpec, table: Table, condition: &CondContext) -> Resul
     if table != Table::Target && target_only {
         bail!("dir, if, default and preset belong to a [target] table, not to [defaults], a preset or a when block");
     }
-    if table == Table::Shared && spec.kind.is_some() {
-        bail!("kind belongs to a [target] table or its when blocks, not to [defaults] or a preset");
+    if matches!(table, Table::Shared | Table::SharedWhen) && spec.kind.is_some() {
+        bail!("kind belongs to a [target] table or its when blocks, not to [defaults], a preset or their when blocks");
     }
 
     // Values
@@ -816,7 +834,7 @@ fn check_spec(spec: &TargetSpec, table: Table, condition: &CondContext) -> Resul
     for (text, block) in &spec.when {
         let context = || format!("in when.\"{text}\"");
         condition.check(text).with_context(context)?;
-        check_spec(block, Table::When, condition).with_context(context)?;
+        check_spec(block, table.when(), condition).with_context(context)?;
     }
 
     Ok(())
@@ -859,12 +877,12 @@ impl Accumulated {
         if table != Table::Target && target_only {
             bail!("dir, if, default and preset belong to a [target] table, not to [defaults], a preset or a when block");
         }
-        if table == Table::Shared && spec.kind.is_some() {
-            bail!("kind belongs to a [target] table or its when blocks, not to [defaults] or a preset");
+        if matches!(table, Table::Shared | Table::SharedWhen) && spec.kind.is_some() {
+            bail!("kind belongs to a [target] table or its when blocks, not to [defaults], a preset or their when blocks");
         }
 
         // Sources: a when block's belong to its condition
-        if table == Table::When {
+        if matches!(table, Table::When | Table::SharedWhen) {
             self.when_sources.extend(spec.sources.iter().flatten().cloned());
         } else {
             replace_or_extend(&mut self.sources, &spec.sources);
@@ -905,7 +923,10 @@ impl Accumulated {
         self.needs.extend(spec.needs.iter().flatten().cloned());
         self.link_depends.extend(spec.link_depends.iter().flatten().cloned());
         self.whole_archive.extend(spec.whole_archive.iter().flatten().cloned());
-        self.data.extend(spec.data.iter().flatten().cloned());
+        match table {
+            Table::Shared | Table::SharedWhen => self.shared_data.extend(spec.data.iter().flatten().cloned()),
+            _ => self.data.extend(spec.data.iter().flatten().cloned()),
+        }
         self.cuda_flags.extend(spec.cuda_flags.iter().flatten().cloned());
         if let Some(cuda_arch) = &spec.cuda_arch {
             self.cuda_arch = Some(cuda_arch.to_vec());
@@ -953,7 +974,7 @@ impl Accumulated {
             collect_sources(block, &mut self.claimed_sources);
             let holds = condition.test(condition_text).with_context(|| format!("in when.\"{condition_text}\""))?;
             if holds {
-                self.apply(block, condition, Table::When)
+                self.apply(block, condition, table.when())
                     .with_context(|| format!("in when.\"{condition_text}\""))?;
             }
         }
@@ -1263,14 +1284,22 @@ fn expand_lib(lib: &str, dir: &Path, scope: &PackageScope, target_name: &str) ->
     }
 }
 
+/// A target that copies data files beside its file: a program or a shared library.
+fn copies_data(kind: Kind) -> bool {
+    matches!(kind, Kind::Exe | Kind::Test | Kind::Shared)
+}
+
 /// `data` patterns: each file they match, with its path under `dir` (where it goes beside the target's file). A
 /// folder stands for everything in it; a pattern that matches nothing is an error.
 fn resolve_data(patterns: &[String], dir: &Path, scope: &PackageScope, target_name: &str, kind: Kind) -> Result<Vec<(PathBuf, PathBuf)>> {
     if patterns.is_empty() {
         return Ok(Vec::new());
     }
-    if !matches!(kind, Kind::Exe | Kind::Test | Kind::Shared) {
+    if !copies_data(kind) {
         bail!("data: a {} target makes no program or shared library to copy files beside", kind.name());
+    }
+    if patterns.iter().all(|pattern| pattern.starts_with('!')) {
+        bail!("data: only `!` patterns, which exclude files; name the files to copy too (data = [\"assets\", \"!assets/raw\"])");
     }
 
     // Each pattern's files, then the `!` exclusions

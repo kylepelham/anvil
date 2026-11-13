@@ -1293,7 +1293,7 @@ fn install_layout(toolchain: Option<&str>, test: &str) {
     let exe = if cfg!(windows) { ".exe" } else { "" };
 
     let first = project.anvil(&with_toolchain(toolchain, &["install"]));
-    first.success().contains("Installed out/install:");
+    first.success().contains("Installed out/install:").contains("Finished release");
     let files = files_under(&project.path("out/install"));
     for expected in [
         format!("bin/tool{exe}"),
@@ -1304,15 +1304,16 @@ fn install_layout(toolchain: Option<&str>, test: &str) {
         "include/geo/util.h".to_string(),
         "lib/cmake/geo/geoConfig.cmake".to_string(),
         "lib/cmake/geo/geoConfigVersion.cmake".to_string(),
+        "lib/cmake/geo/geoTargets-release.cmake".to_string(),
         "lib/pkgconfig/geo.pc".to_string(),
+        "lib/pkgconfig/geo-core.pc".to_string(),
+        "lib/pkgconfig/geo-util.pc".to_string(),
+        "share/geo/install_manifest.txt".to_string(),
     ] {
         assert!(files.contains(&expected), "no {expected} in {files:?}");
     }
-    assert_eq!(
-        files.iter().filter(|file| file.starts_with("lib/") && file.contains("core")).count(),
-        1,
-        "{files:?}"
-    );
+    let in_lib = |file: &&String| file.strip_prefix("lib/").is_some_and(|name| !name.contains('/'));
+    assert_eq!(files.iter().filter(in_lib).filter(|file| file.contains("core")).count(), 1, "{files:?}");
     assert!(!files.iter().any(|file| file.contains("check")), "a test was installed: {files:?}");
 
     // The installed program finds its data beside it
@@ -1331,6 +1332,45 @@ fn install_layout(toolchain: Option<&str>, test: &str) {
         .anvil(&with_toolchain(toolchain, &["install"]))
         .success()
         .contains("0 files copied");
+
+    // A debug install shares the prefix: its programs and libraries go to debug/, the package tells the two apart
+    project
+        .anvil(&with_toolchain(toolchain, &["install", "-p", "debug"]))
+        .success()
+        .contains("Finished debug");
+    let files = files_under(&project.path("out/install"));
+    for expected in [
+        format!("bin/tool{exe}"),
+        format!("debug/bin/tool{exe}"),
+        "debug/bin/assets/maps/one.txt".to_string(),
+        "debug/lib/pkgconfig/geo-core.pc".to_string(),
+        "lib/cmake/geo/geoTargets-debug.cmake".to_string(),
+        "lib/cmake/geo/geoTargets-release.cmake".to_string(),
+    ] {
+        assert!(files.contains(&expected), "no {expected} in {files:?}");
+    }
+    let program = project.path(&format!("out/install/debug/bin/tool{exe}"));
+    assert_eq!(run_installed(&project.path("out/install/debug"), &program), "area 12 map hills");
+    let debug_files = project.read("out/install/lib/cmake/geo/geoTargets-debug.cmake");
+    assert!(
+        debug_files.contains("IMPORTED_LOCATION_DEBUG \"${_IMPORT_PREFIX}/debug/lib/"),
+        "{debug_files}"
+    );
+
+    // What the last install copied and this one does not is removed, and nothing else
+    project.write("core/include/geo/extra.h", "#pragma once\n");
+    project.write("out/install/notes.txt", "mine\n");
+    project.anvil(&with_toolchain(toolchain, &["install"])).success();
+    assert!(project.path("out/install/include/geo/extra.h").is_file());
+    std::fs::remove_file(project.path("core/include/geo/extra.h")).unwrap();
+    project
+        .anvil(&with_toolchain(toolchain, &["install"]))
+        .success()
+        .contains("0 files copied")
+        .contains("1 removed");
+    assert!(!project.path("out/install/include/geo/extra.h").exists());
+    assert!(project.path("out/install/notes.txt").is_file());
+    assert!(project.path(&format!("out/install/debug/bin/tool{exe}")).is_file());
 
     // Shared: the DLL beside the program on Windows, the library in lib/ elsewhere, and its definition for users
     let shared = project.anvil(&with_toolchain(toolchain, &["install", "-o", "SHARED", "--prefix", "out/shared"]));
@@ -1417,6 +1457,149 @@ fn cmake_project_uses_an_installed_library() {
     }
 }
 
+/// Visual Studio's x64 developer environment (vcvarsall), for running CMake with cl.
+#[cfg(windows)]
+fn msvc_environment() -> Vec<(String, String)> {
+    use std::os::windows::process::CommandExt;
+
+    let program_files = std::env::var("ProgramFiles(x86)").expect("ProgramFiles(x86)");
+    let vswhere = Path::new(&program_files).join("Microsoft Visual Studio/Installer/vswhere.exe");
+    let output = Command::new(vswhere)
+        .args(["-latest", "-products", "*", "-property", "installationPath"])
+        .output()
+        .expect("running vswhere");
+    let vcvarsall = Path::new(String::from_utf8_lossy(&output.stdout).trim()).join(r"VC\Auxiliary\Build\vcvarsall.bat");
+
+    let output = Command::new("cmd")
+        .raw_arg(format!("/c \"\"{}\" x64 >nul && set\"", vcvarsall.display()))
+        .output()
+        .expect("running vcvarsall");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
+// A CMake project built with MSVC links the installed libraries built with its own C runtime: a Debug build the debug
+// install's, a Release build the release install's; with only the other one installed, it finds no package
+
+#[test]
+#[cfg(windows)]
+fn cmake_msvc_project_links_the_install_of_its_runtime() {
+    require!("msvc");
+    if !on_path("cmake") || !on_path("ninja") {
+        eprintln!("skipped: cmake and ninja must be on PATH");
+        return;
+    }
+
+    let project = Project::fixture("install", "install_msvc_runtime");
+    let consumer = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/install_consumer");
+    let prefix = project.path("out/prefix");
+    let environment = msvc_environment();
+    let cmake = |args: &[&str]| {
+        let output = Command::new("cmake")
+            .args(args)
+            .envs(environment.iter().cloned())
+            .output()
+            .expect("running cmake");
+        let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        (output.status.success(), text)
+    };
+    let configure = |configuration: &str| {
+        let build = project.path(&format!("consumer-{configuration}"));
+        let _ = std::fs::remove_dir_all(&build);
+        cmake(&[
+            "-S",
+            &consumer.to_string_lossy(),
+            "-B",
+            &build.to_string_lossy(),
+            "-G",
+            "Ninja",
+            &format!("-DCMAKE_BUILD_TYPE={configuration}"),
+            "-DCMAKE_CXX_COMPILER=cl",
+            &format!("-DCMAKE_PREFIX_PATH={}", prefix.to_string_lossy().replace('\\', "/")),
+        ])
+    };
+
+    // Release only: a Debug build would mix the C runtimes
+    project.anvil(&["install", "--toolchain", "msvc", "--prefix", "out/prefix"]).success();
+    let (configured, output) = configure("Debug");
+    assert!(!configured, "a Debug build took the release install:\n{output}");
+    assert!(output.contains("libraries built with the release runtime only"), "{output}");
+
+    // With a debug install too, each configuration links its own
+    project
+        .anvil(&["install", "--toolchain", "msvc", "-p", "debug", "--prefix", "out/prefix"])
+        .success();
+    for (configuration, folder) in [("Debug", "debug/"), ("Release", "")] {
+        let (configured, output) = configure(configuration);
+        assert!(configured, "{output}");
+        let build = project.path(&format!("consumer-{configuration}"));
+        let (built, output) = cmake(&["--build", &build.to_string_lossy()]);
+        assert!(built, "{output}");
+
+        let ninja = std::fs::read_to_string(build.join("build.ninja")).unwrap().replace('\\', "/");
+        assert!(
+            ninja.contains(&format!("out/prefix/{folder}lib/core.lib")),
+            "{configuration} links another core.lib"
+        );
+        assert_eq!(run_installed(&prefix.join(folder), &build.join("app.exe")), "consumer 10");
+    }
+}
+
+// What a library's public include folders install: headers, also extensionless ones, but not what builds the package
+// (sources, build files, tests, other targets' folders, the prefix inside it); a workspace folder beside the member
+// counts as the project's
+
+#[test]
+fn install_takes_headers_and_leaves_the_build_out() {
+    require!("default");
+    let project = Project::empty("install_headers");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"hdrs\"\n\n\
+         [target.eig]\nkind = \"headers\"\npublic.include = [\".\"]\n\n\
+         [target.gen]\nkind = \"lib\"\nsources = [\"src/*.cpp\"]\npublic.include = [\"src\"]\n\n\
+         [target.check]\nkind = \"test\"\nsources = [\"tests/check.cpp\"]\ndeps = [\"gen\"]\n",
+    );
+    for (file, text) in [
+        ("Eig/Core", "#pragma once\n#include \"src/Block.h\"\n"),
+        ("Eig/src/Block.h", "#pragma once\n"),
+        ("NOTES.md", "notes\n"),
+        (".github/check.h", "#pragma once\n"),
+        ("src/gen.h", "#pragma once\nint gen();\n"),
+        ("src/gen.cpp", "#include \"gen.h\"\nint gen() { return 1; }\n"),
+        ("src/CMakeLists.txt", "add_library(gen gen.cpp)\n"),
+        ("src/config.h.in", "#define X @X@\n"),
+        ("src/gen.py", "print(1)\n"),
+        ("tests/check.cpp", "#include \"gen.h\"\nint main() { return gen() - 1; }\n"),
+        ("tests/helper.h", "#pragma once\n"),
+    ] {
+        project.write(file, text);
+    }
+
+    // Twice: the second finds the prefix inside the root folder, and leaves it out
+    project.anvil(&["install", "--prefix", "prefix"]).success();
+    project.anvil(&["install", "--prefix", "prefix"]).success().contains("0 files copied");
+    let headers = files_under(&project.path("prefix/include"));
+    assert_eq!(headers, ["Eig/Core", "Eig/src/Block.h", "gen.h"]);
+
+    // A member's include folder beside it, in the workspace
+    let workspace = Project::empty("install_workspace_headers");
+    workspace.write("anvil.toml", "[workspace]\nmembers = [\"core\"]\n");
+    workspace.write(
+        "core/anvil.toml",
+        "[project]\nname = \"core\"\n\n[target.core]\nkind = \"lib\"\npublic.include = [\"include\", \"../shared\"]\n",
+    );
+    workspace.write("core/src/core.cpp", "int core() { return 1; }\n");
+    workspace.write("core/include/core/core.h", "#pragma once\n");
+    workspace.write("shared/shared/common.h", "#pragma once\n");
+    workspace.anvil(&["install"]).success();
+    let headers = files_under(&workspace.path("out/install/include"));
+    assert_eq!(headers, ["core/core.h", "shared/common.h"]);
+}
+
 // 26. data files go beside the program at their path under the target's folder, and are copied again only when they
 //     change; a pattern that matches nothing is an error
 
@@ -1446,6 +1629,58 @@ fn data_files_copy_beside_the_program_when_changed() {
         .anvil(&["build"])
         .code(1)
         .contains("data: \"sounds/*.wav\" matches no files (in tool)");
+}
+
+// [defaults] data goes to the programs and shared libraries only; data that only excludes, data landing where a DLL
+// is copied, a `v` version, kind in a [defaults] when block and a project that installs nothing are errors
+
+#[test]
+fn data_and_manifest_mistakes() {
+    require!("default");
+    let project = Project::empty("data_mistakes");
+    project.write("src/main.cpp", "int main() {}\n");
+    project.write("lib/f.cpp", "int f() { return 1; }\n");
+    project.write("assets/a.txt", "a\n");
+    project.write("runtime/x.dll", "runtime\n");
+    project.write("x.dll", "data\n");
+    let program = "[target.app]\nkind = \"exe\"\nsources = [\"src/main.cpp\"]\n";
+
+    project.write(
+        "anvil.toml",
+        &format!("[defaults]\ndata = [\"assets\"]\n\n[target.f]\nkind = \"lib\"\nsources = [\"lib/*.cpp\"]\n\n{program}deps = [\"f\"]\n"),
+    );
+    project.anvil(&["build"]).success();
+    assert_eq!(project.read("out/debug/assets/a.txt"), "a\n");
+
+    project.write("anvil.toml", &format!("{program}data = [\"!assets/a.txt\"]\n"));
+    project.anvil(&["targets"]).code(1).contains("data: only `!` patterns");
+
+    project.write(
+        "anvil.toml",
+        &format!("[deps]\nrt = {{ libs = [\"user32\"], runtime = [\"runtime/x.dll\"] }}\n\n{program}deps = [\"rt\"]\ndata = [\"x.dll\"]\n"),
+    );
+    project
+        .anvil(&["build"])
+        .code(1)
+        .contains("the runtime file runtime/x.dll and the data file x.dll would both be copied to out/debug/x.dll");
+
+    project.write("anvil.toml", &format!("[project]\nversion = \"v2.1.0\"\n\n{program}"));
+    project
+        .anvil(&["targets"])
+        .code(1)
+        .contains("[project] version = \"v2.1.0\": write one to four numbers separated by dots (\"2.1.0\", without the v)");
+
+    project.write("anvil.toml", &format!("[defaults.when.windows]\nkind = \"lib\"\n\n{program}"));
+    project
+        .anvil(&["targets"])
+        .code(1)
+        .contains("kind belongs to a [target] table or its when blocks");
+
+    project.write("anvil.toml", &format!("{program}install = false\n"));
+    project
+        .anvil(&["install"])
+        .code(1)
+        .contains("nothing to install: every program and library of the project says `install = false`");
 }
 
 // 27. anvil schema prints the JSON Schemas of anvil.toml and tests.toml; --install writes them to the data folder
