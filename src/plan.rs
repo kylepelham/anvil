@@ -47,6 +47,9 @@ pub struct Action {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Arc<Vec<(String, String)>>,
+    /// A compiler cache the program runs through (`sccache cl ...`): left out of the hash and compile_commands.json,
+    /// so turning it on or off rebuilds nothing.
+    pub launcher: Option<PathBuf>,
     pub workdir: Option<PathBuf>,
     pub response: ResponseStyle,
 
@@ -185,6 +188,7 @@ impl Action {
             program,
             args: Vec::new(),
             env,
+            launcher: None,
             workdir: None,
             response: ResponseStyle::Never,
             inputs: Vec::new(),
@@ -863,6 +867,7 @@ impl<'a> Planner<'a> {
         action.response = self.response_style();
         action.echo_line = self.compiler_echo(source);
         action.color_diagnostics = self.color_diagnostics();
+        action.launcher = self.model.launcher.clone();
 
         self.compile_commands.push(CompileEntry {
             source: source.to_path_buf(),
@@ -913,6 +918,7 @@ impl<'a> Planner<'a> {
         action.after = barrier.to_vec();
         action.response = self.response_style();
         action.color_diagnostics = self.color_diagnostics();
+        action.launcher = self.model.launcher.clone();
 
         let (file, use_args) = match self.toolchain.family {
             // cl: compile a stub source with /Yc; its object links into the target
@@ -2058,6 +2064,17 @@ fn dedup_libs(libs: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launcher_is_not_part_of_the_command() {
+        let mut action = Action::new(ActionKind::Compile, String::new(), PathBuf::from("cl"), Arc::new(Vec::new()));
+        action.args = vec!["/c".into(), "a.cpp".into()];
+        let without = action.compute_command_hash();
+
+        action.launcher = Some(PathBuf::from("sccache"));
+        assert_eq!(action.compute_command_hash(), without);
+        assert_eq!(crate::exec::command_line(&action), "sccache cl /c a.cpp");
+    }
 
     fn values() -> Vec<ShellValue> {
         vec![

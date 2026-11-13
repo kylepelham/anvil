@@ -14,6 +14,9 @@ const CACHE_VERSION: u32 = 5;
 
 const PROBE_SOURCE: &str = "int main() { return 0; }\n";
 
+// Names the compiler cache compiles run through, over the project's `launcher` (for CI)
+const LAUNCHER_VARIABLE: &str = "ANVIL_LAUNCHER";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Family {
     Msvc,
@@ -330,6 +333,36 @@ fn resolve_program(text: &str) -> Option<PathBuf> {
     let current_dir = std::env::current_dir().ok()?;
 
     Some(util::absolute(&current_dir, &found))
+}
+
+/// The compiler cache compiles run through: ANVIL_LAUNCHER when it is set (empty turns the cache off), else the
+/// project's `launcher`. A program that is not there is an error: a build quietly going without its cache is slow.
+pub fn find_launcher(configured: Option<&str>, root: &Path) -> Result<Option<PathBuf>> {
+    let (text, source) = match std::env::var(LAUNCHER_VARIABLE) {
+        Ok(text) => (text, LAUNCHER_VARIABLE),
+        Err(_) => match configured {
+            Some(text) => (text.to_string(), "[project] launcher in anvil.toml"),
+            None => return Ok(None),
+        },
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+
+    // A path is the project's (relative to its folder); a name is looked up on PATH
+    let found = if text.contains(['/', '\\']) {
+        Some(util::absolute(root, Path::new(text))).filter(|path| path.is_file())
+    } else {
+        resolve_program(text)
+    };
+
+    match found {
+        Some(program) => Ok(Some(program)),
+        None => bail!(
+            "{source}: no program `{text}` (on PATH or as a path); install it, or set {LAUNCHER_VARIABLE}= (empty) to build without a compiler cache"
+        ),
+    }
 }
 
 /// Does a generic compiler name (c++, and on macOS g++ too) stand for clang (`--version`)?

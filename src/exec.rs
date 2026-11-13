@@ -691,7 +691,8 @@ fn run_action(index: usize, action: &Action, low_priority: bool) -> Outcome {
             return outcome;
         }
         Err(error) => {
-            outcome.error = Some(format!("{}: could not start {}: {error}", action.description, action.program.display()));
+            let program = action.launcher.as_ref().unwrap_or(&action.program);
+            outcome.error = Some(format!("{}: could not start {}: {error}", action.description, program.display()));
             return outcome;
         }
     };
@@ -835,7 +836,14 @@ fn hash_objects(action: &Action, output_mtimes: &[Option<i64>], stamps: &Stamps)
 }
 
 fn build_command(action: &Action, low_priority: bool) -> Result<Command> {
-    let mut command = Command::new(&action.program);
+    let mut command = match &action.launcher {
+        Some(launcher) => {
+            let mut command = Command::new(launcher);
+            command.arg(&action.program);
+            command
+        }
+        None => Command::new(&action.program),
+    };
     command.envs(action.env.iter().cloned());
     if let Some(workdir) = &action.workdir {
         command.current_dir(workdir);
@@ -1190,6 +1198,9 @@ pub fn command_line(action: &Action) -> String {
     }
 
     let mut line = quote_for_display(&action.program.to_string_lossy());
+    if let Some(launcher) = &action.launcher {
+        line = format!("{} {line}", quote_for_display(&launcher.to_string_lossy()));
+    }
     for argument in &action.args {
         line.push(' ');
         if action.raw_args {

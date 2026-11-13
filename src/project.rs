@@ -95,6 +95,8 @@ pub struct Model {
 
     pub profile: Profile,
     pub toolchain: Toolchain,
+    /// The compiler cache C and C++ compiles run through (crate::toolchain::find_launcher).
+    pub launcher: Option<PathBuf>,
     pub condition: CondContext,
     pub default_run: Option<String>,
 
@@ -133,6 +135,7 @@ impl Model {
         let requested = options.toolchain.clone().or(project.toolchain.clone()).or(Settings::load().toolchain);
         let toolchain = Toolchain::find(requested.as_deref(), &platform)?;
         toolchain.adapt_profile(&mut profile)?;
+        let launcher = crate::toolchain::find_launcher(project.launcher.as_deref(), &root)?;
 
         // Output folders: a toolchain or a target machine picked on the command line gets its own
         let out_root = util::absolute(&root, Path::new(project.out.as_deref().unwrap_or("out")));
@@ -174,6 +177,7 @@ impl Model {
             tests: Vec::new(),
             profile,
             toolchain,
+            launcher,
             condition,
             default_run: project.default_run.clone(),
             vcpkg: None,

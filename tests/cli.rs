@@ -563,3 +563,141 @@ fn gui_program_with_main_links_msvc() {
     let project = Project::fixture("gui_main", "gui_main");
     project.anvil(&["build", "--toolchain", "msvc"]).success();
 }
+
+// 18. A compiler cache: a clean rebuild hits it, a header edit still recompiles, and it stays out of the commands
+
+/// A private sccache server for one test (its own cache folder and port), stopped when the test ends.
+struct Sccache {
+    folder: PathBuf,
+    port: String,
+}
+
+impl Sccache {
+    /// Starts the server, or None when sccache is not on PATH.
+    fn start(project: &Project, port: u16) -> Option<Sccache> {
+        let sccache = Sccache {
+            folder: project.path("sccache"),
+            port: port.to_string(),
+        };
+        let started = sccache.command(&["--start-server"]).output().ok()?;
+        assert!(
+            started.status.success(),
+            "sccache --start-server: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        Some(sccache)
+    }
+
+    /// Runs `anvil -C <root> <args>` with this server and without ANVIL_LAUNCHER, so the manifest's `launcher` counts.
+    fn anvil(&self, project: &Project, args: &[&str]) -> Run {
+        let mut command = Command::new(common::ANVIL);
+        command.arg("-C").arg(&project.root).args(args).current_dir(&project.root);
+        command.env("NO_COLOR", "1").env_remove("ANVIL_LAUNCHER");
+        command.env("SCCACHE_DIR", &self.folder).env("SCCACHE_SERVER_PORT", &self.port);
+
+        let started = std::time::Instant::now();
+        let output = command.output().expect("starting anvil");
+        Run {
+            code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+            stderr: String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n"),
+            elapsed: started.elapsed(),
+            command: format!("anvil -C {} {}", project.root.display(), args.join(" ")),
+        }
+    }
+
+    /// The server's cache hits since its statistics were last zeroed.
+    fn hits(&self) -> usize {
+        let output = self.command(&["--show-stats"]).output().expect("running sccache --show-stats");
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("Cache hits "))
+            .unwrap_or_else(|| panic!("no hits in:\n{text}"));
+        line.split_whitespace().last().unwrap().parse().unwrap()
+    }
+
+    fn zero_stats(&self) {
+        self.command(&["--zero-stats"]).output().expect("running sccache --zero-stats");
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new("sccache");
+        command.args(args).env("SCCACHE_DIR", &self.folder).env("SCCACHE_SERVER_PORT", &self.port);
+        command
+    }
+}
+
+impl Drop for Sccache {
+    fn drop(&mut self) {
+        let _ = self.command(&["--stop-server"]).output();
+    }
+}
+
+fn compiler_cache(toolchain: Option<&str>, test: &str, port: u16) {
+    let project = Project::fixture("headers", test);
+    project.write("anvil.toml", "[project]\nname = \"headers\"\nlauncher = \"sccache\"\n");
+    let Some(sccache) = Sccache::start(&project, port) else {
+        eprintln!("skipped: sccache is not on PATH");
+        return;
+    };
+    let anvil = |args: &[&str]| sccache.anvil(&project, &with_toolchain(toolchain, args));
+
+    // The first build fills the cache; after a clean every compile is a hit
+    assert_eq!(anvil(&["build", "-v"]).success().contains("sccache").compiled(), 3);
+    sccache.anvil(&project, &["clean", "--all"]).success();
+    sccache.zero_stats();
+    assert_eq!(anvil(&["build"]).success().compiled(), 3);
+    assert_eq!(sccache.hits(), 3);
+    assert_eq!(program_output(anvil(&["run"]).success()), "4");
+
+    // Headers are still tracked after hits
+    project.write("src/a.h", "#define A_VALUE 3\n");
+    let edited = anvil(&["build"]);
+    assert_eq!(edited.success().compiled(), 2, "{:?}", edited.actions());
+    assert_eq!(program_output(anvil(&["run"]).success()), "8");
+
+    // The cache is not part of any command: turning it off rebuilds nothing, and compile_commands.json omits it
+    project.write("anvil.toml", "[project]\nname = \"headers\"\n");
+    anvil(&["build"]).success().up_to_date();
+    assert!(!project.read("out/compile_commands.json").contains("sccache"));
+}
+
+#[test]
+fn compiler_cache_hits_after_clean() {
+    require!("default");
+    compiler_cache(None, "compiler_cache", 4361);
+}
+
+#[test]
+fn compiler_cache_hits_after_clean_gcc() {
+    require!("gcc");
+    compiler_cache(Some("gcc"), "compiler_cache_gcc", 4362);
+}
+
+#[test]
+fn missing_compiler_cache_is_an_error() {
+    require!("default");
+    let project = Project::fixture("headers", "missing_compiler_cache");
+    project.write("anvil.toml", "[project]\nname = \"headers\"\nlauncher = \"anvil-no-such-cache\"\n");
+
+    let mut command = Command::new(common::ANVIL);
+    command
+        .arg("-C")
+        .arg(&project.root)
+        .arg("build")
+        .env("NO_COLOR", "1")
+        .env_remove("ANVIL_LAUNCHER");
+    let output = command.output().expect("starting anvil");
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("[project] launcher in anvil.toml: no program `anvil-no-such-cache`"),
+        "{text}"
+    );
+
+    // ANVIL_LAUNCHER set empty turns it off
+    command.env("ANVIL_LAUNCHER", "");
+    let output = command.output().expect("starting anvil");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}

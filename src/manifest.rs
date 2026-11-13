@@ -68,6 +68,8 @@ pub struct ProjectSpec {
     pub c_std: Option<String>,
     /// msvc | clang-cl | clang | gcc. Default: the best one installed.
     pub toolchain: Option<String>,
+    /// A compiler cache C and C++ compiles run through: "sccache", "ccache" or a path (ANVIL_LAUNCHER overrides it).
+    pub launcher: Option<String>,
     /// Output folder (default "out").
     pub out: Option<String>,
     /// The executable `anvil run` starts when there are several.
