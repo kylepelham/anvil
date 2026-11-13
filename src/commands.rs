@@ -29,6 +29,9 @@ const PROFILE_MARKER: &str = "profile";
 const OUT_FILES: &[&str] = &[OUT_MARKER, "compile_commands.json"];
 const OUT_FOLDERS: &[&str] = &["vcpkg", "install", "convert-check"];
 
+// Tries at deleting a profile's folder that another clean may be deleting too
+const CLEAN_ATTEMPTS: usize = 3;
+
 // The machines `--target` takes by name, for a mistyped one
 const MACHINES: &[&str] = &["x64", "x86", "arm64", "arm"];
 
@@ -54,25 +57,64 @@ pub fn run(start_dir: &Path, build: &BuildArgs, name: Option<&str>, args: &[Stri
     let target = choose_program(&model, name)?;
     check_runs_here(&model, "run")?;
 
-    let (model, plan) = build_roots(model, build, &[target])?;
-    let program = plan
-        .artifacts
-        .get(&target)
-        .cloned()
-        .with_context(|| format!("`{}` produced no program to run", model.targets[target].name))?;
+    let (model, _plan) = build_roots(model, build, &[target])?;
+    let mut setup = run_setup(&model, target, &std::env::current_dir()?)?;
+    setup.args.extend(args.iter().cloned());
 
     ui::status(
         "Running",
-        &format!("{} {}", util::rel(&program, &std::env::current_dir()?), args.join(" ")),
+        &format!("{} {}", util::rel(&setup.program, &std::env::current_dir()?), setup.args.join(" ")),
     );
     // Ctrl-C reaches the program too: it decides how to end, and Anvil waits for it
     crate::job::FOREGROUND_PROGRAM.store(true, std::sync::atomic::Ordering::Relaxed);
-    let status = std::process::Command::new(&program).args(args).status();
+    let status = std::process::Command::new(&setup.program)
+        .args(&setup.args)
+        .current_dir(&setup.workdir)
+        .envs(setup.env.iter().cloned())
+        .status();
     crate::job::FOREGROUND_PROGRAM.store(false, std::sync::atomic::Ordering::Relaxed);
-    let status = status.with_context(|| format!("starting {}", program.display()))?;
+    let status = status.with_context(|| format!("starting {}", setup.program.display()))?;
     drop(model);
 
     Ok(status.code().unwrap_or(1))
+}
+
+/// How `anvil run` starts a program (and an IDE's debugger with it): the file, its arguments, folder and environment.
+#[derive(Debug)]
+pub struct RunSetup {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub workdir: PathBuf,
+    pub env: Vec<(String, String)>,
+}
+
+/// A test target runs as its test does (its `args`, `workdir` and `env`); another program in `here`, the folder Anvil
+/// was started in.
+pub fn run_setup(model: &Model, target: usize, here: &Path) -> Result<RunSetup> {
+    let program =
+        plan::artifact_path(model, &model.targets[target]).with_context(|| format!("`{}` produces no program to run", model.targets[target].name))?;
+    if model.targets[target].kind != Kind::Test {
+        return Ok(RunSetup {
+            program,
+            args: Vec::new(),
+            workdir: here.to_path_buf(),
+            env: Vec::new(),
+        });
+    }
+
+    // Its test's command is `{target:<itself>} args...`
+    let test = model.target_test(target)?;
+    let args = test.command[1..]
+        .iter()
+        .map(|word| plan::substitute_targets(word, model))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(RunSetup {
+        program,
+        args,
+        workdir: test.workdir,
+        env: test.env,
+    })
 }
 
 pub fn test(start_dir: &Path, build: &BuildArgs, options: &TestArgs) -> Result<i32> {
@@ -226,7 +268,7 @@ pub fn clean(start_dir: &Path, release: bool, profile: Option<&str>, all: bool) 
     for entry in std::fs::read_dir(&out_root).into_iter().flatten().flatten() {
         let ours = entry.path().join(".anvil").is_dir();
         if ours && is_profile_folder(&entry.path(), profile) {
-            std::fs::remove_dir_all(entry.path()).with_context(|| format!("deleting {}", slash(&entry.path())))?;
+            remove_folder(&entry.path())?;
             ui::status("Removed", &slash(&entry.path()));
             removed += 1;
         }
@@ -236,6 +278,19 @@ pub fn clean(start_dir: &Path, release: bool, profile: Option<&str>, all: bool) 
         ui::status("Clean", &format!("nothing built for `{profile}`"));
     }
     Ok(())
+}
+
+/// Deletes a profile's folder. Another `anvil clean` may be deleting it at the same time (an IDE cleans each of its
+/// projects at once): it is done when the folder is gone, whoever deleted it.
+fn remove_folder(folder: &Path) -> Result<()> {
+    for _ in 0..CLEAN_ATTEMPTS {
+        if std::fs::remove_dir_all(folder).is_ok() || !folder.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    std::fs::remove_dir_all(folder).with_context(|| format!("deleting {}", slash(folder)))
 }
 
 /// Whether `folder`, in the output folder, holds a build with `profile`: the profile its build wrote down, else its
@@ -627,6 +682,7 @@ pub fn build_roots(mut model: Model, build: &BuildArgs, roots: &[usize]) -> Resu
     };
 
     let plan = plan::plan(&model, host.as_ref(), roots, ui::color())?;
+    crate::ide::refresh(&model, build);
     let options = ExecOptions {
         jobs: jobs(build),
         keep_going: build.keep_going,
@@ -733,7 +789,7 @@ fn parse_option_overrides(texts: &[String]) -> Result<Vec<(String, bool)>> {
 }
 
 /// The program `anvil run` starts: the named one, [project] default-run, or the only one.
-fn choose_program(model: &Model, name: Option<&str>) -> Result<usize> {
+pub fn choose_program(model: &Model, name: Option<&str>) -> Result<usize> {
     if let Some(name) = name.or(model.default_run.as_deref()) {
         let index = model.find_target(name)?;
         if !model.targets[index].kind.is_executable() {

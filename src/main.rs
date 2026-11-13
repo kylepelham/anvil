@@ -11,6 +11,7 @@ mod depfile;
 mod exec;
 mod export_header;
 mod flags;
+mod ide;
 mod install;
 mod job;
 mod lint;
@@ -187,6 +188,22 @@ enum CommandLine {
 
     /// List the project's targets.
     Targets {
+        /// Print the targets, tests and toolchain as JSON, for editors: each program's file and how `anvil run`
+        /// starts it. Builds and installs nothing.
+        #[arg(long)]
+        json: bool,
+
+        #[command(flatten)]
+        plan: PlanArgs,
+    },
+
+    /// Write the project files of an IDE (vs: a solution and projects; vscode: tasks, launch and settings; clion,
+    /// zed): build, run and debug every program from it. Every build keeps them up to date.
+    Ide {
+        /// The IDEs (default: those set up before, and those whose folders are here).
+        #[arg(value_enum)]
+        ides: Vec<ide::Ide>,
+
         #[command(flatten)]
         plan: PlanArgs,
     },
@@ -491,7 +508,9 @@ fn main() {
         CommandLine::Remove { name } => scaffold::remove(&start_dir, &name).map(|_| 0),
         CommandLine::Convert { path, check: true, plan, .. } => commands::convert_check(&start_dir, path.as_deref(), &BuildArgs::planning(plan)),
         CommandLine::Convert { path, stdout, force, .. } => commands::convert(&start_dir, path.as_deref(), stdout, force).map(|_| 0),
-        CommandLine::Targets { plan } => commands::list_targets(&start_dir, &BuildArgs::planning(plan)).map(|_| 0),
+        CommandLine::Targets { json: true, plan } => ide::print_targets(&start_dir, &BuildArgs::planning(plan)).map(|_| 0),
+        CommandLine::Targets { plan, .. } => commands::list_targets(&start_dir, &BuildArgs::planning(plan)).map(|_| 0),
+        CommandLine::Ide { ides, plan } => ide::setup(&start_dir, &BuildArgs::planning(plan), &ides).map(|_| 0),
         CommandLine::Toolchains { refresh, set_default } => commands::toolchains(refresh, set_default.as_deref()).map(|_| 0),
         CommandLine::Vcpkg { action, args } => commands::vcpkg(&start_dir, action, &args),
         CommandLine::Compdb { plan } => commands::compdb(&start_dir, &BuildArgs::planning(plan)).map(|_| 0),

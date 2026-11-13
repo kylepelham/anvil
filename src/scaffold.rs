@@ -10,9 +10,6 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// What `anvil new` and `anvil init` keep out of git
-const GITIGNORE: &str = "/out/\n/compile_commands.json\n";
-
 // Folders `anvil init` does not take sources from: tests, samples, vendored code, build output
 const NOT_SOURCE_FOLDERS: &[&str] = &[
     "tests",
@@ -96,7 +93,7 @@ pub fn new_project(start_dir: &Path, path: &str, library: bool, shell_dir: &Path
         .with_context(|| format!("`{path}` does not name a folder"))?;
     let identifier = targets::sanitize_name(&name).replace(['-', '.'], "_");
     write_new(&folder.join(MANIFEST_NAME), &project_document(&name).to_string())?;
-    write_new(&folder.join(".gitignore"), GITIGNORE)?;
+    write_new(&folder.join(".gitignore"), &gitignore(&name))?;
 
     if library {
         let header = format!("{}#pragma once\n\n#include <string>\n\nnamespace {identifier} {{\n\nstd::string greeting(const std::string& name);\n\n}} // namespace {identifier}\n", header_block(&format!("{identifier}.h"), &format!("The {name} library.")));
@@ -122,6 +119,12 @@ pub fn new_project(start_dir: &Path, path: &str, library: bool, shell_dir: &Path
     ui::note(&format!("next: cd {relative} && {next}"));
 
     Ok(())
+}
+
+/// What `anvil new` and `anvil init` keep out of git: the build output, and what is written for this machine (the
+/// compilation database, `anvil ide`'s files, Visual Studio's solution and its settings).
+fn gitignore(name: &str) -> String {
+    format!("/out/\n/compile_commands.json\n/.anvil/\n/.vs/\n/{name}.sln\n")
 }
 
 pub fn init(start_dir: &Path) -> Result<()> {
@@ -163,7 +166,7 @@ pub fn init(start_dir: &Path) -> Result<()> {
     std::fs::write(&manifest_path, document.to_string()).with_context(|| format!("writing {}", slash(&manifest_path)))?;
     ui::status("Created", &slash(&manifest_path));
     if !folder.join(".gitignore").exists() {
-        std::fs::write(folder.join(".gitignore"), GITIGNORE)?;
+        std::fs::write(folder.join(".gitignore"), gitignore(&name))?;
     }
 
     // Say what the conventions found

@@ -18,6 +18,9 @@ use std::sync::Arc;
 // The longest object file path, as CMake's CMAKE_OBJECT_PATH_MAX on Windows: tools fail past MAX_PATH (260)
 const OBJECT_PATH_MAX: usize = 250;
 
+// The version of what compile_commands.json holds besides the commands: a new one rewrites it
+const COMPILE_COMMANDS_FORMAT: u8 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
     Compile,
@@ -1984,6 +1987,7 @@ impl<'a> Planner<'a> {
             self.model.out_root.join("compile_commands.json"),
         ];
         let mut fingerprint = Vec::with_capacity(self.compile_commands.len() * 8);
+        fingerprint.push(COMPILE_COMMANDS_FORMAT);
         for entry in &self.compile_commands {
             fingerprint.extend(entry_hash(&entry.source, self.compile_action(entry)).to_le_bytes());
         }
@@ -1997,14 +2001,41 @@ impl<'a> Planner<'a> {
             return Ok(());
         }
 
+        // cl's own folders of system headers (its INCLUDE), which clangd and cpptools would otherwise guess
+        let system_includes: Vec<String> = match self.toolchain.is_msvc_abi() {
+            true => self
+                .toolchain
+                .env
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("INCLUDE"))
+                .flat_map(|(_, value)| std::env::split_paths(value).collect::<Vec<_>>())
+                .filter(|folder| !folder.as_os_str().is_empty())
+                .map(|folder| format!("/external:I{}", path_text(&folder)))
+                .collect(),
+            false => Vec::new(),
+        };
+
         self.add_unplanned_compile_commands(&unplanned);
         let entries: Vec<serde_json::Value> = self
             .compile_commands
             .iter()
             .map(|entry| {
                 let action = self.compile_action(entry);
+                // The source as a word of its own (`/TC file`, not `/Tcfile`) and without /sourceDependencies, so
+                // clangd sees one source, the one it names
                 let mut arguments = vec![path_text(&action.program)];
-                arguments.extend(action.args.iter().cloned());
+                let mut args = action.args.iter();
+                while let Some(arg) = args.next() {
+                    match (arg.as_str(), arg.get(..3)) {
+                        ("/sourceDependencies", _) => drop(args.next()),
+                        (_, Some(language @ ("/Tc" | "/Tp"))) if arg.len() > 3 => {
+                            arguments.push(language.to_uppercase());
+                            arguments.push(arg[3..].to_string());
+                        }
+                        _ => arguments.push(arg.clone()),
+                    }
+                }
+                arguments.extend(system_includes.iter().cloned());
                 serde_json::json!({
                     "directory": path_text(action.workdir.as_deref().unwrap_or(&self.model.root)),
                     "file": path_text(&entry.source),

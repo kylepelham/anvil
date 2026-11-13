@@ -4006,3 +4006,268 @@ fn target_flag_and_unused_dependencies_name_only_what_they_should() {
     project.edit("anvil.toml", "name = \"n\"\n", "name = \"n\"\nversion = \"1.0/beta\"\n");
     project.anvil(&["build"]).code(1).contains("write a version without spaces, `/`");
 }
+
+// 57. IDEs: `anvil targets --json` describes the programs as `anvil run` starts them, without building; `anvil ide`
+// writes Visual Studio's solution (which MSBuild builds through anvil) and VS Code's files (merged into the user's),
+// and every build keeps them up to date
+
+/// `anvil targets --json`, parsed.
+#[track_caller]
+fn targets_json(project: &Project, args: &[&str]) -> serde_json::Value {
+    let mut words = vec!["targets", "--json"];
+    words.extend(args);
+    let run = project.anvil(&words);
+    run.success();
+    serde_json::from_str(&run.stdout).unwrap_or_else(|error| panic!("targets --json is not JSON ({error}):\n{}", run.stdout))
+}
+
+fn find<'a>(list: &'a serde_json::Value, key: &str, name: &str) -> &'a serde_json::Value {
+    list.as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry[key] == name)
+        .unwrap_or_else(|| panic!("no {key} `{name}` in {list:#}"))
+}
+
+#[test]
+fn targets_json_describes_programs_as_run_starts_them() {
+    require!("default");
+    let project = Project::fixture("ide", "targets_json");
+    let description = targets_json(&project, &[]);
+
+    // Nothing built
+    assert!(!project.path("out/debug/obj").exists());
+
+    assert_eq!(description["version"], 1);
+    assert_eq!(description["name"], "idegame");
+    assert_eq!(description["profile"], "debug");
+    assert_eq!(description["default_run"], "game");
+    assert_eq!(description["profiles"], serde_json::json!(["debug", "release"]));
+    assert!(description["toolchain"]["family"].is_string());
+    assert!(["msvc", "gnu"].contains(&description["toolchain"]["abi"].as_str().unwrap()));
+    assert!(description["compile_commands"].as_str().unwrap().ends_with("out/compile_commands.json"));
+    let targets = &description["targets"];
+
+    let core = find(targets, "name", "core");
+    assert_eq!(core["kind"], "lib");
+    assert_eq!(core["runnable"], false);
+    assert!(core["workdir"].is_null());
+
+    let tool = find(targets, "name", "tool");
+    assert_eq!((tool["gui"].clone(), tool["default"].clone()), (true.into(), false.into()));
+
+    // A test target runs with its args, env and workdir
+    let unit = find(targets, "name", "unit");
+    assert_eq!(unit["kind"], "test");
+    assert_eq!(unit["args"], serde_json::json!(["--fast"]));
+    assert_eq!(unit["env"]["UNIT_PROFILE"], "debug");
+    assert_eq!(unit["workdir"], description["root"]);
+
+    // The program file is the one `anvil run` starts, in the folder it was started in
+    let game = find(targets, "name", "game");
+    assert_eq!((game["kind"].clone(), game["runnable"].clone()), ("exe".into(), true.into()));
+    let output = game["output"].as_str().unwrap().to_string();
+    assert!(Path::new(&output).is_absolute(), "{output}");
+    assert_eq!(game["workdir"], description["root"]);
+    let run = project.anvil(&["run", "game"]);
+    run.success().contains("game 2");
+    assert_eq!(project.path(&run.program()), Path::new(&output));
+    assert!(Path::new(&output).is_file());
+
+    // Tests: the program a test of the project runs, and its command
+    let smoke = find(&description["tests"], "name", "smoke");
+    assert_eq!(smoke["program"], "game");
+    assert_eq!(smoke["command"], serde_json::json!([output, "--smoke"]));
+    assert_eq!(find(&description["tests"], "name", "unit")["program"], "unit");
+
+    // Another profile names its own folder and placeholders
+    let release = targets_json(&project, &["-r"]);
+    assert_eq!(release["profile"], "release");
+    let unit = find(&release["targets"], "name", "unit");
+    assert_eq!(unit["env"]["UNIT_PROFILE"], "release");
+    assert!(unit["output"].as_str().unwrap().contains("/out/release/"));
+}
+
+#[test]
+fn anvil_run_of_a_test_target_runs_it_as_its_test() {
+    require!("default");
+    let project = Project::fixture("ide", "run_test_target");
+    project.anvil(&["run", "unit"]).success().contains("unit debug 2");
+    project.anvil(&["test"]).success();
+}
+
+#[test]
+fn ide_vscode_merges_into_the_users_files_and_builds_refresh_them() {
+    require!("default");
+    let project = Project::fixture("ide", "ide_vscode");
+    let launch = "{\n    // My launch configurations\n    \"version\": \"0.2.0\",\n    \"configurations\": [\n        \
+                  // Attach to the game\n        {\n            \"name\": \"Attach\",\n            \"type\": \"cppvsdbg\",\n            \
+                  \"request\": \"attach\",\n        },\n    ]\n}\n";
+    project.write(".vscode/launch.json", launch);
+    project.write(".vscode/settings.json", "{\n    // mine\n    \"editor.tabSize\": 2\n}\n");
+
+    project.anvil(&["ide", "vscode"]).success().contains("Wrote .vscode/tasks.json");
+
+    // The user's entries and comments stay; Anvil's are added
+    let text = project.read(".vscode/launch.json");
+    for kept in ["// My launch configurations", "// Attach to the game", "\"name\": \"Attach\""] {
+        assert!(text.contains(kept), "{text}");
+    }
+    assert!(text.contains("\"name\": \"anvil: game\""), "{text}");
+    assert!(text.contains("\"preLaunchTask\": \"anvil: build game\""), "{text}");
+    assert!(text.contains("\"--fast\""), "{text}");
+    let settings = project.read(".vscode/settings.json");
+    assert!(settings.contains("// mine") && settings.contains("\"editor.tabSize\": 2"), "{settings}");
+    assert!(
+        settings.contains("\"C_Cpp.default.compileCommands\": \"${workspaceFolder}/compile_commands.json\""),
+        "{settings}"
+    );
+    assert!(settings.contains("evenBetterToml.schema.associations"), "{settings}");
+    let tasks = project.read(".vscode/tasks.json");
+    assert!(
+        tasks.contains("\"isDefault\": true") && tasks.contains("$msCompile") && tasks.contains("$gcc"),
+        "{tasks}"
+    );
+    assert!(project.path("compile_commands.json").is_file());
+
+    // A build writes nothing when nothing changed
+    project.anvil(&["build"]).success().lacks("Updated");
+    project.anvil(&["build"]).success().up_to_date().lacks("Updated");
+
+    // A new program appears, a removed one goes, the user's entry stays
+    project.write("extra/src/main.c", "int main(void) { return 0; }\n");
+    project.edit(
+        "anvil.toml",
+        "[target.unit]",
+        "[target.extra]\nkind = \"exe\"\ndir = \"extra\"\n\n[target.unit]",
+    );
+    project.anvil(&["build"]).success().contains("Updated .vscode/launch.json");
+    assert!(project.read(".vscode/launch.json").contains("\"name\": \"anvil: extra\""));
+    project.edit("anvil.toml", "[target.extra]\nkind = \"exe\"\ndir = \"extra\"\n\n", "");
+    project.anvil(&["build"]).success().contains("Updated .vscode/launch.json");
+    let text = project.read(".vscode/launch.json");
+    assert!(!text.contains("anvil: extra") && text.contains("// Attach to the game"), "{text}");
+
+    // A launch configuration deleted by hand comes back on the next build
+    project.write(".vscode/launch.json", launch);
+    project.anvil(&["build"]).success().contains("Updated .vscode/launch.json");
+
+    // `anvil targets --json` agrees with the launch configuration
+    let description = targets_json(&project, &[]);
+    let output = find(&description["targets"], "name", "game")["output"].as_str().unwrap().to_string();
+    let root = description["root"].as_str().unwrap().to_string();
+    let program = output.replace(&root, "${workspaceFolder}");
+    assert!(project.read(".vscode/launch.json").contains(&format!("\"program\": \"{program}\"")));
+
+    // With GCC, clangd may ask the compiler for its system headers, and the debugger is gdb's
+    if common::missing("gcc").is_none() {
+        project.anvil(&["ide", "vscode", "--toolchain", "gcc"]).success();
+        assert!(project.read(".vscode/settings.json").contains("\"--query-driver="));
+        let launch = project.read(".vscode/launch.json");
+        assert!(
+            launch.contains("\"MIMode\": \"gdb\"") && launch.contains("/out/debug-gcc/game.exe"),
+            "{launch}"
+        );
+        assert!(project.read(".anvil/ide.toml").contains("toolchain = \"gcc\""));
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn ide_vs_solution_builds_through_anvil_with_msbuild() {
+    require!("msvc", "windows");
+    let Some(msbuild) = msbuild() else {
+        eprintln!("skipped: no MSBuild");
+        return;
+    };
+    let project = Project::fixture("ide", "ide_vs");
+    project
+        .anvil(&["ide", "vs", "--toolchain", "msvc"])
+        .success()
+        .contains("Wrote idegame.sln");
+
+    // The startup project comes first; each target has a project with a configuration per profile
+    let solution = project.read("idegame.sln");
+    let first = solution.lines().find(|line| line.starts_with("Project(")).unwrap();
+    assert!(first.contains("\"game\""), "{solution}");
+    assert!(
+        solution.contains("Debug|x64 = Debug|x64") && solution.contains("Release|x64 = Release|x64"),
+        "{solution}"
+    );
+    let game = project.read(".anvil/vs/game.vcxproj");
+    assert!(game.contains("build game -p debug --toolchain msvc</NMakeBuildCommandLine>"), "{game}");
+    assert!(game.contains("out\\debug-msvc\\game.exe</NMakeOutput>"), "{game}");
+    assert!(game.contains("out\\release-msvc\\game.exe</LocalDebuggerCommand>"), "{game}");
+    assert!(game.contains("core\\include;") || game.contains("core\\include<"), "{game}");
+    assert!(game.contains("<AdditionalOptions>/std:"), "{game}");
+    let unit = project.read(".anvil/vs/unit.vcxproj");
+    assert!(
+        unit.contains("<LocalDebuggerCommandArguments>--fast</LocalDebuggerCommandArguments>"),
+        "{unit}"
+    );
+    assert!(
+        unit.contains("<LocalDebuggerEnvironment>UNIT_PROFILE=release</LocalDebuggerEnvironment>"),
+        "{unit}"
+    );
+    assert!(project.path(".anvil/vs/core.vcxproj").is_file() && project.path(".anvil/vs/tool.vcxproj").is_file());
+
+    // Building the solution runs anvil
+    let built = msbuild_run(&msbuild, &project, &["idegame.sln", "-p:Configuration=Release", "-p:Platform=x64"]);
+    assert!(built.0, "{}", built.1);
+    assert!(project.path("out/release-msvc/game.exe").is_file(), "{}", built.1);
+    assert!(project.path("out/release-msvc/unit.exe").is_file(), "{}", built.1);
+
+    // A compile error is an MSBuild error with its file and line
+    project.edit("src/main.c", "return 0;", "return undefined_name;");
+    let failed = msbuild_run(
+        &msbuild,
+        &project,
+        &[".anvil/vs/game.vcxproj", "-p:Configuration=Debug", "-p:Platform=x64"],
+    );
+    assert!(!failed.0, "{}", failed.1);
+    let main = project.path("src/main.c").display().to_string().replace('/', "\\");
+    let error_line = failed
+        .1
+        .lines()
+        .find(|line| line.contains("error C2065"))
+        .unwrap_or_else(|| panic!("{}", failed.1));
+    assert!(
+        error_line.to_lowercase().starts_with(&format!("{}(7)", main.to_lowercase())),
+        "{error_line}"
+    );
+}
+
+/// MSBuild of the newest Visual Studio, found by vswhere.
+#[cfg(windows)]
+fn msbuild() -> Option<PathBuf> {
+    let program_files = std::env::var_os("ProgramFiles(x86)")?;
+    let vswhere = Path::new(&program_files).join("Microsoft Visual Studio/Installer/vswhere.exe");
+    let output = Command::new(vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.Component.MSBuild",
+            "-find",
+            "MSBuild\\**\\Bin\\MSBuild.exe",
+        ])
+        .output()
+        .ok()?;
+    let found = String::from_utf8_lossy(&output.stdout).lines().next()?.trim().to_string();
+    (!found.is_empty()).then(|| PathBuf::from(found))
+}
+
+/// Runs MSBuild in the project: whether it succeeded, and what it printed.
+#[cfg(windows)]
+fn msbuild_run(msbuild: &Path, project: &Project, args: &[&str]) -> (bool, String) {
+    let output = Command::new(msbuild)
+        .args(args)
+        .args(["-nologo", "-v:minimal", "-m:1"])
+        .current_dir(&project.root)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("running MSBuild");
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    (output.status.success(), text)
+}

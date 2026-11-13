@@ -253,6 +253,16 @@ fn read_database(file: &Path, build_folder: &Path, model: &Model) -> Result<Data
         root: util::path_key(&model.root),
     };
 
+    // cl's own header folders (its INCLUDE), which Anvil's database names for editors and CMake's leaves out
+    let system_folders: Vec<String> = model
+        .toolchain
+        .env
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("INCLUDE"))
+        .flat_map(|(_, value)| std::env::split_paths(value).collect::<Vec<_>>())
+        .map(|folder| util::path_key(&util::normalize(&folder)))
+        .collect();
+
     let mut files = Database::new();
     for entry in &entries {
         let directory = PathBuf::from(entry["directory"].as_str().unwrap_or_default());
@@ -277,7 +287,8 @@ fn read_database(file: &Path, build_folder: &Path, model: &Model) -> Result<Data
             }
             FlagKind::Include => {
                 let folder = util::absolute(&directory, Path::new(value));
-                if !is_empty_gen_folder(&folder, model) {
+                let system = system_folders.contains(&util::path_key(&util::normalize(&folder)));
+                if !system && !is_empty_gen_folder(&folder, model) {
                     flags.includes.insert(comparable_path(&folder, &prefixes));
                 }
             }
