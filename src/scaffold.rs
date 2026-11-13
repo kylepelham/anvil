@@ -79,7 +79,8 @@ pub struct AddArgs {
     pub dev: bool,
 }
 
-pub fn new_project(start_dir: &Path, path: &str, library: bool) -> Result<()> {
+/// `anvil new`; `shell_dir` is the folder Anvil was started in (before -C), which the hint to `cd` is relative to.
+pub fn new_project(start_dir: &Path, path: &str, library: bool, shell_dir: &Path) -> Result<()> {
     let folder = util::absolute(&std::env::current_dir()?, &start_dir.join(path));
     if folder.exists() && std::fs::read_dir(&folder)?.next().is_some() {
         bail!("{} already exists and is not empty", slash(&folder));
@@ -111,7 +112,11 @@ pub fn new_project(start_dir: &Path, path: &str, library: bool) -> Result<()> {
     let kind = if library { "library" } else { "program" };
     ui::status("Created", &format!("{kind} `{name}` in {}", slash(&folder)));
     let next = if library { "anvil test" } else { "anvil run" };
-    ui::note(&format!("next: cd {path} && {next}"));
+    let mut relative = util::rel(&folder, shell_dir);
+    if relative.contains(' ') {
+        relative = format!("\"{relative}\"");
+    }
+    ui::note(&format!("next: cd {relative} && {next}"));
 
     Ok(())
 }
@@ -135,8 +140,8 @@ pub fn init(start_dir: &Path) -> Result<()> {
         .unwrap_or_else(|| "app".into());
     let mut document = project_document(&name);
 
-    // Sources the conventions find (src/, or files here), else a target over the folders that hold some
-    let conventional = folder.join("src").is_dir() || has_sources_in(&folder, 1);
+    // Sources the conventions find (in src/, or files here), else targets over the folders that hold some
+    let conventional = has_sources_in(&folder.join("src"), 8) || has_sources_in(&folder, 1);
     if !conventional {
         let source_folders = source_folders(&folder);
         if source_folders.is_empty() {
@@ -147,7 +152,9 @@ pub fn init(start_dir: &Path) -> Result<()> {
         }
         document["target"] = toml_edit::table();
         document["target"].as_table_mut().unwrap().set_implicit(true);
-        document["target"][name.as_str()] = target_table(&folder, &source_folders);
+        for (target_name, table) in init_targets(&folder, &name, &source_folders)? {
+            document["target"][target_name.as_str()] = table;
+        }
     }
 
     std::fs::write(&manifest_path, document.to_string()).with_context(|| format!("writing {}", slash(&manifest_path)))?;
@@ -172,8 +179,9 @@ pub fn init(start_dir: &Path) -> Result<()> {
 }
 
 pub fn add(start_dir: &Path, args: &AddArgs) -> Result<()> {
+    // The package the user is in gets the entry; vcpkg settings and vcpkg.json are the project root's
     let (root, manifest) = project::locate(start_dir)?;
-    let manifest_path = root.join(MANIFEST_NAME);
+    let manifest_path = package_manifest_path(start_dir, &root)?;
     let text = match std::fs::read_to_string(&manifest_path) {
         Ok(text) => text,
         Err(_) => project_document(
@@ -264,9 +272,11 @@ pub fn add(start_dir: &Path, args: &AddArgs) -> Result<()> {
 /// `anvil remove <name>`: the [deps] or [dev-deps] entry, the targets' uses of it, and its port in the project's
 /// vcpkg.json when no other entry needs it.
 pub fn remove(start_dir: &Path, name: &str) -> Result<()> {
-    let (root, manifest) = project::locate(start_dir)?;
-    let manifest_path = root.join(MANIFEST_NAME);
+    // The package the user is in loses the entry; vcpkg settings and vcpkg.json are the project root's
+    let (root, workspace_manifest) = project::locate(start_dir)?;
+    let manifest_path = package_manifest_path(start_dir, &root)?;
     let text = std::fs::read_to_string(&manifest_path).with_context(|| format!("reading {}", slash(&manifest_path)))?;
+    let manifest = crate::manifest::parse_str(&text).with_context(|| format!("in {}", slash(&manifest_path)))?;
     let mut document: toml_edit::DocumentMut = text.parse().with_context(|| format!("parsing {}", slash(&manifest_path)))?;
 
     // The entry
@@ -309,19 +319,38 @@ pub fn remove(start_dir: &Path, name: &str) -> Result<()> {
         ui::note(&format!("and from the deps of {}", users.join(", ")));
     }
 
-    // The port in vcpkg.json, unless another entry still uses it
+    // The port in vcpkg.json, unless another entry (of this package or another of the workspace) still uses it
     let Some(port) = port else { return Ok(()) };
-    let still_used = manifest
-        .deps
-        .iter()
-        .chain(&manifest.dev_deps)
-        .filter(|(other, _)| other.as_str() != name)
-        .any(|(other, value)| crate::manifest::parse_dep(other, value).ok().and_then(|spec| spec.vcpkg).as_deref() == Some(port.as_str()));
+    let mut manifests = vec![crate::manifest::parse_str(&document.to_string())?];
+    let mut packages = vec![root.clone()];
+    packages.extend(project::workspace_members(&root, &workspace_manifest)?);
+    for folder in packages {
+        let file = folder.join(MANIFEST_NAME);
+        if file.is_file() && util::path_key(&file) != util::path_key(&manifest_path) {
+            manifests.push(crate::manifest::load(&file)?);
+        }
+    }
+    let still_used = manifests.iter().any(|other| {
+        other
+            .deps
+            .iter()
+            .chain(&other.dev_deps)
+            .any(|(other, value)| crate::manifest::parse_dep(other, value).ok().and_then(|spec| spec.vcpkg).as_deref() == Some(port.as_str()))
+    });
     if !still_used {
-        remove_from_vcpkg_json(&root, &manifest.vcpkg.clone().unwrap_or_default(), &port)?;
+        remove_from_vcpkg_json(&root, &workspace_manifest.vcpkg.clone().unwrap_or_default(), &port)?;
     }
 
     Ok(())
+}
+
+/// The anvil.toml of the package the user is in: the nearest one up from `start_dir` (a workspace member's own, not
+/// the workspace's), else the project root's (which may not exist yet).
+fn package_manifest_path(start_dir: &Path, project_root: &Path) -> Result<PathBuf> {
+    let start = util::absolute(&std::env::current_dir()?, start_dir);
+    let nearest = start.ancestors().find(|folder| folder.join(MANIFEST_NAME).is_file());
+
+    Ok(nearest.unwrap_or(project_root).join(MANIFEST_NAME))
 }
 
 /// A new project's anvil.toml: `[project]` with its name, a version and the default standard.
@@ -336,27 +365,92 @@ fn project_document(name: &str) -> toml_edit::DocumentMut {
     document
 }
 
-/// `[target.<name>]` over folders of sources the conventions do not find: a program when one has a main file.
-fn target_table(root: &Path, folders: &[String]) -> toml_edit::Item {
-    let has_main = folders.iter().any(|folder| {
-        walkdir::WalkDir::new(root.join(folder))
+/// `[target]` tables over folders of sources the conventions do not find: a program per folder with a main file
+/// (named after the project when there is one, else after its folder), and a library of the other folders, which the
+/// programs use. Header-only `include/` and `src/` folders are the library's (or the programs') include folders.
+fn init_targets(root: &Path, name: &str, folders: &[String]) -> Result<Vec<(String, toml_edit::Item)>> {
+    // Folders with a main file; two in one folder would be two programs in one target
+    let mut program_folders = Vec::new();
+    for folder in folders {
+        let mains: Vec<String> = walkdir::WalkDir::new(root.join(folder))
+            .sort_by_file_name()
             .into_iter()
             .flatten()
-            .any(|entry| entry.file_type().is_file() && entry.path().file_stem().is_some_and(|stem| stem == "main"))
-    });
+            .filter(|entry| {
+                entry.file_type().is_file() && is_source_file(entry.path()) && entry.path().file_stem().is_some_and(|stem| stem == "main")
+            })
+            .map(|entry| util::rel(entry.path(), root))
+            .collect();
+        if mains.len() > 1 {
+            bail!(
+                "{folder}/ holds several main files ({}), which `anvil init` cannot split into programs: write [target] tables for them (kind = \"exe\", sources = [...]), or start with `anvil new <name>`",
+                mains.join(", ")
+            );
+        }
+        if mains.len() == 1 {
+            program_folders.push(folder.clone());
+        }
+    }
+    let library_folders: Vec<&String> = folders.iter().filter(|folder| !program_folders.contains(folder)).collect();
+    let header_folders: Vec<&str> = ["include", "src"]
+        .into_iter()
+        .filter(|folder| root.join(folder).is_dir() && !has_sources_in(&root.join(folder), 8))
+        .collect();
+    let globs = |folders: &mut dyn Iterator<Item = &String>| -> toml_edit::Array {
+        folders.map(|folder| format!("{folder}/{}", targets::SOURCE_GLOB)).collect()
+    };
 
-    let mut sources = toml_edit::Array::new();
-    let mut include = toml_edit::Array::new();
-    for folder in folders {
-        sources.push(format!("{folder}/{}", targets::SOURCE_GLOB));
-        include.push(folder.as_str());
+    // The programs: named after the project when there is one
+    let mut programs = Vec::new();
+    for folder in &program_folders {
+        let program_name = if program_folders.len() == 1 {
+            name.to_string()
+        } else {
+            targets::sanitize_name(folder)
+        };
+        let mut include: toml_edit::Array = std::iter::once(folder.as_str()).collect();
+        if library_folders.is_empty() {
+            include.extend(header_folders.iter().copied());
+        }
+
+        let mut table = toml_edit::Table::new();
+        table.insert("kind", toml_edit::value("exe"));
+        table.insert("sources", toml_edit::value(globs(&mut std::iter::once(folder))));
+        table.insert("include", toml_edit::value(include));
+        programs.push((program_name, table));
     }
 
-    let mut table = toml_edit::Table::new();
-    table.insert("kind", toml_edit::value(if has_main { "exe" } else { "lib" }));
-    table.insert("sources", toml_edit::value(sources));
-    table.insert("include", toml_edit::value(include));
-    toml_edit::Item::Table(table)
+    // The library of the rest, named after the project unless a program is
+    let mut targets = Vec::new();
+    if !library_folders.is_empty() {
+        let library_name = if programs.iter().any(|(program, _)| program == name) {
+            format!("{name}_lib")
+        } else {
+            name.to_string()
+        };
+        let mut public = toml_edit::InlineTable::new();
+        let public_include: toml_edit::Array = library_folders
+            .iter()
+            .map(|folder| folder.as_str())
+            .chain(header_folders.iter().copied())
+            .collect();
+        public.insert("include", public_include.into());
+
+        let mut table = toml_edit::Table::new();
+        table.insert("kind", toml_edit::value("lib"));
+        table.insert("sources", toml_edit::value(globs(&mut library_folders.iter().copied())));
+        table.insert("public", toml_edit::value(public));
+        for (_, program) in &mut programs {
+            program.insert(
+                "deps",
+                toml_edit::value(std::iter::once(library_name.as_str()).collect::<toml_edit::Array>()),
+            );
+        }
+        targets.push((library_name, toml_edit::Item::Table(table)));
+    }
+    targets.extend(programs.into_iter().map(|(program, table)| (program, toml_edit::Item::Table(table))));
+
+    Ok(targets)
 }
 
 /// Folders under `root` holding C or C++ sources, outside tests, samples, vendored code and build output.
@@ -377,10 +471,17 @@ fn source_folders(root: &Path) -> Vec<String> {
 
 /// C or C++ files in `folder`, `depth` levels deep.
 fn has_sources_in(folder: &Path, depth: usize) -> bool {
-    walkdir::WalkDir::new(folder).max_depth(depth).into_iter().flatten().any(|entry| {
-        let extension = entry.path().extension().map(|extension| extension.to_string_lossy().to_ascii_lowercase());
-        entry.file_type().is_file() && matches!(extension.as_deref(), Some("c" | "cc" | "cpp" | "cxx" | "c++"))
-    })
+    walkdir::WalkDir::new(folder)
+        .max_depth(depth)
+        .into_iter()
+        .flatten()
+        .any(|entry| entry.file_type().is_file() && is_source_file(entry.path()))
+}
+
+/// A C or C++ source file (not a header).
+fn is_source_file(path: &Path) -> bool {
+    let extension = path.extension().map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+    matches!(extension.as_deref(), Some("c" | "cc" | "cpp" | "cxx" | "c++"))
 }
 
 /// The [deps] value for the arguments, checking the vcpkg port exists.
@@ -452,40 +553,124 @@ fn add_features(item: &mut toml_edit::Item, name: &str, features: &[String]) -> 
     Ok(changed)
 }
 
-/// Takes `name` out of the dependency lists of a target-like table and its when blocks; says whether it was there.
-fn remove_uses(table: &mut toml_edit::Item, name: &str) -> bool {
-    let Some(table) = table.as_table_like_mut() else { return false };
+/// Takes `name` and its `name/<target>` uses out of the dependency lists of a target-like table, its `public` table
+/// and its when blocks; lists, tables and blocks that end up empty go too. Says whether it was there.
+fn remove_uses(item: &mut toml_edit::Item, name: &str) -> bool {
+    let Some(table) = item.as_table_like_mut() else { return false };
     let mut removed = false;
 
     for key in ["deps", "header-deps", "needs", "whole-archive"] {
-        if let Some(list) = table.get_mut(key).and_then(|item| item.as_array_mut()) {
-            let before = list.len();
-            list.retain(|dep| dep.as_str() != Some(name));
-            removed |= list.len() != before;
-
-            // `[a, b]` without `a` is `[b]`, not `[ b]`
-            if let Some(first) = list.get_mut(0) {
-                let inline = first
-                    .decor()
-                    .prefix()
-                    .and_then(|prefix| prefix.as_str())
-                    .is_some_and(|prefix| !prefix.contains('\n'));
-                if inline {
-                    first.decor_mut().set_prefix("");
-                }
+        let Some(list) = table.get_mut(key).and_then(|item| item.as_array_mut()) else {
+            continue;
+        };
+        if remove_from_list(list, name) {
+            removed = true;
+            if list.is_empty() {
+                table.remove(key);
             }
         }
     }
+
     if let Some(public) = table.get_mut("public") {
-        removed |= remove_uses(public, name);
+        if remove_uses(public, name) {
+            removed = true;
+            if public.as_table_like().is_some_and(|public| public.is_empty()) {
+                table.remove("public");
+            }
+        }
     }
+
+    // when blocks: each, then the `when` table itself
+    let mut when_emptied = false;
     if let Some(when) = table.get_mut("when").and_then(|item| item.as_table_like_mut()) {
-        for (_, block) in when.iter_mut() {
-            removed |= remove_uses(block, name);
+        let mut emptied = Vec::new();
+        for (condition, block) in when.iter_mut() {
+            if remove_uses(block, name) {
+                removed = true;
+                if block.as_table_like().is_some_and(|block| block.is_empty()) {
+                    emptied.push(condition.get().to_string());
+                }
+            }
+        }
+        for condition in &emptied {
+            when.remove(condition);
+        }
+        when_emptied = !emptied.is_empty() && when.is_empty();
+    }
+    if when_emptied {
+        table.remove("when");
+    }
+
+    // `{ kind = "exe", deps = [...] }` without deps is `{ kind = "exe" }`
+    if let Some(inline) = item.as_inline_table_mut().filter(|_| removed) {
+        inline.fmt();
+    }
+
+    removed
+}
+
+/// Takes `name` and `name/<target>` out of a list, with the comment on the removed item's line; keeps the comment of
+/// the item before it. Says whether anything went.
+fn remove_from_list(list: &mut toml_edit::Array, name: &str) -> bool {
+    let is_use = |value: &toml_edit::Value| {
+        value
+            .as_str()
+            .is_some_and(|dep| dep == name || dep.strip_prefix(name).is_some_and(|rest| rest.starts_with('/')))
+    };
+    let mut removed = false;
+
+    let mut index = 0;
+    while index < list.len() {
+        if !list.get(index).is_some_and(is_use) {
+            index += 1;
+            continue;
+        }
+
+        let item = list.remove(index);
+        removed = true;
+
+        // What follows it: the next item's prefix, or the list's end
+        let before = item.decor().prefix().and_then(|prefix| prefix.as_str()).unwrap_or_default().to_string();
+        let after = match list.get(index) {
+            Some(next) => next.decor().prefix().and_then(|prefix| prefix.as_str()).unwrap_or_default(),
+            None => list.trailing().as_str().unwrap_or_default(),
+        };
+        let joined = join_around_removed(&before, after);
+        match list.get_mut(index) {
+            Some(next) => next.decor_mut().set_prefix(joined),
+            None => list.set_trailing(joined),
+        }
+    }
+
+    // `[a, b]` without `a` is `[b]`, not `[ b]`
+    if let Some(first) = list.get_mut(0) {
+        let inline = first
+            .decor()
+            .prefix()
+            .and_then(|prefix| prefix.as_str())
+            .is_some_and(|prefix| !prefix.contains('\n'));
+        if inline {
+            first.decor_mut().set_prefix("");
         }
     }
 
     removed
+}
+
+/// The whitespace and comments left where an item was: `before` is what preceded it (its first line ends the line
+/// before: the previous item's comment), `after` what followed it (its first line ends the item's own line: its
+/// comment, which goes with it).
+fn join_around_removed(before: &str, after: &str) -> String {
+    let after = match after.split_once('\n') {
+        Some((own_line, rest)) if own_line.contains('#') => format!("\n{rest}"),
+        _ => after.to_string(),
+    };
+
+    match before.split_once('\n') {
+        Some((previous_line, _)) if after.starts_with('\n') => format!("{previous_line}{after}"),
+        Some(_) => before.to_string(),
+        None => after,
+    }
 }
 
 /// The targets to add the dependency to: --to, else the only non-test target (the only test for --dev).
@@ -708,4 +893,63 @@ fn current_year() -> i64 {
     let month = (5 * day_of_year + 2) / 153;
 
     year_of_era + era * 400 + i64::from(month >= 10)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The document after taking `name` out of every target, preset and [defaults] use.
+    fn without(text: &str, name: &str) -> String {
+        let mut document: toml_edit::DocumentMut = text.parse().unwrap();
+        for section in ["target", "preset"] {
+            if let Some(tables) = document.get_mut(section).and_then(|item| item.as_table_like_mut()) {
+                for (_, table) in tables.iter_mut() {
+                    remove_uses(table, name);
+                }
+            }
+        }
+        document.to_string()
+    }
+
+    #[test]
+    fn remove_takes_uses_with_their_comments() {
+        let text = "[target.app]\ndeps = [\n    \"a\", # about a\n    \"fmt\", # printing\n    \"mylib/core\",\n    \"zlib\", # last\n]\n";
+
+        // The removed item's comment goes, the one before stays
+        assert_eq!(
+            without(text, "fmt"),
+            "[target.app]\ndeps = [\n    \"a\", # about a\n    \"mylib/core\",\n    \"zlib\", # last\n]\n"
+        );
+
+        // `name/target` uses go with the name; so does a comment at the end of the list
+        assert_eq!(
+            without(&without(text, "mylib"), "zlib"),
+            "[target.app]\ndeps = [\n    \"a\", # about a\n    \"fmt\", # printing\n]\n"
+        );
+        assert_eq!(
+            without("[target.app]\ndeps = [\"fmt\", \"b\"]\n", "fmt"),
+            "[target.app]\ndeps = [\"b\"]\n"
+        );
+    }
+
+    #[test]
+    fn remove_drops_lists_and_blocks_left_empty() {
+        let text = "[target.app]\nkind = \"exe\"\nsources = []\ndeps = [\"fmt\"]\nheader-deps = [\"fmt\"]\n\n\
+                    [target.app.public]\ndeps = [\"fmt\"]\n\n[target.app.when.windows]\ndeps = [\"fmt\"]\n\n\
+                    [target.app.when.linux]\ndeps = [\"fmt\", \"x\"]\n\n[preset.p]\ndeps = [\"fmt\"]\n";
+        let result = without(text, "fmt");
+
+        assert!(
+            !result.contains("header-deps") && !result.contains("public") && !result.contains("when.windows"),
+            "{result}"
+        );
+        assert!(
+            result.contains("sources = []") && result.contains("deps = [\"x\"]") && result.contains("[preset.p]"),
+            "{result}"
+        );
+
+        let inline = "[target]\napp = { kind = \"exe\", deps = [\"fmt\"], when = { windows = { deps = [\"fmt\"] } } }\n";
+        assert_eq!(without(inline, "fmt"), "[target]\napp = { kind = \"exe\" }\n");
+    }
 }

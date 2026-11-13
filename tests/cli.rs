@@ -867,3 +867,209 @@ fn tidy_reports_and_fixes_findings_gcc() {
     require!("gcc");
     tidy_reports_and_fixes(Some("gcc"), "tidy_gcc");
 }
+
+// 21. Dependencies: anvil.lock keeps only the pins something declares; dev-deps; anvil remove, init, completions
+
+/// A git repository at `<project>/<folder>` holding a static library `<name>` (and a second one, `<name>_extra`),
+/// tagged v1: its file:/// url and commit.
+fn git_library(project: &Project, folder: &str, name: &str) -> (String, String) {
+    project.write(
+        &format!("{folder}/anvil.toml"),
+        &format!(
+            "[project]\nname = \"{name}\"\n\n[target.{name}]\nkind = \"lib\"\nsources = [\"src/*.c\"]\n\n\
+             [target.{name}_extra]\nkind = \"lib\"\nsources = [\"src/*.c\"]\n"
+        ),
+    );
+    project.write(&format!("{folder}/src/{name}.c"), &format!("int {name}_value(void) {{ return 1; }}\n"));
+
+    let repository = project.path(folder);
+    git(&repository, &["init", "--quiet"]);
+    git(&repository, &["add", "-A"]);
+    git(&repository, &["commit", "--quiet", "-m", "one"]);
+    git(&repository, &["tag", "v1"]);
+
+    let url = format!("file:///{}", repository.display().to_string().replace('\\', "/").trim_start_matches('/'));
+    (url, git(&repository, &["rev-parse", "v1^{commit}"]))
+}
+
+#[test]
+fn lock_keeps_only_declared_pins() {
+    require!("default", "git");
+    let project = Project::empty("lock_declared");
+    let (alpha, alpha_commit) = git_library(&project, "alpha", "alpha");
+    let (beta, beta_commit) = git_library(&project, "beta", "beta");
+    let _checkouts = GitCheckouts(vec![alpha_commit, beta_commit]);
+
+    // `opt` (a path dependency behind an option) declares `beta`; the project itself `alpha`
+    project.write(
+        "app/anvil.toml",
+        &format!("[project]\nname = \"app\"\n\n[options]\nwithopt = false\n\n[deps]\nalpha = {{ git = \"{alpha}\", tag = \"v1\" }}\nopt = {{ path = \"opt\", if = \"withopt\" }}\n"),
+    );
+    project.write("app/src/main.c", "int main(void) { return 0; }\n");
+    project.write(
+        "app/opt/anvil.toml",
+        &format!("[project]\nname = \"opt\"\n\n[deps]\nbeta = {{ git = \"{beta}\", tag = \"v1\" }}\n"),
+    );
+    project.write("app/opt/src/opt.c", "int opt_value(void) { return 1; }\n");
+
+    // beta's pin, made with the option on, stays while opt is off, and --locked accepts the lock either way
+    project.anvil_in("app", &["build", "-o", "withopt"]).success();
+    assert!(project.read("app/anvil.lock").contains("parent = \"opt\""));
+    project.anvil_in("app", &["build"]).success();
+    project.anvil_in("app", &["build", "--locked"]).success();
+    project.anvil_in("app", &["build", "--locked", "-o", "withopt"]).success();
+    assert!(project.read("app/anvil.lock").contains("[git.beta]"));
+
+    // Once opt no longer declares it, it goes
+    project.edit("app/opt/anvil.toml", "beta = ", "# beta = ");
+    project.anvil_in("app", &["build", "-o", "withopt"]).success().contains("beta: removed");
+    assert!(!project.read("app/anvil.lock").contains("beta"));
+
+    // A gated git dependency whose tag changed: --locked notices without fetching it
+    project.edit(
+        "app/anvil.toml",
+        "[deps]\n",
+        &format!("[deps]\ngated = {{ git = \"{beta}\", tag = \"v1\", if = \"withopt\" }}\n"),
+    );
+    project.anvil_in("app", &["build", "-o", "withopt"]).success();
+    project.edit("app/anvil.toml", "tag = \"v1\", if", "branch = \"main\", if");
+    project
+        .anvil_in("app", &["build", "--locked"])
+        .code(1)
+        .contains("pins git dependency `gated`");
+}
+
+#[test]
+fn targets_lists_package_targets_of_unfetched_git_dependency() {
+    require!("default", "git");
+    let project = Project::empty("list_unfetched");
+    let (alpha, alpha_commit) = git_library(&project, "alpha", "alpha");
+    let _checkouts = GitCheckouts(vec![alpha_commit]);
+
+    project.write(
+        "app/anvil.toml",
+        &format!("[project]\nname = \"app\"\n\n[deps]\nalpha = {{ git = \"{alpha}\", tag = \"v1\" }}\n\n[target.app]\nkind = \"exe\"\ndeps = [\"alpha/alpha_extra\"]\n"),
+    );
+    project.write("app/src/main.c", "int alpha_value(void);\nint main(void) { return alpha_value() - 1; }\n");
+
+    // Listing fetches nothing, then a build fetches and links the named target
+    project.anvil_in("app", &["targets"]).success().contains("-> alpha").lacks("Fetching");
+    project.anvil_in("app", &["run"]).success();
+    project.anvil_in("app", &["targets"]).success().contains("-> alpha_extra");
+}
+
+#[test]
+fn dev_deps_reach_test_support_libraries_only() {
+    require!("default");
+    let project = Project::empty("dev_deps_support");
+    project.write(
+        "helper/anvil.toml",
+        "[project]\nname = \"helper\"\n\n[target.helper]\nkind = \"lib\"\nsources = [\"*.c\"]\n",
+    );
+    project.write("helper/helper.c", "int helper_value(void) { return 0; }\n");
+    project.write(
+        "src/support.c",
+        "int helper_value(void);\nint support_value(void) { return helper_value(); }\n",
+    );
+    project.write("tests/t.c", "int support_value(void);\nint main(void) { return support_value(); }\n");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"app\"\n\n[dev-deps]\nhelper = { path = \"helper\" }\n\n\
+         [target.support]\nkind = \"lib\"\nsources = [\"src/support.c\"]\ndeps = [\"helper\"]\n\n\
+         [target.t]\nkind = \"test\"\nsources = [\"tests/t.c\"]\ndeps = [\"support\"]\n",
+    );
+
+    // A library only tests link may use a dev-dep
+    project.anvil(&["test"]).success();
+
+    // Not once a program uses it; nor through header-deps
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+    project.edit(
+        "anvil.toml",
+        "[target.t]",
+        "[target.app]\nkind = \"exe\"\nsources = [\"src/main.c\"]\ndeps = [\"support\"]\n\n[target.t]",
+    );
+    project
+        .anvil(&["build"])
+        .code(1)
+        .contains("`support` is used by `app` (exe), which is not a test");
+    project.edit(
+        "anvil.toml",
+        "deps = [\"support\"]\n\n[target.t]",
+        "header-deps = [\"helper\"]\n\n[target.t]",
+    );
+    project
+        .anvil(&["build"])
+        .code(1)
+        .contains("target `app` (exe) uses `helper`, which is under [dev-deps]");
+}
+
+#[test]
+fn remove_takes_every_use_in_the_member_it_runs_in() {
+    let project = Project::empty("remove_uses");
+    project.write("anvil.toml", "[workspace]\nmembers = [\"app\"]\n\n[deps]\nmylib = \"system\"\n");
+    project.write(
+        "app/anvil.toml",
+        "[project]\nname = \"app\"\n\n[deps]\nmylib = { path = \"lib\" }\nzlib = \"system\"\n\n\
+         [target.app]\nkind = \"exe\"\ndeps = [\n    \"mylib/core\", # the core\n    \"zlib\",\n]\nheader-deps = [\"mylib\"]\n\n\
+         [target.app.when.windows]\ndeps = [\"mylib\"]\n",
+    );
+
+    project.anvil_in("app", &["remove", "mylib"]).success();
+    assert_eq!(
+        project.read("app/anvil.toml"),
+        "[project]\nname = \"app\"\n\n[deps]\nzlib = \"system\"\n\n[target.app]\nkind = \"exe\"\ndeps = [\n    \"zlib\",\n]\n"
+    );
+    assert!(project.read("anvil.toml").contains("mylib = \"system\""), "the workspace root was edited");
+
+    // `anvil add` in the member writes there too
+    project.anvil_in("app", &["add", "user32", "--system"]).success();
+    assert!(project.read("app/anvil.toml").contains("user32 = \"system\""));
+}
+
+#[test]
+fn init_makes_a_program_per_folder_with_a_main() {
+    require!("default");
+    let project = Project::empty("init_programs");
+    project.write("server/main.c", "int shared_value(void);\nint main(void) { return shared_value(); }\n");
+    project.write("client/main.c", "int shared_value(void);\nint main(void) { return shared_value(); }\n");
+    project.write("common/shared.c", "#include \"shared.h\"\nint shared_value(void) { return 0; }\n");
+    project.write("include/shared.h", "#pragma once\n");
+
+    project.anvil(&["init"]).success().contains("exe `server`").contains("exe `client`");
+    let manifest = project.read("anvil.toml");
+    assert!(manifest.contains("public = { include = [\"common\", \"include\"] }"), "{manifest}");
+    project.anvil(&["build"]).success();
+
+    // A folder with two main files cannot be split
+    let mixed = Project::empty("init_two_mains");
+    mixed.write("tools/a/main.c", "int main(void) { return 0; }\n");
+    mixed.write("tools/b/main.c", "int main(void) { return 0; }\n");
+    mixed.anvil(&["init"]).code(1).contains("several main files");
+}
+
+#[test]
+fn vcpkg_triplet_must_use_the_profile_runtime() {
+    require!("msvc", "windows");
+    let project = Project::empty("triplet_runtime");
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"app\"\n\n[vcpkg]\ntriplet = \"x64-windows-static\"\n\n[deps]\nfmt = \"vcpkg\"\n",
+    );
+
+    project
+        .anvil(&["targets", "--toolchain", "msvc"])
+        .code(1)
+        .contains("static C runtime (/MT)")
+        .contains("static-runtime = true");
+    project.edit("anvil.toml", "[deps]", "[profile.debug]\nstatic-runtime = true\n\n[deps]");
+    project.anvil(&["targets", "--toolchain", "msvc"]).success();
+}
+
+#[test]
+fn completions_leave_out_hidden_commands() {
+    let project = Project::empty("completions");
+    let run = project.anvil(&["completions", "bash"]);
+    run.success().contains("remove").lacks("cmake-e");
+}
