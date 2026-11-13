@@ -17,7 +17,7 @@ const FAMILIES: [&str; 4] = ["msvc", "clang-cl", "clang", "gcc"];
 static NEXT_FOLDER: AtomicUsize = AtomicUsize::new(0);
 
 /// Skips the test (returns from it) when something it needs is missing: a toolchain (`"msvc"`, `"clang-cl"`,
-/// `"clang"`, `"gcc"`), `"default"` (any toolchain), `"git"`, or `"windows"`.
+/// `"clang"`, `"gcc"`), `"default"` (any toolchain), `"git"`, `"qt"` (Qt 6 Widgets), or `"windows"`.
 #[macro_export]
 macro_rules! require {
     ($($what:expr),+ $(,)?) => {
@@ -79,6 +79,7 @@ pub fn missing(what: &str) -> Option<String> {
             let found = output.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).lines().any(|line| line.starts_with('*')));
             (!found).then(|| "no vcpkg found".into())
         }
+        "qt" => (!qt_found()).then(|| "no Qt 6 with Widgets in CMAKE_PREFIX_PATH or /usr".into()),
         "git" => {
             let runs = Command::new("git").arg("--version").output().is_ok_and(|output| output.status.success());
             (!runs).then(|| "git is not on PATH".into())
@@ -319,6 +320,33 @@ impl Run {
     fn dump(&self) -> String {
         format!("--- stdout\n{}--- stderr\n{}---", self.stdout, self.stderr)
     }
+}
+
+/// Is a Qt 6 with Widgets where Anvil's `cmake` dependencies look: CMAKE_PREFIX_PATH, then /usr and /usr/local.
+fn qt_found() -> bool {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let mut prefixes: Vec<PathBuf> = std::env::var("CMAKE_PREFIX_PATH")
+        .unwrap_or_default()
+        .split(separator)
+        .filter(|prefix| !prefix.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    if !cfg!(windows) {
+        prefixes.extend(["/usr", "/usr/local"].map(PathBuf::from));
+    }
+
+    // lib/cmake, or a multiarch lib/<triple>/cmake
+    prefixes.iter().any(|prefix| {
+        let mut lib_dirs = vec![prefix.join("lib")];
+        lib_dirs.extend(
+            std::fs::read_dir(prefix.join("lib"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path()),
+        );
+        lib_dirs.iter().any(|lib| lib.join("cmake/Qt6Widgets/Qt6WidgetsConfig.cmake").is_file())
+    })
 }
 
 fn copy_folder(from: &Path, to: &Path) {

@@ -22,6 +22,7 @@ mod plan;
 mod platform;
 mod profile;
 mod project;
+mod qt;
 mod scaffold;
 mod schema;
 mod settings;

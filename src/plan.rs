@@ -168,6 +168,9 @@ struct Planner<'a> {
     /// Files of the package build steps name in their commands, by step action: inputs once planning ends (see
     /// `add_named_files`).
     named_files: Vec<(usize, Vec<PathBuf>)>,
+
+    /// The Qt each target that uses it builds with (crate::qt).
+    qt: HashMap<usize, Arc<crate::qt::Qt>>,
 }
 
 impl Action {
@@ -426,6 +429,8 @@ enum SourceKind {
     Definition,
     /// A Windows application manifest, embedded by the link.
     Manifest,
+    /// A Qt form or resource file, which Qt's tools turn into sources (crate::qt).
+    Qt,
 }
 
 fn source_kind(source: &Path, family: crate::toolchain::Family) -> Result<SourceKind> {
@@ -446,6 +451,7 @@ fn source_kind(source: &Path, family: crate::toolchain::Family) -> Result<Source
         "h" | "hh" | "hpp" | "hxx" | "h++" | "inl" | "inc" | "ipp" | "tpp" => SourceKind::Header,
         "def" => SourceKind::Definition,
         "manifest" => SourceKind::Manifest,
+        "ui" | "qrc" => SourceKind::Qt,
         "cppm" | "ixx" | "ccm" | "cxxm" | "c++m" | "mpp" => bail!(
             "{}: C++20 modules are not supported yet; take it out of `sources` (its code can go in an ordinary header and source)",
             slash(source)
@@ -510,6 +516,7 @@ impl<'a> Planner<'a> {
             copies: HashMap::new(),
             host_tools: HashMap::new(),
             named_files: Vec::new(),
+            qt: crate::qt::installations(model),
         }
     }
 
@@ -583,9 +590,10 @@ impl<'a> Planner<'a> {
             return Ok(());
         }
 
-        // Compiles
+        // Compiles, with the sources Qt's tools write
         let mut sources = target.sources.clone();
         sources.extend(generated_sources);
+        sources.extend(self.plan_qt(index)?);
         self.plan_compiles(index, &sources)?;
 
         // The binary
@@ -663,6 +671,56 @@ impl<'a> Planner<'a> {
         Ok(planned)
     }
 
+    /// Qt's moc, uic and rcc for a target that uses Qt (crate::qt), before its compiles, which wait for them; returns
+    /// the sources they write that compile into it.
+    fn plan_qt(&mut self, index: usize) -> Result<Vec<PathBuf>> {
+        let target = &self.model.targets[index];
+        let Some(qt) = self.qt.get(&index).cloned() else {
+            crate::qt::check_sources(target)?;
+            return Ok(Vec::new());
+        };
+
+        // moc sees what the target's files compile with
+        let inputs = self.compile_inputs(index);
+        let settings = crate::qt::CompileSettings {
+            includes: &inputs.includes,
+            system_includes: &inputs.system_includes,
+            defines: &inputs.defines,
+        };
+        let generated = crate::qt::plan(self.model, index, &qt, &settings)?;
+
+        // One action per run, after what the target's files may include is generated (moc after the predefined macros)
+        let barrier = self.generation_barrier(index);
+        let mut first = None;
+        let mut actions = Vec::new();
+        for step in generated.steps {
+            let mut action = Action::new(ActionKind::Run, step.description, step.program, self.env.clone());
+            action.args = step.args;
+            action.inputs = step.inputs;
+            action.outputs = step.outputs;
+            action.after = barrier.clone();
+            action.after.extend(first.filter(|_| step.after_first));
+            if let Some(depfile) = step.depfile {
+                action.deps = DepsFormat::Make(depfile);
+            }
+            for output in &action.outputs {
+                let message = format!(
+                    "{}: it succeeded but did not write {}",
+                    action.description,
+                    util::rel(output, &self.model.root)
+                );
+                action.must_create.push((output.clone(), message));
+            }
+
+            let action = self.push(action);
+            first.get_or_insert(action);
+            actions.push(action);
+        }
+        self.generation.entry(index).or_default().extend(actions);
+
+        Ok(generated.sources)
+    }
+
     /// What a target's placeholders resolve against.
     fn package_scope(&self, index: usize) -> PackageScope<'a> {
         let model = self.model;
@@ -721,7 +779,7 @@ impl<'a> Planner<'a> {
         let mut others = Vec::new();
         for source in sources {
             match source_kind(source, self.toolchain.family)? {
-                SourceKind::Header | SourceKind::Definition | SourceKind::Manifest => {}
+                SourceKind::Header | SourceKind::Definition | SourceKind::Manifest | SourceKind::Qt => {}
                 SourceKind::Resource => resources.push(source.clone()),
                 SourceKind::Assembly => assembly.push(source.clone()),
                 SourceKind::Cuda => cuda.push(source.clone()),
@@ -1293,6 +1351,14 @@ impl<'a> Planner<'a> {
             let runtime_files = link.runtime_files.iter().chain(&sanitizer_runtime).cloned().collect();
             self.runtime_files.insert(index, runtime_files);
 
+            // The Qt plugins a Windows program loads from folders beside it (platforms/qwindows.dll)
+            for (file, relative) in crate::qt::windows_plugins(self.model, index, &link.runtime_files) {
+                self.plan_copy_to(&file, &folder.join(relative), false)?;
+            }
+            if let Some(text) = crate::qt::windows_qt_conf(self.model, index, &link.runtime_files) {
+                util::write_if_changed(&folder.join("qt.conf"), text.as_bytes())?;
+            }
+
             // Data files, at their path under the target's folder
             for (file, relative) in &target.data {
                 self.plan_copy_to(file, &folder.join(relative), true)?;
@@ -1795,6 +1861,9 @@ impl<'a> Planner<'a> {
             inputs
                 .includes
                 .push(targets::gen_dir(&self.model.package_out_dir(target.package), &target.name));
+        }
+        if self.qt.contains_key(&index) {
+            inputs.includes.push(crate::qt::output_dir(self.model, target).join("include"));
         }
         inputs.system_includes.extend(target.system_include.iter().cloned());
         inputs.system_includes.extend(target.public_system_include.iter().cloned());

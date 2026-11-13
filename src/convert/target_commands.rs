@@ -1227,10 +1227,7 @@ impl Interpreter {
                     });
                 }
             }
-            "AUTOMOC" | "AUTOUIC" | "AUTORCC" => {
-                let note = format!("{property}: Qt's code generators are not supported; add run steps for moc/uic/rcc");
-                self.targets.get_mut(target).unwrap().notes.push(note);
-            }
+            "AUTOMOC" | "AUTOUIC" | "AUTORCC" => self.qt_generator_property(target, base_property, &items),
             imported if imported.starts_with("IMPORTED_LOCATION") || imported.starts_with("IMPORTED_IMPLIB") => {
                 self.set_imported_location(target, imported, &items);
             }

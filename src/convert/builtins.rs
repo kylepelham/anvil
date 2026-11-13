@@ -181,7 +181,10 @@ const MESSAGE_MODES: &[&str] = &[
 
 /// Does CMake (or the converter) define this command? For if(COMMAND name).
 pub fn is_builtin(name: &str) -> bool {
-    HANDLED_COMMANDS.contains(&name) || IGNORED_COMMANDS.contains(&name) || INTERCEPTED_COMMANDS.contains(&name)
+    HANDLED_COMMANDS.contains(&name)
+        || IGNORED_COMMANDS.contains(&name)
+        || INTERCEPTED_COMMANDS.contains(&name)
+        || super::qt_commands::is_qt_command(name)
 }
 
 /// A command's arguments sorted by keyword, as cmake_parse_arguments does it.
@@ -470,6 +473,7 @@ impl Interpreter {
                 );
                 self.builtin.external_projects.push(name);
             }
+            qt if super::qt_commands::is_qt_command(qt) => self.command_qt(command, &args),
 
             _ => {
                 self.unknown_commands.insert(command.name.clone());
@@ -1896,6 +1900,8 @@ impl Interpreter {
     /// an optional one Anvil has (Threads, Python) or can add (a known port, one in vcpkg.json, a fetched one, a port
     /// in the vcpkg checkout); other optional ones are not, as on a machine without them, and the warning says so.
     fn command_find_package(&mut self, command: &Command, args: &[String]) {
+        let qt_args = self.qt_find_package_names(args);
+        let args = qt_args.as_deref().unwrap_or(args);
         let Some(name) = args.first() else { return };
         let required = args.iter().any(|word| word == "REQUIRED");
         let source = if required {
