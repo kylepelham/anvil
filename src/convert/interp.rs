@@ -84,6 +84,10 @@ pub struct Interpreter {
     pub tests: Vec<Test>,
     pub custom_commands: Vec<CustomCommand>,
     pub source_properties: Vec<SourceProperties>,
+    /// Files set_source_files_properties(HEADER_FILE_ONLY) keeps out of every target (path keys).
+    pub(super) header_only_sources: HashSet<String>,
+    /// Words added to a CMAKE_<LANG>_FLAGS variable under a condition: (variable, word) -> condition.
+    pub(super) flag_word_conditions: HashMap<(String, String), String>,
     pub export_headers: Vec<ExportHeader>,
     pub pkg_config: IndexMap<String, Vec<String>>,
     pub project_name: Option<String>,
@@ -130,6 +134,8 @@ impl Interpreter {
             tests: Vec::new(),
             custom_commands: Vec::new(),
             source_properties: Vec::new(),
+            header_only_sources: HashSet::new(),
+            flag_word_conditions: HashMap::new(),
             export_headers: Vec::new(),
             pkg_config: IndexMap::new(),
             project_name: None,
@@ -174,6 +180,7 @@ impl Interpreter {
     }
 
     pub fn set_variable(&mut self, name: &str, value: &str) {
+        self.note_flag_words(name, value);
         self.scopes.last_mut().unwrap().insert(name.to_string(), value.to_string());
         if self.options.contains_key(name) {
             self.overridden_options.insert(name.to_string());
@@ -181,6 +188,7 @@ impl Interpreter {
     }
 
     pub fn set_parent_variable(&mut self, name: &str, value: &str) {
+        self.note_flag_words(name, value);
         let count = self.scopes.len();
         let index = if count >= 2 { count - 2 } else { 0 };
         self.scopes[index].insert(name.to_string(), value.to_string());
@@ -468,9 +476,9 @@ impl Interpreter {
         self.depth -= 1;
 
         self.list_files.pop();
+        self.finish_directory(dir_id);
         self.scopes.pop();
         self.dir_stack.pop();
-        self.finish_directory(dir_id);
 
         result.map(|_| ())
     }
@@ -773,11 +781,18 @@ impl Interpreter {
         Ok(Flow::Normal)
     }
 
-    /// Applies a directory's settings to the targets defined in it.
+    /// Applies a directory's settings to the targets defined in it: its definitions and include folders (also those
+    /// added after a target was made, as in CMake) and the flag variables' final values. Its compile options,
+    /// libraries and link options are copied when each target is made.
     fn finish_directory(&mut self, dir_id: usize) {
+        self.apply_flag_variables(dir_id);
         let state = self.dirs[dir_id].clone();
 
-        for target in self.targets.values_mut().filter(|target| target.dir_id == dir_id) {
+        for target in self
+            .targets
+            .values_mut()
+            .filter(|target| target.dir_id == dir_id || target.other_dir_ids.contains(&dir_id))
+        {
             let mut includes = state.includes.clone();
             includes.append(&mut target.includes);
             target.includes = includes;
@@ -785,14 +800,6 @@ impl Interpreter {
             let mut defines = state.defines.clone();
             defines.append(&mut target.defines);
             target.defines = defines;
-
-            let mut options = state.options.clone();
-            options.append(&mut target.options);
-            target.options = options;
-
-            target.links.extend(state.links.iter().cloned());
-            target.link_options.extend(state.link_options.iter().cloned());
-            target.lib_dirs.extend(state.lib_dirs.iter().cloned());
         }
     }
 
@@ -1131,7 +1138,7 @@ fn compare_values(left: &str, operator: &str, right: &str, variable: &dyn Fn(&st
     }
 }
 
-fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+pub(super) fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
     let parts = |text: &str| -> Vec<u64> {
         text.split('.')
             .map(|part| {

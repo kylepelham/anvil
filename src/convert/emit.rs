@@ -125,8 +125,8 @@ const KNOWN_PORTS: &[(&str, &str)] = &[
 
 // Condition words every manifest knows; any other word is an option or a profile
 const KNOWN_ATOMS: &[&str] = &[
-    "windows", "linux", "macos", "unix", "x64", "arm64", "msvc", "gnu", "cl", "clang-cl", "clang", "gcc", "mingw", "debug", "release", "true",
-    "false",
+    "windows", "linux", "macos", "unix", "x64", "x86", "arm64", "arm", "msvc", "gnu", "cl", "clang-cl", "clang", "gcc", "mingw", "debug", "release",
+    "true", "false",
 ];
 
 // The order settings appear in within a table
@@ -144,6 +144,7 @@ const KEY_ORDER: &[&str] = &[
     "header-deps",
     "needs",
     "std",
+    "c-std",
     "warnings",
     "werror",
     "arch",
@@ -427,12 +428,16 @@ impl Blocks {
                     self.set(None, key, here.clone().unwrap());
                 }
 
-                // List items under both hold everywhere too
+                // List items under both hold everywhere too (a list this empties goes: an empty one says something)
                 if let (Some(Value::List(here)), Some(Value::List(there))) = (here, there) {
                     let both: Vec<String> = here.into_iter().filter(|item| there.contains(item)).collect();
                     for condition in [Some(condition.clone()), negated.clone()] {
-                        if let Some(Value::List(items)) = self.blocks.get_mut(&condition).and_then(|block| block.get_mut(key)) {
+                        let Some(block) = self.blocks.get_mut(&condition) else { continue };
+                        if let Some(Value::List(items)) = block.get_mut(key) {
                             items.retain(|item| !both.contains(item));
+                            if items.is_empty() && !both.is_empty() {
+                                block.shift_remove(key);
+                            }
                         }
                     }
                     for item in both {
@@ -540,12 +545,13 @@ impl Emitter {
                 "cuda-arch" if !has_cuda => {}
                 "link-depends" => converted.blocks.push(condition, key, self.path_text(Path::new(value), &dir)),
                 "output-dir" if value == "{out}" => {}
-                "output-dir" => converted.blocks.set(condition, key, Value::Text(self.path_text(Path::new(value), &dir))),
+                "output-dir" | "pch" => converted.blocks.set(condition, key, Value::Text(self.path_text(Path::new(value), &dir))),
                 "exports" => {
                     if super::model::constant_truth(value) == Some(true) {
                         converted.blocks.set(condition, key, Value::Bool(true));
                     }
                 }
+                "gui" => converted.blocks.set(condition, key, Value::Bool(value == "true")),
                 _ => converted.blocks.set(condition, key, Value::Text(value.clone())),
             }
         }
@@ -625,6 +631,17 @@ impl Emitter {
                 .blocks
                 .push(relative_condition(&item.condition), "interface.defines", self.define_text(&item.value));
         }
+        for item in &target.interface_options {
+            converted
+                .blocks
+                .push(relative_condition(&item.condition), "interface.flags", item.value.clone());
+        }
+        for item in &target.interface_includes {
+            let path = self.generated_folder(&item.value.0).unwrap_or_else(|| item.value.0.clone());
+            converted
+                .blocks
+                .push(relative_condition(&item.condition), "interface.include", self.path_text(&path, &dir));
+        }
 
         for item in &target.options {
             self.convert_compile_flag(item, &relative_condition(&item.condition), &mut converted);
@@ -700,6 +717,9 @@ impl Emitter {
         // Single settings
         if let Some(standard) = self.effective_standard(&target.name, &mut Vec::new()) {
             converted.blocks.set(None, "std", Value::Text(format!("c++{standard}")));
+        }
+        if let Some(standard) = target.c_std {
+            converted.blocks.set(None, "c-std", Value::Text(format!("c{standard}")));
         }
         if target.gui {
             converted.blocks.set(None, "gui", Value::Bool(true));
@@ -1004,7 +1024,10 @@ impl Emitter {
             FlagMeaning::Warnings(level) => converted.blocks.set(condition.clone(), "warnings", Value::Text(level.into())),
             FlagMeaning::Werror => converted.blocks.set(condition.clone(), "werror", Value::Bool(true)),
             FlagMeaning::Arch(arch) => converted.blocks.set(condition.clone(), "arch", Value::Text(arch.into())),
-            FlagMeaning::Standard(standard) => converted.blocks.set(condition.clone(), "std", Value::Text(standard)),
+            FlagMeaning::Standard(standard) => {
+                let key = if standard.starts_with("c++") { "std" } else { "c-std" };
+                converted.blocks.set(condition.clone(), key, Value::Text(standard))
+            }
             FlagMeaning::Define(define) => converted.blocks.push(
                 condition.clone(),
                 if item.public { "public.defines" } else { "defines" },
@@ -1090,6 +1113,29 @@ impl Emitter {
             }
 
             converted.files.push(rule);
+        }
+
+        // Flags and definitions for the files of one language
+        let target_condition = condition_text(&target.condition, None);
+        for language_rule in &target.language_rules {
+            let folder = self.path_text(&language_rule.folder, &target.dir);
+            let prefix = if folder == "." { String::new() } else { format!("{folder}/") };
+            let mut rule = FileRuleOut {
+                files: vec![format!("{prefix}**/{}", language_rule.pattern)],
+                condition: condition_text(&language_rule.condition, target_condition.as_deref()),
+                defines: language_rule.defines.iter().map(|define| self.define_text(define)).collect(),
+                ..Default::default()
+            };
+            for flag in &language_rule.options {
+                match compile_flag_meaning(flag) {
+                    FlagMeaning::Define(define) => rule.defines.push(self.define_text(&define)),
+                    FlagMeaning::Drop => {}
+                    _ => rule.flags.push(flag.clone()),
+                }
+            }
+            if !rule.defines.is_empty() || !rule.flags.is_empty() {
+                converted.files.push(rule);
+            }
         }
 
         converted.files = merge_file_rules(std::mem::take(&mut converted.files));
@@ -2836,7 +2882,7 @@ fn compile_flag_meaning(flag: &str) -> FlagMeaning {
         _ => {
             let standard = flag.strip_prefix("/std:").or_else(|| flag.strip_prefix("-std="));
             if let Some(standard) = standard {
-                let standard = standard.replace("gnu++", "c++").replace("c++latest", "c++23");
+                let standard = standard.replace("gnu++", "c++").replace("c++latest", "c++23").replace("gnu", "c");
                 return FlagMeaning::Standard(standard);
             }
 
