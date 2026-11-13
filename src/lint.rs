@@ -3,7 +3,7 @@
 
 use crate::commands;
 use crate::exec::{self, ExecOptions};
-use crate::manifest::{self, Manifest};
+use crate::manifest::Manifest;
 use crate::plan::{ActionKind, Plan};
 use crate::project::{self, Model, MANIFEST_NAME};
 use crate::targets::{self, Kind};
@@ -560,11 +560,8 @@ fn format_files(start_dir: &Path, paths: &[PathBuf]) -> Result<(PathBuf, Vec<Pat
     let (root, manifest) = project::locate(start_dir)?;
     let members = project::workspace_members(&root, &manifest)?;
 
-    // Every package's output folder is left alone
-    let mut out_roots = vec![out_root(&root, &manifest)];
-    for member in &members {
-        out_roots.push(out_root(member, &manifest::load(&member.join(MANIFEST_NAME))?));
-    }
+    // The output folder is left alone (only the root sets `out`)
+    let out_roots = vec![out_root(&root, &manifest)];
 
     let mut files = Vec::new();
     if paths.is_empty() {

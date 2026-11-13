@@ -1721,7 +1721,7 @@ fn data_files_copy_beside_the_program_when_changed() {
 }
 
 // [defaults] data goes to the programs and shared libraries only; data that only excludes, data landing where a DLL
-// is copied, a `v` version, kind in a [defaults] when block and a project that installs nothing are errors
+// is copied, a version with a space, kind in a [defaults] when block and a project that installs nothing are errors
 
 #[test]
 fn data_and_manifest_mistakes() {
@@ -1753,11 +1753,11 @@ fn data_and_manifest_mistakes() {
         .code(1)
         .contains("the runtime file runtime/x.dll and the data file x.dll would both be copied to out/debug/x.dll");
 
-    project.write("anvil.toml", &format!("[project]\nversion = \"v2.1.0\"\n\n{program}"));
+    project.write("anvil.toml", &format!("[project]\nversion = \"2.1 beta\"\n\n{program}"));
     project
         .anvil(&["targets"])
         .code(1)
-        .contains("[project] version = \"v2.1.0\": write one to four numbers separated by dots (\"2.1.0\", without the v)");
+        .contains("[project] version = \"2.1 beta\": write a version without spaces");
 
     project.write("anvil.toml", &format!("[defaults.when.windows]\nkind = \"lib\"\n\n{program}"));
     project
@@ -2266,4 +2266,93 @@ fn convert_checks_msvc() {
 fn convert_checks_gcc() {
     require!("gcc");
     convert_checks("gcc", "convert_checks_gcc");
+}
+
+// 36. Package loading: a dependency's version is free-form, two packages of one name are an error, a broken workspace
+//     above a project it does not list is ignored (and said inside one of its members)
+
+#[test]
+fn package_versions_names_and_unrelated_workspaces() {
+    require!("default");
+    let project = Project::empty("package_loading");
+    let library =
+        |name: &str| format!("[project]\nname = \"{name}\"\nversion = \"1.4.0-beta.2\"\n\n[target.{name}]\nkind = \"lib\"\nsources = [\"*.cpp\"]\n");
+    project.write("a/anvil.toml", &library("util"));
+    project.write("a/a.cpp", "int a() { return 1; }\n");
+    project.write("b/anvil.toml", &library("util"));
+    project.write("b/b.cpp", "int b() { return 2; }\n");
+    project.write("app/src/main.cpp", "int main() {}\n");
+
+    project.write("app/anvil.toml", "[project]\nname = \"app\"\n\n[deps]\na = { path = \"../a\" }\n");
+    project.anvil_in("app", &["targets"]).success().contains("util");
+
+    project.write(
+        "app/anvil.toml",
+        "[project]\nname = \"app\"\n\n[deps]\na = { path = \"../a\" }\nb = { path = \"../b\" }\n",
+    );
+    project
+        .anvil_in("app", &["targets"])
+        .code(1)
+        .contains("two packages are named `util`")
+        .contains("Give one another [project] name");
+
+    // `libs/*` matches no package: an error in a member, not in a project the workspace does not list
+    project.write(
+        "ws/anvil.toml",
+        "[project]\nname = \"ws\"\n\n[workspace]\nmembers = [\"member\", \"libs/*\"]\n",
+    );
+    project.write("ws/member/anvil.toml", "[project]\nname = \"member\"\n");
+    project.write("ws/member/src/main.cpp", "int main() {}\n");
+    project.write("ws/other/anvil.toml", "[project]\nname = \"other\"\n");
+    project.write("ws/other/src/main.cpp", "int main() {}\n");
+    project.anvil_in("ws/other", &["targets"]).success().contains("other");
+    project
+        .anvil_in("ws/member", &["targets"])
+        .code(1)
+        .contains("workspace member \"libs/*\" matches no folder");
+}
+
+// 37. MinGW gcc's OpenMP runtime (libgomp-1.dll and the DLLs it loads) goes beside the program and into the install,
+//     so it runs without the compiler's folder on PATH
+
+#[test]
+fn openmp_runtime_of_mingw_gcc_is_copied() {
+    require!("gcc", "windows");
+    let project = Project::empty("openmp_mingw_runtime");
+    project.write("anvil.toml", "[project]\nname = \"omp\"\n\n[deps]\nopenmp = \"system\"\n");
+    project.write(
+        "src/main.cpp",
+        "#include <omp.h>\n#include <cstdio>\nint main() { std::printf(\"%d\\n\", omp_get_max_threads() > 0); }\n",
+    );
+    project.anvil(&["build", "--toolchain", "gcc"]).success();
+    project.anvil(&["install", "--toolchain", "gcc", "--prefix", "installed"]).success();
+
+    let system = format!("{}\\System32", std::env::var("SystemRoot").unwrap());
+    for program in ["out/debug-gcc/omp.exe", "installed/bin/omp.exe"] {
+        let output = Command::new(project.path(program)).env("PATH", &system).output().unwrap();
+        assert!(output.status.success(), "{program} exited with {:?}", output.status.code());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1");
+    }
+}
+
+// 38. A resource script gets no second _DEBUG when the target defines `_DEBUG=1`
+
+#[test]
+fn resource_script_keeps_a_debug_value_msvc() {
+    require!("msvc", "windows");
+    let project = Project::empty("rc_debug_value");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"app\"\n\n[target.app]\nkind = \"exe\"\nsources = [\"src/*.c\", \"src/*.rc\"]\ndefines = [\"_DEBUG=1\"]\n",
+    );
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+    project.write(
+        "src/app.rc",
+        "#if _DEBUG != 1\n#error _DEBUG is not 1\n#endif\nSTRINGTABLE { 1, \"debug\" }\n",
+    );
+
+    let run = project.anvil(&["build", "-v", "--toolchain", "msvc"]);
+    run.success();
+    let resource = run.output().lines().find(|line| line.contains("rc.exe")).unwrap().to_string();
+    assert!(resource.contains("/D_DEBUG=1") && !resource.contains("/D_DEBUG "), "{resource}");
 }

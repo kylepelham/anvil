@@ -1048,7 +1048,8 @@ impl<'a> Planner<'a> {
 
         // cl defines _DEBUG with the debug C runtime; rc gets it too, as CMake's Debug does
         let mut defines = inputs.defines.clone();
-        if self.toolchain.is_msvc_abi() && self.model.profile.debug_runtime && !defines.iter().any(|define| define == "_DEBUG") {
+        let defines_debug = defines.iter().any(|define| define.split('=').next() == Some("_DEBUG"));
+        if self.toolchain.is_msvc_abi() && self.model.profile.debug_runtime && !defines_debug {
             defines.push("_DEBUG".to_string());
         }
         action.args = self.toolchain.resource_args(source, &output, &inputs.includes, &defines);

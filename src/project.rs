@@ -359,6 +359,14 @@ impl Model {
 
     fn add_package(&mut self, root: &Path, manifest: Manifest, member: bool) -> Result<usize> {
         let name = package_name(root, &manifest);
+        if let Some(other) = self.packages.iter().find(|package| package.name == name) {
+            bail!(
+                "two packages are named `{name}`: {} and {}, so `{name}/<target>` and `{{target:...}}` could not tell them apart. \
+                 Give one another [project] name in its anvil.toml (a folder without one is named by its [deps] key: rename that)",
+                slash(&other.root),
+                slash(root)
+            );
+        }
         let index = self.packages.len();
         self.package_dirs.insert(util::path_key(root), index);
 
@@ -1728,7 +1736,12 @@ pub fn locate(start: &Path) -> Result<(PathBuf, Manifest)> {
         if manifest.workspace.is_none() {
             continue;
         }
-        let members = workspace_members(ancestor, &manifest).with_context(|| format!("in the workspace {}", slash(&candidate)))?;
+        // A broken workspace is said only when this package is, or could be, one of its members
+        let members = match workspace_members(ancestor, &manifest) {
+            Ok(members) => members,
+            Err(_) if !could_be_member(ancestor, &manifest, &nearest) => continue,
+            Err(error) => return Err(error.context(format!("in the workspace {}", slash(&candidate)))),
+        };
         if members.iter().any(|member| util::path_key(member) == util::path_key(&nearest)) {
             return Ok((ancestor.to_path_buf(), manifest));
         }
@@ -1736,6 +1749,17 @@ pub fn locate(start: &Path) -> Result<(PathBuf, Manifest)> {
 
     let manifest = manifest::load(&nearest.join(MANIFEST_NAME))?;
     Ok((nearest, manifest))
+}
+
+/// Whether one of a workspace's member patterns names a package's folder, whether or not the workspace loads.
+fn could_be_member(root: &Path, manifest: &Manifest, package: &Path) -> bool {
+    let Some(workspace) = &manifest.workspace else { return false };
+
+    workspace.members.iter().any(|pattern| match targets::split_pattern(root, pattern) {
+        (base, None) => util::path_key(&base) == util::path_key(package),
+        (base, Some(glob)) => util::strip_prefix_ci(package, &base)
+            .is_some_and(|relative| targets::compile_glob(&glob).map_or(true, |glob| glob.compile_matcher().is_match(slash(&relative)))),
+    })
 }
 
 fn zero_config(start: &Path) -> Result<(PathBuf, Manifest)> {
@@ -1786,16 +1810,14 @@ pub fn is_version(text: &str) -> bool {
             .all(|part| !part.is_empty() && part.chars().all(|character| character.is_ascii_digit()))
 }
 
-fn check_version(version: &str) -> Result<()> {
-    if is_version(version) {
+/// `[project] version` is free-form ("1.4.0-beta.2"), but one word: it fills {version} in commands and file names.
+/// Only `anvil install`'s CMake package needs numbers (`is_version`).
+pub fn check_version(version: &str) -> Result<()> {
+    if !version.is_empty() && !version.contains(char::is_whitespace) {
         return Ok(());
     }
 
-    let hint = match version.strip_prefix(['v', 'V']).filter(|rest| is_version(rest)) {
-        Some(rest) => format!(" (\"{rest}\", without the v)"),
-        None => " (\"2.1.0\")".to_string(),
-    };
-    bail!("[project] version = \"{version}\": write one to four numbers separated by dots{hint}");
+    bail!("[project] version = \"{version}\": write a version without spaces (\"2.1.0\", \"1.4.0-beta.2\")");
 }
 
 /// Where a package's errors come from: its anvil.toml, and its name outside the root package.

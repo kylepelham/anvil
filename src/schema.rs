@@ -37,8 +37,8 @@ const CXX_STANDARDS: &[&str] = &[
 ];
 const C_STANDARDS: &[&str] = &["c17", "c11", "c23", "c99", "c89", "c90", "c18"];
 
-// What crate::project::is_version takes
-const VERSION_PATTERN: &str = r"^[0-9]+(\.[0-9]+){0,3}$";
+// What crate::project::check_version takes
+const VERSION_PATTERN: &str = r"^\S+$";
 
 // Every spelling crate::flags::normalize_standard takes ("20", "cxx20", "GNU++20")
 const CXX_STANDARD_PATTERN: &str = r"^([cC]\+\+)*([cC][xX][xX])*([cC][pP][pP])*([gG][nN][uU]\+\+)*[cC]*(11|14|17|20|23|26)$";
@@ -208,7 +208,7 @@ fn project_table() -> Value {
                 "type": "string",
                 "pattern": VERSION_PATTERN,
                 "examples": ["0.1.0"],
-                "description": "The package's version, one to four numbers (\"2.1.0\"): the {version} placeholder, and the installed package's.",
+                "description": "The package's version, without spaces (\"2.1.0\", \"1.4.0-beta.2\"): the {version} placeholder, and the installed package's (whose CMake package file needs one to four numbers).",
             }),
         ),
         ("description", text(metadata)),
@@ -1140,13 +1140,14 @@ mod tests {
             "[target.a]\nfile = [{ match = \"*.c\" }]\nfiles = [{ match = \"*.c\" }]\n",
             "[[test]]\nname = \"a_{v}\"\ncommand = \"a\"\nmatrix.v = [true]\n",
             "[[test]]\nname = \"a_{v}\"\nmatrix.v = [\"x\"]\n",
-            "[project]\nversion = \"v2.1.0\"\n",
-            "[project]\nversion = \"1.2.3.4.5\"\n",
+            "[project]\nversion = \"2.1 beta\"\n",
+            "[project]\nversion = \"\"\n",
         ];
         let accepted = [
             "[target.t]\nkind = \"test\"\ntimeout = 5000000000\n",
             "[[test]]\nname = \"a_{v}\"\nmatrix.v = [{ v = \"x\", command = \"a\" }]\n",
             "[project]\nversion = \"2.1\"\n",
+            "[project]\nversion = \"v1.4.0-beta.2\"\n",
         ];
         let condition = crate::cond::CondContext {
             family: crate::toolchain::Family::Msvc,
@@ -1160,7 +1161,7 @@ mod tests {
                 // What Model::load checks of each package: the version, then every target table
                 let loads = manifest::parse_str(text).is_ok_and(|manifest| {
                     let version = manifest.project.as_ref().and_then(|project| project.version.as_deref()).unwrap_or("1");
-                    crate::project::is_version(version) && crate::targets::check_package(&manifest, &condition).is_ok()
+                    crate::project::check_version(version).is_ok() && crate::targets::check_package(&manifest, &condition).is_ok()
                 });
                 assert_eq!(loads, !rejects, "anvil {}:\n{text}", if rejects { "takes" } else { "rejects" });
                 assert_eq!(validate(&root, &as_json(text)).is_empty(), !rejects, "the schema disagrees:\n{text}");

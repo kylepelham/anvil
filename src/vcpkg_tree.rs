@@ -59,13 +59,89 @@ struct ImportedTarget {
     runtime: Vec<PathBuf>,
 }
 
-/// LLVM's libomp.dll beside a clang or clang-cl that builds for the MSVC ABI (Visual Studio's `VC/Tools/Llvm/x64/bin`,
-/// or LLVM's install).
-fn openmp_runtime(toolchain: &Toolchain) -> Option<PathBuf> {
+/// The OpenMP runtime programs need beside them: LLVM's libomp.dll beside a clang or clang-cl that builds for the MSVC
+/// ABI (Visual Studio's `VC/Tools/Llvm/x64/bin`, or LLVM's install), or MinGW gcc's libgomp-1.dll with the DLLs of
+/// its bin folder it loads (libwinpthread-1.dll, libgcc_s_seh-1.dll).
+fn openmp_runtime(toolchain: &Toolchain) -> Vec<PathBuf> {
+    let Some(bin) = toolchain.cxx.parent() else { return Vec::new() };
     let llvm = matches!(toolchain.family, Family::Clang | Family::ClangCl) && toolchain.is_msvc_abi();
-    let runtime = toolchain.cxx.parent()?.join("libomp.dll");
+    let mingw = toolchain.family == Family::Gcc && toolchain.platform.os == Os::Windows;
 
-    (llvm && runtime.is_file()).then_some(runtime)
+    let runtime = match (llvm, mingw) {
+        (true, _) => bin.join("libomp.dll"),
+        (_, true) => bin.join("libgomp-1.dll"),
+        _ => return Vec::new(),
+    };
+    if !runtime.is_file() {
+        return Vec::new();
+    }
+
+    // The DLLs it loads from the same folder, and theirs (the system's are never there)
+    let mut files = vec![runtime];
+    let mut next = 0;
+    while next < files.len() {
+        for name in imported_dlls(&files[next]) {
+            let file = bin.join(&name);
+            if file.is_file() && !files.iter().any(|known| util::path_key(known) == util::path_key(&file)) {
+                files.push(file);
+            }
+        }
+        next += 1;
+    }
+
+    files
+}
+
+/// The DLLs a Windows program or DLL imports, as its PE import table names them; none when it cannot be read.
+fn imported_dlls(file: &Path) -> Vec<String> {
+    std::fs::read(file).ok().and_then(|bytes| pe_imports(&bytes)).unwrap_or_default()
+}
+
+fn pe_imports(bytes: &[u8]) -> Option<Vec<String>> {
+    let number = |offset: usize, size: usize| -> Option<usize> {
+        let field = bytes.get(offset..offset + size)?;
+        Some(field.iter().rev().fold(0, |value, byte| (value << 8) | *byte as usize))
+    };
+
+    // The headers: the PE signature, the optional header (PE32 or PE32+) and its import directory, the sections
+    let header = number(0x3c, 4)?;
+    if bytes.get(header..header + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let section_count = number(header + 6, 2)?;
+    let optional = header + 24;
+    let directories = match number(optional, 2)? {
+        0x10b => optional + 96,
+        0x20b => optional + 112,
+        _ => return None,
+    };
+    let imports = number(directories + 8, 4)?;
+    let sections = optional + number(header + 20, 2)?;
+
+    // An address once loaded to its place in the file
+    let file_offset = |address: usize| -> Option<usize> {
+        (0..section_count).find_map(|index| {
+            let section = sections + index * 40;
+            let start = number(section + 12, 4)?;
+            let size = number(section + 8, 4)?.max(number(section + 16, 4)?);
+            if !(start..start + size).contains(&address) {
+                return None;
+            }
+            Some(address - start + number(section + 20, 4)?)
+        })
+    };
+
+    // One 20-byte descriptor per DLL, up to an empty one
+    let mut names = Vec::new();
+    let mut descriptor = file_offset(imports)?;
+    while let Some(name) = number(descriptor + 12, 4).filter(|name| *name != 0) {
+        let start = file_offset(name)?;
+        let length = bytes.get(start..)?.iter().position(|byte| *byte == 0)?;
+        names.push(String::from_utf8_lossy(&bytes[start..start + length]).into_owned());
+        descriptor += 20;
+    }
+
+    Some(names)
 }
 
 /// Whether a build links the packages' debug libraries: with the MSVC ABI's debug runtime, which they must match.
@@ -111,8 +187,9 @@ pub struct BuildContext {
     language: Option<&'static str>,
     link: bool,
 
-    /// LLVM's OpenMP runtime beside the compiler (clang and clang-cl with the MSVC ABI), copied beside programs.
-    openmp_runtime: Option<PathBuf>,
+    /// The OpenMP runtime DLLs beside the compiler (clang and clang-cl with the MSVC ABI, MinGW gcc), copied beside
+    /// programs.
+    openmp_runtime: Vec<PathBuf>,
 }
 
 impl BuildContext {
@@ -1045,7 +1122,7 @@ mod tests {
             frontend: if family.is_msvc_style() { "MSVC" } else { "GNU" },
             language: None,
             link: false,
-            openmp_runtime: None,
+            openmp_runtime: Vec::new(),
         }
     }
 
@@ -1174,6 +1251,16 @@ mod tests {
 
         // Includes only: nothing to link
         assert!(parse_usage("    find_package(Stb REQUIRED)\n    target_include_directories(main PRIVATE ${Stb_INCLUDE_DIR})").is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn reads_dll_imports() {
+        // This test program imports kernel32.dll; a file that is not a program imports nothing
+        let imports = imported_dlls(&std::env::current_exe().unwrap());
+        assert!(imports.iter().any(|name| name.eq_ignore_ascii_case("kernel32.dll")), "{imports:?}");
+        assert!(imported_dlls(Path::new(file!())).is_empty());
+        assert_eq!(pe_imports(b"MZ"), None);
     }
 
     #[test]
