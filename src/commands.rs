@@ -46,10 +46,11 @@ pub fn run(start_dir: &Path, build: &BuildArgs, name: Option<&str>, args: &[Stri
         "Running",
         &format!("{} {}", util::rel(&program, &std::env::current_dir()?), args.join(" ")),
     );
-    let status = std::process::Command::new(&program)
-        .args(args)
-        .status()
-        .with_context(|| format!("starting {}", program.display()))?;
+    // Ctrl-C reaches the program too: it decides how to end, and Anvil waits for it
+    crate::job::FOREGROUND_PROGRAM.store(true, std::sync::atomic::Ordering::Relaxed);
+    let status = std::process::Command::new(&program).args(args).status();
+    crate::job::FOREGROUND_PROGRAM.store(false, std::sync::atomic::Ordering::Relaxed);
+    let status = status.with_context(|| format!("starting {}", program.display()))?;
     drop(model);
 
     Ok(status.code().unwrap_or(1))
@@ -94,9 +95,15 @@ pub fn test(start_dir: &Path, build: &BuildArgs, options: &TestArgs) -> Result<i
     }
     check_runs_here(&model, "test")?;
 
-    // Arguments after `--` go to every test's program
+    // Arguments after `--` go to the tests that run a program of the project, not to commands such as cmake -E
     for test in &mut tests {
-        test.command.extend(options.args.iter().cloned());
+        let runs_target = test
+            .command
+            .first()
+            .is_some_and(|program| program.starts_with("{target:") && program.ends_with('}'));
+        if runs_target {
+            test.command.extend(options.args.iter().cloned());
+        }
     }
 
     // Build every program the tests use

@@ -1238,6 +1238,7 @@ impl Model {
     pub fn collect_tests(&mut self) -> Result<()> {
         // Tests and targets that are declared but off (their `if` is false): `after` may name them
         let mut switched_off = Vec::new();
+        let mut origins = Vec::new();
 
         // Test targets run their program
         for target in &self.targets {
@@ -1270,6 +1271,10 @@ impl Model {
             let workdir = target.workdir.clone().unwrap_or_else(|| package.root.clone());
             let test = test_case(&spec, workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name).with_context(|| format!("in [target.{}]", target.name))?;
             self.tests.push(test);
+            origins.push(TestOrigin {
+                package: target.package,
+                place: format!("[target.{}] in {}", target.name, util::rel(&package.root.join(MANIFEST_NAME), &self.root)),
+            });
         }
         for package in self.packages.iter().filter(|package| package.member) {
             let off = package
@@ -1281,13 +1286,15 @@ impl Model {
         }
 
         // [[test]] tables run any command
-        for package in self.packages.iter().filter(|package| package.member) {
-            let mut specs = package.manifest.test.clone();
-            for file in tests_files(&package.root, &self.out_root) {
-                specs.extend(manifest::load_tests(&file)?);
+        for (package_index, package) in self.packages.iter().enumerate().filter(|(_, package)| package.member) {
+            let manifest_file = package.root.join(MANIFEST_NAME);
+            let mut specs: Vec<(TestSpec, &Path)> = package.manifest.test.iter().map(|spec| (spec.clone(), manifest_file.as_path())).collect();
+            let files = tests_files(&package.root, &self.out_root);
+            for file in &files {
+                specs.extend(manifest::load_tests(file)?.into_iter().map(|spec| (spec, file.as_path())));
             }
 
-            for spec in &specs {
+            for (spec, file) in &specs {
                 let context = || format!("in [[test]] `{}`", spec.name);
                 if let Some(condition_text) = &spec.cond {
                     if !self.condition.test(condition_text).with_context(context)? {
@@ -1305,10 +1312,15 @@ impl Model {
                 };
                 self.tests
                     .push(test_case(spec, workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name).with_context(context)?);
+                origins.push(TestOrigin {
+                    package: package_index,
+                    place: util::rel(file, &self.root),
+                });
             }
         }
 
-        check_tests(&mut self.tests, &switched_off)
+        let package_names: Vec<&str> = self.packages.iter().map(|package| package.name.as_str()).collect();
+        check_tests(&mut self.tests, &origins, &package_names, &switched_off)
     }
 }
 
@@ -1819,23 +1831,85 @@ fn test_case(spec: &TestSpec, workdir: PathBuf, package: &Package, out_dir: &Pat
     })
 }
 
-/// Test names are unique, `after` names a test (one that is off is not waited for), and no tests wait for each
-/// other in a circle.
-fn check_tests(tests: &mut [TestCase], switched_off: &[String]) -> Result<()> {
-    let mut seen = HashSet::new();
-    if let Some(twice) = tests.iter().find(|test| !seen.insert(test.name.as_str())) {
-        bail!("two tests are named `{}`; test names must be unique", twice.name);
+/// Where a test was declared: its package, and the file (or target) that declares it.
+struct TestOrigin {
+    package: usize,
+    place: String,
+}
+
+/// Test names are unique in a package, and the same name in two packages becomes `<package>/<name>` outside the
+/// root package; `after` names a test (of its own package first; one that is off is not waited for), and no tests
+/// wait for each other in a circle.
+fn check_tests(tests: &mut [TestCase], origins: &[TestOrigin], package_names: &[&str], switched_off: &[String]) -> Result<()> {
+    // Unique in a package
+    let mut in_package: HashMap<(usize, &str), usize> = HashMap::new();
+    for (index, test) in tests.iter().enumerate() {
+        let Some(first) = in_package.insert((origins[index].package, test.name.as_str()), index) else {
+            continue;
+        };
+        let (first_place, second_place) = (&origins[first].place, &origins[index].place);
+        if first_place == second_place {
+            bail!(
+                "two tests are named `{}` in {first_place}; test names must be unique in a package",
+                test.name
+            );
+        }
+        bail!(
+            "two tests are named `{}`, in {first_place} and in {second_place}; test names must be unique in a package: rename one",
+            test.name
+        );
     }
 
-    let names: Vec<String> = tests.iter().map(|test| test.name.clone()).collect();
-    for test in tests.iter_mut() {
-        if let Some(unknown) = test.after.iter().find(|name| !names.contains(name) && !switched_off.contains(name)) {
-            let hint = util::suggest(unknown, names.iter().map(String::as_str))
-                .map(|close| format!(" (did you mean `{close}`?)"))
-                .unwrap_or_default();
-            bail!("test `{}`: after = [\"{unknown}\"] names no test{hint}", test.name);
+    // The same name in several packages: those outside the root package get their package's name in front
+    let mut packages_with: HashMap<&str, HashSet<usize>> = HashMap::new();
+    for (index, test) in tests.iter().enumerate() {
+        packages_with.entry(test.name.as_str()).or_default().insert(origins[index].package);
+    }
+    let final_names: Vec<String> = tests
+        .iter()
+        .enumerate()
+        .map(|(index, test)| {
+            let package = origins[index].package;
+            if packages_with[test.name.as_str()].len() > 1 && package != 0 {
+                format!("{}/{}", package_names[package], test.name)
+            } else {
+                test.name.clone()
+            }
+        })
+        .collect();
+    let mut by_final_name: HashMap<&str, usize> = HashMap::new();
+    for (index, name) in final_names.iter().enumerate() {
+        if let Some(first) = by_final_name.insert(name.as_str(), index) {
+            bail!(
+                "two tests are named `{name}`, in {} and in {}; rename one",
+                origins[first].place,
+                origins[index].place
+            );
         }
-        test.after.retain(|name| names.contains(name));
+    }
+
+    // `after`: a test of the same package by its name, else any test by its full name
+    let mut afters = Vec::new();
+    for (index, test) in tests.iter().enumerate() {
+        let mut resolved = Vec::new();
+        for name in &test.after {
+            let own = in_package.get(&(origins[index].package, name.as_str()));
+            match own.or_else(|| by_final_name.get(name.as_str())) {
+                Some(other) => resolved.push(final_names[*other].clone()),
+                None if switched_off.contains(name) => {}
+                None => {
+                    let hint = util::suggest(name, final_names.iter().map(String::as_str))
+                        .map(|close| format!(" (did you mean `{close}`?)"))
+                        .unwrap_or_default();
+                    bail!("test `{}`: after = [\"{name}\"] names no test{hint}", final_names[index]);
+                }
+            }
+        }
+        afters.push(resolved);
+    }
+    for ((test, name), after) in tests.iter_mut().zip(final_names).zip(afters) {
+        test.name = name;
+        test.after = after;
     }
 
     if let Some(circle) = find_after_circle(tests) {

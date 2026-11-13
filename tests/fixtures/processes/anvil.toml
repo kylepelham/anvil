@@ -1,0 +1,31 @@
+[project]
+name = "processes"
+
+[target.procs]
+kind = "exe"
+
+# A server a later test uses goes on after the test that started it ends
+[[test]]
+name = "server_start"
+command = ["{target:procs}", "server", "{out}/ping"]
+
+[[test]]
+name = "server_use"
+command = ["{target:procs}", "check", "{out}/ping"]
+after = ["server_start"]
+
+# A process holding the output open does not keep the test waiting
+[[test]]
+name = "holder"
+command = ["{target:procs}", "holder"]
+
+# Arguments after `--` go to programs of the project, not to cmake -E
+[[test]]
+name = "args_program"
+command = ["{target:procs}", "print"]
+expect = ["extra"]
+
+[[test]]
+name = "args_cmake"
+command = ["cmake", "-E", "echo", "fixed"]
+reject = ["extra"]

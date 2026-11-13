@@ -84,7 +84,8 @@ enum CommandLine {
         args: Vec<String>,
     },
 
-    /// Build and run the tests; arguments after `--` go to every test's program.
+    /// Build and run the tests; arguments after `--` go to every test that runs a program of the project
+    /// ({target:...}).
     #[command(visible_alias = "t")]
     Test {
         #[command(flatten)]
@@ -326,8 +327,11 @@ fn main() {
     let cli = Cli::parse();
     ui::init(cli.quiet);
 
-    // Ctrl-C: finish what is running, save the build database, stop
+    // Ctrl-C: finish what is running, save the build database, stop. `anvil run`'s program handles its own.
     let _ = ctrlc::set_handler(|| {
+        if job::FOREGROUND_PROGRAM.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         if exec::INTERRUPTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             std::process::exit(130);
         }
@@ -338,8 +342,10 @@ fn main() {
         std::process::exit(cmake_tool::run(args));
     }
 
-    // Whoever kills Anvil stops what it started too
+    // Whoever kills Anvil stops what it started too, and only that
     job::contain_self();
+    job::keep_handles_to_self();
+    job::separate_pdb_server();
 
     // -C: run in that folder, so every relative path (`anvil -C x convert sub`) starts there
     if let Some(dir) = &cli.dir {
