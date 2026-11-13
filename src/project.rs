@@ -214,6 +214,7 @@ impl Model {
 
         model.check_cycles()?;
         model.check_output_names()?;
+        model.check_data_files()?;
         model.check_sources()?;
         model.find_cuda()?;
         let mut declared = model.request_declared_vcpkg()?;
@@ -1064,6 +1065,35 @@ impl Model {
         Ok(())
     }
 
+    /// Two targets must not copy different data files to the same place.
+    fn check_data_files(&self) -> Result<()> {
+        let mut destinations: HashMap<String, (usize, &Path)> = HashMap::new();
+
+        for (index, target) in self.targets.iter().enumerate() {
+            let Some(folder) = crate::plan::artifact_path(self, target).and_then(|file| file.parent().map(Path::to_path_buf)) else {
+                continue;
+            };
+            for (file, relative) in &target.data {
+                let destination = folder.join(relative);
+                let Some((other, other_file)) = destinations.insert(util::path_key(&destination), (index, file)) else {
+                    continue;
+                };
+                if util::path_key(other_file) != util::path_key(file) {
+                    bail!(
+                        "targets `{}` and `{}` both copy a data file to {}: {} and {}; rename one, or give one target an `output-dir`",
+                        self.qualified_name(other),
+                        self.qualified_name(index),
+                        util::rel(&destination, &self.root),
+                        util::rel(other_file, &self.root),
+                        util::rel(file, &self.root)
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// With .cu files: the CUDA toolkit, its headers left out of dependency tracking, and its runtime linked into
     /// whatever uses the targets holding them.
     fn find_cuda(&mut self) -> Result<()> {
@@ -1268,7 +1298,8 @@ impl Model {
 
             // Its workdir was resolved with its other paths, relative to its folder
             let workdir = target.workdir.clone().unwrap_or_else(|| package.root.clone());
-            let test = test_case(&spec, workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name).with_context(|| format!("in [target.{}]", target.name))?;
+            let test = test_case(&spec, workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name)
+                .with_context(|| format!("in [target.{}]", target.name))?;
             self.tests.push(test);
         }
         for package in self.packages.iter().filter(|package| package.member) {

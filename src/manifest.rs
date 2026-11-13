@@ -74,6 +74,8 @@ pub struct ProjectSpec {
     pub out: Option<String>,
     /// The executable `anvil run` starts when there are several.
     pub default_run: Option<String>,
+    /// `anvil install` writes CMake and pkg-config files for the installed libraries (default true).
+    pub export: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -194,6 +196,10 @@ pub struct TargetSpec {
     /// Static libraries linked whole, every object in them, even those nothing here calls (a program that loads
     /// plugins and exports the engine to them).
     pub whole_archive: Option<Vec<String>>,
+    /// Files (globs relative to `dir`) copied beside the program or shared library, keeping their path under `dir`.
+    pub data: Option<Vec<String>>,
+    /// `anvil install` installs it (default: whether it is a default target; tests never).
+    pub install: Option<bool>,
 
     #[serde(default)]
     pub when: IndexMap<String, TargetSpec>,

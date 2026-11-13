@@ -730,7 +730,11 @@ fn default_triplet(toolchain: &Toolchain, static_runtime: bool, static_libraries
 
     Ok(match (toolchain.platform.os, static_libraries) {
         (Os::Windows, _) if !toolchain.is_msvc_abi() => {
-            let linkage = if static_libraries.unwrap_or(static_runtime) { "static" } else { "dynamic" };
+            let linkage = if static_libraries.unwrap_or(static_runtime) {
+                "static"
+            } else {
+                "dynamic"
+            };
             format!("{architecture}-mingw-{linkage}")
         }
         (Os::Windows, Some(false)) if static_runtime => {

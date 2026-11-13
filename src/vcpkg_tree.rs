@@ -46,6 +46,15 @@ pub struct Usage {
     pub runtime: Vec<PathBuf>,
 }
 
+/// How CMake users find and link an installed port: `find_package(<name> [CONFIG])`, then its targets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CmakePackage {
+    pub name: String,
+    /// find_package needs CONFIG (a config file only), else CMake's own Find module finds it too.
+    pub config: bool,
+    pub targets: Vec<String>,
+}
+
 impl InstalledTree {
     pub fn load(install_root: &Path, triplet: &str) -> Result<InstalledTree> {
         let status_file = install_root.join("vcpkg").join("status");
@@ -137,6 +146,49 @@ impl InstalledTree {
         }
 
         Ok(usage)
+    }
+
+    /// How CMake finds and links port `name`: what its `usage` file says, else its config file and imported library
+    /// targets. None when it has neither (its files are then linked by path).
+    pub fn cmake_package(&self, name: &str) -> Option<CmakePackage> {
+        let package = self.packages.get(name)?;
+        let share = format!("{}/share/", self.triplet);
+        let shared_files: Vec<&String> = package.files.iter().filter(|file| file.starts_with(&share)).collect();
+
+        // The port's own advice
+        let usage = shared_files
+            .iter()
+            .find(|file| file.ends_with("/usage"))
+            .and_then(|file| std::fs::read_to_string(self.root.join(file)).ok())
+            .and_then(|text| parse_usage(&text));
+        if usage.is_some() {
+            return usage;
+        }
+
+        // Its config file, and the imported targets that have a library (all of them when it is header-only)
+        let config = shared_files.iter().find_map(|file| {
+            let file_name = file.rsplit('/').next()?;
+            file_name
+                .strip_suffix("Config.cmake")
+                .or_else(|| file_name.strip_suffix("-config.cmake"))
+                .map(str::to_string)
+        })?;
+        let imported = self.imported_targets(package, "Release");
+        let has_library = imported.iter().any(|target| target.has_library);
+        let targets: Vec<String> = imported
+            .iter()
+            .filter(|target| target.has_library || !has_library)
+            .map(|target| target.name.clone())
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+
+        Some(CmakePackage {
+            name: config,
+            config: true,
+            targets,
+        })
     }
 
     /// The imported targets a package's CMake files define, with what each gives its users for `configuration`.
@@ -332,6 +384,29 @@ impl InstalledTree {
     }
 }
 
+/// A port's usage file: its first `find_package(...)` and the targets of the first `target_link_libraries(...)` after it.
+fn parse_usage(text: &str) -> Option<CmakePackage> {
+    let start = text.find("find_package(")? + "find_package(".len();
+    let after = &text[start..];
+    let arguments: Vec<&str> = after[..after.find(')')?].split_whitespace().collect();
+    let name = arguments.first()?.to_string();
+    let config = arguments.iter().any(|word| *word == "CONFIG" || *word == "NO_MODULE");
+
+    let link_start = after.find("target_link_libraries(")? + "target_link_libraries(".len();
+    let link = &after[link_start..];
+    let targets: Vec<String> = link[..link.find(')')?]
+        .split_whitespace()
+        .skip(1)
+        .filter(|word| !matches!(*word, "PRIVATE" | "PUBLIC" | "INTERFACE"))
+        .map(str::to_string)
+        .collect();
+    if targets.is_empty() {
+        return None;
+    }
+
+    Some(CmakePackage { name, config, targets })
+}
+
 /// An imported target's path with the variables package files write for the install prefix and their own folder.
 fn expand_import_prefixes(entry: &str, prefix: &str, list_dir: &str) -> String {
     entry
@@ -502,6 +577,22 @@ mod tests {
         let blocks = target_property_blocks("set_target_properties(a::b PROPERTIES\n  INTERFACE_COMPILE_DEFINITIONS \"X=f(1)\"\n)\nset_target_properties(a::c PROPERTIES IMPORTED_IMPLIB \"x.lib\")");
         assert_eq!(blocks.len(), 2);
         assert_eq!(property_values(&blocks[0].1, "INTERFACE_COMPILE_DEFINITIONS", "Debug"), vec!["X=f(1)"]);
+    }
+
+    #[test]
+    fn reads_usage_files() {
+        let glm = "The package glm provides CMake targets:\n\n    find_package(glm CONFIG REQUIRED)\n    target_link_libraries(main PRIVATE glm::glm)\n\n    # Or use the header-only version\n    find_package(glm CONFIG REQUIRED)\n    target_link_libraries(main PRIVATE glm::glm-header-only)\n";
+        let package = parse_usage(glm).unwrap();
+        assert_eq!(
+            (package.name.as_str(), package.config, package.targets),
+            ("glm", true, vec!["glm::glm".to_string()])
+        );
+
+        let zlib = "    find_package(ZLIB REQUIRED)\n    target_link_libraries(main PRIVATE ZLIB::ZLIB)\n";
+        assert!(!parse_usage(zlib).unwrap().config);
+
+        // Includes only: nothing to link
+        assert!(parse_usage("    find_package(Stb REQUIRED)\n    target_include_directories(main PRIVATE ${Stb_INCLUDE_DIR})").is_none());
     }
 
     #[test]

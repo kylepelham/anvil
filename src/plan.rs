@@ -96,6 +96,11 @@ pub struct Plan {
 
     /// Each planned target's program or library file.
     pub artifacts: HashMap<usize, PathBuf>,
+
+    /// Each linked DLL's (or exporting program's) import library, and the runtime files copied beside each program
+    /// and shared library (DLLs of its dependencies, the sanitizer's).
+    pub import_libs: HashMap<usize, PathBuf>,
+    pub runtime_files: HashMap<usize, Vec<PathBuf>>,
 }
 
 /// Include folders, defines and flags a target compiles with.
@@ -144,6 +149,8 @@ struct Planner<'a> {
     objects: HashMap<usize, Vec<(PathBuf, usize)>>,
     link_artifact: HashMap<usize, (PathBuf, usize)>,
     artifacts: HashMap<usize, PathBuf>,
+    import_libs: HashMap<usize, PathBuf>,
+    runtime_files: HashMap<usize, Vec<PathBuf>>,
 
     // Runtime files already copied into the output folder (by destination)
     copies: HashSet<String>,
@@ -244,6 +251,8 @@ pub fn plan(model: &Model, host: Option<&Model>, roots: &[usize], color: bool) -
     Ok(Plan {
         actions: planner.actions,
         artifacts: planner.artifacts,
+        import_libs: planner.import_libs,
+        runtime_files: planner.runtime_files,
     })
 }
 
@@ -469,6 +478,8 @@ impl<'a> Planner<'a> {
             objects: HashMap::new(),
             link_artifact: HashMap::new(),
             artifacts: HashMap::new(),
+            import_libs: HashMap::new(),
+            runtime_files: HashMap::new(),
             copies: HashSet::new(),
             host_tools: HashMap::new(),
         }
@@ -766,7 +777,11 @@ impl<'a> Planner<'a> {
         // The target's settings, borrowed until a file rule adds to them
         let mut settings = FileSettings {
             language,
-            standard: if matches!(language, Language::C | Language::ObjC) { &target.c_std } else { &target.std },
+            standard: if matches!(language, Language::C | Language::ObjC) {
+                &target.c_std
+            } else {
+                &target.std
+            },
             opt: profile.opt,
             warnings: target.warnings,
             werror: target.werror,
@@ -1151,6 +1166,7 @@ impl<'a> Planner<'a> {
 
         // A DLL (or exporting program) that exports nothing makes no import library: say why instead of failing later
         if let Some(import_lib) = &import_lib {
+            self.import_libs.insert(index, import_lib.clone());
             action.outputs.push(import_lib.clone());
             let remedy = if shared { "or make it kind = \"lib\"" } else { "or drop exports = true" };
             let message = format!(
@@ -1170,6 +1186,13 @@ impl<'a> Planner<'a> {
             let sanitizer_runtime = self.toolchain.sanitizer_runtime(&self.model.profile)?;
             for file in link.runtime_files.iter().chain(&sanitizer_runtime) {
                 self.plan_copy(file, &folder);
+            }
+            let runtime_files = link.runtime_files.iter().chain(&sanitizer_runtime).cloned().collect();
+            self.runtime_files.insert(index, runtime_files);
+
+            // Data files, at their path under the target's folder
+            for (file, relative) in &target.data {
+                self.plan_copy_to(file, &folder.join(relative));
             }
         }
 
@@ -1210,12 +1233,19 @@ impl<'a> Planner<'a> {
     }
 
     fn plan_copy(&mut self, file: &Path, folder: &Path) {
-        let destination = folder.join(file.file_name().unwrap());
+        self.plan_copy_to(file, &folder.join(file.file_name().unwrap()));
+    }
+
+    fn plan_copy_to(&mut self, file: &Path, destination: &Path) {
+        let destination = destination.to_path_buf();
         if !self.copies.insert(util::path_key(&destination)) {
             return;
         }
 
-        let description = format!("Copying {}", destination.file_name().unwrap().to_string_lossy());
+        let shown = util::strip_prefix_ci(&destination, &self.model.out_dir)
+            .map(|relative| slash(&relative))
+            .unwrap_or_else(|| destination.file_name().unwrap().to_string_lossy().into_owned());
+        let description = format!("Copying {shown}");
         let mut action = Action::new(ActionKind::Copy, description, PathBuf::new(), self.env.clone());
         action.copy_from = Some(file.to_path_buf());
         action.inputs = vec![file.to_path_buf()];

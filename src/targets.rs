@@ -105,6 +105,10 @@ pub struct Target {
     pub output_suffix: Option<String>,
     pub output_dir: Option<PathBuf>,
 
+    // Files copied beside the output (source, path under `dir`), and whether `anvil install` takes it (None: default)
+    pub data: Vec<(PathBuf, PathBuf)>,
+    pub install: Option<bool>,
+
     // Test settings
     pub args: Vec<String>,
     pub workdir: Option<PathBuf>,
@@ -209,6 +213,8 @@ struct Accumulated {
     output_name: Option<String>,
     output_suffix: Option<String>,
     output_dir: Option<String>,
+    data: Vec<String>,
+    install: Option<bool>,
     file_rules: Vec<FileRule>,
     runs: Vec<RunSpec>,
     pre_build: Vec<StepSpec>,
@@ -330,6 +336,8 @@ impl Target {
             output_name: name.to_string(),
             output_suffix: None,
             output_dir: None,
+            data: Vec::new(),
+            install: None,
             args: Vec::new(),
             workdir: None,
             timeout: None,
@@ -632,6 +640,8 @@ impl Target {
             .map(|folder| paths(&[folder]).map(|mut list| list.remove(0)))
             .transpose()?;
         self.export_header = settings.export_header.map(|spec| self.resolve_export_header(spec));
+        self.data = resolve_data(&settings.data, &dir, scope, &self.name, self.kind)?;
+        self.install = settings.install;
 
         // The export header is on the public include path, and exports while the target builds as a shared library
         if let Some((_, macro_name)) = &self.export_header {
@@ -892,6 +902,7 @@ impl Accumulated {
         self.needs.extend(spec.needs.iter().flatten().cloned());
         self.link_depends.extend(spec.link_depends.iter().flatten().cloned());
         self.whole_archive.extend(spec.whole_archive.iter().flatten().cloned());
+        self.data.extend(spec.data.iter().flatten().cloned());
         self.cuda_flags.extend(spec.cuda_flags.iter().flatten().cloned());
         if let Some(cuda_arch) = &spec.cuda_arch {
             self.cuda_arch = Some(cuda_arch.to_vec());
@@ -921,6 +932,7 @@ impl Accumulated {
         set_if_some(&mut self.output_name, &spec.output_name);
         set_if_some(&mut self.output_suffix, &spec.output_suffix);
         set_if_some(&mut self.output_dir, &spec.output_dir);
+        set_if_some(&mut self.install, &spec.install);
         set_if_some(&mut self.workdir, &spec.workdir);
         set_if_some(&mut self.timeout, &spec.timeout);
         set_if_some(&mut self.will_fail, &spec.will_fail);
@@ -1217,6 +1229,59 @@ fn expand_lib(lib: &str, dir: &Path, scope: &PackageScope, target_name: &str) ->
     } else {
         Ok(expanded)
     }
+}
+
+/// `data` patterns: each file they match, with its path under `dir` (where it goes beside the target's file). A
+/// folder stands for everything in it; a pattern that matches nothing is an error.
+fn resolve_data(patterns: &[String], dir: &Path, scope: &PackageScope, target_name: &str, kind: Kind) -> Result<Vec<(PathBuf, PathBuf)>> {
+    if patterns.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !matches!(kind, Kind::Exe | Kind::Test | Kind::Shared) {
+        bail!("data: a {} target makes no program or shared library to copy files beside", kind.name());
+    }
+
+    // Each pattern's files, then the `!` exclusions
+    let mut files = Vec::new();
+    let mut excludes = GlobSetBuilder::new();
+    for pattern in patterns {
+        let pattern = expand_path_text(pattern, scope, target_name)?;
+        if let Some(excluded) = pattern.strip_prefix('!') {
+            excludes.add(compile_glob(&absolute_glob(dir, excluded)).with_context(|| format!("data: bad pattern \"{pattern}\""))?);
+            continue;
+        }
+
+        let (base, glob) = split_pattern(dir, &pattern);
+        let found = match glob {
+            None if base.is_dir() => walk_glob(&base, "**", scope.out_root)?,
+            _ => walk_glob(dir, &pattern, scope.out_root)?,
+        };
+        if found.is_empty() {
+            bail!("data: \"{pattern}\" matches no files (in {})", util::rel(dir, scope.root));
+        }
+        files.extend(found);
+    }
+    let excludes = excludes.build()?;
+    files.retain(|file| !excludes.is_match(slash(file)));
+
+    // Each file once, at its path under the target's folder
+    let mut seen = HashSet::new();
+    let mut data = Vec::new();
+    for file in files {
+        if !seen.insert(util::path_key(&file)) {
+            continue;
+        }
+        let Some(relative) = util::strip_prefix_ci(&file, dir) else {
+            bail!(
+                "data: {} is outside the target's folder ({}); data files keep their path under it, so give the target a `dir` that holds them",
+                util::rel(&file, scope.root),
+                util::rel(dir, scope.root)
+            );
+        };
+        data.push((file, relative));
+    }
+
+    Ok(data)
 }
 
 fn resolve_file_rule(rule: &FileRule, dir: &Path, scope: &PackageScope, target_name: &str) -> Result<Option<ResolvedFileRule>> {
