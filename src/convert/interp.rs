@@ -150,6 +150,9 @@ pub struct Interpreter {
     pub(super) header_only_sources: HashSet<String>,
     /// Words added to a CMAKE_<LANG>_FLAGS variable under a condition: (variable, word) -> condition.
     pub(super) flag_word_conditions: HashMap<(String, String), String>,
+    /// Words added to a flag variable in a branch this machine does not take, which puts the variable back
+    /// afterwards: (variable, the word before it then, word), in the order they were added.
+    pub(super) off_host_flag_words: Vec<(String, Option<String>, String)>,
     pub export_headers: Vec<ExportHeader>,
     pub pkg_config: IndexMap<String, Vec<String>>,
     pub project_name: Option<String>,
@@ -200,6 +203,7 @@ impl Interpreter {
             source_properties: Vec::new(),
             header_only_sources: HashSet::new(),
             flag_word_conditions: HashMap::new(),
+            off_host_flag_words: Vec::new(),
             export_headers: Vec::new(),
             pkg_config: IndexMap::new(),
             project_name: None,

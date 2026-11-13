@@ -75,6 +75,8 @@ pub struct Target {
     pub public_std: Option<u32>,
     /// The C standard of its C files (C_STANDARD, c_std_NN).
     pub c_std: Option<u32>,
+    /// The C standard its dependents need too (a PUBLIC or INTERFACE c_std_NN).
+    pub public_c_std: Option<u32>,
     pub pch: Option<PathBuf>,
     pub gui: bool,
     pub output_name: Option<String>,
@@ -214,6 +216,7 @@ impl Target {
             std: None,
             public_std: None,
             c_std: None,
+            public_c_std: None,
             pch: None,
             gui: false,
             output_name: None,
