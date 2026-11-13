@@ -813,6 +813,31 @@ fn find_llvm_tool(name: &str, visual_studio: Option<&Path>) -> Option<PathBuf> {
         return Some(found);
     }
 
+    llvm_folders(visual_studio)
+        .into_iter()
+        .map(|folder| folder.join(exe(name)))
+        .find(|candidate| candidate.is_file())
+}
+
+/// An LLVM program Anvil runs itself (clang-format, clang-tidy), found as clang is; else an error naming where it looked.
+pub fn find_llvm_program(name: &str) -> Result<PathBuf> {
+    let visual_studio = if cfg!(windows) { find_visual_studio() } else { None };
+    if let Some(found) = find_llvm_tool(name, visual_studio.as_deref()) {
+        return Ok(found);
+    }
+
+    let mut places = vec!["PATH".to_string()];
+    places.extend(llvm_folders(visual_studio.as_deref()).iter().map(|folder| slash(folder)));
+    let install = if cfg!(windows) {
+        "Install LLVM, or the \"C++ Clang tools for Windows\" component of Visual Studio"
+    } else {
+        "Install LLVM"
+    };
+    bail!("{name} not found (looked on {}). {install}, or put {name} on PATH", places.join(", "))
+}
+
+/// The folders LLVM programs are looked for in after PATH: Visual Studio's bundled LLVM, the default LLVM install.
+fn llvm_folders(visual_studio: Option<&Path>) -> Vec<PathBuf> {
     let mut folders = Vec::new();
     if let Some(visual_studio) = visual_studio {
         folders.push(visual_studio.join(r"VC\Tools\Llvm\x64\bin"));
@@ -822,9 +847,6 @@ fn find_llvm_tool(name: &str, visual_studio: Option<&Path>) -> Option<PathBuf> {
     }
 
     folders
-        .into_iter()
-        .map(|folder| folder.join(exe(name)))
-        .find(|candidate| candidate.is_file())
 }
 
 /// cl prints its version banner on stderr when run with no arguments.

@@ -563,3 +563,82 @@ fn gui_program_with_main_links_msvc() {
     let project = Project::fixture("gui_main", "gui_main");
     project.anvil(&["build", "--toolchain", "msvc"]).success();
 }
+
+// anvil fmt formats the package's files as .clang-format says, past ignored and output folders; anvil tidy reports
+// clang-tidy's findings (once for a header two sources include), through a precompiled header, and fixes them
+
+/// Says why a test is skipped when anvil found no `tool` (clang-format, clang-tidy) on this machine.
+fn lint_tool_missing(run: &Run, tool: &str) -> bool {
+    let missing = run.output().contains(&format!("{tool} not found (looked on"));
+    if missing {
+        eprintln!("skipped: {tool} not found");
+    }
+    missing
+}
+
+#[test]
+fn fmt_checks_then_formats_the_package() {
+    let project = Project::fixture("lint", "fmt");
+    project.write("out/debug/generated.cpp", "int  generated( ){return 1;}\n");
+
+    let check = project.anvil(&["fmt", "--check"]);
+    if lint_tool_missing(&check, "clang-format") {
+        return;
+    }
+    check
+        .code(1)
+        .contains("src/main.cpp")
+        .contains("1 of 4 files are not formatted")
+        .lacks("pick.cpp")
+        .lacks("ugly.cpp")
+        .lacks("generated.cpp");
+    assert!(project.read("src/main.cpp").contains("int main(){"), "--check changed a file");
+
+    project.anvil(&["fmt"]).success().contains("Formatted src/main.cpp");
+    assert!(project.read("src/main.cpp").contains("int main() { return pick(twice(1)); }"));
+    assert_eq!(project.read("third_party/ugly.cpp"), "int  ugly( ){return 1;}\n");
+    project.anvil(&["fmt", "--check"]).success().contains("4 files already formatted");
+
+    // Without a .clang-format, nothing is rewritten in clang-format's own style
+    std::fs::remove_file(project.path(".clang-format")).unwrap();
+    project.edit("src/pick.cpp", "  return 0;", "      return 0;");
+    project.anvil(&["fmt"]).code(1).contains("have no .clang-format");
+    assert!(project.read("src/pick.cpp").contains("      return 0;"));
+}
+
+fn tidy_reports_and_fixes(toolchain: Option<&str>, test: &str) {
+    let project = Project::fixture("lint", test);
+
+    let run = project.anvil(&with_toolchain(toolchain, &["tidy"]));
+    if lint_tool_missing(&run, "clang-tidy") {
+        return;
+    }
+    run.code(1)
+        .contains("pick.cpp:4:13: warning:")
+        .contains("[bugprone-assignment-in-if-condition]")
+        .contains("found 2 warnings checking 2 files")
+        .lacks("clang-diagnostic-error");
+    assert_eq!(run.output().matches("[modernize-use-nullptr]").count(), 1, "{}", run.output());
+
+    // --fix changes the header once, though both sources include it
+    project.anvil(&with_toolchain(toolchain, &["tidy", "--fix"])).code(1).contains("Fixed");
+    assert!(project.read("include/lint/twice.h").contains("int *unused = nullptr;"));
+
+    project.edit("src/pick.cpp", "value = twice(value)", "value == twice(value)");
+    project
+        .anvil(&with_toolchain(toolchain, &["tidy", "app"]))
+        .success()
+        .contains("2 files, nothing found");
+}
+
+#[test]
+fn tidy_reports_and_fixes_findings() {
+    require!("default");
+    tidy_reports_and_fixes(None, "tidy");
+}
+
+#[test]
+fn tidy_reports_and_fixes_findings_gcc() {
+    require!("gcc");
+    tidy_reports_and_fixes(Some("gcc"), "tidy_gcc");
+}

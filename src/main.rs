@@ -12,6 +12,7 @@ mod exec;
 mod export_header;
 mod flags;
 mod job;
+mod lint;
 mod lockfile;
 mod manifest;
 mod plan;
@@ -178,6 +179,29 @@ enum CommandLine {
 
     /// Write compile_commands.json to the project root (for clangd).
     Compdb {
+        #[command(flatten)]
+        build: BuildArgs,
+    },
+
+    /// Format the C and C++ files with clang-format, as the project's .clang-format says.
+    Fmt {
+        /// Files or folders (default: every package's sources and headers).
+        paths: Vec<PathBuf>,
+
+        /// Change nothing: list the files that are not formatted, and exit with 1 when there are any.
+        #[arg(long)]
+        check: bool,
+    },
+
+    /// Check the targets' sources with clang-tidy (the project's .clang-tidy) and the profile's compile commands.
+    Tidy {
+        /// Targets to check (default: every one of the project's, tests too).
+        targets: Vec<String>,
+
+        /// Apply the fixes clang-tidy suggests.
+        #[arg(long)]
+        fix: bool,
+
         #[command(flatten)]
         build: BuildArgs,
     },
@@ -349,6 +373,8 @@ fn main() {
         CommandLine::Toolchains { refresh, set_default } => commands::toolchains(refresh, set_default.as_deref()).map(|_| 0),
         CommandLine::Vcpkg { action, args } => commands::vcpkg(&start_dir, action, &args),
         CommandLine::Compdb { build } => commands::compdb(&start_dir, &build).map(|_| 0),
+        CommandLine::Fmt { paths, check } => lint::format(&start_dir, check, &paths),
+        CommandLine::Tidy { targets, fix, build } => lint::tidy(&start_dir, &build, fix, &targets),
         CommandLine::Update { names, build } => commands::update(&start_dir, &build, &names).map(|_| 0),
         CommandLine::Completions { shell } => {
             clap_complete::generate(shell, &mut <Cli as clap::CommandFactory>::command(), "anvil", &mut std::io::stdout());

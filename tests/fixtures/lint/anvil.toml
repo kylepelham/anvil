@@ -1,0 +1,6 @@
+[project]
+name = "lint"
+
+[target.app]
+kind = "exe"
+pch = "src/pch.h"

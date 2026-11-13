@@ -1133,7 +1133,7 @@ fn package_name(root: &Path, manifest: &Manifest) -> String {
     })
 }
 
-fn workspace_members(root: &Path, manifest: &Manifest) -> Result<Vec<PathBuf>> {
+pub fn workspace_members(root: &Path, manifest: &Manifest) -> Result<Vec<PathBuf>> {
     let Some(workspace) = &manifest.workspace else { return Ok(Vec::new()) };
     let mut members = Vec::new();
 
