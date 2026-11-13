@@ -67,10 +67,26 @@ pub fn run(start_dir: &Path, build: &BuildArgs, name: Option<&str>, args: &[Stri
     );
     // Ctrl-C reaches the program too: it decides how to end, and Anvil waits for it
     crate::job::FOREGROUND_PROGRAM.store(true, std::sync::atomic::Ordering::Relaxed);
-    let status = std::process::Command::new(&program).args(args).status();
+    let mut command = std::process::Command::new(&program);
+    command.args(args);
+    crate::job::end_with_anvil(&mut command);
+    let status = command.status();
     crate::job::FOREGROUND_PROGRAM.store(false, std::sync::atomic::Ordering::Relaxed);
     let status = status.with_context(|| format!("starting {}", program.display()))?;
     drop(model);
+
+    // Killed by a signal (a crash) off Windows: said, and the exit code a shell gives (128 + the signal)
+    #[cfg(unix)]
+    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
+        if signal != libc::SIGINT {
+            ui::error(&format!(
+                "{} was {}",
+                util::rel(&program, &std::env::current_dir()?),
+                crate::testrun::describe_exit(status)
+            ));
+        }
+        return Ok(128 + signal);
+    }
 
     Ok(status.code().unwrap_or(1))
 }

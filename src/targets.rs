@@ -14,6 +14,9 @@ use std::path::{Component, Path, PathBuf};
 
 pub const SOURCE_GLOB: &str = "**/*.{c,cc,cpp,cxx,c++,cu}";
 
+/// The folder of the output folder holding each target's generated files.
+pub const GENERATED_FOLDER: &str = "generated";
+
 // Characters that make a pattern a glob
 const GLOB_CHARACTERS: &[char] = &['*', '?', '[', '{'];
 
@@ -1152,9 +1155,10 @@ pub fn config_name(profile: &str) -> String {
     }
 }
 
-/// Generated files of a target live here (`out_dir` is its package's output folder: `package_out_dir`).
+/// Generated files of a target live here (`out_dir` is its package's output folder: `package_out_dir`). Not `gen`:
+/// that is a program's name (a code generator's) beside it off Windows.
 pub fn gen_dir(out_dir: &Path, target_name: &str) -> PathBuf {
-    out_dir.join("gen").join(sanitize_name(target_name))
+    out_dir.join(GENERATED_FOLDER).join(sanitize_name(target_name))
 }
 
 /// Where a package's objects, generated files and static libraries go: the output folder for the root package,

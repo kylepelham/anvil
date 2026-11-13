@@ -13,7 +13,8 @@ use std::process::Command;
 const CMAKE_IMPLICIT_DEFINES: &[&str] = &["WIN32", "_WINDOWS", "_MBCS", "UNICODE", "_UNICODE"];
 
 // Options each side adds by itself (output and dependency files, precompiled headers, optimization, debug info,
-// warning level, conformance, diagnostics), left out of the comparison; a trailing `*` matches any rest.
+// warning level, conformance, diagnostics, -pthread where glibc needs none), left out of the comparison; a trailing
+// `*` matches any rest.
 // MSVC options are compared with `-`, however written; `@file` (response files, module maps) is CMake's own too
 const OWN_OPTIONS: &[&str] = &[
     "-nologo",
@@ -63,6 +64,7 @@ const OWN_OPTIONS: &[&str] = &[
     "-fcolor-diagnostics",
     "-fPIC",
     "-fpic",
+    "-pthread",
     "-w",
     "-Wextra",
     "-Winvalid-pch",
@@ -298,7 +300,7 @@ fn read_database(file: &Path, build_folder: &Path, model: &Model) -> Result<Data
 
 /// Anvil's folder for a target's generated headers ({gen}) while nothing is in it: CMake has none to match.
 fn is_empty_gen_folder(folder: &Path, model: &Model) -> bool {
-    let gen_root = format!("{}/", util::path_key(&model.out_dir.join("gen")));
+    let gen_root = format!("{}/", util::path_key(&model.out_dir.join(crate::targets::GENERATED_FOLDER)));
     let is_gen = util::path_key(folder).starts_with(&gen_root);
     let has_files = walkdir::WalkDir::new(folder)
         .into_iter()
@@ -341,10 +343,11 @@ fn read_flags(words: &[String], found: &mut dyn FnMut(FlagKind, &str)) {
     flags.extend(INCLUDE_FLAGS.iter().map(|flag| (*flag, false)));
     flags.sort_by_key(|(flag, _)| std::cmp::Reverse(flag.len()));
 
-    // MSVC takes `/` and `-` alike: compared as `-`
-    let program = words
-        .first()
-        .map(|word| Path::new(word).file_stem().unwrap_or_default().to_string_lossy().to_lowercase());
+    // MSVC takes `/` and `-` alike: compared as `-` (the program's name read on any system: C:\VS\cl.exe is cl)
+    let program = words.first().map(|word| {
+        let file_name = word.rsplit(['/', '\\']).next().unwrap_or_default();
+        Path::new(file_name).file_stem().unwrap_or_default().to_string_lossy().to_lowercase()
+    });
     let msvc = matches!(program.as_deref(), Some("cl" | "clang-cl"));
 
     let mut index = 1;

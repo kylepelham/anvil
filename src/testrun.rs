@@ -383,7 +383,7 @@ fn judge(test: &TestCase, status: ExitStatus, output: &str) -> (Outcome, String)
 
 /// "exit code 3", or how it crashed: "exit code 0xC0000005: access violation", "killed by SIGSEGV: segmentation
 /// fault".
-fn describe_exit(status: ExitStatus) -> String {
+pub fn describe_exit(status: ExitStatus) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;

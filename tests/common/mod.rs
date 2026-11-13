@@ -145,9 +145,15 @@ impl Project {
 
     /// Runs `anvil -C <root>/<folder> <args>`, from that folder.
     pub fn anvil_in(&self, folder: &str, args: &[&str]) -> Run {
+        self.anvil_with(folder, &[], args)
+    }
+
+    /// Runs `anvil -C <root>/<folder> <args>` with more environment variables.
+    pub fn anvil_with(&self, folder: &str, environment: &[(&str, &str)], args: &[&str]) -> Run {
         let folder = if folder == "." { self.root.clone() } else { self.root.join(folder) };
         let mut command = Command::new(ANVIL);
         command.arg("-C").arg(&folder).args(args).current_dir(&folder).env("NO_COLOR", "1");
+        command.envs(environment.iter().copied());
 
         let started = Instant::now();
         let output = command.output().expect("starting anvil");

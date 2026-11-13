@@ -1382,11 +1382,21 @@ pub fn command_line(action: &Action) -> String {
     line
 }
 
+/// An argument as a shell would need it typed: in double quotes when it holds spaces on Windows; in single quotes when
+/// it holds spaces or characters sh reads (`$ORIGIN`) elsewhere.
 fn quote_for_display(text: &str) -> String {
-    if text.contains(' ') {
-        format!("\"{text}\"")
-    } else {
+    if cfg!(windows) {
+        return if text.contains(' ') { format!("\"{text}\"") } else { text.to_string() };
+    }
+
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_./=:,+@%".contains(character));
+    if plain {
         text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
     }
 }
 
@@ -1422,5 +1432,17 @@ mod tests {
     fn briefs_arguments() {
         assert_eq!(brief_arguments(&["-DFOO=1"]), "-DFOO=1");
         assert_eq!(brief_arguments(&["a", "b", "c", "d", "e"]), "a b c (and 2 more)");
+    }
+
+    #[test]
+    fn verbose_lines_quote_as_a_shell_needs() {
+        if cfg!(windows) {
+            assert_eq!(quote_for_display("C:/a b/x.cpp"), "\"C:/a b/x.cpp\"");
+            assert_eq!(quote_for_display("/Fo:x.obj"), "/Fo:x.obj");
+        } else {
+            assert_eq!(quote_for_display("-Wl,-rpath,$ORIGIN/../lib"), "'-Wl,-rpath,$ORIGIN/../lib'");
+            assert_eq!(quote_for_display("-DNAME=\"it's\""), "'-DNAME=\"it'\\''s\"'");
+            assert_eq!(quote_for_display("-std=c++20"), "-std=c++20");
+        }
     }
 }

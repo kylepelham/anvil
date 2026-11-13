@@ -3220,10 +3220,13 @@ fn library_truth(library: &str) -> Truth {
     }
 }
 
-/// Where a check's source compiles: GCC extensions not with cl (nor a visibility attribute with MinGW's GCC, which
-/// warns about it, when warnings fail the check), its `#if` tests of platform macros (an `#error` under them, or a
-/// main() only there), and the platform headers and functions it uses where they exist (unless it picks its code by
-/// platform macros).
+// A visibility attribute on a static function's declaration
+static STATIC_VISIBILITY: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\bstatic\b[^;]*visibility").unwrap());
+
+/// Where a check's source compiles: GCC extensions not with cl (nor a visibility attribute with MinGW's GCC, nor on
+/// a static function with any GCC, which warn about it, when warnings fail the check), its `#if` tests of platform
+/// macros (an `#error` under them, or a main() only there), and the platform headers and functions it uses where they
+/// exist (unless it picks its code by platform macros).
 fn source_truth(source: &str, warnings_fail: bool) -> Truth {
     let mut truth = Truth::Known(true);
     if ["__attribute__", "__builtin_", "__asm__", "__typeof__"]
@@ -3233,7 +3236,8 @@ fn source_truth(source: &str, warnings_fail: bool) -> Truth {
         truth = Truth::Depends("!msvc".into());
     }
     if warnings_fail && source.contains("__attribute__") && source.contains("visibility") {
-        truth = truth.and(Truth::Depends("!mingw".into()));
+        let on_static = STATIC_VISIBILITY.is_match(source);
+        truth = truth.and(Truth::Depends(if on_static { "!gcc" } else { "!mingw" }.into()));
     }
     truth = truth.and(preprocessor_truth(source));
     if PLATFORM_MACROS.iter().any(|macro_name| source.contains(macro_name)) {
@@ -4351,10 +4355,13 @@ list(TRANSFORM TOOLS APPEND .c OUTPUT_VARIABLE FILES)
             assert_eq!(source_truth(source, false), truth, "{source}");
         }
 
-        // zlib's visibility check made with -Werror: MinGW's GCC warns that it ignores the attribute
+        // zlib's visibility check made with -Werror: GCC warns that it ignores the attribute on a static function,
+        // MinGW's GCC on any
         let visibility = "static void f(void) __attribute__ ((visibility(\"hidden\")));\nint main(void) {return 0;}";
         assert_eq!(source_truth(visibility, false), depends("!msvc"));
-        assert_eq!(source_truth(visibility, true), depends("!msvc & !mingw"));
+        assert_eq!(source_truth(visibility, true), depends("!msvc & !gcc"));
+        let exported = "void f(void) __attribute__ ((visibility(\"default\")));\nint main(void) {return 0;}";
+        assert_eq!(source_truth(exported, true), depends("!msvc & !mingw"));
     }
 
     #[test]
@@ -4396,7 +4403,7 @@ check_c_source_compiles("int main(void) { return 0; }" HAVE_AVX2_FLAG)
 "#;
         let interpreter = run("required-flags", &[("CMakeLists.txt", cmake)]);
 
-        assert_eq!(model::marked_condition(&variable(&interpreter, "HAVE_HIDDEN")), Some("!msvc & !mingw"));
+        assert_eq!(model::marked_condition(&variable(&interpreter, "HAVE_HIDDEN")), Some("!msvc & !gcc"));
         assert_eq!(variable(&interpreter, "HAVE_PLAIN"), "1");
         if cfg!(windows) {
             assert_eq!(model::marked_condition(&variable(&interpreter, "HAVE_AVX2_FLAG")), Some("!msvc"));

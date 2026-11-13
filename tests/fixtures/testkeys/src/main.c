@@ -1,4 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
+#define _POSIX_C_SOURCE 200809L
 /* A test helper: print, exit with a code, sleep, create or check files, hold a lock folder or check nobody holds it */
 #include <stdio.h>
 #include <stdlib.h>

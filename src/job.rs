@@ -1,7 +1,7 @@
 //! Process trees: a test's program and every process it starts stop together at its timeout and at Ctrl-C (a job
 //! object on Windows, a process group on Unix); what a test leaves running when it ends by itself (a server later
 //! tests use) goes on. Anvil also puts itself in a job, so that whoever kills Anvil (an IDE's stop button) stops its
-//! compilers and tests with it.
+//! compilers and tests with it (on Linux, `anvil run`'s program and the tests end with Anvil).
 
 use std::io;
 use std::process::{Child, Command, ExitStatus};
@@ -47,6 +47,7 @@ impl ProcessTree {
         use std::os::unix::process::CommandExt;
 
         command.process_group(0);
+        end_with_anvil(command);
         Ok(ProcessTree { child: command.spawn()? })
     }
 
@@ -83,6 +84,30 @@ impl ProcessTree {
         return unsafe { libc::kill(-(self.child.id() as i32), 0) } == 0;
     }
 }
+
+/// Makes a program Anvil starts and waits for (`anvil run`'s, a test's) end when Anvil does, however Anvil ends (an
+/// IDE's stop button, a CI timeout), as Anvil's job does on Windows: on Linux the kernel kills it when the thread that
+/// started it ends. Not done for compiles: they end soon by themselves, and spawning without it is faster.
+#[cfg(target_os = "linux")]
+pub fn end_with_anvil(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    let anvil = std::process::id() as libc::pid_t;
+    unsafe {
+        command.pre_exec(move || {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+
+            // Anvil ended before that: nothing would signal it
+            if libc::getppid() != anvil {
+                libc::raise(libc::SIGKILL);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn end_with_anvil(_command: &mut Command) {}
 
 /// Puts Anvil in a job that stops everything it started when Anvil dies or is killed. `release` before a normal exit.
 #[cfg(windows)]
