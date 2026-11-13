@@ -311,9 +311,17 @@ pub(super) struct TestOut {
 
 #[derive(Debug, Clone)]
 enum DependencyEntry {
-    Vcpkg { verified: bool, note: Option<String> },
-    Git { url: String, tag: Option<String> },
+    Vcpkg {
+        verified: bool,
+        note: Option<String>,
+    },
+    Git {
+        url: String,
+        tag: Option<String>,
+    },
     PkgConfig(String),
+    /// A dependency Anvil has built in: `openmp`, `threads`, `opengl` (`"system"`).
+    System,
 }
 
 /// What a link item turned out to be.
@@ -1420,17 +1428,20 @@ impl Emitter {
     fn resolve_package(&mut self, item: &str) -> Vec<(Option<String>, Link)> {
         let lower = item.to_lowercase();
 
-        // System packages
+        // System packages: Anvil's built-in dependencies
+        let system = match lower.as_str() {
+            "threads::threads" => Some("threads"),
+            "opengl::gl" | "opengl::opengl" => Some("opengl"),
+            "openmp::openmp_cxx" | "openmp::openmp_c" => Some("openmp"),
+            _ => None,
+        };
+        if let Some(name) = system {
+            self.dependencies.insert(name.to_string(), DependencyEntry::System);
+            return vec![(None, Link::Dependency(name.to_string()))];
+        }
         match lower.as_str() {
-            "threads::threads" => return vec![(Some("unix".into()), Link::Library("pthread".into()))],
             // The CUDA runtime links into whatever has .cu files; the toolkit's other libraries are in its lib folder
             "cuda::cudart" | "cuda::cudart_static" | "cuda::toolkit" => return Vec::new(),
-            "opengl::gl" | "opengl::opengl" => {
-                return vec![
-                    (Some("windows".into()), Link::Library("opengl32".into())),
-                    (Some("linux".into()), Link::Library("GL".into())),
-                ];
-            }
             _ => {}
         }
 
@@ -2335,12 +2346,16 @@ impl Emitter {
                         )
                     }
                     DependencyEntry::PkgConfig(module) => (format!("{{ pkg-config = {} }}", quote(module)), None),
+                    DependencyEntry::System => ("\"system\"".to_string(), None),
                 };
 
                 // Needed only where the targets using it are: installed only there
                 let value = match (self.dependency_condition(name), value.strip_suffix(" }")) {
                     (None, _) => value,
                     (Some(condition), Some(table)) => format!("{table}, if = {} }}", quote(&condition)),
+                    (Some(condition), None) if matches!(entry, DependencyEntry::System) => {
+                        format!("{{ libs = [{}], if = {} }}", quote(name), quote(&condition))
+                    }
                     (Some(condition), None) => format!("{{ vcpkg = {}, if = {} }}", quote(name), quote(&condition)),
                 };
                 if note.as_deref().is_some_and(|note| note.starts_with("TODO")) {

@@ -7,7 +7,7 @@ use crate::platform::Platform;
 use crate::project::{self, LoadOptions, Model};
 use crate::settings::Settings;
 use crate::targets::Kind;
-use crate::toolchain::{Family, Toolchain};
+use crate::toolchain::{self, Family, Toolchain};
 use crate::ui;
 use crate::util::{self, slash};
 use crate::vcpkg::Instance;
@@ -478,7 +478,13 @@ fn check_runs_here(model: &Model, command: &str) -> Result<()> {
 }
 
 /// Plans and runs the actions `roots` need, then prints the summary line.
-pub fn build_roots(model: Model, build: &BuildArgs, roots: &[usize]) -> Result<(Model, Plan)> {
+pub fn build_roots(mut model: Model, build: &BuildArgs, roots: &[usize]) -> Result<(Model, Plan)> {
+    // The compiler cache, needed now that compiles run
+    model.launcher = toolchain::find_launcher(model.launcher_setting.as_deref(), &model.root)?;
+    if let Some(launcher) = &model.launcher {
+        toolchain::check_launcher(launcher, model.toolchain.family);
+    }
+
     std::fs::create_dir_all(&model.out_root)?;
     std::fs::write(
         model.out_root.join(OUT_MARKER),
@@ -487,11 +493,11 @@ pub fn build_roots(model: Model, build: &BuildArgs, roots: &[usize]) -> Result<(
 
     // A cross build's steps run programs built for this machine, from the project loaded for it
     let host = if model.toolchain.platform.is_cross() && !plan::step_programs(&model, roots)?.is_empty() {
-        Some(
-            model
-                .load_host_tools()
-                .context("loading the project for this machine (for programs build steps run)")?,
-        )
+        let mut host = model
+            .load_host_tools()
+            .context("loading the project for this machine (for programs build steps run)")?;
+        host.launcher = model.launcher.clone();
+        Some(host)
     } else {
         None
     };
@@ -525,6 +531,18 @@ pub fn build_roots(model: Model, build: &BuildArgs, roots: &[usize]) -> Result<(
 fn print_timings(model: &Model, summary: &Summary) {
     let trace = model.out_dir.join(".anvil").join(crate::timings::TRACE_FILE);
     let here = std::env::current_dir().unwrap_or_default();
+
+    // Nothing ran: say so, and where the last build's trace is
+    if summary.timings.is_empty() {
+        let last = if trace.is_file() {
+            format!("; the last trace: {}", util::rel(&trace, &here))
+        } else {
+            String::new()
+        };
+        ui::print_line(&format!("Timings: nothing ran{last}"));
+        return;
+    }
+
     crate::timings::print_report(&summary.timings, &util::rel(&trace, &here));
 }
 

@@ -419,6 +419,59 @@ pub fn find_launcher(configured: Option<&str>, root: &Path) -> Result<Option<Pat
     }
 }
 
+/// Warns when the launcher is a ccache too old to cache cl's compiles (before 4.10, as Strawberry Perl's 4.9.1). Its
+/// version is asked once per ccache file and remembered.
+pub fn check_launcher(launcher: &Path, family: Family) {
+    let is_ccache = launcher.file_stem().is_some_and(|stem| stem.eq_ignore_ascii_case("ccache"));
+    if !is_ccache || family != Family::Msvc {
+        return;
+    }
+
+    let Some(version) = launcher_version(launcher) else { return };
+    if parse_version_numbers(&version) < (4, 10) {
+        crate::ui::warn(&format!(
+            "{} is ccache {version}, which caches nothing for cl: use ccache 4.10 or newer (put it first on PATH, or name it in [project] launcher or {LAUNCHER_VARIABLE})",
+            slash(launcher)
+        ));
+    }
+}
+
+/// A compiler cache's version (`ccache version 4.9.1` -> `4.9.1`), from a cache file keyed by its path and time stamp.
+fn launcher_version(launcher: &Path) -> Option<String> {
+    let cache_file = util::user_data_dir().join("launcher-versions.json");
+    let key = util::path_key(launcher);
+    let mtime = util::mtime(launcher)?;
+
+    let mut known: std::collections::HashMap<String, (i64, String)> = std::fs::read_to_string(&cache_file)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    if let Some((known_mtime, version)) = known.get(&key) {
+        if *known_mtime == mtime {
+            return Some(version.clone());
+        }
+    }
+
+    let output = Command::new(launcher).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let version = regex::Regex::new(r"version (\d+(?:\.\d+)*)").unwrap().captures(&text)?[1].to_string();
+
+    // A cache that cannot be written only costs the next run a `--version`
+    known.insert(key, (mtime, version.clone()));
+    if let Ok(text) = serde_json::to_string_pretty(&known) {
+        let _ = util::write_atomic(&cache_file, text.as_bytes());
+    }
+
+    Some(version)
+}
+
+/// The major and minor numbers of a version (`4.9.1` -> (4, 9)).
+fn parse_version_numbers(version: &str) -> (u32, u32) {
+    let mut numbers = version.split('.').map(|number| number.parse().unwrap_or(0));
+
+    (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0))
+}
+
 /// Does a generic compiler name (c++, and on macOS g++ too) stand for clang (`--version`)?
 fn reports_clang(compiler: &Path) -> bool {
     let stem = compiler.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1085,6 +1138,13 @@ mod tests {
         assert_eq!(without_launcher("ccache g++"), "g++");
         assert_eq!(without_launcher("/usr/bin/sccache /usr/bin/clang++"), "/usr/bin/clang++");
         assert_eq!(without_launcher(" g++ "), "g++");
+    }
+
+    #[test]
+    fn reads_launcher_versions() {
+        assert_eq!(parse_version_numbers("4.9.1"), (4, 9));
+        assert_eq!(parse_version_numbers("4.10"), (4, 10));
+        assert!(parse_version_numbers("4.9.1") < (4, 10));
     }
 
     #[test]

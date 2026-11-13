@@ -1664,6 +1664,12 @@ impl Interpreter {
                     self.set_variable(variable, "OpenGL::GL");
                 }
             }
+            "OpenMP" => {
+                for language in ["CXX", "C"] {
+                    self.set_variable(&format!("OpenMP_{language}_LIBRARIES"), &format!("OpenMP::OpenMP_{language}"));
+                    self.set_variable(&format!("OpenMP_{language}_FOUND"), "ON");
+                }
+            }
             _ if !SYSTEM_PACKAGES.contains(&name.as_str()) => {
                 // A find module's libraries are the package's imported target; its include folders, that
                 // dependency's headers
@@ -2263,6 +2269,7 @@ const SYSTEM_PACKAGES: &[&str] = &[
     "PythonInterp",
     "Git",
     "OpenGL",
+    "OpenMP",
     "CUDAToolkit",
 ];
 

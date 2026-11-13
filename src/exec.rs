@@ -26,6 +26,10 @@ const RESPONSE_FILE_THRESHOLD: usize = 8000;
 const WINDOWS_COMMAND_LINE_LIMIT: usize = 32767;
 const ERROR_COMMAND_LINE_TOO_LONG: i32 = 206;
 
+// A compiler cache reads a response file and starts the compiler with the whole line (sccache does): a compile whose
+// arguments are longer than this runs without it, on Windows
+const LAUNCHER_LINE_LIMIT: usize = 30_000;
+
 // What gcc and clang color their diagnostics with (added when the process starts, see Action::color_diagnostics)
 const COLOR_DIAGNOSTICS: &str = "-fdiagnostics-color=always";
 
@@ -394,6 +398,12 @@ impl Executor<'_> {
                             }
                             if self.options.verbose {
                                 ui::print_line(&ui::dim(&command_line(action)));
+                                if let (Some(launcher), None) = (&action.launcher, launcher_for(action)) {
+                                    let name = launcher.file_stem().unwrap_or_default().to_string_lossy();
+                                    ui::print_line(&ui::dim(&format!(
+                                        "  (without {name}: the command line is too long for it to start the compiler with)"
+                                    )));
+                                }
                             }
 
                             started += 1;
@@ -772,7 +782,7 @@ fn run_action(index: usize, action: &Action, low_priority: bool) -> Outcome {
             return outcome;
         }
         Err(error) => {
-            let program = action.launcher.as_ref().unwrap_or(&action.program);
+            let program = launcher_for(action).unwrap_or(&action.program);
             outcome.error = Some(format!("{}: could not start {}: {error}", action.description, program.display()));
             return outcome;
         }
@@ -974,8 +984,23 @@ fn hash_objects(action: &Action, output_mtimes: &[Option<i64>], stamps: &Stamps)
     }
 }
 
+/// The compiler cache an action runs through: none when its arguments are too long for the cache to pass on.
+fn launcher_for(action: &Action) -> Option<&PathBuf> {
+    let launcher = action.launcher.as_ref()?;
+    if cfg!(windows) && arguments_length(action) > LAUNCHER_LINE_LIMIT {
+        return None;
+    }
+
+    Some(launcher)
+}
+
+/// How long the action's arguments are on a command line, roughly (quotes and a space each).
+fn arguments_length(action: &Action) -> usize {
+    action.args.iter().map(|argument| argument.len() + 3).sum()
+}
+
 fn build_command(action: &Action, low_priority: bool) -> Result<Command> {
-    let mut command = match &action.launcher {
+    let mut command = match launcher_for(action) {
         Some(launcher) => {
             let mut command = Command::new(launcher);
             command.arg(&action.program);
@@ -993,7 +1018,7 @@ fn build_command(action: &Action, low_priority: bool) -> Result<Command> {
 
     // Long command lines go through a response file: on Windows only, where the limit is low (elsewhere it is far
     // higher, and Apple's ar reads no response files)
-    let length: usize = action.args.iter().map(|argument| argument.len() + 3).sum();
+    let length = arguments_length(action);
     if cfg!(windows) && action.response != ResponseStyle::Never && length > RESPONSE_FILE_THRESHOLD {
         let response_file = PathBuf::from(format!("{}.rsp", action.outputs[0].display()));
         std::fs::write(&response_file, response_file_content(&action.args, action.response)).context("writing a response file")?;
@@ -1337,7 +1362,7 @@ pub fn command_line(action: &Action) -> String {
     }
 
     let mut line = quote_for_display(&action.program.to_string_lossy());
-    if let Some(launcher) = &action.launcher {
+    if let Some(launcher) = launcher_for(action) {
         line = format!("{} {line}", quote_for_display(&launcher.to_string_lossy()));
     }
     for argument in &action.args {

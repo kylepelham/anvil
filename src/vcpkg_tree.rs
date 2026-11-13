@@ -44,8 +44,10 @@ struct Package {
 struct ImportedTarget {
     name: String,
     has_library: bool,
-    includes: Vec<PathBuf>,
-    defines: Vec<String>,
+    /// INTERFACE_INCLUDE_DIRECTORIES (prefixes expanded) and INTERFACE_COMPILE_DEFINITIONS as written: evaluated per
+    /// language, like compile options.
+    include_values: Vec<String>,
+    define_values: Vec<String>,
     /// Targets its users link too (not those under $<LINK_ONLY:...>).
     links: Vec<String>,
     /// Everything its users link, $<LINK_ONLY:...> too: targets, system libraries and linker flags.
@@ -53,6 +55,22 @@ struct ImportedTarget {
     /// INTERFACE_COMPILE_OPTIONS as written: evaluated per language.
     compile_options: Vec<String>,
     link_options: Vec<String>,
+    /// Files its users' programs need beside them (LLVM's libomp.dll).
+    runtime: Vec<PathBuf>,
+}
+
+/// LLVM's libomp.dll beside a clang or clang-cl that builds for the MSVC ABI (Visual Studio's `VC/Tools/Llvm/x64/bin`,
+/// or LLVM's install).
+fn openmp_runtime(toolchain: &Toolchain) -> Option<PathBuf> {
+    let llvm = matches!(toolchain.family, Family::Clang | Family::ClangCl) && toolchain.is_msvc_abi();
+    let runtime = toolchain.cxx.parent()?.join("libomp.dll");
+
+    (llvm && runtime.is_file()).then_some(runtime)
+}
+
+/// Whether a build links the packages' debug libraries: with the MSVC ABI's debug runtime, which they must match.
+pub fn uses_debug_libraries(toolchain: &Toolchain, profile: &Profile) -> bool {
+    profile.debug_runtime && toolchain.is_msvc_abi()
 }
 
 /// What a project needs from one vcpkg dependency (and everything it depends on).
@@ -92,6 +110,9 @@ pub struct BuildContext {
     frontend: &'static str,
     language: Option<&'static str>,
     link: bool,
+
+    /// LLVM's OpenMP runtime beside the compiler (clang and clang-cl with the MSVC ABI), copied beside programs.
+    openmp_runtime: Option<PathBuf>,
 }
 
 impl BuildContext {
@@ -104,12 +125,18 @@ impl BuildContext {
             (Family::Clang | Family::ClangCl, _) => "Clang",
         };
 
-        // The configuration CMake builds for the profile: the first built-in one along its chain
-        let configuration = profile
-            .chain
-            .iter()
-            .find(|name| matches!(name.as_str(), "debug" | "release" | "relwithdebinfo" | "minsizerel"))
-            .unwrap_or(&profile.name);
+        // The configuration CMake builds for the profile: Debug exactly when the packages' debug libraries are linked,
+        // else the first built-in release one along its chain
+        let configuration = if uses_debug_libraries(toolchain, profile) {
+            "debug"
+        } else {
+            profile
+                .chain
+                .iter()
+                .map(String::as_str)
+                .find(|name| matches!(*name, "release" | "relwithdebinfo" | "minsizerel"))
+                .unwrap_or("release")
+        };
 
         BuildContext {
             family: toolchain.family,
@@ -120,6 +147,7 @@ impl BuildContext {
             frontend: if toolchain.family.is_msvc_style() { "MSVC" } else { "GNU" },
             language: None,
             link: false,
+            openmp_runtime: openmp_runtime(toolchain),
         }
     }
 
@@ -247,6 +275,7 @@ impl InstalledTree {
             }
             if requirements.linked.contains(&module.name) {
                 requirements.add_link(&module, &known, self);
+                push_new(&mut usage.runtime, &module.runtime);
             }
         }
 
@@ -325,21 +354,11 @@ impl InstalledTree {
                 let target = &mut targets[index];
                 target.has_library |= properties.contains("IMPORTED_LOCATION") || properties.contains("IMPORTED_IMPLIB");
 
-                for entry in property_values(&properties, "INTERFACE_INCLUDE_DIRECTORIES", build) {
-                    let entry = expand_import_prefixes(&entry, &prefix, &list_dir);
-                    if entry.contains("${") {
-                        continue;
-                    }
-                    let folder = crate::util::normalize(Path::new(&entry));
-                    if folder.is_dir() && !target.includes.contains(&folder) {
-                        target.includes.push(folder);
-                    }
+                // Include folders and definitions may depend on the file's language too: evaluated for each
+                if let Some(value) = property_value(&properties, "INTERFACE_INCLUDE_DIRECTORIES") {
+                    target.include_values.push(expand_import_prefixes(&value, &prefix, &list_dir));
                 }
-                for define in property_values(&properties, "INTERFACE_COMPILE_DEFINITIONS", build) {
-                    if !define.contains("${") && !target.defines.contains(&define) {
-                        target.defines.push(define);
-                    }
-                }
+                target.define_values.extend(property_value(&properties, "INTERFACE_COMPILE_DEFINITIONS"));
                 target.links.extend(property_values(&properties, "INTERFACE_LINK_LIBRARIES", build));
 
                 // What linking needs: every linked item, and the link options
@@ -547,9 +566,10 @@ struct Requirements {
     visible: HashSet<String>,
     linked: HashSet<String>,
 
-    includes: Vec<PathBuf>,
-    defines: Vec<String>,
-    /// Compile options for each language of LANGUAGES, each once, as written (`SHELL:` ones whole).
+    /// Include folders, definitions and compile options for each language of LANGUAGES, each once (options as
+    /// written, `SHELL:` ones whole).
+    includes: [Vec<PathBuf>; 4],
+    defines: [Vec<String>; 4],
     options: [Vec<String>; 4],
     link_options: Vec<String>,
     system_libs: Vec<PathBuf>,
@@ -558,11 +578,21 @@ struct Requirements {
 impl Requirements {
     /// Adds what users compile with from `target`, and the targets it names publicly.
     fn add_compile(&mut self, target: &ImportedTarget, build: &BuildContext) {
-        push_new(&mut self.includes, &target.includes);
-        push_new(&mut self.defines, &target.defines);
-
         for (index, (_, language)) in LANGUAGES.iter().enumerate() {
             let build = build.for_language(language);
+            for value in &target.include_values {
+                let folders: Vec<PathBuf> = evaluate_list(value, &build)
+                    .into_iter()
+                    .filter(|entry| !entry.contains("${"))
+                    .map(|entry| util::normalize(Path::new(&entry)))
+                    .filter(|folder| folder.is_dir())
+                    .collect();
+                push_new(&mut self.includes[index], &folders);
+            }
+            for value in &target.define_values {
+                let defines: Vec<String> = evaluate_list(value, &build).into_iter().filter(|define| !define.contains("${")).collect();
+                push_new(&mut self.defines[index], &defines);
+            }
             for value in &target.compile_options {
                 let options = evaluate_list(value, &build);
                 push_new(
@@ -598,10 +628,20 @@ impl Requirements {
         }
     }
 
-    /// Fills `usage` in: options every language's files get, then those of one language only, as words.
+    /// Fills `usage` in: include folders, definitions and options every language's files get, then those of one
+    /// language only, as flags.
     fn fill(self, usage: &mut Usage, build: &BuildContext) {
-        push_new(&mut usage.includes, &self.includes);
-        usage.defines = self.defines;
+        let (common_includes, language_includes) = split_common(&self.includes);
+        push_new(&mut usage.includes, &common_includes);
+        for (language, folder) in language_includes {
+            usage.language_flags.push((language, format!("-I{}", folder.display())));
+        }
+
+        let (common_defines, language_defines) = split_common(&self.defines);
+        usage.defines = common_defines;
+        for (language, define) in language_defines {
+            usage.language_flags.push((language, format!("-D{define}")));
+        }
 
         let [first, others @ ..] = &self.options;
         let common: Vec<&String> = first.iter().filter(|option| others.iter().all(|list| list.contains(option))).collect();
@@ -619,6 +659,25 @@ impl Requirements {
         usage.link_flags = self.link_options.iter().flat_map(|option| option_words(option, build)).collect();
         usage.libs.extend(self.system_libs);
     }
+}
+
+/// What every language's list holds, and the rest by language.
+fn split_common<T: Clone + PartialEq>(lists: &[Vec<T>; 4]) -> (Vec<T>, Vec<(Language, T)>) {
+    let [first, others @ ..] = lists;
+    let common: Vec<T> = first
+        .iter()
+        .filter(|value| others.iter().all(|list| list.contains(value)))
+        .cloned()
+        .collect();
+
+    let mut by_language = Vec::new();
+    for ((language, _), list) in LANGUAGES.iter().zip(lists) {
+        for value in list.iter().filter(|value| !common.contains(value)) {
+            by_language.push((*language, value.clone()));
+        }
+    }
+
+    (common, by_language)
 }
 
 /// Appends the values `list` does not hold yet.
@@ -647,9 +706,32 @@ fn option_words(option: &str, build: &BuildContext) -> Vec<String> {
     vec![option.to_string()]
 }
 
+/// What a built-in system dependency gives its users for `build` (`[deps] openmp = "system"`, likewise `threads` and
+/// `opengl`): the same as the CMake find module targets a package links. None for other names.
+pub fn system_dependency(name: &str, build: &BuildContext) -> Option<Usage> {
+    let modules: &[&str] = match name {
+        "openmp" => &["OpenMP::OpenMP_CXX", "OpenMP::OpenMP_C"],
+        "threads" => &["Threads::Threads"],
+        "opengl" => &["OpenGL::GL"],
+        _ => return None,
+    };
+
+    let mut usage = Usage::default();
+    let mut requirements = Requirements::default();
+    let no_packages = InstalledTree::default();
+    for module in modules.iter().filter_map(|module_name| module_target(module_name, build)) {
+        requirements.add_compile(&module, build);
+        requirements.add_link(&module, &HashSet::new(), &no_packages);
+        push_new(&mut usage.runtime, &module.runtime);
+    }
+    requirements.fill(&mut usage, build);
+
+    Some(usage)
+}
+
 /// An imported target of a CMake find module, with what the module gives it for `build`: FindOpenMP's flag (cl's
-/// -openmp brings its runtime; clang-cl and clang on Windows link LLVM's libomp, which Visual Studio ships), FindThreads'
-/// -pthread outside Windows, FindOpenGL's system library.
+/// -openmp brings its runtime; clang-cl and clang on Windows link LLVM's libomp, which Visual Studio ships, clang's
+/// driver through -fopenmp=libomp), FindThreads' -pthread outside Windows, FindOpenGL's system library.
 fn module_target(name: &str, build: &BuildContext) -> Option<ImportedTarget> {
     let mut target = ImportedTarget {
         name: name.to_string(),
@@ -662,7 +744,7 @@ fn module_target(name: &str, build: &BuildContext) -> Option<ImportedTarget> {
             let (flag, library) = match (build.family, build.os) {
                 (Family::Msvc, _) => ("-openmp", None),
                 (Family::ClangCl, _) => ("-Xclang -fopenmp", Some("libomp.lib")),
-                (Family::Clang, Os::Windows) if build.msvc_abi => ("-fopenmp=libomp", Some("libomp.lib")),
+                (Family::Clang, Os::Windows) if build.msvc_abi => ("-fopenmp=libomp", None),
                 (Family::Clang, Os::Macos) => ("-Xclang -fopenmp", Some("omp")),
                 (Family::Clang, _) => ("-fopenmp=libomp", None),
                 (Family::Gcc, _) => ("-fopenmp", None),
@@ -673,6 +755,7 @@ fn module_target(name: &str, build: &BuildContext) -> Option<ImportedTarget> {
                 None if !flag.contains(' ') && build.frontend == "GNU" => target.link_options.push(flag.to_string()),
                 None => {}
             }
+            target.runtime.extend(build.openmp_runtime.clone());
         }
         "Threads::Threads" if build.os != Os::Windows => {
             target.compile_options.push("-pthread".into());
@@ -962,6 +1045,7 @@ mod tests {
             frontend: if family.is_msvc_style() { "MSVC" } else { "GNU" },
             language: None,
             link: false,
+            openmp_runtime: None,
         }
     }
 
@@ -1045,6 +1129,35 @@ mod tests {
         assert_eq!(openmp.link_items, vec!["libomp.lib"]);
         assert!(module_target("Threads::Threads", &msvc).is_none());
         assert_eq!(module_target("Threads::Threads", &gcc).unwrap().link_options, vec!["-pthread"]);
+
+        // clang's driver links LLVM's libomp itself, from -fopenmp=libomp (a bare libomp.lib is a file to it)
+        let openmp = module_target("OpenMP::OpenMP_CXX", &build(Family::Clang, Os::Windows, "Debug")).unwrap();
+        assert!(openmp.link_items.is_empty());
+        assert_eq!(openmp.link_options, vec!["-fopenmp=libomp"]);
+    }
+
+    #[test]
+    fn system_dependencies_are_find_modules() {
+        let gcc = build(Family::Gcc, Os::Linux, "Release");
+        let openmp = system_dependency("openmp", &gcc).unwrap();
+        let language_flag = |language: Language, flag: &str| (language, flag.to_string());
+        assert_eq!(
+            openmp.language_flags,
+            vec![language_flag(Language::Cxx, "-fopenmp"), language_flag(Language::C, "-fopenmp")]
+        );
+        assert_eq!(openmp.link_flags, vec!["-fopenmp"]);
+
+        let threads = system_dependency("threads", &gcc).unwrap();
+        assert_eq!(
+            (threads.flags, threads.link_flags),
+            (vec!["-pthread".to_string()], vec!["-pthread".to_string()])
+        );
+
+        let msvc = build(Family::Msvc, Os::Windows, "Debug");
+        let opengl = system_dependency("opengl", &msvc).unwrap();
+        assert_eq!(opengl.libs, vec![PathBuf::from("opengl32")]);
+        assert_eq!(system_dependency("openmp", &msvc).unwrap().language_flags.len(), 2);
+        assert!(system_dependency("user32", &msvc).is_none());
     }
 
     #[test]
@@ -1087,6 +1200,7 @@ mod tests {
         std::fs::create_dir_all(share.join("volk")).unwrap();
         let sdl3_targets = r#"set_target_properties(SDL3::SDL3 PROPERTIES
   INTERFACE_COMPILE_OPTIONS "/Zc:preprocessor;\$<\$<CONFIG:Release>:/GL>"
+  INTERFACE_COMPILE_DEFINITIONS "SDL_ALL;\$<\$<COMPILE_LANGUAGE:CXX>:SDL_CXX>"
   INTERFACE_LINK_LIBRARIES "OpenMP::OpenMP_CXX;\$<LINK_ONLY:ws2_32>;\$<LINK_ONLY:volk::volk>"
   INTERFACE_LINK_OPTIONS "\$<\$<CONFIG:Release>:/LTCG>"
 )
@@ -1110,7 +1224,11 @@ set_target_properties(SDL3::SDL3 PROPERTIES IMPORTED_IMPLIB_RELEASE "${_IMPORT_P
         assert_eq!(names, vec!["SDL3.lib", "SDL3main.lib", "volk.lib", "ws2_32", "user32"]);
         assert_eq!(usage.runtime.len(), 1);
         assert_eq!(usage.flags, vec!["/Zc:preprocessor", "/GL"]);
-        assert_eq!(usage.language_flags, vec![(Language::Cxx, "-openmp".to_string())]);
+        assert_eq!(usage.defines, vec!["SDL_ALL"]);
+        assert_eq!(
+            usage.language_flags,
+            vec![(Language::Cxx, "-DSDL_CXX".to_string()), (Language::Cxx, "-openmp".to_string())]
+        );
         assert_eq!(usage.link_flags, vec!["/LTCG", "-ignore:4221"]);
         assert!(tree.usage("missing", false, None, &build(Family::Msvc, Os::Windows, "Release")).is_err());
 
