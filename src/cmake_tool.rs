@@ -106,7 +106,7 @@ fn run_command(args: &[String]) -> Result<i32> {
             }
             return remove(paths.iter(), recursive, force);
         }
-        "remove_directory" => return remove(rest.iter(), true, true),
+        "remove_directory" => return remove(rest.iter().filter(|word| Path::new(word).is_dir()), true, true),
         "rename" => {
             let [from, to] = rest else { bail!("rename takes two paths") };
             std::fs::rename(from, to).with_context(|| format!("renaming {from} to {to}"))?;
@@ -135,11 +135,17 @@ fn run_command(args: &[String]) -> Result<i32> {
             if !Path::new(folder).is_dir() {
                 bail!("the folder {folder} does not exist");
             }
-            let status = std::process::Command::new(program)
+
+            // A program given by path is found from the folder, as the shell would (Windows looks from ours)
+            let program = match program.contains(['/', '\\']) {
+                true => std::path::absolute(folder)?.join(program),
+                false => PathBuf::from(program),
+            };
+            let status = std::process::Command::new(&program)
                 .args(args)
                 .current_dir(folder)
                 .status()
-                .with_context(|| format!("running {program}"))?;
+                .with_context(|| format!("running {}", program.display()))?;
             return Ok(status.code().unwrap_or(1));
         }
         "sleep" => {
@@ -553,6 +559,24 @@ mod tests {
         assert_eq!(run(&words(&format!("remove {}", path("missing")))), 0);
         assert_eq!(run(&words(&format!("compare_files {} {}", path("c"), path("missing")))), 1);
         assert_eq!(run(&words("false")), 1);
+
+        // remove_directory leaves files alone, as CMake does
+        assert_eq!(run(&words(&format!("remove_directory {} {}", path("c"), path("a")))), 0);
+        assert!(folder.join("c").is_file());
+        assert!(!folder.join("a").exists());
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn chdir_finds_a_program_from_the_folder() {
+        let folder = std::env::temp_dir().join(format!("anvil-cmake-e-chdir-{}", std::process::id()));
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(folder.join("sub/tool.bat"), "@exit /b 3\r\n").unwrap();
+
+        let folder_text = folder.to_string_lossy().into_owned();
+        assert_eq!(run(&words(&format!("chdir {folder_text} sub/tool.bat"))), 3);
 
         let _ = std::fs::remove_dir_all(&folder);
     }
