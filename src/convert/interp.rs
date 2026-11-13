@@ -273,6 +273,10 @@ impl Cache {
     }
 }
 
+/// One option's declarations: each default under its branch (None: everywhere), and whether one whose branch holds
+/// on this machine set its default.
+pub(super) type OptionDeclarations = (Vec<(Option<String>, bool)>, bool);
+
 pub struct Interpreter {
     pub root: PathBuf,
 
@@ -333,7 +337,7 @@ pub struct Interpreter {
     pub(super) command_warnings: RefCell<Vec<String>>,
     /// Each option's defaults as declared, under the branch of each declaration (None: everywhere), and whether one
     /// whose branch holds on this machine set its default.
-    pub(super) option_declarations: HashMap<String, (Vec<(Option<String>, bool)>, bool)>,
+    pub(super) option_declarations: HashMap<String, OptionDeclarations>,
     pub(super) unknown_commands: IndexSet<String>,
     /// What the built-in commands keep besides variables (builtins.rs).
     pub(super) builtin: super::builtins::BuiltinState,

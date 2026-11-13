@@ -5,6 +5,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 pub type Node = u32;
+
+/// A sum of products: each product a list of (variable, value) literals.
+pub type Cover = Vec<Vec<(u32, bool)>>;
 pub const FALSE: Node = 0;
 pub const TRUE: Node = 1;
 
@@ -121,7 +124,7 @@ impl Manager {
     }
 
     /// Minato-Morreale: an irredundant sum of products between `lower` and `upper`, with the node it stands for.
-    fn isop(&mut self, lower: Node, upper: Node, cache: &mut HashMap<(Node, Node), (Vec<Vec<(u32, bool)>>, Node)>) -> (Vec<Vec<(u32, bool)>>, Node) {
+    fn isop(&mut self, lower: Node, upper: Node, cache: &mut HashMap<(Node, Node), (Cover, Node)>) -> (Cover, Node) {
         if lower == FALSE {
             return (Vec::new(), FALSE);
         }
@@ -236,7 +239,7 @@ pub fn eval(node: Node, value: &dyn Fn(u32) -> bool) -> bool {
 }
 
 /// An irredundant sum of products covering `lower` within `upper`: each product a list of (variable, positive).
-pub fn sum_of_products(lower: Node, upper: Node) -> Vec<Vec<(u32, bool)>> {
+pub fn sum_of_products(lower: Node, upper: Node) -> Cover {
     with(|manager| manager.isop(lower, upper, &mut HashMap::new()).0)
 }
 

@@ -313,6 +313,9 @@ pub struct TypeSize {
 /// Reads a list (list(GET), list(SUBLIST), ...): the variable it sets and its value.
 type ListRead<'a> = dyn Fn(&[String]) -> Option<(String, String)> + 'a;
 
+/// Renders a text given whether each condition is chosen (None: not one of the choices).
+type ChoiceRender<'a> = dyn Fn(&dyn Fn(&str) -> Option<bool>) -> String + 'a;
+
 impl Interpreter {
     /// Runs one command: a user function, a built-in, or (when unknown) records it.
     pub(super) fn run_command(&mut self, command: &Command) -> Result<Flow> {
@@ -3460,7 +3463,7 @@ fn chosen_as(known: &str, condition: &str) -> Option<bool> {
 /// What `render` gives under every choice of `conditions` (each true or false), the choices with the same text
 /// merged into one condition; choices that cannot happen (`windows` with `unix`, or outside the `enclosing` condition
 /// the text is written under) are left out, and the conditions say only what the enclosing one does not.
-fn texts_by_choice(conditions: &[String], enclosing: Option<&str>, render: &dyn Fn(&dyn Fn(&str) -> Option<bool>) -> String) -> Vec<(Truth, String)> {
+fn texts_by_choice(conditions: &[String], enclosing: Option<&str>, render: &ChoiceRender) -> Vec<(Truth, String)> {
     let simplified = |truth: Truth| match truth {
         Truth::Depends(condition) => match model::simplify(
             &model::and_optional(&enclosing.map(str::to_string), &Some(condition.clone())).unwrap_or_default(),
@@ -3667,7 +3670,7 @@ fn resolved_items(items: &[String], options: &HashMap<String, bool>) -> Vec<Stri
 
 /// The conditions under which items are there that change what `read` gives for the list, or None when its
 /// versions all read the same (or are too many to tell).
-fn platforms_changing(items: &[String], read: &dyn Fn(&[String]) -> Option<(String, String)>) -> Option<String> {
+fn platforms_changing(items: &[String], read: &ListRead) -> Option<String> {
     let versions = super::interp::text_versions(&items.join(";"))?;
     let results: Vec<Option<(String, String)>> = versions.iter().map(|(_, text)| read(&model::list_elements(text))).collect();
     if results.windows(2).all(|pair| pair[0] == pair[1]) {
