@@ -56,7 +56,12 @@ pub fn run(start_dir: &Path, build: &BuildArgs, name: Option<&str>, args: &[Stri
 }
 
 pub fn test(start_dir: &Path, build: &BuildArgs, options: &TestArgs) -> Result<i32> {
-    let mut model = load_model(start_dir, build)?;
+    // --list only names the tests: nothing to fetch or install
+    let mut model = if options.list {
+        load_model_for_listing(start_dir, build)?
+    } else {
+        load_model(start_dir, build)?
+    };
     model.collect_tests()?;
 
     // The tests asked for, and with --rerun-failed only those that failed last time

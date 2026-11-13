@@ -16,6 +16,20 @@ const VCPKG_REPOSITORY: &str = "https://github.com/microsoft/vcpkg.git";
 // The install stamp's name, in each triplet's install folder
 const STAMP_NAME: &str = ".anvil.stamp";
 
+// The processors vcpkg's triplet names start with
+const KNOWN_CPUS: &[&str] = &[
+    "x64",
+    "x86",
+    "arm64",
+    "arm",
+    "arm64ec",
+    "wasm32",
+    "ppc64le",
+    "s390x",
+    "riscv64",
+    "loongarch64",
+];
+
 /// One vcpkg checkout or installation.
 #[derive(Debug, Clone)]
 pub struct Instance {
@@ -336,7 +350,8 @@ impl Instance {
     fn prepare_manifest(&mut self, requests: &[Request], config: &InstallConfig) -> Result<(PathBuf, String, Vec<String>, Option<String>)> {
         if let Some(manifest) = &config.manifest {
             let text = std::fs::read_to_string(manifest).with_context(|| format!("reading {}", manifest.display()))?;
-            let features = manifest_features_for(manifest, &text, requests)?;
+            let port_defaults = |name: &str| self.port_default_features(name, &config.overlay_ports, &config.triplet);
+            let features = manifest_features_for(manifest, &text, requests, &config.triplet, &port_defaults)?;
 
             let folder = manifest.parent().unwrap().to_path_buf();
             return Ok((folder, text, features, None));
@@ -386,6 +401,29 @@ impl Instance {
         util::write_if_changed(&manifest_file, text.as_bytes())?;
 
         Ok((folder, text, Vec::new(), baseline))
+    }
+
+    /// A port's default features for a triplet, from its vcpkg.json in an overlay folder or the ports tree. None when
+    /// it cannot be read (registries, Visual Studio's copy).
+    fn port_default_features(&self, name: &str, overlay_ports: &[PathBuf], triplet: &str) -> Option<Vec<String>> {
+        let candidates = overlay_ports
+            .iter()
+            .flat_map(|folder| [folder.join(name).join("vcpkg.json"), folder.join("vcpkg.json")])
+            .chain([self.root.join("ports").join(name).join("vcpkg.json")]);
+
+        for file in candidates {
+            let Some(json) = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            else {
+                continue;
+            };
+            if json.get("name").and_then(|own| own.as_str()) == Some(name) {
+                return Some(feature_names(json.get("default-features"), triplet));
+            }
+        }
+
+        None
     }
 
     /// The commit the ports tree is checked out at, when it is a git checkout.
@@ -674,20 +712,7 @@ pub fn choose_triplet(spec: &VcpkgSpec, toolchain: &Toolchain, static_runtime: b
     let (Some(cpu), Some(system)) = (parts.next(), parts.next()) else {
         return Ok(triplet.clone());
     };
-    if ![
-        "x64",
-        "x86",
-        "arm64",
-        "arm",
-        "arm64ec",
-        "wasm32",
-        "ppc64le",
-        "s390x",
-        "riscv64",
-        "loongarch64",
-    ]
-    .contains(&cpu)
-    {
+    if !KNOWN_CPUS.contains(&cpu) {
         return Ok(triplet.clone());
     }
 
@@ -700,6 +725,10 @@ pub fn choose_triplet(spec: &VcpkgSpec, toolchain: &Toolchain, static_runtime: b
     };
     let fits_system = system == wanted_system || (wanted_system == "windows" && system == "uwp");
     if cpu == platform.cpu.name() && fits_system {
+        // Its C runtime must be the profile's too (LNK2038 otherwise)
+        if let Some(static_crt) = named_static_crt(triplet).filter(|static_crt| *static_crt != static_runtime) {
+            return Err(runtime_mismatch(triplet, static_crt, toolchain));
+        }
         return Ok(triplet.clone());
     }
 
@@ -723,6 +752,71 @@ pub fn choose_triplet(spec: &VcpkgSpec, toolchain: &Toolchain, static_runtime: b
     )
 }
 
+/// A custom `[vcpkg] triplet` (one whose name does not say its C runtime) must use the profile's C runtime too:
+/// VCPKG_CRT_LINKAGE from its file, in the overlay triplet folders, else the vcpkg's triplets/ or triplets/community/.
+/// Passes when no file is found.
+pub fn check_triplet_runtime(
+    triplet: &str,
+    toolchain: &Toolchain,
+    static_runtime: bool,
+    overlay_triplets: &[PathBuf],
+    vcpkg_root: &Path,
+) -> Result<()> {
+    if !toolchain.is_msvc_abi() || named_static_crt(triplet).is_some() {
+        return Ok(());
+    }
+
+    let file_name = format!("{triplet}.cmake");
+    let folders = overlay_triplets
+        .iter()
+        .cloned()
+        .chain([vcpkg_root.join("triplets"), vcpkg_root.join("triplets").join("community")]);
+    let Some(text) = folders
+        .map(|folder| folder.join(&file_name))
+        .find_map(|file| std::fs::read_to_string(file).ok())
+    else {
+        return Ok(());
+    };
+
+    match crt_linkage_of(&text) {
+        Some(static_crt) if static_crt != static_runtime => Err(runtime_mismatch(triplet, static_crt, toolchain)),
+        _ => Ok(()),
+    }
+}
+
+/// Whether a Windows triplet of vcpkg's (`x64-windows`, `x64-windows-static`, `x64-windows-static-md`,
+/// `x64-uwp`, ...) builds against the static C runtime: `-static` without `-md`. None for other names.
+fn named_static_crt(triplet: &str) -> Option<bool> {
+    let parts: Vec<&str> = triplet.split('-').collect();
+    if parts.len() < 2 || !["windows", "uwp"].contains(&parts[1]) || !KNOWN_CPUS.contains(&parts[0]) {
+        return None;
+    }
+
+    let rest = &parts[2..];
+    Some(rest.contains(&"static") && !rest.contains(&"md"))
+}
+
+/// `set(VCPKG_CRT_LINKAGE static|dynamic)` in a triplet file: true for static.
+fn crt_linkage_of(text: &str) -> Option<bool> {
+    let pattern = regex::Regex::new(r"(?i)set\s*\(\s*VCPKG_CRT_LINKAGE\s+(\w+)").unwrap();
+    let value = pattern.captures(text)?.get(1)?.as_str().to_ascii_lowercase();
+
+    Some(value == "static")
+}
+
+/// A triplet whose C runtime is not the profile's: its libraries would not link.
+fn runtime_mismatch(triplet: &str, static_crt: bool, toolchain: &Toolchain) -> anyhow::Error {
+    let architecture = toolchain.platform.cpu.name();
+    if static_crt {
+        return anyhow::anyhow!(
+            "[vcpkg] triplet = \"{triplet}\" builds its libraries against the static C runtime (/MT), but this profile uses the DLL runtime (/MD): they would not link (LNK2038). Set `static-runtime = true` in the profile, or replace the triplet with `linkage = \"static\"`, which picks static libraries on the profile's runtime ({architecture}-windows-static-md here, {architecture}-windows-static with static-runtime)."
+        );
+    }
+    anyhow::anyhow!(
+        "[vcpkg] triplet = \"{triplet}\" builds its libraries against the DLL C runtime (/MD), but this profile has `static-runtime = true` (/MT): they would not link (LNK2038). Remove the triplet (Anvil picks {architecture}-windows-static for static-runtime profiles), or remove `static-runtime` from the profile."
+    )
+}
+
 /// The default triplet for what a toolchain builds; `static_libraries` asks for static libraries or DLLs instead of
 /// the system's usual kind.
 fn default_triplet(toolchain: &Toolchain, static_runtime: bool, static_libraries: Option<bool>) -> Result<String> {
@@ -730,7 +824,11 @@ fn default_triplet(toolchain: &Toolchain, static_runtime: bool, static_libraries
 
     Ok(match (toolchain.platform.os, static_libraries) {
         (Os::Windows, _) if !toolchain.is_msvc_abi() => {
-            let linkage = if static_libraries.unwrap_or(static_runtime) { "static" } else { "dynamic" };
+            let linkage = if static_libraries.unwrap_or(static_runtime) {
+                "static"
+            } else {
+                "dynamic"
+            };
             format!("{architecture}-mingw-{linkage}")
         }
         (Os::Windows, Some(false)) if static_runtime => {
@@ -772,9 +870,15 @@ pub fn all_visual_studios() -> Vec<PathBuf> {
 /// The manifest features to enable so every request is installed: none for those in "dependencies", the first
 /// feature that lists one otherwise. A request listed nowhere may still come in through a listed package; whether it
 /// did is checked after the install, for the packages a target links.
-fn manifest_features_for(manifest: &Path, text: &str, requests: &[Request]) -> Result<Vec<String>> {
+fn manifest_features_for(
+    manifest: &Path,
+    text: &str,
+    requests: &[Request],
+    triplet: &str,
+    port_defaults: &dyn Fn(&str) -> Option<Vec<String>>,
+) -> Result<Vec<String>> {
     let json: serde_json::Value = serde_json::from_str(text).with_context(|| format!("{} is not valid JSON", manifest.display()))?;
-    check_requested_features(manifest, &json, requests)?;
+    check_requested_features(manifest, &json, requests, triplet, port_defaults)?;
     let listed = dependency_names(json.get("dependencies"));
 
     let mut features = Vec::new();
@@ -798,29 +902,42 @@ fn manifest_features_for(manifest: &Path, text: &str, requests: &[Request]) -> R
 }
 
 /// The project's own vcpkg.json decides what installs (CMake reads it too, and vcpkg takes port features only from a
-/// manifest), so the port features anvil.toml asks for must be in it: say exactly what to add.
-fn check_requested_features(manifest: &Path, json: &serde_json::Value, requests: &[Request]) -> Result<()> {
+/// manifest), so the port features anvil.toml asks for must be in it, or be the port's defaults it keeps: say exactly
+/// what to add. Only entries whose "platform" holds for the triplet count.
+fn check_requested_features(
+    manifest: &Path,
+    json: &serde_json::Value,
+    requests: &[Request],
+    triplet: &str,
+    port_defaults: &dyn Fn(&str) -> Option<Vec<String>>,
+) -> Result<()> {
     let file = slash(manifest);
 
     for request in requests {
         let name = &request.name;
-        let entry = find_dependency(json, name);
-        let entry_object = entry.and_then(|entry| entry.as_object());
-        let entry_features = dependency_names(entry_object.and_then(|object| object.get("features")));
-        let entry_default_features = entry_object
-            .and_then(|object| object.get("default-features"))
-            .and_then(|value| value.as_bool())
-            .unwrap_or(true);
+        let entries = find_dependencies(json, name, triplet);
+        let mut entry_features = Vec::new();
+        for entry in &entries {
+            entry_features.extend(feature_names(entry.get("features"), triplet));
+        }
+
+        // Default features stay unless every entry turns them off (a port listed nowhere comes in with them)
+        let keeps_defaults = entries.is_empty()
+            || entries
+                .iter()
+                .any(|entry| entry.get("default-features").and_then(|value| value.as_bool()) != Some(false));
+        let defaults = port_defaults(name);
+        let is_default = |feature: &String| keeps_defaults && defaults.as_ref().is_some_and(|defaults| defaults.contains(feature));
 
         let missing: Vec<String> = request
             .features
             .iter()
-            .filter(|feature| !entry_features.contains(feature))
+            .filter(|feature| !entry_features.contains(feature) && !is_default(feature))
             .map(|feature| format!("\"{feature}\""))
             .collect();
         if !missing.is_empty() {
             let list = missing.join(", ");
-            let fix = if entry.is_none() {
+            let fix = if entries.is_empty() {
                 format!("add {{ \"name\": \"{name}\", \"features\": [{list}] }} to its \"dependencies\"")
             } else if entry_features.is_empty() {
                 format!("add \"features\": [{list}] to {name} in vcpkg.json")
@@ -830,26 +947,232 @@ fn check_requested_features(manifest: &Path, json: &serde_json::Value, requests:
             bail!("anvil.toml asks for {name} with features [{list}], which {file} does not turn on (with a vcpkg.json, it decides what installs): {fix}");
         }
 
-        if !request.default_features && entry.is_some() && entry_default_features {
-            bail!(
-                "anvil.toml asks for {name} without its default features, but {file} keeps them (with a vcpkg.json, it decides what installs): add \"default-features\": false to {name} in vcpkg.json"
-            );
+        // Default features installed anyway only cost build time: say so when the port has some
+        let has_defaults = defaults.is_none_or(|defaults| !defaults.is_empty());
+        if !request.default_features && !entries.is_empty() && keeps_defaults && has_defaults {
+            crate::ui::warn(&format!(
+                "anvil.toml asks for {name} without its default features, but {file} keeps them, so they install (with a vcpkg.json, it decides what installs): add \"default-features\": false to {name} in vcpkg.json"
+            ));
         }
     }
 
     Ok(())
 }
 
-/// A port's entry in a vcpkg.json: in "dependencies", else in a manifest feature's.
-fn find_dependency<'a>(json: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
-    let is_named =
-        |dependency: &&serde_json::Value| dependency.as_str().or_else(|| dependency.get("name").and_then(|name| name.as_str())) == Some(name);
-    let in_list = |list: Option<&'a serde_json::Value>| list.and_then(|list| list.as_array()).and_then(|list| list.iter().find(is_named));
+/// A port's entries in a vcpkg.json whose "platform" holds for the triplet: those in "dependencies", else those in
+/// manifest features'.
+fn find_dependencies<'a>(json: &'a serde_json::Value, name: &str, triplet: &str) -> Vec<&'a serde_json::Value> {
+    let applies = |dependency: &&'a serde_json::Value| {
+        let own_name = dependency.as_str().or_else(|| dependency.get("name").and_then(|name| name.as_str()));
+        let platform = dependency.get("platform").and_then(|platform| platform.as_str());
+        own_name == Some(name) && platform.is_none_or(|platform| platform_matches(platform, triplet))
+    };
+    let in_list = |list: Option<&'a serde_json::Value>| -> Vec<&'a serde_json::Value> {
+        list.and_then(|list| list.as_array())
+            .map(|list| list.iter().filter(applies).collect())
+            .unwrap_or_default()
+    };
 
-    in_list(json.get("dependencies")).or_else(|| {
-        let features = json.get("features").and_then(|features| features.as_object())?;
-        features.values().find_map(|feature| in_list(feature.get("dependencies")))
-    })
+    let listed = in_list(json.get("dependencies"));
+    if !listed.is_empty() {
+        return listed;
+    }
+    let features = json.get("features").and_then(|features| features.as_object());
+    features
+        .into_iter()
+        .flat_map(|features| features.values())
+        .flat_map(|feature| in_list(feature.get("dependencies")))
+        .collect()
+}
+
+/// Feature names in a "features" or "default-features" list ("name" strings and { "name", "platform" } objects) that
+/// apply to the triplet.
+fn feature_names(list: Option<&serde_json::Value>, triplet: &str) -> Vec<String> {
+    let items = list.and_then(|list| list.as_array()).into_iter().flatten();
+
+    items
+        .filter_map(|item| {
+            let platform = item.get("platform").and_then(|platform| platform.as_str());
+            if platform.is_some_and(|platform| !platform_matches(platform, triplet)) {
+                return None;
+            }
+            item.as_str()
+                .or_else(|| item.get("name").and_then(|name| name.as_str()))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Whether a vcpkg platform expression (`"windows & !static"`, `"(linux | osx), x64"`) holds for a triplet, judged
+/// from its name: `!`/`not`, `&`/`and`, `|`, `,` (or, loosest) and parentheses over vcpkg's identifiers. One that does
+/// not parse holds, so nothing is dropped by mistake.
+pub fn platform_matches(expression: &str, triplet: &str) -> bool {
+    let mut tokens = Vec::new();
+    let mut characters = expression.chars().peekable();
+    while let Some(&character) = characters.peek() {
+        if character.is_whitespace() {
+            characters.next();
+        } else if character.is_ascii_alphanumeric() || character == '_' {
+            let mut word = String::new();
+            while let Some(&next) = characters.peek().filter(|next| next.is_ascii_alphanumeric() || **next == '_') {
+                word.push(next);
+                characters.next();
+            }
+            tokens.push(word);
+        } else {
+            tokens.push(character.to_string());
+            characters.next();
+        }
+    }
+
+    let facts = TripletFacts::from_name(triplet);
+    let mut parser = PlatformParser {
+        tokens: &tokens,
+        position: 0,
+        facts: &facts,
+    };
+    match parser.parse_list() {
+        Some(value) if parser.position == tokens.len() => value,
+        _ => true,
+    }
+}
+
+/// What a triplet's name says about it, for platform expressions.
+struct TripletFacts {
+    cpu: String,
+    system: String,
+    static_libraries: bool,
+    static_crt: bool,
+}
+
+impl TripletFacts {
+    fn from_name(triplet: &str) -> TripletFacts {
+        const SYSTEMS: &[&str] = &[
+            "windows",
+            "uwp",
+            "mingw",
+            "xbox",
+            "linux",
+            "android",
+            "osx",
+            "ios",
+            "tvos",
+            "watchos",
+            "visionos",
+            "freebsd",
+            "openbsd",
+            "netbsd",
+            "emscripten",
+            "qnx",
+        ];
+        let parts: Vec<&str> = triplet.split('-').collect();
+        let system = parts.iter().skip(1).find(|part| SYSTEMS.contains(part)).copied().unwrap_or_default();
+
+        // Windows triplets are DLLs unless they say static; the others static libraries unless they say dynamic
+        let windows_like = ["windows", "uwp", "mingw", "xbox"].contains(&system);
+        let static_libraries = if windows_like {
+            parts.contains(&"static")
+        } else {
+            !parts.contains(&"dynamic")
+        };
+
+        TripletFacts {
+            cpu: parts[0].to_string(),
+            system: system.to_string(),
+            static_libraries,
+            static_crt: named_static_crt(triplet).unwrap_or(false),
+        }
+    }
+
+    fn identifier(&self, name: &str) -> bool {
+        let cpu = self.cpu.as_str();
+        let system = self.system.as_str();
+        match name {
+            "x64" | "x86" | "arm64" | "arm64ec" | "wasm32" | "mips64" => cpu == name,
+            "arm" => cpu == "arm" || cpu == "arm64",
+            "arm32" => cpu == "arm",
+            "windows" => ["windows", "uwp", "mingw", "xbox"].contains(&system),
+            "apple" => ["osx", "ios", "tvos", "watchos", "visionos"].contains(&system),
+            "bsd" => ["freebsd", "openbsd", "netbsd"].contains(&system),
+            "static" => self.static_libraries,
+            "staticcrt" => self.static_crt,
+            "native" => {
+                let host = match std::env::consts::ARCH {
+                    "x86_64" => "x64",
+                    "aarch64" => "arm64",
+                    other => other,
+                };
+                let host_system = if cfg!(windows) {
+                    "windows"
+                } else if cfg!(target_os = "macos") {
+                    "osx"
+                } else {
+                    "linux"
+                };
+                cpu == host && (system == host_system || (cfg!(windows) && self.identifier("windows")))
+            }
+            other => system == other,
+        }
+    }
+}
+
+/// A recursive-descent reader of one platform expression; None for a syntax error.
+struct PlatformParser<'a> {
+    tokens: &'a [String],
+    position: usize,
+    facts: &'a TripletFacts,
+}
+
+impl PlatformParser<'_> {
+    /// `a, b`: the loosest or.
+    fn parse_list(&mut self) -> Option<bool> {
+        let mut value = self.parse_or()?;
+        while self.take(",") {
+            value |= self.parse_or()?;
+        }
+        Some(value)
+    }
+
+    fn parse_or(&mut self) -> Option<bool> {
+        let mut value = self.parse_and()?;
+        while self.take("|") {
+            value |= self.parse_and()?;
+        }
+        Some(value)
+    }
+
+    fn parse_and(&mut self) -> Option<bool> {
+        let mut value = self.parse_unary()?;
+        while self.take("&") || self.take("and") {
+            value &= self.parse_unary()?;
+        }
+        Some(value)
+    }
+
+    fn parse_unary(&mut self) -> Option<bool> {
+        if self.take("!") || self.take("not") {
+            return Some(!self.parse_unary()?);
+        }
+        if self.take("(") {
+            let value = self.parse_list()?;
+            return self.take(")").then_some(value);
+        }
+
+        let word = self.tokens.get(self.position)?;
+        if !word.starts_with(|first: char| first.is_ascii_alphanumeric()) {
+            return None;
+        }
+        self.position += 1;
+        Some(self.facts.identifier(word))
+    }
+
+    fn take(&mut self, token: &str) -> bool {
+        let found = self.tokens.get(self.position).is_some_and(|next| next == token);
+        if found {
+            self.position += 1;
+        }
+        found
+    }
 }
 
 /// Port names in a vcpkg.json "dependencies" list: "name" strings and { "name": ... } objects.
@@ -897,5 +1220,79 @@ mod tests {
         assert_eq!(checkout_commit(&root).as_deref(), Some("ddd"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn platform_expressions() {
+        let holds = |expression: &str, triplet: &str| platform_matches(expression, triplet);
+
+        assert!(holds("windows", "x64-windows"));
+        assert!(holds("windows", "x64-mingw-dynamic") && holds("mingw", "x64-mingw-dynamic"));
+        assert!(!holds("windows", "x64-linux"));
+        assert!(holds("!windows", "arm64-osx") && holds("apple & arm", "arm64-osx"));
+        assert!(holds("windows & static", "x64-windows-static-md") && !holds("staticcrt", "x64-windows-static-md"));
+        assert!(holds("staticcrt", "x64-windows-static") && !holds("static", "x64-windows"));
+        assert!(holds("static", "x64-linux") && !holds("static", "x64-linux-dynamic"));
+        assert!(holds("(windows & arm64) | (linux & x64)", "x64-linux"));
+        assert!(!holds("(windows & arm64) | (linux & x64)", "x64-windows"));
+        assert!(holds("linux, windows", "x64-windows") && holds("not linux and x64", "x64-windows"));
+        assert!(!holds("uwp | xbox", "x64-windows"));
+
+        // A syntax error keeps the entry
+        assert!(holds("windows &", "x64-linux"));
+    }
+
+    #[test]
+    fn triplet_runtimes() {
+        assert_eq!(named_static_crt("x64-windows"), Some(false));
+        assert_eq!(named_static_crt("x64-windows-static"), Some(true));
+        assert_eq!(named_static_crt("x64-windows-static-md"), Some(false));
+        assert_eq!(named_static_crt("x86-windows-static-release"), Some(true));
+        assert_eq!(named_static_crt("x64-linux"), None);
+        assert_eq!(named_static_crt("my-triplet"), None);
+
+        assert_eq!(
+            crt_linkage_of("set(VCPKG_TARGET_ARCHITECTURE x64)\nset( VCPKG_CRT_LINKAGE Static )\n"),
+            Some(true)
+        );
+        assert_eq!(crt_linkage_of("set(VCPKG_CRT_LINKAGE dynamic)"), Some(false));
+        assert_eq!(crt_linkage_of("set(VCPKG_LIBRARY_LINKAGE static)"), None);
+    }
+
+    #[test]
+    fn requested_features_follow_platforms_and_defaults() {
+        let manifest = Path::new("vcpkg.json");
+        let check = |json: &str, request: Request, triplet: &str, defaults: Option<Vec<String>>| {
+            let json: serde_json::Value = serde_json::from_str(json).unwrap();
+            check_requested_features(manifest, &json, &[request], triplet, &|_: &str| defaults.clone())
+        };
+        let request = |name: &str, features: &[&str], default_features: bool| Request {
+            name: name.into(),
+            features: features.iter().map(|feature| feature.to_string()).collect(),
+            default_features,
+        };
+
+        // Two entries for one port: only the one for this platform counts
+        let curl = r#"{ "dependencies": [ { "name": "curl", "features": ["openssl"], "platform": "linux" },
+                                         { "name": "curl", "features": ["schannel"], "platform": "windows" } ] }"#;
+        assert!(check(curl, request("curl", &["schannel"], true), "x64-windows", None).is_ok());
+        assert!(check(curl, request("curl", &["openssl"], true), "x64-windows", None).is_err());
+        assert!(check(curl, request("curl", &["openssl"], true), "x64-linux", None).is_ok());
+
+        // A default feature of the port is on while the entry keeps the defaults
+        let plain = r#"{ "dependencies": [ "curl" ] }"#;
+        let defaults = Some(vec!["ssl".to_string()]);
+        assert!(check(plain, request("curl", &["ssl"], true), "x64-windows", defaults.clone()).is_ok());
+        let no_defaults = r#"{ "dependencies": [ { "name": "curl", "default-features": false } ] }"#;
+        assert!(check(no_defaults, request("curl", &["ssl"], true), "x64-windows", defaults).is_err());
+
+        // default-features = false against a vcpkg.json that keeps them is not an error
+        assert!(check(
+            r#"{ "dependencies": [ "fmt" ] }"#,
+            request("fmt", &[], false),
+            "x64-windows",
+            Some(Vec::new())
+        )
+        .is_ok());
     }
 }

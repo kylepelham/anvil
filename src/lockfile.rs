@@ -48,6 +48,10 @@ pub struct GitLock {
     /// The tag, branch or commit anvil.toml asks for ("HEAD" for none).
     pub reference: String,
     pub commit: String,
+    /// Whose anvil.toml declares it: the project's (or a workspace member's) name, or the [deps] name of the
+    /// dependency that does. None in locks written before Anvil recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 /// What `anvil update` re-resolves.
@@ -63,10 +67,15 @@ pub enum Refresh {
 /// What the loaded manifests declare, whether or not this build resolved it.
 #[derive(Debug, Default)]
 pub struct Declared {
-    /// Names of git dependencies.
-    pub git: Vec<String>,
-    /// Every git and path dependency was resolved (none is behind a false `if` or unused).
-    pub all_resolved: bool,
+    /// Git dependencies: name, url and reference.
+    pub git: Vec<(String, String, String)>,
+    /// Every [deps] and [dev-deps] name of the loaded packages.
+    pub names: Vec<String>,
+    /// Their path and git dependencies.
+    pub packages: Vec<String>,
+    /// Packages loaded this run (the project, members, and path and git dependencies by [deps] name): their own
+    /// declarations are known.
+    pub loaded: Vec<String>,
     /// A vcpkg dependency, or the project's own vcpkg.json.
     pub vcpkg: bool,
 }
@@ -149,7 +158,8 @@ impl LockFile {
         )
     }
 
-    pub fn set_git(&mut self, name: &str, url: &str, reference: &str, commit: &str) {
+    /// Pins a git dependency; `parent` is whose anvil.toml declares it (see `GitLock::parent`).
+    pub fn set_git(&mut self, name: &str, url: &str, reference: &str, commit: &str, parent: Option<&str>) {
         self.used_git.push(name.to_string());
         self.lock.git.insert(
             name.to_string(),
@@ -157,6 +167,7 @@ impl LockFile {
                 url: url.to_string(),
                 reference: reference.to_string(),
                 commit: commit.to_string(),
+                parent: parent.map(str::to_string),
             },
         );
     }
@@ -184,15 +195,19 @@ impl LockFile {
         }
     }
 
-    /// Writes the file when it changed (or says what would change, under --locked). Pins of declared git
-    /// dependencies stay even when this build did not use them (behind an `if`, or another platform's); other pins go
-    /// only when every git and path dependency was resolved, so none can be a dependency's own. The vcpkg entry stays
-    /// while any [deps] entry is a vcpkg port.
+    /// Writes the file when it changed (or says what would change, under --locked). See `keeps_pin` for the pins
+    /// that stay; the vcpkg entry stays while any [deps] entry is a vcpkg port.
     pub fn finish(mut self, declared: &Declared) -> Result<()> {
         let used = std::mem::take(&mut self.used_git);
-        self.lock
+        let kept: Vec<String> = self
+            .lock
             .git
-            .retain(|name, _| used.contains(name) || declared.git.contains(name) || !declared.all_resolved);
+            .keys()
+            .filter(|name| self.keeps_pin(name, &used, declared, 0))
+            .cloned()
+            .collect();
+        self.stale_pin_error(&kept, declared)?;
+        self.lock.git.retain(|name, _| kept.contains(name));
         if !declared.vcpkg {
             self.lock.vcpkg = None;
         }
@@ -228,9 +243,67 @@ impl LockFile {
         Ok(())
     }
 
+    /// A pin stays when this build used it; when a loaded package declares it with the same url and reference (behind
+    /// an `if`, or another platform's); or when the package that declares it was not loaded this run and is itself
+    /// still declared or pinned, so its declarations are unknown.
+    fn keeps_pin(&self, name: &str, used: &[String], declared: &Declared, depth: usize) -> bool {
+        let Some(pin) = self.lock.git.get(name) else { return false };
+        if used.iter().any(|used| used == name) {
+            return true;
+        }
+
+        // Declared as it was pinned (a changed url or reference would need a new pin)
+        let declarations: Vec<_> = declared.git.iter().filter(|(declared, _, _)| declared == name).collect();
+        if !declarations.is_empty() {
+            return declarations
+                .iter()
+                .any(|(_, url, reference)| *url == pin.url && *reference == pin.reference);
+        }
+
+        // From a lock that does not say who declared it: kept while some path or git package was not loaded
+        let Some(parent) = &pin.parent else {
+            return declared.packages.iter().any(|package| !declared.loaded.contains(package));
+        };
+
+        // Declared by a package this run did not load (a chain of them at most as long as the lock)
+        if declared.loaded.contains(parent) || depth > self.lock.git.len() {
+            return false;
+        }
+        declared.names.contains(parent) || self.keeps_pin(parent, used, declared, depth + 1)
+    }
+
+    /// Under --locked, a declared git dependency this run did not fetch (behind an `if`) whose url or reference no
+    /// longer matches its pin.
+    fn stale_pin_error(&self, kept: &[String], declared: &Declared) -> Result<()> {
+        if !self.locked {
+            return Ok(());
+        }
+
+        for (name, url, reference) in &declared.git {
+            let Some(pin) = self.lock.git.get(name).filter(|_| !kept.contains(name)) else {
+                continue;
+            };
+            bail!(
+                "{} pins git dependency `{name}` to {} @ {}, but anvil.toml asks for {url} @ {reference}, and --locked forbids changing the pin. Run a build without --locked (or `anvil update {name}`) and commit the file.",
+                slash(&self.path),
+                pin.url,
+                pin.reference
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A pin was added, removed or moved (`parent` is bookkeeping: a lock written before it had it still holds).
     fn pins_changed(&self) -> bool {
         let baseline = |lock: &Lock| lock.vcpkg.as_ref().and_then(|vcpkg| vcpkg.baseline.clone());
-        self.lock.git != self.original.git || baseline(&self.lock) != baseline(&self.original)
+        let pins = |lock: &Lock| -> Vec<(String, String, String, String)> {
+            let entries = lock.git.iter();
+            entries
+                .map(|(name, pin)| (name.clone(), pin.url.clone(), pin.reference.clone(), pin.commit.clone()))
+                .collect()
+        };
+        pins(&self.lock) != pins(&self.original) || baseline(&self.lock) != baseline(&self.original)
     }
 
     /// One line per pin or port that changed.
@@ -292,6 +365,7 @@ mod tests {
                 url: "https://github.com/nlohmann/json".into(),
                 reference: "v3.11.3".into(),
                 commit: "9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03".into(),
+                parent: Some("engine".into()),
             },
         );
         let mut ports = BTreeMap::new();
@@ -316,7 +390,7 @@ mod tests {
             refresh: Refresh::Nothing,
             used_git: Vec::new(),
         };
-        file.set_git("lib", "https://x/lib", "main", "1234");
+        file.set_git("lib", "https://x/lib", "main", "1234", None);
         assert_eq!(file.git_commit("lib", "https://x/lib", "main").as_deref(), Some("1234"));
         assert_eq!(file.git_commit("lib", "https://x/lib", "v2"), None);
 
@@ -324,16 +398,78 @@ mod tests {
         assert_eq!(file.git_commit("lib", "https://x/lib", "main"), None);
     }
 
+    fn pin(name: &str, parent: Option<&str>) -> GitLock {
+        GitLock {
+            url: format!("https://x/{name}"),
+            reference: "main".into(),
+            commit: "1234".into(),
+            parent: parent.map(str::to_string),
+        }
+    }
+
+    fn declared_git(name: &str) -> (String, String, String) {
+        (name.to_string(), format!("https://x/{name}"), "main".to_string())
+    }
+
+    #[test]
+    fn pins_stay_only_while_something_declares_them() {
+        let mut lock = Lock::default();
+        for (name, parent) in [
+            ("used", Some("app")),
+            ("gated", Some("app")),
+            ("moved", Some("app")),
+            ("removed", Some("app")),
+            ("of_unloaded", Some("opt")),
+            ("of_loaded", Some("alpha")),
+            ("of_removed", Some("gone")),
+            ("of_kept_pin", Some("of_unloaded")),
+            ("legacy", None),
+        ] {
+            lock.git.insert(name.to_string(), pin(name, parent));
+        }
+        let file = LockFile {
+            path: PathBuf::from("anvil.lock"),
+            original: lock.clone(),
+            lock,
+            locked: false,
+            refresh: Refresh::Nothing,
+            used_git: Vec::new(),
+        };
+
+        // The project `app` declares `gated` (behind an `if`), `moved` at another url, and `opt` (a path dependency
+        // not loaded this run); `alpha` was loaded and no longer declares `of_loaded`. `legacy` comes from a lock that
+        // does not say who declared it, so it stays while some package (`opt`) was not loaded.
+        let mut declared = Declared {
+            git: vec![declared_git("gated"), ("moved".into(), "https://y/moved".into(), "main".into())],
+            names: vec!["gated".into(), "moved".into(), "opt".into(), "alpha".into()],
+            packages: vec!["opt".into(), "alpha".into()],
+            loaded: vec!["app".into(), "alpha".into()],
+            vcpkg: false,
+        };
+        let used = vec!["used".to_string()];
+        let kept: Vec<String> = file
+            .lock
+            .git
+            .keys()
+            .filter(|name| file.keeps_pin(name, &used, &declared, 0))
+            .cloned()
+            .collect();
+        assert_eq!(kept, ["gated", "legacy", "of_kept_pin", "of_unloaded", "used"]);
+        declared.loaded.push("opt".into());
+        assert!(!file.keeps_pin("legacy", &used, &declared, 0));
+        declared.loaded.pop();
+
+        // --locked names the pin whose url changed
+        let locked = LockFile { locked: true, ..file };
+        let error = locked.stale_pin_error(&kept, &declared).unwrap_err().to_string();
+        assert!(error.contains("`moved`") && error.contains("https://y/moved"), "{error}");
+    }
+
     #[test]
     fn unused_declared_pins_stay() {
         let root = std::env::temp_dir().join(format!("anvil-lock-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join(LOCK_NAME);
-        let pinned = |name: &str| GitLock {
-            url: format!("https://x/{name}"),
-            reference: "main".into(),
-            commit: "1234".into(),
-        };
 
         // A lock with a pin for `extra` (behind an `if` this build) and one nothing declares any more
         let mut lock = Lock {
@@ -344,14 +480,16 @@ mod tests {
             }),
             ..Default::default()
         };
-        lock.git.insert("extra".into(), pinned("extra"));
-        lock.git.insert("gone".into(), pinned("gone"));
+        lock.git.insert("extra".into(), pin("extra", Some("app")));
+        lock.git.insert("gone".into(), pin("gone", Some("app")));
         std::fs::write(&path, format!("{HEADER}{}", toml::to_string(&lock).unwrap())).unwrap();
 
-        // Every package resolved: only the undeclared pin goes; the baseline stays for an unused vcpkg dependency
+        // Only the undeclared pin goes; the baseline stays for an unused vcpkg dependency
         let declared = Declared {
-            git: vec!["extra".into()],
-            all_resolved: true,
+            git: vec![declared_git("extra")],
+            names: vec!["extra".into()],
+            packages: vec!["extra".into()],
+            loaded: vec!["app".into()],
             vcpkg: true,
         };
         LockFile::load(&root, false, Refresh::Nothing).unwrap().finish(&declared).unwrap();

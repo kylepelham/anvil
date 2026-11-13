@@ -182,13 +182,6 @@ enum CommandLine {
         build: BuildArgs,
     },
 
-    /// Runs a `cmake -E` command (build steps converted from CMake use it).
-    #[command(name = "cmake-e", hide = true)]
-    CmakeE {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
     /// Move git dependencies to the newest commit of their branch or tag and vcpkg to its newest ports, and rewrite
     /// anvil.lock (`anvil update json` for one dependency, `anvil update vcpkg` for vcpkg only).
     Update {
@@ -294,6 +287,13 @@ pub struct BuildArgs {
 }
 
 fn main() {
+    // Build steps' `anvil cmake-e <command>`: no project, no output of Anvil's own; not a subcommand clap knows, so
+    // help and completions do not offer it
+    if std::env::args_os().nth(1).is_some_and(|first| first == cmake_tool::SUBCOMMAND) {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(cmake_tool::run(&args));
+    }
+
     let cli = Cli::parse();
     ui::init(cli.quiet);
 
@@ -304,15 +304,11 @@ fn main() {
         }
     });
 
-    // Build steps' `cmake -E` commands: no project, no output of Anvil's own
-    if let Some(CommandLine::CmakeE { args }) = &cli.command {
-        std::process::exit(cmake_tool::run(args));
-    }
-
     // Whoever kills Anvil stops what it started too
     job::contain_self();
 
     // -C: run in that folder, so every relative path (`anvil -C x convert sub`) starts there
+    let shell_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if let Some(dir) = &cli.dir {
         let entered = if dir.is_dir() {
             std::env::set_current_dir(dir).map_err(|error| error.to_string())
@@ -337,7 +333,7 @@ fn main() {
         CommandLine::Run { target, build, args } => commands::run(&start_dir, &build, target.as_deref(), &args),
         CommandLine::Test { test, build } => commands::test(&start_dir, &build, &test),
         CommandLine::Clean { release, profile, all } => commands::clean(&start_dir, release, profile.as_deref(), all).map(|_| 0),
-        CommandLine::New { name, lib } => scaffold::new_project(&start_dir, &name, lib).map(|_| 0),
+        CommandLine::New { name, lib } => scaffold::new_project(&start_dir, &name, lib, &shell_dir).map(|_| 0),
         CommandLine::Init => scaffold::init(&start_dir).map(|_| 0),
         CommandLine::Add(args) => scaffold::add(&start_dir, &args).map(|_| 0),
         CommandLine::Remove { name } => scaffold::remove(&start_dir, &name).map(|_| 0),
@@ -354,7 +350,6 @@ fn main() {
             clap_complete::generate(shell, &mut <Cli as clap::CommandFactory>::command(), "anvil", &mut std::io::stdout());
             Ok(0)
         }
-        CommandLine::CmakeE { .. } => unreachable!("cmake-e runs before the project loads"),
     };
 
     job::release();
