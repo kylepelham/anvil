@@ -568,7 +568,7 @@ pub fn parse_unity(value: &toml::Value) -> Result<Option<usize>> {
 }
 
 pub fn load(path: &Path) -> Result<Manifest> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = crate::lsp::session::read_text(path).with_context(|| format!("reading {}", path.display()))?;
     parse_str(&text).map_err(|error| anyhow::anyhow!("{}: {error}", crate::util::slash(path)))
 }
 
@@ -581,7 +581,7 @@ struct TestsFile {
 }
 
 pub fn load_tests(path: &Path) -> Result<Vec<TestSpec>> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = crate::lsp::session::read_text(path).with_context(|| format!("reading {}", path.display()))?;
     parse_tests(&text).map_err(|error| anyhow::anyhow!("{}: {error}", crate::util::slash(path)))
 }
 
@@ -746,7 +746,7 @@ const RENAMED_KEYS: &[(&str, &str)] = &[
 
 /// serde says "unknown field `x`, expected one of `a`, `b`": add "(did you mean `a`?)" after the key, or what a key
 /// an older format had is written as now.
-fn explain_unknown_key(message: &str) -> String {
+pub fn explain_unknown_key(message: &str) -> String {
     let pattern = regex::Regex::new(r"unknown field `([^`]+)`, expected (?:one of )?(.*)").unwrap();
     let Some(captures) = pattern.captures(message) else {
         return message.to_string();

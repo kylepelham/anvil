@@ -1764,7 +1764,7 @@ impl Model {
                     }
                 }
 
-                if std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
+                if crate::lsp::session::active() || std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
                     continue;
                 }
 
@@ -2524,7 +2524,7 @@ fn collect_dep_words(file: &Path, words: &mut Vec<String>) {
         }
     }
 
-    let Ok(text) = std::fs::read_to_string(file) else { return };
+    let Ok(text) = crate::lsp::session::read_text(file) else { return };
     let Ok(table) = text.parse::<toml::Table>() else { return };
     for (key, value) in &table {
         if key != "deps" && key != "dev-deps" {
@@ -2534,6 +2534,12 @@ fn collect_dep_words(file: &Path, words: &mut Vec<String>) {
 }
 
 fn tests_files(root: &Path, out_root: &Path) -> Vec<PathBuf> {
+    // The language server reuses a walk while only manifests are edited
+    let walk = || Ok::<_, ()>(tests_files_uncached(root, out_root));
+    crate::lsp::session::walk("tests", &[root, out_root], walk).unwrap_or_default()
+}
+
+fn tests_files_uncached(root: &Path, out_root: &Path) -> Vec<PathBuf> {
     let walker = walkdir::WalkDir::new(root).sort_by_file_name().into_iter().filter_entry(|entry| {
         let other_package = entry.depth() > 0 && entry.file_type().is_dir() && entry.path().join(MANIFEST_NAME).is_file();
         !targets::is_skipped_dir(entry, out_root) && !other_package

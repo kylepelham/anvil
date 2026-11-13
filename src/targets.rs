@@ -1229,6 +1229,13 @@ pub fn sanitize_name(name: &str) -> String {
 }
 
 pub fn walk_glob(dir: &Path, pattern: &str, out_root: &Path) -> Result<Vec<PathBuf>> {
+    // The language server reuses a walk while only manifests are edited
+    crate::lsp::session::walk("glob", &[dir, Path::new(pattern), out_root], || {
+        walk_glob_uncached(dir, pattern, out_root)
+    })
+}
+
+fn walk_glob_uncached(dir: &Path, pattern: &str, out_root: &Path) -> Result<Vec<PathBuf>> {
     // Walk from the pattern's literal folder prefix, matching the rest as deep as it reaches
     let (base, glob) = split_pattern(dir, pattern);
     let Some(glob) = glob else {

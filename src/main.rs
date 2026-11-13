@@ -17,6 +17,7 @@ mod install;
 mod job;
 mod lint;
 mod lockfile;
+mod lsp;
 mod manifest;
 mod plan;
 mod platform;
@@ -289,6 +290,21 @@ enum CommandLine {
         plan: PlanArgs,
     },
 
+    /// Run the language server for anvil.toml and tests.toml (LSP over stdin and stdout, for editors).
+    Lsp {
+        /// Log what the server does to stderr and to the editor's log.
+        #[arg(long)]
+        verbose: bool,
+
+        /// Accepted for editors that pass it; stdio is the only transport.
+        #[arg(long, hide = true)]
+        stdio: bool,
+
+        /// Accepted for editors that pass it.
+        #[arg(long = "clientProcessId", hide = true)]
+        client_process_id: Option<String>,
+    },
+
     /// Print a shell completion script (`anvil completions powershell >> $PROFILE`).
     Completions { shell: clap_complete::Shell },
 }
@@ -524,6 +540,7 @@ fn main() {
             lint::tidy(&start_dir, &BuildArgs::new(plan, run), fix, &targets)
         }
         CommandLine::Update { names, plan } => commands::update(&start_dir, &BuildArgs::planning(plan), &names).map(|_| 0),
+        CommandLine::Lsp { verbose, .. } => lsp::run(verbose),
         CommandLine::Completions { shell } => {
             clap_complete::generate(shell, &mut <Cli as clap::CommandFactory>::command(), "anvil", &mut std::io::stdout());
             Ok(0)
