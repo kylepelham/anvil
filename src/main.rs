@@ -159,7 +159,7 @@ enum CommandLine {
         force: bool,
 
         /// Compare the converted build with CMake's: configure CMake (Ninja), plan Anvil, and diff each file's
-        /// definitions and include folders. Needs cmake and ninja; uses the existing anvil.toml.
+        /// definitions, include folders, standard and other options. Needs cmake and ninja; uses the existing anvil.toml.
         #[arg(long, conflicts_with_all = ["stdout", "force"])]
         check: bool,
 
