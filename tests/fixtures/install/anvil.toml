@@ -1,0 +1,31 @@
+[project]
+name = "geo"
+version = "1.2.0"
+
+[options]
+SHARED = false
+
+[target.util]
+kind = "lib"
+dir = "util"
+
+[target.core]
+kind = "lib"
+dir = "core"
+export-header = "geo/core_export.h"
+deps = ["util"]
+public.defines = ["GEO_UNITS=1"]
+
+[target.core.when.SHARED]
+kind = "shared"
+
+[target.tool]
+kind = "exe"
+dir = "tool"
+deps = ["core"]
+data = ["assets/**"]
+
+[target.check]
+kind = "test"
+sources = ["tests/check.cpp"]
+deps = ["core"]

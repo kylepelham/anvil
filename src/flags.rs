@@ -811,12 +811,15 @@ impl Toolchain {
             args.push(if self.targets_windows() { "-static" } else { "-static-libstdc++" }.into());
         }
 
-        // Shared libraries beside the binary are found at run time
+        // Shared libraries beside the binary are found at run time, and from bin/ in lib/ as `anvil install` lays
+        // them out, so installing needs no relink
         if linux {
             args.push("-Wl,-rpath,$ORIGIN".into());
+            args.push("-Wl,-rpath,$ORIGIN/../lib".into());
         }
         if macos {
             args.push("-Wl,-rpath,@loader_path".into());
+            args.push("-Wl,-rpath,@loader_path/../lib".into());
         }
 
         // The target's and profile's options go before the inputs, as CMake puts them (-Wl,--as-needed); the libraries
@@ -1179,6 +1182,7 @@ mod tests {
         let args = link(&linux, true, Gui::Off, false);
         assert!(args.contains(&"-Wl,-soname,libplugin.so".to_string()));
         assert!(args.contains(&"-Wl,-rpath,$ORIGIN".to_string()));
+        assert!(args.contains(&"-Wl,-rpath,$ORIGIN/../lib".to_string()));
 
         // The target's flags come before the objects and libraries they affect
         let flag = args.iter().position(|arg| arg == "-Wl,--as-needed").unwrap();
@@ -1189,6 +1193,7 @@ mod tests {
         let args = link(&macos, true, Gui::Off, true);
         assert!(args.contains(&"-Wl,-install_name,@rpath/libplugin.so".to_string()));
         assert!(args.contains(&"-Wl,-rpath,@loader_path".to_string()));
+        assert!(args.contains(&"-Wl,-rpath,@loader_path/../lib".to_string()));
         assert!(args.contains(&"-Wl,-undefined,dynamic_lookup".to_string()));
 
         // Frameworks, as a name or a flag and its value

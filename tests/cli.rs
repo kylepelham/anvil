@@ -1142,3 +1142,202 @@ fn test_names_are_qualified_by_package() {
         .code(1)
         .contains("two tests are named `smoke`, in app/anvil.toml and in app/one/tests.toml");
 }
+
+// 25. anvil install lays out programs (with their data), libraries, headers and the CMake and pkg-config files, copies
+//     only what changed, and installed programs run from the prefix; a CMake project builds against the install
+
+/// The files under a folder, relative to it, sorted.
+fn files_under(folder: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut pending = vec![folder.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in std::fs::read_dir(&current).unwrap().map(|entry| entry.unwrap()) {
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            } else {
+                let relative = entry.path().strip_prefix(folder).unwrap().to_string_lossy().replace('\\', "/");
+                files.push(relative);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Runs an installed program, with the prefix's bin/ first on PATH (where Windows finds DLLs).
+fn run_installed(prefix: &Path, program: &Path) -> String {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut folders = vec![prefix.join("bin")];
+    folders.extend(std::env::split_paths(&path));
+    let output = Command::new(program)
+        .env("PATH", std::env::join_paths(folders).unwrap())
+        .output()
+        .unwrap_or_else(|error| panic!("starting {}: {error}", program.display()));
+    assert!(
+        output.status.success(),
+        "{} failed: {}",
+        program.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn install_layout(toolchain: Option<&str>, test: &str) {
+    let project = Project::fixture("install", test);
+    let exe = if cfg!(windows) { ".exe" } else { "" };
+
+    let first = project.anvil(&with_toolchain(toolchain, &["install"]));
+    first.success().contains("Installed out/install:");
+    let files = files_under(&project.path("out/install"));
+    for expected in [
+        format!("bin/tool{exe}"),
+        "bin/assets/logo.png".to_string(),
+        "bin/assets/maps/one.txt".to_string(),
+        "include/geo/core.h".to_string(),
+        "include/geo/core_export.h".to_string(),
+        "include/geo/util.h".to_string(),
+        "lib/cmake/geo/geoConfig.cmake".to_string(),
+        "lib/cmake/geo/geoConfigVersion.cmake".to_string(),
+        "lib/pkgconfig/geo.pc".to_string(),
+    ] {
+        assert!(files.contains(&expected), "no {expected} in {files:?}");
+    }
+    assert_eq!(
+        files.iter().filter(|file| file.starts_with("lib/") && file.contains("core")).count(),
+        1,
+        "{files:?}"
+    );
+    assert!(!files.iter().any(|file| file.contains("check")), "a test was installed: {files:?}");
+
+    // The installed program finds its data beside it
+    let program = project.path(&format!("out/install/bin/tool{exe}"));
+    assert_eq!(run_installed(&project.path("out/install"), &program), "area 12 map hills");
+
+    // The package names the static library and what its users link
+    let config = project.read("out/install/lib/cmake/geo/geoConfig.cmake");
+    assert!(config.contains("add_library(geo::core STATIC IMPORTED)"), "{config}");
+    assert!(config.contains("INTERFACE_COMPILE_DEFINITIONS \"GEO_UNITS=1\""), "{config}");
+    assert!(config.contains("$<LINK_ONLY:geo::util>"), "{config}");
+    assert!(project.read("out/install/lib/pkgconfig/geo.pc").contains("Version: 1.2.0"));
+
+    // Nothing changed: nothing copied
+    project
+        .anvil(&with_toolchain(toolchain, &["install"]))
+        .success()
+        .contains("0 files copied");
+
+    // Shared: the DLL beside the program on Windows, the library in lib/ elsewhere, and its definition for users
+    let shared = project.anvil(&with_toolchain(toolchain, &["install", "-o", "SHARED", "--prefix", "out/shared"]));
+    shared.success();
+    let files = files_under(&project.path("out/shared"));
+    let library_folder = if cfg!(windows) { "bin/" } else { "lib/" };
+    assert!(
+        files.iter().any(|file| file.starts_with(library_folder) && file.contains("core.")),
+        "no shared core in {library_folder}: {files:?}"
+    );
+    let program = project.path(&format!("out/shared/bin/tool{exe}"));
+    assert_eq!(run_installed(&project.path("out/shared"), &program), "area 12 map hills");
+    let config = project.read("out/shared/lib/cmake/geo/geoConfig.cmake");
+    assert!(config.contains("add_library(geo::core SHARED IMPORTED)"), "{config}");
+    assert!(config.contains("CORE_SHARED"), "{config}");
+}
+
+#[test]
+fn install_lays_out_programs_libraries_and_headers() {
+    require!("default");
+    install_layout(None, "install");
+}
+
+#[test]
+fn install_lays_out_programs_libraries_and_headers_gcc() {
+    require!("gcc");
+    install_layout(Some("gcc"), "install_gcc");
+}
+
+/// Whether a program runs from PATH (`cmake --version`).
+fn on_path(program: &str) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[test]
+fn cmake_project_uses_an_installed_library() {
+    require!("gcc");
+    if !on_path("cmake") || !on_path("ninja") {
+        eprintln!("skipped: cmake and ninja must be on PATH");
+        return;
+    }
+
+    let project = Project::fixture("install", "install_cmake");
+    let consumer = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("install_consumer");
+    for (kind, options) in [("static", vec![]), ("shared", vec!["-o", "SHARED"])] {
+        let prefix_name = format!("out/{kind}");
+        let mut args = vec!["install", "--toolchain", "gcc", "--prefix", prefix_name.as_str()];
+        args.extend(options);
+        project.anvil(&args).success();
+
+        // Configure and build the consumer with the same compiler, against the prefix
+        let prefix = project.path(&prefix_name);
+        let build = project.path(&format!("consumer-{kind}"));
+        let cmake = |args: &[&str]| {
+            let output = Command::new("cmake").args(args).output().expect("running cmake");
+            assert!(
+                output.status.success(),
+                "cmake {args:?} failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        cmake(&[
+            "-S",
+            &consumer.to_string_lossy(),
+            "-B",
+            &build.to_string_lossy(),
+            "-G",
+            "Ninja",
+            "-DCMAKE_BUILD_TYPE=Debug",
+            "-DCMAKE_CXX_COMPILER=g++",
+            &format!("-DCMAKE_PREFIX_PATH={}", prefix.to_string_lossy().replace('\\', "/")),
+        ]);
+        cmake(&["--build", &build.to_string_lossy()]);
+
+        let app = build.join(if cfg!(windows) { "app.exe" } else { "app" });
+        assert_eq!(run_installed(&prefix, &app), "consumer 10", "{kind}");
+    }
+}
+
+// 26. data files go beside the program at their path under the target's folder, and are copied again only when they
+//     change; a pattern that matches nothing is an error
+
+#[test]
+fn data_files_copy_beside_the_program_when_changed() {
+    require!("default");
+    let project = Project::fixture("install", "data_files");
+
+    let run = project.anvil(&["run", "tool"]);
+    run.success();
+    assert_eq!(program_output(&run), "area 12 map hills");
+    assert!(run.actions().contains(&"Copying assets/maps/one.txt".to_string()), "{:?}", run.actions());
+    assert_eq!(project.read("out/debug/assets/logo.png").trim(), "logo");
+    project.anvil(&["build"]).success().up_to_date();
+
+    // An edited file is copied again, alone; a touched one is not
+    project.write("tool/assets/maps/one.txt", "valleys\n");
+    let edited = project.anvil(&["build"]);
+    edited.success();
+    assert_eq!(edited.actions(), ["Copying assets/maps/one.txt"]);
+    project.touch("tool/assets/logo.png");
+    project.anvil(&["build"]).success().up_to_date();
+    assert_eq!(program_output(&project.anvil(&["run", "tool"])), "area 12 map valleys");
+
+    project.edit("anvil.toml", "data = [\"assets/**\"]", "data = [\"assets/**\", \"sounds/*.wav\"]");
+    project
+        .anvil(&["build"])
+        .code(1)
+        .contains("data: \"sounds/*.wav\" matches no files (in tool)");
+}

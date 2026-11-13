@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+project(consumer CXX)
+find_package(geo 1.0 CONFIG REQUIRED)
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE geo::core)

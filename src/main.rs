@@ -11,6 +11,7 @@ mod depfile;
 mod exec;
 mod export_header;
 mod flags;
+mod install;
 mod job;
 mod lint;
 mod lockfile;
@@ -90,6 +91,20 @@ enum CommandLine {
     Test {
         #[command(flatten)]
         test: TestArgs,
+
+        #[command(flatten)]
+        build: BuildArgs,
+    },
+
+    /// Build, then copy the programs, libraries and public headers into a prefix (bin/, lib/, include/), with CMake
+    /// and pkg-config files for the libraries.
+    Install {
+        /// Targets to install (default: every default program and library).
+        targets: Vec<String>,
+
+        /// Where to install (default: out/install).
+        #[arg(long, value_name = "DIR")]
+        prefix: Option<PathBuf>,
 
         #[command(flatten)]
         build: BuildArgs,
@@ -367,6 +382,7 @@ fn main() {
         CommandLine::Build { targets, all, build } => commands::build(&start_dir, &build, &targets, all).map(|_| 0),
         CommandLine::Run { target, build, args } => commands::run(&start_dir, &build, target.as_deref(), &args),
         CommandLine::Test { test, build } => commands::test(&start_dir, &build, &test),
+        CommandLine::Install { targets, prefix, build } => install::install(&start_dir, &build, &targets, prefix.as_deref()).map(|_| 0),
         CommandLine::Clean { release, profile, all } => commands::clean(&start_dir, release, profile.as_deref(), all).map(|_| 0),
         CommandLine::New { name, lib } => scaffold::new_project(&start_dir, &name, lib, &shell_dir).map(|_| 0),
         CommandLine::Init => scaffold::init(&start_dir).map(|_| 0),

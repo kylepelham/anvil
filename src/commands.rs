@@ -127,6 +127,8 @@ pub fn test(start_dir: &Path, build: &BuildArgs, options: &TestArgs) -> Result<i
             Plan {
                 actions: Vec::new(),
                 artifacts: Default::default(),
+                import_libs: Default::default(),
+                runtime_files: Default::default(),
             },
         )
     } else {
@@ -469,7 +471,7 @@ fn check_runs_here(model: &Model, command: &str) -> Result<()> {
 }
 
 /// Plans and runs the actions `roots` need, then prints the summary line.
-fn build_roots(model: Model, build: &BuildArgs, roots: &[usize]) -> Result<(Model, Plan)> {
+pub fn build_roots(model: Model, build: &BuildArgs, roots: &[usize]) -> Result<(Model, Plan)> {
     std::fs::create_dir_all(&model.out_root)?;
     std::fs::write(
         model.out_root.join(OUT_MARKER),
