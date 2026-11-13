@@ -2,6 +2,7 @@
 //! project's, the user's pick, VCPKG_ROOT, then the best found), packages install on demand only when the
 //! requested set changes, and their headers, libraries and DLLs feed the build directly with no CMake toolchain file.
 
+use crate::manifest::VcpkgSpec;
 use crate::platform::Os;
 use crate::settings::Settings;
 use crate::toolchain::Toolchain;
@@ -11,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const VCPKG_REPOSITORY: &str = "https://github.com/microsoft/vcpkg.git";
+
+// The install stamp's name, in each triplet's install folder
+const STAMP_NAME: &str = ".anvil.stamp";
 
 /// One vcpkg checkout or installation.
 #[derive(Debug, Clone)]
@@ -37,14 +41,19 @@ pub struct Request {
 
 /// What `install` needs beyond the requests.
 pub struct InstallConfig<'a> {
-    pub project_root: &'a Path,
+    /// `[project]` name and version, which the generated manifest carries (vcpkg names them in its errors).
+    pub project_name: &'a str,
+    pub project_version: &'a str,
     pub out_root: &'a Path,
     pub triplet: String,
+    /// The project's own vcpkg.json (checked by `own_manifest`).
     pub manifest: Option<PathBuf>,
     /// `[vcpkg] baseline` in anvil.toml.
     pub baseline: Option<String>,
     /// The baseline anvil.lock pins.
     pub locked_baseline: Option<String>,
+    /// `anvil update`: take the newest baseline, not one an earlier run stored.
+    pub refresh_baseline: bool,
     pub overlay_ports: Vec<PathBuf>,
     pub overlay_triplets: Vec<PathBuf>,
 }
@@ -139,6 +148,12 @@ impl Instance {
     /// The vcpkg to use: the project's `[vcpkg] root`, the user's `anvil vcpkg use` choice, VCPKG_ROOT, then the
     /// first found checkout with its own ports, then any. With none at all, one is set up in the Anvil data folder.
     pub fn select(project_root_override: Option<&Path>) -> Result<Instance> {
+        Instance::select_with(project_root_override, None)
+    }
+
+    /// `select`, trying `remembered` (the one the last install used) before searching the machine, which runs
+    /// vswhere and reads PATH.
+    pub fn select_with(project_root_override: Option<&Path>, remembered: Option<&Path>) -> Result<Instance> {
         if let Some(root) = project_root_override {
             return Instance::at(root, "anvil.toml").with_context(|| format!("[vcpkg] root = \"{}\" is not a vcpkg checkout", slash(root)));
         }
@@ -153,12 +168,16 @@ impl Instance {
             ));
         }
 
+        let from_environment = std::env::var_os("VCPKG_ROOT").and_then(|root| Instance::at(Path::new(&root), "VCPKG_ROOT"));
+        if let Some(instance) = from_environment {
+            return Ok(instance);
+        }
+        if let Some(instance) = remembered.and_then(|root| Instance::at(root, "the last install")) {
+            return Ok(instance);
+        }
+
         let instances = Instance::discover();
-        let preferred = instances
-            .iter()
-            .find(|instance| instance.source == "VCPKG_ROOT")
-            .or_else(|| instances.iter().find(|instance| instance.has_ports))
-            .or_else(|| instances.first());
+        let preferred = instances.iter().find(|instance| instance.has_ports).or_else(|| instances.first());
 
         match preferred {
             Some(instance) => Ok(instance.clone()),
@@ -243,23 +262,60 @@ impl Instance {
         let install_root = config.out_root.join("vcpkg").join("installed").join(&config.triplet);
         let (manifest_folder, manifest_text, features, baseline) = self.prepare_manifest(requests, config)?;
 
-        // Skip vcpkg when the inputs match the last successful install
-        let stamp = self.install_stamp(&manifest_folder, &format!("{manifest_text}|{}", features.join(",")), config);
-        let stamp_file = install_root.join(".anvil.stamp");
+        // Skip vcpkg when the inputs match the last successful install; the stamp's first line is the vcpkg it used
+        let stamp = format!(
+            "{}\n{}",
+            slash(&self.root),
+            self.install_stamp(&manifest_folder, &format!("{manifest_text}|{}", features.join(",")), config)
+        );
+        let stamp_file = install_root.join(STAMP_NAME);
         let up_to_date = std::fs::read_to_string(&stamp_file).ok() == Some(stamp.clone()) && install_root.join(&config.triplet).is_dir();
 
         if !up_to_date {
+            self.check_requests(requests, &manifest_folder, config)?;
+            if let Some(baseline) = baseline.as_deref().filter(|_| config.manifest.is_none()) {
+                self.check_baseline(baseline, config)?;
+            }
             self.run_install(&manifest_folder, &install_root, &features, config)?;
             util::write_atomic(&stamp_file, stamp.as_bytes())?;
         }
 
         let tree = crate::vcpkg_tree::InstalledTree::load(&install_root, &config.triplet)?;
-        let own_manifest = Some(manifest_folder.join("vcpkg.json")).filter(|_| !manifest_folder.starts_with(config.out_root));
         Ok(Installed {
             tree,
-            own_manifest,
+            own_manifest: config.manifest.clone(),
             baseline,
         })
+    }
+
+    /// Whether `name` is a port this instance knows: in its ports tree, an overlay folder, or one that
+    /// the vcpkg-configuration.json beside the project's own vcpkg.json adds (vcpkg reads none without one). None
+    /// when it cannot tell: no ports tree, or registries.
+    pub fn knows_port(&self, name: &str, overlay_ports: &[PathBuf], configuration_folder: Option<&Path>) -> Option<bool> {
+        let overlays = all_overlay_ports(overlay_ports, configuration_folder)?;
+        if overlays.iter().any(|folder| overlay_has_port(folder, name)) {
+            return Some(true);
+        }
+
+        self.has_port(name)
+    }
+
+    /// "vcpkg has no port `x`", with the closest port name.
+    pub fn unknown_port_error(&self, name: &str, overlay_ports: &[PathBuf]) -> anyhow::Error {
+        let mut port_names: Vec<String> = Vec::new();
+        for folder in std::iter::once(&self.root.join("ports")).chain(overlay_ports) {
+            let entries = std::fs::read_dir(folder).into_iter().flatten().flatten();
+            port_names.extend(entries.map(|entry| entry.file_name().to_string_lossy().into_owned()));
+        }
+
+        let hint = util::suggest(name, port_names.iter().map(|port| port.as_str()))
+            .map(|close| format!(" Did you mean `{close}`?"))
+            .unwrap_or_default();
+        let overlays = if overlay_ports.is_empty() { "" } else { " or the overlay ports" };
+        anyhow::anyhow!(
+            "vcpkg has no port `{name}` (in {}{overlays}).{hint} Search with `anvil vcpkg search {name}`.",
+            slash(&self.root.join("ports"))
+        )
     }
 
     /// Runs vcpkg with the given arguments in the foreground (for `anvil vcpkg -- ...`).
@@ -278,14 +334,9 @@ impl Instance {
     /// manifest features that hold the ones it lists only there), or one generated from anvil.toml with a pinned
     /// baseline. Also returns that manifest's text, the features to enable, and the baseline it pins.
     fn prepare_manifest(&mut self, requests: &[Request], config: &InstallConfig) -> Result<(PathBuf, String, Vec<String>, Option<String>)> {
-        let own_manifest = config
-            .manifest
-            .clone()
-            .or_else(|| Some(config.project_root.join("vcpkg.json")).filter(|path| path.is_file()));
-
-        if let Some(manifest) = own_manifest {
-            let text = std::fs::read_to_string(&manifest).with_context(|| format!("reading {}", manifest.display()))?;
-            let features = manifest_features_for(&manifest, &text, requests)?;
+        if let Some(manifest) = &config.manifest {
+            let text = std::fs::read_to_string(manifest).with_context(|| format!("reading {}", manifest.display()))?;
+            let features = manifest_features_for(manifest, &text, requests)?;
 
             let folder = manifest.parent().unwrap().to_path_buf();
             return Ok((folder, text, features, None));
@@ -310,7 +361,10 @@ impl Instance {
             dependencies.push(serde_json::Value::Object(entry));
         }
 
+        // Named after the project, so vcpkg's messages ("needed by ...") say whose it is
         let mut manifest = serde_json::Map::new();
+        manifest.insert("name".into(), manifest_name(config.project_name).into());
+        manifest.insert("version-string".into(), config.project_version.into());
         manifest.insert("dependencies".into(), dependencies.into());
 
         // A baseline pins versions: anvil.toml's, else the lock's, else the ports tree's current commit (or for
@@ -321,7 +375,7 @@ impl Instance {
             if self.has_ports {
                 self.ports_commit()
             } else {
-                self.baseline_for_portless(&manifest_file)
+                self.baseline_for_portless(&manifest_file, config.refresh_baseline)
             }
         });
         if let Some(baseline) = &baseline {
@@ -341,15 +395,15 @@ impl Instance {
         (output.status.success() && commit.len() == 40).then_some(commit)
     }
 
-    /// A baseline for an instance without a ports tree: the one an earlier run generated, else the one vcpkg itself
-    /// picks (`x-update-baseline --add-initial-baseline`), so it stays fixed from then on.
-    fn baseline_for_portless(&mut self, manifest_file: &Path) -> Option<String> {
+    /// A baseline for an instance without a ports tree: the one an earlier run generated (unless refreshing), else the
+    /// one vcpkg itself picks (`x-update-baseline --add-initial-baseline`), so it stays fixed from then on.
+    fn baseline_for_portless(&mut self, manifest_file: &Path, refresh: bool) -> Option<String> {
         let read_baseline = |file: &Path| -> Option<String> {
             let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
             json.get("builtin-baseline")?.as_str().map(|baseline| baseline.to_string())
         };
 
-        if let Some(existing) = read_baseline(manifest_file) {
+        if let Some(existing) = read_baseline(manifest_file).filter(|_| !refresh) {
             return Some(existing);
         }
 
@@ -357,7 +411,7 @@ impl Instance {
         let executable = self.ensure_bootstrapped().ok()?;
         util::write_if_changed(manifest_file, b"{ \"dependencies\": [] }\n").ok()?;
         Command::new(executable)
-            .args(["x-update-baseline", "--add-initial-baseline"])
+            .args(["x-update-baseline", "--add-initial-baseline", "--x-wait-for-lock"])
             .arg(format!("--x-manifest-root={}", manifest_file.parent()?.display()))
             .env("VCPKG_ROOT", &self.root)
             .output()
@@ -392,9 +446,49 @@ impl Instance {
         if let Some(executable) = &self.executable {
             text.push_str(&format!("|{:?}", util::mtime(executable)));
         }
-        text.push_str(&format!("|{:?}", util::mtime(&self.root.join(".git").join("HEAD"))));
+        text.push_str(&format!("|{:?}", checkout_commit(&self.root)));
 
         format!("{:016x}", util::hash_bytes(text.as_bytes()))
+    }
+
+    /// Fails with a suggestion for a port name that neither the ports tree nor an overlay has.
+    fn check_requests(&self, requests: &[Request], manifest_folder: &Path, config: &InstallConfig) -> Result<()> {
+        for request in requests {
+            if self.knows_port(&request.name, &config.overlay_ports, Some(manifest_folder)) == Some(false) {
+                return Err(self
+                    .unknown_port_error(&request.name, &config.overlay_ports)
+                    .context(format!("`{}` is a vcpkg port in anvil.toml's [deps]", request.name)));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// A baseline the checkout lacks fails inside vcpkg with a raw `git show` error: say what to do instead.
+    fn check_baseline(&self, baseline: &str, config: &InstallConfig) -> Result<()> {
+        if !self.has_ports || !self.root.join(".git").exists() {
+            return Ok(());
+        }
+
+        let present = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["cat-file", "-e", &format!("{baseline}^{{commit}}")])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if present {
+            return Ok(());
+        }
+
+        let root = slash(&self.root);
+        if config.baseline.as_deref() == Some(baseline) {
+            bail!(
+                "[vcpkg] baseline = \"{baseline}\" is a ports tree commit the vcpkg checkout at {root} does not have. Run `git -C {root} fetch` to get it, or change the baseline."
+            );
+        }
+        bail!(
+            "anvil.lock pins vcpkg baseline {baseline}, a ports tree commit the vcpkg checkout at {root} does not have (the lock was written with a newer or other vcpkg). Run `git -C {root} pull` to get it, or `anvil update vcpkg` to lock this checkout's ports instead (and commit anvil.lock)."
+        )
     }
 
     fn run_install(&mut self, manifest_folder: &Path, install_root: &Path, features: &[String], config: &InstallConfig) -> Result<()> {
@@ -404,6 +498,7 @@ impl Instance {
             &format!("installing packages for {} (using {})", config.triplet, slash(&self.root)),
         );
 
+        // Another build may be using this vcpkg: wait for its lock rather than fail
         let mut command = Command::new(executable);
         command
             .arg("install")
@@ -411,6 +506,7 @@ impl Instance {
             .arg(format!("--x-manifest-root={}", manifest_folder.display()))
             .arg(format!("--x-install-root={}", install_root.display()))
             .arg("--no-print-usage")
+            .arg("--x-wait-for-lock")
             .env("VCPKG_ROOT", &self.root);
         for feature in features {
             command.arg(format!("--x-feature={feature}"));
@@ -422,6 +518,17 @@ impl Instance {
             command.arg(format!("--overlay-triplets={}", folder.display()));
         }
 
+        // -q: vcpkg's output only when it fails
+        if crate::ui::quiet() {
+            let output = command.output().context("running vcpkg install")?;
+            if !output.status.success() {
+                crate::ui::print_block(&String::from_utf8_lossy(&output.stdout));
+                crate::ui::print_block(&String::from_utf8_lossy(&output.stderr));
+                bail!("vcpkg install failed (its output is above)");
+            }
+            return Ok(());
+        }
+
         let status = command.status().context("running vcpkg install")?;
         if !status.success() {
             bail!("vcpkg install failed (see its output above)");
@@ -431,22 +538,212 @@ impl Instance {
     }
 }
 
-/// The default triplet for what a toolchain builds.
-pub fn default_triplet(toolchain: &Toolchain, static_runtime: bool) -> String {
+/// The vcpkg the last install into `out_root` for `triplet` used (the stamp's first line).
+pub fn remembered_root(out_root: &Path, triplet: &str) -> Option<PathBuf> {
+    let stamp_file = out_root.join("vcpkg").join("installed").join(triplet).join(STAMP_NAME);
+    let text = std::fs::read_to_string(stamp_file).ok()?;
+
+    text.lines().next().filter(|line| !line.is_empty()).map(PathBuf::from)
+}
+
+/// The project's own vcpkg.json: `[vcpkg] manifest` (a folder, or the vcpkg.json in one), else one beside anvil.toml.
+pub fn own_manifest(project_root: &Path, configured: Option<&Path>) -> Result<Option<PathBuf>> {
+    let Some(configured) = configured else {
+        return Ok(Some(project_root.join("vcpkg.json")).filter(|file| file.is_file()));
+    };
+
+    // vcpkg reads only a file named vcpkg.json, from the folder it is given
+    let file = if configured.is_dir() {
+        configured.join("vcpkg.json")
+    } else {
+        configured.to_path_buf()
+    };
+    if file.file_name().is_none_or(|name| name != "vcpkg.json") {
+        bail!(
+            "[vcpkg] manifest = \"{}\": vcpkg reads only a file named vcpkg.json; name the folder that holds it (or rename the file)",
+            slash(configured)
+        );
+    }
+    if !file.is_file() {
+        bail!("[vcpkg] manifest: {} does not exist", slash(&file));
+    }
+
+    Ok(Some(file))
+}
+
+/// The commit a git checkout is at, read from its files (HEAD, the branch it names, or packed-refs): a pull or a
+/// checkout changes it, which a time stamp of HEAD misses when HEAD names a branch.
+fn checkout_commit(root: &Path) -> Option<String> {
+    let git_folder = root.join(".git");
+    let head = std::fs::read_to_string(git_folder.join("HEAD")).ok()?;
+    let Some(reference) = head.trim().strip_prefix("ref: ") else {
+        return Some(head.trim().to_string());
+    };
+
+    if let Ok(commit) = std::fs::read_to_string(git_folder.join(reference)) {
+        return Some(commit.trim().to_string());
+    }
+    let packed = std::fs::read_to_string(git_folder.join("packed-refs")).ok()?;
+    packed
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .find(|(_, name)| *name == reference)
+        .map(|(commit, _)| commit.to_string())
+}
+
+/// A vcpkg manifest name from the project's: lowercase letters and digits joined by single dashes.
+fn manifest_name(project_name: &str) -> String {
+    let mut name = String::new();
+    for character in project_name.chars() {
+        if character.is_ascii_alphanumeric() {
+            name.push(character.to_ascii_lowercase());
+        } else if !name.is_empty() && !name.ends_with('-') {
+            name.push('-');
+        }
+    }
+    let name = name.trim_end_matches('-');
+
+    // Names vcpkg reserves (Windows device names among them)
+    let device = name.len() == 4 && (name.starts_with("lpt") || name.starts_with("com")) && name.ends_with(|last: char| last.is_ascii_digit());
+    let reserved = device || ["core", "default", "prn", "aux", "nul", "con"].contains(&name);
+    match name {
+        "" => "anvil-project".to_string(),
+        _ if reserved => format!("{name}-project"),
+        _ => name.to_string(),
+    }
+}
+
+/// Overlay port folders: anvil.toml's and those vcpkg-configuration.json in `configuration_folder` names. None when
+/// that file adds registries, whose ports Anvil cannot list.
+fn all_overlay_ports(overlay_ports: &[PathBuf], configuration_folder: Option<&Path>) -> Option<Vec<PathBuf>> {
+    let mut folders = overlay_ports.to_vec();
+
+    let Some(configuration_folder) = configuration_folder else {
+        return Some(folders);
+    };
+    let configuration_file = configuration_folder.join("vcpkg-configuration.json");
+    let Ok(text) = std::fs::read_to_string(&configuration_file) else {
+        return Some(folders);
+    };
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if json.get("registries").is_some() || json.get("default-registry").is_some() {
+        return None;
+    }
+
+    let listed = json.get("overlay-ports").and_then(|list| list.as_array()).into_iter().flatten();
+    folders.extend(
+        listed
+            .filter_map(|folder| folder.as_str())
+            .map(|folder| util::absolute(configuration_folder, Path::new(folder))),
+    );
+    Some(folders)
+}
+
+/// An overlay folder holds the port: as a subfolder, or it is that port's folder itself.
+fn overlay_has_port(folder: &Path, name: &str) -> bool {
+    if folder.join(name).is_dir() {
+        return true;
+    }
+
+    let own_name = std::fs::read_to_string(folder.join("vcpkg.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|json| json.get("name")?.as_str().map(|name| name.to_string()));
+    own_name.as_deref() == Some(name)
+}
+
+/// The triplet for a build: `[vcpkg] triplet` when it fits the machine and compiler built for, else Anvil's pick for
+/// them, with `[vcpkg] linkage`.
+pub fn choose_triplet(spec: &VcpkgSpec, toolchain: &Toolchain, static_runtime: bool) -> Result<String> {
+    let linkage = match spec.linkage.as_deref() {
+        None => None,
+        Some("static") => Some(true),
+        Some("dynamic") => Some(false),
+        Some(other) => bail!("[vcpkg] linkage = \"{other}\": expected \"static\" (static libraries) or \"dynamic\" (DLLs or shared libraries)"),
+    };
+
+    let Some(triplet) = &spec.triplet else {
+        return default_triplet(toolchain, static_runtime, linkage);
+    };
+    if linkage.is_some() {
+        bail!("[vcpkg] has both `triplet` and `linkage`: keep `linkage`, which picks the triplet for each machine and compiler");
+    }
+
+    // A triplet named <cpu>-<system>... must be for the machine and the compiler's ABI (custom names pass)
+    let mut parts = triplet.split('-');
+    let (Some(cpu), Some(system)) = (parts.next(), parts.next()) else {
+        return Ok(triplet.clone());
+    };
+    if ![
+        "x64",
+        "x86",
+        "arm64",
+        "arm",
+        "arm64ec",
+        "wasm32",
+        "ppc64le",
+        "s390x",
+        "riscv64",
+        "loongarch64",
+    ]
+    .contains(&cpu)
+    {
+        return Ok(triplet.clone());
+    }
+
+    let platform = &toolchain.platform;
+    let wanted_system = match platform.os {
+        Os::Windows if toolchain.is_msvc_abi() => "windows",
+        Os::Windows => "mingw",
+        Os::Linux => "linux",
+        Os::Macos => "osx",
+    };
+    let fits_system = system == wanted_system || (wanted_system == "windows" && system == "uwp");
+    if cpu == platform.cpu.name() && fits_system {
+        return Ok(triplet.clone());
+    }
+
+    // What Anvil would pick, keeping the triplet's linkage
+    let implied_linkage = if triplet.contains("static") {
+        Some(true)
+    } else if triplet.contains("dynamic") {
+        Some(false)
+    } else {
+        None
+    };
+    let pick = default_triplet(toolchain, static_runtime, implied_linkage)?;
+    let instead = match implied_linkage {
+        Some(true) => "replace it with `linkage = \"static\"`, which picks the static triplet for each machine and compiler",
+        _ => "remove it, and Anvil picks the triplet for each machine and compiler",
+    };
+    bail!(
+        "[vcpkg] triplet = \"{triplet}\" is not for this build ({} with {}): its libraries would not link. This build needs \"{pick}\"; {instead}.",
+        platform.name(),
+        toolchain.family.name()
+    )
+}
+
+/// The default triplet for what a toolchain builds; `static_libraries` asks for static libraries or DLLs instead of
+/// the system's usual kind.
+fn default_triplet(toolchain: &Toolchain, static_runtime: bool, static_libraries: Option<bool>) -> Result<String> {
     let architecture = toolchain.platform.cpu.name();
 
-    match toolchain.platform.os {
-        Os::Windows if !toolchain.is_msvc_abi() => {
-            let linkage = if static_runtime { "static" } else { "dynamic" };
+    Ok(match (toolchain.platform.os, static_libraries) {
+        (Os::Windows, _) if !toolchain.is_msvc_abi() => {
+            let linkage = if static_libraries.unwrap_or(static_runtime) { "static" } else { "dynamic" };
             format!("{architecture}-mingw-{linkage}")
         }
-        Os::Windows => {
-            let suffix = if static_runtime { "-static" } else { "" };
-            format!("{architecture}-windows{suffix}")
+        (Os::Windows, Some(false)) if static_runtime => {
+            bail!("[vcpkg] linkage = \"dynamic\" and a profile with static-runtime: vcpkg's DLLs use the DLL runtime")
         }
-        Os::Macos => format!("{architecture}-osx"),
-        Os::Linux => format!("{architecture}-linux"),
-    }
+        (Os::Windows, _) if static_runtime => format!("{architecture}-windows-static"),
+        (Os::Windows, Some(true)) => format!("{architecture}-windows-static-md"),
+        (Os::Windows, _) => format!("{architecture}-windows"),
+        (Os::Macos, Some(false)) => format!("{architecture}-osx-dynamic"),
+        (Os::Macos, _) => format!("{architecture}-osx"),
+        (Os::Linux, Some(false)) => format!("{architecture}-linux-dynamic"),
+        (Os::Linux, _) => format!("{architecture}-linux"),
+    })
 }
 
 /// Every Visual Studio installation (not just the newest), for their bundled vcpkg.
@@ -477,6 +774,7 @@ pub fn all_visual_studios() -> Vec<PathBuf> {
 /// did is checked after the install, for the packages a target links.
 fn manifest_features_for(manifest: &Path, text: &str, requests: &[Request]) -> Result<Vec<String>> {
     let json: serde_json::Value = serde_json::from_str(text).with_context(|| format!("{} is not valid JSON", manifest.display()))?;
+    check_requested_features(manifest, &json, requests)?;
     let listed = dependency_names(json.get("dependencies"));
 
     let mut features = Vec::new();
@@ -499,6 +797,61 @@ fn manifest_features_for(manifest: &Path, text: &str, requests: &[Request]) -> R
     Ok(features)
 }
 
+/// The project's own vcpkg.json decides what installs (CMake reads it too, and vcpkg takes port features only from a
+/// manifest), so the port features anvil.toml asks for must be in it: say exactly what to add.
+fn check_requested_features(manifest: &Path, json: &serde_json::Value, requests: &[Request]) -> Result<()> {
+    let file = slash(manifest);
+
+    for request in requests {
+        let name = &request.name;
+        let entry = find_dependency(json, name);
+        let entry_object = entry.and_then(|entry| entry.as_object());
+        let entry_features = dependency_names(entry_object.and_then(|object| object.get("features")));
+        let entry_default_features = entry_object
+            .and_then(|object| object.get("default-features"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+
+        let missing: Vec<String> = request
+            .features
+            .iter()
+            .filter(|feature| !entry_features.contains(feature))
+            .map(|feature| format!("\"{feature}\""))
+            .collect();
+        if !missing.is_empty() {
+            let list = missing.join(", ");
+            let fix = if entry.is_none() {
+                format!("add {{ \"name\": \"{name}\", \"features\": [{list}] }} to its \"dependencies\"")
+            } else if entry_features.is_empty() {
+                format!("add \"features\": [{list}] to {name} in vcpkg.json")
+            } else {
+                format!("add {list} to the \"features\" of {name} in vcpkg.json")
+            };
+            bail!("anvil.toml asks for {name} with features [{list}], which {file} does not turn on (with a vcpkg.json, it decides what installs): {fix}");
+        }
+
+        if !request.default_features && entry.is_some() && entry_default_features {
+            bail!(
+                "anvil.toml asks for {name} without its default features, but {file} keeps them (with a vcpkg.json, it decides what installs): add \"default-features\": false to {name} in vcpkg.json"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// A port's entry in a vcpkg.json: in "dependencies", else in a manifest feature's.
+fn find_dependency<'a>(json: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    let is_named =
+        |dependency: &&serde_json::Value| dependency.as_str().or_else(|| dependency.get("name").and_then(|name| name.as_str())) == Some(name);
+    let in_list = |list: Option<&'a serde_json::Value>| list.and_then(|list| list.as_array()).and_then(|list| list.iter().find(is_named));
+
+    in_list(json.get("dependencies")).or_else(|| {
+        let features = json.get("features").and_then(|features| features.as_object())?;
+        features.values().find_map(|feature| in_list(feature.get("dependencies")))
+    })
+}
+
 /// Port names in a vcpkg.json "dependencies" list: "name" strings and { "name": ... } objects.
 pub fn dependency_names(dependencies: Option<&serde_json::Value>) -> Vec<String> {
     dependencies
@@ -511,4 +864,38 @@ pub fn dependency_names(dependencies: Option<&serde_json::Value>) -> Vec<String>
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_names_are_valid() {
+        assert_eq!(manifest_name("My App_2"), "my-app-2");
+        assert_eq!(manifest_name("core"), "core-project");
+        assert_eq!(manifest_name("com1"), "com1-project");
+        assert_eq!(manifest_name("compiler"), "compiler");
+        assert_eq!(manifest_name("__"), "anvil-project");
+    }
+
+    #[test]
+    fn checkout_commit_follows_branches() {
+        let root = std::env::temp_dir().join(format!("anvil-vcpkg-head-{}", std::process::id()));
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("refs").join("heads")).unwrap();
+
+        // A branch only in packed-refs, then a loose one that wins
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/master\n").unwrap();
+        std::fs::write(git.join("packed-refs"), "# pack-refs\naaa refs/heads/other\nbbb refs/heads/master\n").unwrap();
+        assert_eq!(checkout_commit(&root).as_deref(), Some("bbb"));
+        std::fs::write(git.join("refs").join("heads").join("master"), "ccc\n").unwrap();
+        assert_eq!(checkout_commit(&root).as_deref(), Some("ccc"));
+
+        // A detached HEAD is the commit
+        std::fs::write(git.join("HEAD"), "ddd\n").unwrap();
+        assert_eq!(checkout_commit(&root).as_deref(), Some("ddd"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

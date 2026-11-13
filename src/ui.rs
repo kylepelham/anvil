@@ -33,12 +33,13 @@ pub fn color() -> bool {
     COLOR.load(Ordering::Relaxed)
 }
 
-pub fn interactive() -> bool {
-    INTERACTIVE.load(Ordering::Relaxed)
-}
-
+/// `-q`: print less.
 pub fn quiet() -> bool {
     QUIET.load(Ordering::Relaxed)
+}
+
+pub fn interactive() -> bool {
+    INTERACTIVE.load(Ordering::Relaxed)
 }
 
 /// "   Compiling foo": a right-aligned green verb, then the message.

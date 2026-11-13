@@ -94,7 +94,7 @@ enum CommandLine {
 
     /// Delete build output (the profile's folder, or everything with --all).
     Clean {
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "profile")]
         release: bool,
 
         #[arg(short, long, value_name = "NAME")]
@@ -119,6 +119,12 @@ enum CommandLine {
 
     /// Add a dependency to anvil.toml (vcpkg by default).
     Add(scaffold::AddArgs),
+
+    /// Remove a dependency from anvil.toml (and from vcpkg.json).
+    Remove {
+        /// The [deps] or [dev-deps] entry.
+        name: String,
+    },
 
     /// Convert a CMake project's CMakeLists.txt into anvil.toml.
     Convert {
@@ -192,6 +198,9 @@ enum CommandLine {
         #[command(flatten)]
         build: BuildArgs,
     },
+
+    /// Print a shell completion script (`anvil completions powershell >> $PROFILE`).
+    Completions { shell: clap_complete::Shell },
 }
 
 #[derive(Subcommand)]
@@ -303,7 +312,20 @@ fn main() {
     // Whoever kills Anvil stops what it started too
     job::contain_self();
 
-    let start_dir = cli.dir.clone().unwrap_or_else(|| PathBuf::from("."));
+    // -C: run in that folder, so every relative path (`anvil -C x convert sub`) starts there
+    if let Some(dir) = &cli.dir {
+        let entered = if dir.is_dir() {
+            std::env::set_current_dir(dir).map_err(|error| error.to_string())
+        } else {
+            Err("no such folder".to_string())
+        };
+        if let Err(reason) = entered {
+            ui::error(&format!("-C {}: {reason}", dir.display()));
+            std::process::exit(1);
+        }
+    }
+
+    let start_dir = PathBuf::from(".");
     let command = cli.command.unwrap_or(CommandLine::Build {
         targets: Vec::new(),
         all: false,
@@ -318,6 +340,7 @@ fn main() {
         CommandLine::New { name, lib } => scaffold::new_project(&start_dir, &name, lib).map(|_| 0),
         CommandLine::Init => scaffold::init(&start_dir).map(|_| 0),
         CommandLine::Add(args) => scaffold::add(&start_dir, &args).map(|_| 0),
+        CommandLine::Remove { name } => scaffold::remove(&start_dir, &name).map(|_| 0),
         CommandLine::Convert {
             path, check: true, build, ..
         } => commands::convert_check(&start_dir, path.as_deref(), &build),
@@ -327,7 +350,11 @@ fn main() {
         CommandLine::Vcpkg { action, args } => commands::vcpkg(&start_dir, action, &args),
         CommandLine::Compdb { build } => commands::compdb(&start_dir, &build).map(|_| 0),
         CommandLine::Update { names, build } => commands::update(&start_dir, &build, &names).map(|_| 0),
-        CommandLine::CmakeE { args } => Ok(cmake_tool::run(&args)),
+        CommandLine::Completions { shell } => {
+            clap_complete::generate(shell, &mut <Cli as clap::CommandFactory>::command(), "anvil", &mut std::io::stdout());
+            Ok(0)
+        }
+        CommandLine::CmakeE { .. } => unreachable!("cmake-e runs before the project loads"),
     };
 
     job::release();

@@ -316,7 +316,8 @@ impl InstalledTree {
             let file_name = entry.file_name().to_string_lossy().into_owned();
 
             let Some(stem) = file_name.strip_suffix(&suffix) else { continue };
-            let Some((name, _version)) = stem.rsplit_once('_') else { continue };
+            // Port names have no `_`; versions may
+            let Some((name, _version)) = stem.split_once('_') else { continue };
             let Some(package) = self.packages.get_mut(name) else { continue };
 
             let list = std::fs::read_to_string(entry.path())?;
