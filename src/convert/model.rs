@@ -2,6 +2,8 @@
 //! generator expressions become Anvil conditions (`windows`, `msvc`, `debug`) instead of being decided for one
 //! machine.
 
+mod bdd;
+
 use std::borrow::Cow;
 use std::path::PathBuf;
 
@@ -372,10 +374,10 @@ fn is_atom(text: &str) -> bool {
 /// Would a condition hold on this machine with this compiler (Windows + MSVC here)? Used to let the host's branch
 /// set variables last, so values computed later match a real configure.
 pub fn holds_on_host(condition: &str, options: &dyn Fn(&str) -> Option<bool>) -> bool {
-    let Ok(parsed) = crate::cond::parse(condition) else { return false };
+    let Some(parsed) = bdd::parse(condition) else { return false };
 
-    let lookup = |atom: &str| -> Option<bool> {
-        Some(match atom {
+    let lookup = |atom: &str| -> bool {
+        match atom {
             "windows" => cfg!(windows),
             "linux" => cfg!(target_os = "linux"),
             "macos" => cfg!(target_os = "macos"),
@@ -388,64 +390,136 @@ pub fn holds_on_host(condition: &str, options: &dyn Fn(&str) -> Option<bool>) ->
             "arm64" => cfg!(target_arch = "aarch64"),
             "arm" => cfg!(target_arch = "arm"),
             "debug" | "release" => atom == "release",
-            "true" => true,
-            "false" => false,
             other => options(other).unwrap_or(false),
-        })
+        }
     };
 
-    parsed.eval(&lookup).unwrap_or(false)
+    let names: std::collections::HashMap<u32, bool> = bdd::support(parsed)
+        .into_iter()
+        .map(|variable| (variable, lookup(&bdd::name(variable))))
+        .collect();
+    bdd::eval(parsed, &|variable| names.get(&variable).copied().unwrap_or(false))
+}
+
+/// Can `condition` hold anywhere? Conditions that do not parse can.
+pub fn satisfiable(condition: &str) -> bool {
+    simplify(condition, None) != Truth::Known(false)
+}
+
+/// Do two conditions hold in the same cases (`!(a | b)` and `!a & !b`)? False when either does not parse.
+pub fn equivalent(left: &str, right: &str) -> bool {
+    left == right || matches!((bdd::parse(left), bdd::parse(right)), (Some(left), Some(right)) if left == right)
 }
 
 /// The shortest equivalent of `condition` (a sum of products), assuming `assumption` holds: where the assumption is
 /// false the result may be anything. `(a | b) & (a & c)` given nothing is `a & c`; `windows & x` given `windows` is
-/// `x`. Conditions over too many names to tabulate come back unchanged.
+/// `x`. Conditions over many names come back as a short sum of products that is not always the shortest.
 pub fn simplify(condition: &str, assumption: Option<&str>) -> Truth {
-    let Ok(parsed) = crate::cond::parse(condition) else {
-        return Truth::Depends(condition.to_string());
-    };
-    let assumed = match assumption.map(crate::cond::parse) {
-        Some(Ok(assumed)) => Some(assumed),
-        Some(Err(_)) | None => None,
-    };
-
-    // The names, in order of appearance
-    let mut atoms: Vec<String> = Vec::new();
-    collect_atoms(&parsed, &mut atoms);
-    if let Some(assumed) = &assumed {
-        collect_atoms(assumed, &mut atoms);
-    }
-    if atoms.len() > MAX_SIMPLIFIED_ATOMS {
-        return Truth::Depends(condition.to_string());
+    thread_local! {
+        static SIMPLIFIED: std::cell::RefCell<std::collections::HashMap<(String, Option<String>), Truth>> = Default::default();
     }
 
-    // The truth table: where it must hold, and where it does not matter (the assumption is false, or the
-    // combination cannot happen, like cl without msvc)
-    let mut required = Vec::new();
-    let mut free = Vec::new();
-    for assignment in 0u32..(1 << atoms.len()) {
-        let lookup = |name: &str| match name {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => atoms.iter().position(|atom| atom == name).map(|index| assignment & (1 << index) != 0),
-        };
-        let applies = assumed.as_ref().map_or(true, |assumed| assumed.eval(&lookup).unwrap_or(true));
-        if !applies || !is_possible(&lookup) {
-            free.push(assignment);
-        } else if parsed.eval(&lookup).unwrap_or(false) {
-            required.push(assignment);
+    let key = (condition.to_string(), assumption.map(str::to_string));
+    if let Some(known) = SIMPLIFIED.with(|simplified| simplified.borrow().get(&key).cloned()) {
+        return known;
+    }
+    let result = simplify_uncached(condition, assumption);
+    SIMPLIFIED.with(|simplified| simplified.borrow_mut().insert(key, result.clone()));
+    result
+}
+
+fn simplify_uncached(condition: &str, assumption: Option<&str>) -> Truth {
+    let (Some(parsed), Some(mut atoms)) = (bdd::parse(condition), bdd::words(condition)) else {
+        return Truth::Depends(condition.to_string());
+    };
+    let assumed = match assumption.and_then(|assumption| Some((bdd::parse(assumption)?, bdd::words(assumption)?))) {
+        Some((assumed, words)) => {
+            for word in words {
+                if !atoms.contains(&word) {
+                    atoms.push(word);
+                }
+            }
+            assumed
         }
-    }
+        None => bdd::TRUE,
+    };
 
-    if required.is_empty() {
+    // Where it matters: the assumption holds and the combination can happen (not cl without msvc)
+    let care = bdd::and(possible(&atoms), assumed);
+    let required = bdd::and(parsed, care);
+    if required == bdd::FALSE {
         return Truth::Known(false);
     }
-    if required.len() + free.len() == 1 << atoms.len() {
+    let allowed = bdd::or(parsed, bdd::not(care));
+    if allowed == bdd::TRUE {
         return Truth::Known(true);
     }
 
-    let cover = minimal_cover(&required, &free, atoms.len() as u32);
-    Truth::Depends(write_sum_of_products(&cover, &atoms))
+    // The names it depends on, in order of appearance
+    let mut support = bdd::support(care);
+    support.extend(bdd::support(parsed));
+    let variables: Vec<u32> = atoms.iter().map(|atom| bdd::index(atom)).collect();
+    let (atoms, variables): (Vec<String>, Vec<u32>) = atoms
+        .into_iter()
+        .zip(variables)
+        .filter(|(_, variable)| support.contains(variable))
+        .unzip();
+
+    if atoms.len() <= MAX_SIMPLIFIED_ATOMS {
+        // The truth table: where it must hold, and where it does not matter
+        let mut needed = Vec::new();
+        let mut free = Vec::new();
+        for assignment in 0u32..(1 << atoms.len()) {
+            let value = |variable: u32| {
+                variables
+                    .iter()
+                    .position(|known| *known == variable)
+                    .is_some_and(|index| assignment & (1 << index) != 0)
+            };
+            if !bdd::eval(care, &value) {
+                free.push(assignment);
+            } else if bdd::eval(parsed, &value) {
+                needed.push(assignment);
+            }
+        }
+        let cover = minimal_cover(&needed, &free, atoms.len() as u32);
+        return Truth::Depends(write_sum_of_products(&cover, &atoms));
+    }
+
+    // Too many names to tabulate: an irredundant cover, each product's names in order of appearance
+    let mut products: Vec<Vec<(usize, bool)>> = bdd::sum_of_products(required, allowed)
+        .into_iter()
+        .map(|product| {
+            let mut literals: Vec<(usize, bool)> = product
+                .into_iter()
+                .filter_map(|(variable, positive)| Some((variables.iter().position(|known| *known == variable)?, positive)))
+                .collect();
+            literals.sort();
+            literals
+        })
+        .collect();
+    products.sort_by_key(|literals| (literals.len(), literals.first().map(|(index, _)| *index)));
+    let written: Vec<String> = products
+        .iter()
+        .map(|literals| {
+            let names: Vec<String> = literals
+                .iter()
+                .map(|(index, positive)| {
+                    if *positive {
+                        atoms[*index].clone()
+                    } else {
+                        format!("!{}", atoms[*index])
+                    }
+                })
+                .collect();
+            if names.len() > 1 && products.len() > 1 {
+                format!("({})", names.join(" & "))
+            } else {
+                names.join(" & ")
+            }
+        })
+        .collect();
+    Truth::Depends(written.join(" | "))
 }
 
 // Above this many names a truth table is too large to be worth it
@@ -474,72 +548,66 @@ const EXCLUSIONS: &[(&str, &str)] = &[
     ("debug", "release"),
 ];
 
-/// Can these condition words hold together? Words not in the condition are unknown and allow anything.
-fn is_possible(lookup: &dyn Fn(&str) -> Option<bool>) -> bool {
-    let implied = IMPLICATIONS
-        .iter()
-        .all(|(word, implied)| !(lookup(word) == Some(true) && lookup(implied) == Some(false)));
-    let excluded = EXCLUSIONS
-        .iter()
-        .any(|(left, right)| holds_with_implications(left, lookup) && holds_with_implications(right, lookup));
+/// Where these condition words can hold together: each implication among them, and no two that exclude each other
+/// (counting what they imply: `gcc` gives `gnu`, so `cl & gcc` cannot hold).
+fn possible(atoms: &[String]) -> bdd::Node {
+    let present = |word: &str| atoms.iter().any(|atom| atom == word);
+    let mut result = bdd::TRUE;
 
-    implied && !excluded
-}
-
-/// Does a condition word hold, or follow from one that does (`gcc` gives `gnu`, so `cl & gcc` cannot hold)?
-fn holds_with_implications(word: &str, lookup: &dyn Fn(&str) -> Option<bool>) -> bool {
-    lookup(word) == Some(true)
-        || IMPLICATIONS
-            .iter()
-            .any(|(implying, implied)| *implied == word && holds_with_implications(implying, lookup))
-}
-
-fn collect_atoms(condition: &crate::cond::Cond, atoms: &mut Vec<String>) {
-    use crate::cond::Cond;
-
-    match condition {
-        Cond::Atom(name) if name != "true" && name != "false" => {
-            if !atoms.contains(name) {
-                atoms.push(name.clone());
-            }
-        }
-        Cond::Atom(_) => {}
-        Cond::Not(inner) => collect_atoms(inner, atoms),
-        Cond::And(left, right) | Cond::Or(left, right) => {
-            collect_atoms(left, atoms);
-            collect_atoms(right, atoms);
+    for (word, implied) in IMPLICATIONS {
+        if present(word) && present(implied) {
+            result = bdd::and(result, bdd::or(bdd::not(bdd::variable(word)), bdd::variable(implied)));
         }
     }
+
+    // A word holds where it or a present word implying it does
+    fn holds(word: &str, present: &dyn Fn(&str) -> bool) -> bdd::Node {
+        let mut result = if present(word) { bdd::variable(word) } else { bdd::FALSE };
+        for (implying, implied) in IMPLICATIONS {
+            if *implied == word {
+                result = bdd::or(result, holds(implying, present));
+            }
+        }
+        result
+    }
+    for (left, right) in EXCLUSIONS {
+        let both = bdd::and(holds(left, &present), holds(right, &present));
+        result = bdd::and(result, bdd::not(both));
+    }
+
+    result
 }
 
 /// Quine-McCluskey: the prime implicants of required + free, then the fewest that cover every required assignment.
 /// An implicant is (value, mask): bits in `mask` may be anything.
 fn minimal_cover(required: &[u32], free: &[u32], width: u32) -> Vec<(u32, u32)> {
+    use std::collections::HashSet;
+
     let mut current: Vec<(u32, u32)> = required.iter().chain(free).map(|assignment| (*assignment, 0)).collect();
     let mut primes: Vec<(u32, u32)> = Vec::new();
 
     // Combine implicants that differ in one bit until nothing combines
     while !current.is_empty() {
-        let mut combined = vec![false; current.len()];
+        let present: HashSet<(u32, u32)> = current.iter().copied().collect();
+        let mut combined: HashSet<(u32, u32)> = HashSet::new();
         let mut next: Vec<(u32, u32)> = Vec::new();
+        let mut seen: HashSet<(u32, u32)> = HashSet::new();
 
-        for first in 0..current.len() {
-            for second in first + 1..current.len() {
-                let (left, right) = (current[first], current[second]);
-                let difference = left.0 ^ right.0;
-                if left.1 == right.1 && difference.count_ones() == 1 {
-                    let merged = (left.0 & !difference, left.1 | difference);
-                    if !next.contains(&merged) {
+        for implicant in &current {
+            for bit in (0..width).map(|index| 1u32 << index).filter(|bit| implicant.1 & bit == 0) {
+                let partner = (implicant.0 ^ bit, implicant.1);
+                if present.contains(&partner) {
+                    combined.insert(*implicant);
+                    let merged = (implicant.0 & !bit, implicant.1 | bit);
+                    if seen.insert(merged) {
                         next.push(merged);
                     }
-                    combined[first] = true;
-                    combined[second] = true;
                 }
             }
         }
 
-        for (index, implicant) in current.iter().enumerate() {
-            if !combined[index] && !primes.contains(implicant) {
+        for implicant in &current {
+            if !combined.contains(implicant) && !primes.contains(implicant) {
                 primes.push(*implicant);
             }
         }
@@ -758,7 +826,12 @@ pub fn expand_genex(item: &str, unknown: &mut Vec<String>, target_exists: Option
 pub fn expand_genex_items(item: &str, unknown: &mut Vec<String>, target_exists: Option<&dyn Fn(&str) -> bool>) -> Vec<(Truth, String)> {
     let mut items: Vec<(Truth, String)> = Vec::new();
 
-    for (truth, text) in expand_genex(item, unknown, target_exists) {
+    // Each element on its own, so independent conditional items do not multiply out
+    let expanded = list_elements(item)
+        .into_iter()
+        .flat_map(|element| expand_genex(&element, unknown, target_exists))
+        .collect::<Vec<_>>();
+    for (truth, text) in expanded {
         for part in split_list(&text) {
             match items.iter_mut().find(|(_, existing)| *existing == part) {
                 Some((existing, _)) => *existing = existing.clone().or(truth.clone()),
@@ -1124,11 +1197,12 @@ fn condition_expression(name: &str, arguments: &[Alternatives], target_exists: O
                 _ => Truth::Known(equal(&left, &right)),
             }
         }
-        // A target made later in the project counts too: undecided until every target is known
-        "TARGET_EXISTS" => match target_exists?(&flat(0)) {
-            true => Truth::Known(true),
-            false => Truth::Depends(target_exists_condition(&flat(0))),
-        },
+        // Undecided until every target is known: one made later in the project counts too, one made under a
+        // condition exists under it
+        "TARGET_EXISTS" => {
+            target_exists?;
+            Truth::Depends(target_exists_condition(&flat(0)))
+        }
         _ => return None,
     })
 }
@@ -1156,16 +1230,20 @@ pub fn target_exists_names(condition: &str) -> Vec<String> {
     names
 }
 
-/// A condition with its `$<TARGET_EXISTS:...>` words decided by `exists`.
-pub fn decide_target_exists(condition: &str, exists: &dyn Fn(&str) -> bool) -> Truth {
+/// A condition with its `$<TARGET_EXISTS:...>` words replaced by where `exists` says each target exists.
+pub fn decide_target_exists(condition: &str, exists: &dyn Fn(&str) -> Truth) -> Truth {
     if !condition.contains(TARGET_EXISTS_PREFIX) {
         return Truth::Depends(condition.to_string());
     }
 
     let mut decided = condition.to_string();
     for name in target_exists_names(condition) {
-        let word = if exists(&name) { "true" } else { "false" };
-        decided = decided.replacen(&target_exists_condition(&name), word, 1);
+        let word = match exists(&name) {
+            Truth::Known(true) => "true".to_string(),
+            Truth::Known(false) => "false".to_string(),
+            Truth::Depends(condition) => format!("({condition})"),
+        };
+        decided = decided.replacen(&target_exists_condition(&name), &word, 1);
     }
     simplify(&decided, None)
 }
@@ -1372,12 +1450,34 @@ pub fn choose_conditional_items<'a>(text: &'a str, holds: &dyn Fn(&str) -> bool)
     Cow::Owned(result)
 }
 
-/// Text with its option and platform markers written as the `${NAME}` they stand for, to show in a comment.
+/// Text with its option and platform markers written as the `${NAME}` they stand for, to show in a comment; a marker
+/// holding a whole condition (an option that exists only where `msvc` holds) as that condition, in parentheses.
 pub fn readable(text: &str) -> String {
-    text.replace(OPTION_MARKER, "${")
-        .replace(SYMBOL_MARKER, "${")
-        .replace(OPTION_MARKER_END, "}")
-        .replace(MARKER_SPACE, " ")
+    let mut result = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(OPTION_MARKER).into_iter().chain(rest.find(SYMBOL_MARKER)).min() {
+        result.push_str(&rest[..start]);
+        let marked = &rest[start..];
+        let inner_start = if marked.starts_with(OPTION_MARKER) {
+            OPTION_MARKER.len()
+        } else {
+            SYMBOL_MARKER.len()
+        };
+        let Some(end) = marked.find(OPTION_MARKER_END) else {
+            result.push_str(&marked[inner_start..]);
+            rest = "";
+            break;
+        };
+        let inner = marked[inner_start..end].replace(MARKER_SPACE, " ");
+        if is_atom(&inner) {
+            result.push_str(&format!("${{{inner}}}"));
+        } else {
+            result.push_str(&format!("({inner})"));
+        }
+        rest = &marked[end + OPTION_MARKER_END.len()..];
+    }
+    result.push_str(rest);
+    result.replace(OPTION_MARKER_END, "}").replace(MARKER_SPACE, " ")
 }
 
 fn marked<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
@@ -1439,7 +1539,11 @@ fn join_alternatives(parts: Vec<Alternatives>) -> Alternatives {
         let mut next = Vec::new();
         for (condition, prefix) in &results {
             for (part_condition, text) in &part {
-                let combined = condition.clone().and(part_condition.clone());
+                // Alternatives that exclude each other (one value per condition) do not combine
+                let combined = match condition.clone().and(part_condition.clone()) {
+                    Truth::Depends(both) => simplify(&both, None),
+                    known => known,
+                };
                 if combined != Truth::Known(false) {
                     next.push((combined, format!("{prefix}{text}")));
                 }
@@ -1615,11 +1719,16 @@ mod tests {
         );
         assert!(unknown.is_empty(), "{unknown:?}");
 
-        // TARGET_EXISTS asks the interpreter; without one it is unknown
+        // TARGET_EXISTS asks the interpreter once every target is known (where each exists); without one it is
+        // unknown
         let exists = |name: &str| name == "real";
+        let real = expand_genex("$<$<TARGET_EXISTS:real>:real>", &mut unknown, Some(&exists));
+        let [(Truth::Depends(condition), _)] = real.as_slice() else {
+            panic!("{real:?}")
+        };
         assert_eq!(
-            expand_genex("$<$<TARGET_EXISTS:real>:real>", &mut unknown, Some(&exists)),
-            vec![(Truth::Known(true), "real".to_string())]
+            decide_target_exists(condition, &|_| Truth::Depends("unix".into())),
+            Truth::Depends("unix".into())
         );
         let later = expand_genex("$<$<TARGET_EXISTS:later::lib>:later>", &mut unknown, Some(&exists));
         let [(Truth::Depends(condition), text)] = later.as_slice() else {
@@ -1627,10 +1736,16 @@ mod tests {
         };
         assert_eq!(text, "later");
         assert_eq!(target_exists_names(condition), vec!["later::lib"]);
-        assert_eq!(decide_target_exists(condition, &|name| name == "later::lib"), Truth::Known(true));
-        assert_eq!(decide_target_exists(&format!("msvc & {condition}"), &|_| false), Truth::Known(false));
         assert_eq!(
-            decide_target_exists(&format!("msvc | {condition}"), &|_| false),
+            decide_target_exists(condition, &|name| Truth::Known(name == "later::lib")),
+            Truth::Known(true)
+        );
+        assert_eq!(
+            decide_target_exists(&format!("msvc & {condition}"), &|_| Truth::Known(false)),
+            Truth::Known(false)
+        );
+        assert_eq!(
+            decide_target_exists(&format!("msvc | {condition}"), &|_| Truth::Known(false)),
             Truth::Depends("msvc".into())
         );
         assert!(unknown.is_empty(), "{unknown:?}");

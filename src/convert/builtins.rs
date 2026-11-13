@@ -284,8 +284,6 @@ pub struct BuiltinState {
     pub install_writes: Vec<model::ConfigureWrite>,
     /// The ports in the project's vcpkg.json, read when a find_package() first needs them.
     pub manifest_ports: Option<Vec<String>>,
-    /// check_type_size() results that differ by platform, by variable.
-    pub type_sizes: HashMap<String, TypeSize>,
     /// The vcpkg checkout optional find_package()s can take ports from, found when one first needs it.
     pub vcpkg: Option<Option<crate::vcpkg::Instance>>,
     /// Folders find_program() searches besides PATH (the MSVC tools'), found when a program is first not on PATH.
@@ -308,8 +306,6 @@ enum PackageSource {
 /// size: the type does not exist there.
 #[derive(Debug, Clone)]
 pub struct TypeSize {
-    /// The size on this machine, as the variable holds it.
-    pub host: String,
     pub cases: Vec<(String, String)>,
     pub otherwise: String,
 }
@@ -325,7 +321,7 @@ impl Interpreter {
         // User functions and macros, unless the converter handles the name itself
         if !INTERCEPTED_COMMANDS.contains(&name) {
             if let Some(function) = self.functions.get(name).cloned() {
-                let args = self.evaluate_args(&command.args);
+                let args = self.evaluate_call_args(&command.args);
                 return self.call_function(function, args);
             }
         }
@@ -339,6 +335,29 @@ impl Interpreter {
         // item again
         if name.starts_with("target_") || LIST_COMMANDS.contains(&name) {
             args = model::join_genex_fragments(args);
+        }
+
+        // Targets named under a condition (from a list a branch added to): the command for each, under its condition
+        if let Some(runs) = super::interp::conditional_target_runs(name, &args) {
+            for (condition, args) in runs {
+                self.conditions.extend(condition.clone());
+                let literal = Command {
+                    args: args
+                        .into_iter()
+                        .map(|text| Arg {
+                            text,
+                            kind: ArgKind::Bracket,
+                        })
+                        .collect(),
+                    ..command.clone()
+                };
+                let flow = self.run_command(&literal);
+                if condition.is_some() {
+                    self.conditions.pop();
+                }
+                flow?;
+            }
+            return Ok(Flow::Normal);
         }
 
         match name {
@@ -498,10 +517,9 @@ impl Interpreter {
             let kind = rest.first().map(String::as_str).unwrap_or("STRING");
             let force = rest.iter().any(|word| word == "FORCE") || kind == "INTERNAL";
 
-            if kind == "BOOL" && self.get_variable(name).is_none() {
+            if kind == "BOOL" && (self.get_variable(name).is_none() || self.options.contains_key(name)) {
                 let description = rest.get(1).cloned().unwrap_or_default();
-                self.options
-                    .insert(name.clone(), (model::constant_truth(&value).unwrap_or(false), description));
+                self.declare_option(name, model::constant_truth(&value).unwrap_or(false), description);
             }
             if force && self.options.contains_key(name) {
                 self.overridden_options.insert(name.clone());
@@ -551,7 +569,10 @@ impl Interpreter {
     fn command_option(&mut self, args: &[String]) {
         let Some(name) = args.first() else { return };
         let branch = self.current_condition();
+        let default = args.get(2).map(|value| model::constant_truth(value).unwrap_or(false)).unwrap_or(false);
+        let description = args.get(1).cloned().unwrap_or_default();
         if self.options.contains_key(name) {
+            self.declare_option(name, default, description);
             self.widen_option_condition(name, branch);
             return;
         }
@@ -559,12 +580,52 @@ impl Interpreter {
             return;
         }
 
-        let default = args.get(2).map(|value| model::constant_truth(value).unwrap_or(false)).unwrap_or(false);
-        let description = args.get(1).cloned().unwrap_or_default();
-        self.options.insert(name.clone(), (default, description));
+        self.declare_option(name, default, description);
         self.cache.insert(name.clone(), if default { "ON" } else { "OFF" }.into());
         if let Some(branch) = branch {
             self.builtin.option_conditions.insert(name.clone(), branch);
+        }
+    }
+
+    /// An option declared (option() or a BOOL cache entry) under the current branch. Declared again with another
+    /// default, it takes the first that holds on this machine (as CMake keeps the first value in the cache), and says
+    /// so: an Anvil option has one default.
+    fn declare_option(&mut self, name: &str, default: bool, description: String) {
+        let branch = self.current_condition();
+        let on_host = branch.as_deref().is_none_or(|branch| {
+            let options = self.option_defaults();
+            model::holds_on_host(branch, &|name| options.get(name).copied())
+        });
+
+        let (declarations, host_set) = self.option_declarations.entry(name.to_string()).or_default();
+        declarations.push((branch, default));
+        let differs = declarations.iter().any(|(_, other)| *other != default);
+        let sets_default = !*host_set && on_host;
+        *host_set |= on_host;
+        let described = declarations
+            .iter()
+            .map(|(branch, default)| {
+                let value = if *default { "ON" } else { "OFF" };
+                match branch {
+                    Some(branch) => format!("{value} where `{branch}`"),
+                    None => format!("{value} elsewhere"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        match self.options.get_mut(name) {
+            Some((current, _)) if sets_default => *current = default,
+            Some(_) => {}
+            None => {
+                self.options.insert(name.to_string(), (default, description));
+            }
+        }
+        if differs {
+            let chosen = if self.options[name].0 { "ON" } else { "OFF" };
+            self.command_warnings.borrow_mut().push(format!(
+                "option {name} has a default per condition ({described}); an Anvil option has one default, so it is this machine's ({chosen})"
+            ));
         }
     }
 
@@ -652,6 +713,11 @@ impl Interpreter {
                         &format!(
                             "list({operation} {variable}) reads items that options add ({changed_by}); the result is the one with the options' defaults"
                         ),
+                    );
+                } else if let Some(changed_by) = platforms_changing(&items, &|items| list_read(operation, items, rest)) {
+                    self.warn(
+                        command,
+                        &format!("list({operation} {variable}) reads items under platform conditions ({changed_by}); the result is this machine's: `{value}`"),
                     );
                 }
                 self.set_variable(&output, &value);
@@ -878,7 +944,52 @@ impl Interpreter {
     fn command_string(&mut self, command: &Command, args: &[String]) {
         let Some((operation, rest)) = args.split_first() else { return };
 
-        match operation.as_str() {
+        // Text holding values set per condition: the operation on each version, the result one value per condition
+        let output = string_output(operation, rest);
+        let current =
+            matches!(operation.as_str(), "APPEND" | "PREPEND").then(|| output.and_then(|output| self.get_variable(output)).unwrap_or_default());
+        let inputs: Vec<&str> = current.iter().map(String::as_str).chain(rest.iter().map(String::as_str)).collect();
+        if let (Some(output), true) = (output, inputs.iter().any(|input| input.contains("$<$<BOOL:"))) {
+            let output = output.to_string();
+            let Some(versions) = super::interp::texts_versions(&inputs) else {
+                let host: Vec<String> = rest.iter().map(|input| self.host_text(input)).collect();
+                self.warn(
+                    command,
+                    &format!("string({operation}) of a value set per condition has too many versions to convert; the result is this machine's"),
+                );
+                if let Some(current) = &current {
+                    let current = self.host_text(current);
+                    self.set_variable(&output, &current);
+                }
+                return self.string_operation(command, operation, &host);
+            };
+            let mut versions: Vec<(Truth, (usize, Vec<String>))> = versions
+                .into_iter()
+                .enumerate()
+                .map(|(index, (condition, parts))| (condition, (index, parts)))
+                .collect();
+            self.host_version_last(&mut versions);
+
+            let mut results = Vec::new();
+            for (condition, (index, mut parts)) in versions {
+                if current.is_some() {
+                    let current = parts.remove(0);
+                    self.set_variable(&output, &current);
+                }
+                self.string_operation(command, operation, &parts);
+                results.push((index, condition, self.get_variable(&output).unwrap_or_default()));
+            }
+            results.sort_by_key(|(index, _, _)| *index);
+            let results = results.into_iter().map(|(_, condition, result)| (condition, result)).collect();
+            self.set_variable(&output, &super::interp::versions_value(results));
+            return;
+        }
+
+        self.string_operation(command, operation, rest);
+    }
+
+    fn string_operation(&mut self, command: &Command, operation: &str, rest: &[String]) {
+        match operation {
             "APPEND" | "PREPEND" => {
                 let Some((variable, values)) = rest.split_first() else { return };
                 let current = self.get_variable(variable).unwrap_or_default();
@@ -1204,14 +1315,28 @@ impl Interpreter {
             return;
         }
 
-        let Some(value) = evaluate_math(expression) else {
-            self.warn(command, &format!("math(EXPR): cannot evaluate `{expression}`"));
-            return;
+        // An expression holding values set per condition (a type's size): evaluated under each
+        let versions = match super::interp::text_versions(expression) {
+            Some(versions) => versions,
+            None => {
+                self.warn(
+                    command,
+                    "math(EXPR) of values set per condition has too many versions to convert; the result is this machine's",
+                );
+                vec![(Truth::Known(true), self.host_text(expression))]
+            }
         };
 
         let hexadecimal = rest.windows(2).any(|pair| pair[0] == "OUTPUT_FORMAT" && pair[1] == "HEXADECIMAL");
-        let text = if hexadecimal { format!("0x{value:x}") } else { value.to_string() };
-        self.set_variable(output, &text);
+        let mut results = Vec::new();
+        for (condition, expression) in versions {
+            let Some(value) = evaluate_math(&expression) else {
+                self.warn(command, &format!("math(EXPR): cannot evaluate `{}`", model::readable(&expression)));
+                return;
+            };
+            results.push((condition, if hexadecimal { format!("0x{value:x}") } else { value.to_string() }));
+        }
+        self.set_variable(output, &super::interp::versions_value(results));
     }
 
     // Files
@@ -2095,12 +2220,10 @@ impl Interpreter {
 
             for condition in read.into_inner() {
                 let inline = c_family && !joined && preprocessor_condition(&condition).is_some();
-                if !inline && !varying.contains(&condition) {
-                    varying.push(condition.clone());
+                if !inline {
+                    push_distinct(&mut varying, &condition);
                 }
-                if !conditions.contains(&condition) {
-                    conditions.push(condition);
-                }
+                push_distinct(&mut conditions, &condition);
             }
         }
         let inline: Vec<String> = conditions.into_iter().filter(|condition| !varying.contains(condition)).collect();
@@ -2121,8 +2244,9 @@ impl Interpreter {
             varying.clear();
         }
 
-        let texts = texts_by_choice(&varying, &|chosen| {
-            self.configured_text(template, only_at, escape_quotes, &inline, &|condition| {
+        let enclosing = self.current_condition();
+        let texts = texts_by_choice(&varying, enclosing.as_deref(), &|chosen| {
+            self.configured_text(template, only_at, escape_quotes, &inline, enclosing.as_deref(), &|condition| {
                 chosen(condition).unwrap_or_else(|| on_host(condition))
             })
         });
@@ -2138,14 +2262,22 @@ impl Interpreter {
 
     /// A template's text with `choice` deciding each condition, except `inline` ones: lines reading those become
     /// `#if` blocks.
-    fn configured_text(&self, template: &str, only_at: bool, escape_quotes: bool, inline: &[String], choice: &dyn Fn(&str) -> bool) -> String {
+    fn configured_text(
+        &self,
+        template: &str,
+        only_at: bool,
+        escape_quotes: bool,
+        inline: &[String],
+        enclosing: Option<&str>,
+        choice: &dyn Fn(&str) -> bool,
+    ) -> String {
         let mut text = String::new();
 
         for line in template.split_inclusive('\n') {
             let read = RefCell::new(Vec::<String>::new());
             let plain = self.configure_line(line, only_at, escape_quotes, &|condition| {
-                if inline.iter().any(|known| known == condition) && !read.borrow().iter().any(|known| known == condition) {
-                    read.borrow_mut().push(condition.to_string());
+                if inline.iter().any(|known| chosen_as(known, condition).is_some()) {
+                    push_distinct(&mut read.borrow_mut(), condition);
                 }
                 choice(condition)
             });
@@ -2155,7 +2287,7 @@ impl Interpreter {
                 continue;
             }
 
-            let versions = texts_by_choice(&read, &|chosen| {
+            let versions = texts_by_choice(&read, enclosing, &|chosen| {
                 self.configure_line(line, only_at, escape_quotes, &|condition| {
                     chosen(condition).unwrap_or_else(|| choice(condition))
                 })
@@ -2219,40 +2351,23 @@ impl Interpreter {
     fn configure_value(&self, name: &str, choice: &dyn Fn(&str) -> bool) -> (bool, String) {
         let value = self.get_variable(name);
 
-        if let Some(size) = self
-            .builtin
-            .type_sizes
-            .get(name)
-            .filter(|size| value.as_deref() == Some(size.host.as_str()))
+        // An option nothing set since reads as on or off, whatever value branches gave its cache entry
+        if let (Some(Truth::Depends(condition)), true) = (self.option_truth(name), value.as_deref().is_some_and(|value| value.contains("$<$<BOOL:")))
         {
-            // Every condition is read, so each choice of them sees the same ones
-            let holding: Vec<bool> = size.cases.iter().map(|(condition, _)| choice(condition)).collect();
-            let text = size
-                .cases
-                .iter()
-                .zip(holding)
-                .find(|(_, holds)| *holds)
-                .map_or(&size.otherwise, |((_, size), _)| size)
-                .clone();
-            return (!text.is_empty(), text);
+            let on = choice(&condition);
+            return (on, if on { "ON" } else { "OFF" }.to_string());
         }
 
+        // Items or text under conditions (inside longer text too): those `choice` takes. Every condition is read, so
+        // each choice of them sees the same ones
         if let Some(value) = value.as_deref().filter(|value| value.contains("$<$<BOOL:")) {
-            let mut conditional = false;
-            let mut kept = Vec::new();
-            for item in model::list_elements(value) {
-                match model::split_conditional_item(&item) {
-                    Some((condition, text)) => {
-                        conditional = true;
-                        if choice(&condition) {
-                            kept.push(text.to_string());
-                        }
-                    }
-                    None => kept.push(item),
-                }
-            }
-            if conditional {
-                let text = self.marker_free_text(&kept.join(";"));
+            let conditional = std::cell::Cell::new(false);
+            let chosen = model::choose_list_items(value, &|condition| {
+                conditional.set(true);
+                choice(condition)
+            });
+            if conditional.get() {
+                let text = self.marker_free_text(&chosen);
                 return (model::constant_truth(&text).unwrap_or(true), text);
             }
         }
@@ -2419,8 +2534,8 @@ impl Interpreter {
         self.set_variable(&variable, &value);
     }
 
-    /// check_type_size(type VAR): VAR is the size on this machine; where it differs by platform, configured files get
-    /// each platform's (see configure_value). A type not in TYPE_SIZES has no size known without compiling.
+    /// check_type_size(type VAR): VAR is the size, one per condition where it differs by platform. A type not in
+    /// TYPE_SIZES has no size known without compiling.
     fn check_type_size(&mut self, command: &Command, type_name: &str, variable: &str) {
         if self.get_variable(variable).is_some() {
             return;
@@ -2433,10 +2548,24 @@ impl Interpreter {
             return;
         };
 
-        self.set_variable(variable, &size.host);
-        if !size.cases.is_empty() {
-            self.builtin.type_sizes.insert(variable.to_string(), size);
+        // Each case where no earlier one holds, then the rest
+        let mut earlier = Truth::Known(false);
+        let mut sizes = Vec::new();
+        for (condition, case_size) in &size.cases {
+            let here = Truth::Depends(condition.clone());
+            sizes.push((earlier.clone().not().and(here.clone()), case_size.clone()));
+            earlier = earlier.or(here);
         }
+        sizes.push((earlier.not(), size.otherwise.clone()));
+        let sizes = sizes
+            .into_iter()
+            .map(|(truth, size)| match truth {
+                Truth::Depends(condition) => (model::simplify(&condition, None), size),
+                known => (known, size),
+            })
+            .filter(|(truth, _)| *truth != Truth::Known(false))
+            .collect();
+        self.set_variable(variable, &super::interp::versions_value(sizes));
     }
 
     /// get_property(var TARGET t PROPERTY p) and GLOBAL properties; other scopes read as empty.
@@ -2784,15 +2913,7 @@ fn type_size(type_name: &str) -> Option<TypeSize> {
     }
     let (_, cases, otherwise) = TYPE_SIZES.iter().find(|(names, _, _)| names.contains(&name.as_str()))?;
 
-    let size_where = |holds: &dyn Fn(&str) -> bool| {
-        cases
-            .iter()
-            .find(|(condition, _)| holds(condition))
-            .map_or(*otherwise, |(_, size)| *size)
-            .to_string()
-    };
     Some(TypeSize {
-        host: size_where(&|condition| model::holds_on_host(condition, &|_| None)),
         cases: cases.iter().map(|(condition, size)| (condition.to_string(), size.to_string())).collect(),
         otherwise: otherwise.to_string(),
     })
@@ -3318,21 +3439,46 @@ fn macro_unary(tokens: &[&str], position: &mut usize) -> Option<Truth> {
     }
 }
 
+/// Adds a condition to a list unless it holds the same or its negation (`msvc` and `!msvc` are one choice).
+fn push_distinct(conditions: &mut Vec<String>, condition: &str) {
+    if !conditions.iter().any(|known| chosen_as(known, condition).is_some()) {
+        conditions.push(condition.to_string());
+    }
+}
+
+/// Is `condition` `known` (true) or its negation (false), or neither (None)?
+fn chosen_as(known: &str, condition: &str) -> Option<bool> {
+    if model::equivalent(known, condition) {
+        Some(true)
+    } else if model::equivalent(&model::negate(known), condition) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// What `render` gives under every choice of `conditions` (each true or false), the choices with the same text
-/// merged into one condition; choices that cannot happen (`windows` with `unix`) are left out.
-fn texts_by_choice(conditions: &[String], render: &dyn Fn(&dyn Fn(&str) -> Option<bool>) -> String) -> Vec<(Truth, String)> {
+/// merged into one condition; choices that cannot happen (`windows` with `unix`, or outside the `enclosing` condition
+/// the text is written under) are left out, and the conditions say only what the enclosing one does not.
+fn texts_by_choice(conditions: &[String], enclosing: Option<&str>, render: &dyn Fn(&dyn Fn(&str) -> Option<bool>) -> String) -> Vec<(Truth, String)> {
     let simplified = |truth: Truth| match truth {
-        Truth::Depends(condition) => model::simplify(&condition, None),
+        Truth::Depends(condition) => match model::simplify(
+            &model::and_optional(&enclosing.map(str::to_string), &Some(condition.clone())).unwrap_or_default(),
+            None,
+        ) {
+            Truth::Known(false) => Truth::Known(false),
+            _ => model::simplify(&condition, enclosing),
+        },
         known => known,
     };
     let mut texts: Vec<(Truth, String)> = Vec::new();
 
     for assignment in 0u32..(1 << conditions.len()) {
         let chosen = |condition: &str| {
-            conditions
-                .iter()
-                .position(|known| known == condition)
-                .map(|index| assignment & (1 << index) != 0)
+            conditions.iter().enumerate().find_map(|(index, known)| {
+                let same = chosen_as(known, condition)?;
+                Some((assignment & (1 << index) != 0) == same)
+            })
         };
         let truth = conditions.iter().fold(Truth::Known(true), |truth, condition| {
             let single = Truth::Depends(condition.clone());
@@ -3519,6 +3665,23 @@ fn resolved_items(items: &[String], options: &HashMap<String, bool>) -> Vec<Stri
         .collect()
 }
 
+/// The conditions under which items are there that change what `read` gives for the list, or None when its
+/// versions all read the same (or are too many to tell).
+fn platforms_changing(items: &[String], read: &dyn Fn(&[String]) -> Option<(String, String)>) -> Option<String> {
+    let versions = super::interp::text_versions(&items.join(";"))?;
+    let results: Vec<Option<(String, String)>> = versions.iter().map(|(_, text)| read(&model::list_elements(text))).collect();
+    if results.windows(2).all(|pair| pair[0] == pair[1]) {
+        return None;
+    }
+    let mut conditions: Vec<String> = Vec::new();
+    for (condition, _) in items.iter().filter_map(|item| model::split_conditional_item(item)) {
+        if !conditions.contains(&condition) {
+            conditions.push(condition);
+        }
+    }
+    Some(conditions.join(", "))
+}
+
 /// list(LENGTH|GET|JOIN|SUBLIST|FIND) of `items`: the output variable and its value.
 fn list_read(operation: &str, items: &[String], rest: &[String]) -> Option<(String, String)> {
     match operation {
@@ -3548,6 +3711,24 @@ fn list_read(operation: &str, items: &[String], rest: &[String]) -> Option<(Stri
         }
         _ => None,
     }
+}
+
+/// The variable a string() operation writes, for those that compute it from their other arguments.
+fn string_output<'a>(operation: &str, rest: &'a [String]) -> Option<&'a str> {
+    let index = match operation {
+        "APPEND" | "PREPEND" | "CONCAT" => 0,
+        "MD5" | "SHA1" | "SHA224" | "SHA256" | "SHA384" | "SHA512" | "SHA3_224" | "SHA3_256" | "SHA3_384" | "SHA3_512" => 0,
+        "JOIN" | "TOLOWER" | "TOUPPER" | "LENGTH" | "STRIP" | "GENEX_STRIP" | "MAKE_C_IDENTIFIER" | "HEX" => 1,
+        "REPEAT" | "REPLACE" | "FIND" => 2,
+        "SUBSTRING" | "COMPARE" => 3,
+        "REGEX" => match rest.first().map(String::as_str) {
+            Some("MATCH" | "MATCHALL") => 2,
+            Some("REPLACE") => 3,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    rest.get(index).map(String::as_str)
 }
 
 /// string(SUBSTRING) and list(SUBLIST)'s begin and length (-1: to the end) as a range within `length` items.
@@ -3911,10 +4092,13 @@ configure_file(config.h.in config.h)
         let template = "#define SIZEOF_LONG @SIZEOF_LONG@\n#cmakedefine SIZEOF_WCHAR_T @SIZEOF_WCHAR_T@\n#define SIZEOF_INT ${SIZEOF_INT}\n";
         let interpreter = run("type-sizes", &[("CMakeLists.txt", cmake), ("config.h.in", template)]);
 
+        // One size per platform where it differs, this machine's among them
         let host_long = if cfg!(windows) { "4" } else { "8" };
-        assert_eq!(variable(&interpreter, "SIZEOF_LONG"), host_long);
-        assert_eq!(variable(&interpreter, "SIZEOF_ULONG"), host_long);
-        assert_eq!(variable(&interpreter, "SIZEOF_CHAR_P"), "8");
+        let long = variable(&interpreter, "SIZEOF_LONG");
+        assert_eq!(model::list_elements(&long).len(), 2, "{long}");
+        assert_eq!(interpreter.host_text(&long), host_long);
+        assert_eq!(interpreter.host_text(&variable(&interpreter, "SIZEOF_ULONG")), host_long);
+        assert_eq!(interpreter.host_text(&variable(&interpreter, "SIZEOF_CHAR_P")), "8");
         assert_eq!(variable(&interpreter, "SIZEOF_INT"), "4");
 
         let text = written(&interpreter, None);
@@ -3941,7 +4125,7 @@ configure_file(config.h.in config.h)
         let long_double = type_size("long double").unwrap();
         assert_eq!(long_double.otherwise, "16");
         assert_eq!(long_double.cases[0], ("msvc | (macos & arm64)".to_string(), "8".to_string()));
-        assert_eq!(type_size("ssize_t").unwrap().host, if cfg!(windows) { "" } else { "8" });
+        assert_eq!(type_size("ssize_t").unwrap().cases[0], ("msvc".to_string(), String::new()));
         assert_eq!(type_size("int *").unwrap().otherwise, "8");
         assert!(type_size("time_t").is_some() && type_size("off_t").is_some() && type_size("size_t").is_some());
         assert!(type_size("struct stat").is_none());

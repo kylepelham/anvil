@@ -1002,7 +1002,7 @@ impl Interpreter {
 
             // COMPILE_FLAGS and LINK_FLAGS are command-line strings, not lists
             let items = if base_property.ends_with("_FLAGS") {
-                crate::util::split_command(&items.join(" "))
+                self.command_words(&items.join(" "))
             } else {
                 items
             };
@@ -1359,7 +1359,7 @@ impl Interpreter {
 
         let (is_options, items) = match property {
             "COMPILE_OPTIONS" => (true, items),
-            "COMPILE_FLAGS" => (true, crate::util::split_command(&items.join(" "))),
+            "COMPILE_FLAGS" => (true, self.command_words(&items.join(" "))),
             "COMPILE_DEFINITIONS" => (false, items),
             _ => return,
         };
