@@ -23,6 +23,11 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     "c", "cc", "cpp", "cxx", "c++", "cp", "m", "mm", "cu", "rc", "asm", "s", "def", "manifest", "ixx", "cppm", "ccm", "cxxm", "c++m", "mpp",
 ];
 
+// The configurations an MSVC package maps a consumer's configurations to when the install with their C runtime is
+// missing: their files are where that install would put them, so the link fails naming them
+const DEBUG_RUNTIME_MISSING: &str = "DEBUG_RUNTIME_NOT_INSTALLED";
+const RELEASE_RUNTIME_MISSING: &str = "RELEASE_RUNTIME_NOT_INSTALLED";
+
 // Source files a library's C++ users link it through, for IMPORTED_LINK_INTERFACE_LANGUAGES
 const CXX_EXTENSIONS: &[&str] = &["cpp", "cc", "cxx", "c++", "cp", "cu", "mm"];
 
@@ -38,6 +43,19 @@ struct InstallFile {
     content: Content,
     /// Who installs it, for messages: "target `core`".
     owner: String,
+    /// Who installs it, as the manifest names it: the target's name, `(package)` or `(package <profile>)`.
+    manifest_owner: String,
+}
+
+// The manifest's owner of the package files every configuration shares (the configuration's own say which profile)
+const PACKAGE_OWNER: &str = "(package)";
+
+/// One line of an install manifest: a file relative to the prefix, who installs it, and whether it was in the prefix
+/// before this project installed it (another project's, or the user's), so that this project never removes it.
+struct ManifestEntry {
+    path: String,
+    owner: String,
+    found: bool,
 }
 
 /// Where one installed library's files went, relative to the prefix.
@@ -56,8 +74,10 @@ struct InstalledLibrary {
 struct Export {
     /// The CMake packages the libraries use (vcpkg ports), each once.
     dependencies: Vec<CmakePackage>,
-    /// One `add_library` block per library, with what does not depend on the configuration.
-    blocks: Vec<String>,
+    /// The CMake find modules of the built-in system dependencies they use (OpenMP, Threads, OpenGL), each once.
+    system_packages: Vec<&'static str>,
+    /// One imported target per library.
+    targets: Vec<CmakeTarget>,
     /// The configuration's files of each library that has some (a `<project>Targets-<profile>.cmake` file).
     locations: Vec<String>,
     /// The imported targets with files of their own, which a configuration is chosen for.
@@ -67,6 +87,22 @@ struct Export {
     /// The package refers to files in the build's output folder (vcpkg's packages), which installing does not copy.
     uses_build_folder: bool,
 }
+
+/// One library's imported target in the CMake package.
+struct CmakeTarget {
+    name: String,
+    /// Its `add_library` line, with notes above.
+    declaration: String,
+    /// Its INTERFACE_* properties in this configuration, item by item (as a quoted CMake argument holds them): another
+    /// configuration's may differ (a debug-only definition, a vcpkg library's debug build).
+    usage: Vec<(&'static str, Vec<String>)>,
+    /// It has files of its own, so a configuration is chosen for it.
+    built: bool,
+}
+
+/// What the other configurations' `<project>Targets-<profile>.cmake` files say each library's usage is there: by
+/// target, its configurations, each with its INTERFACE_* properties.
+type OtherUsage = HashMap<String, Vec<(String, HashMap<String, Vec<String>>)>>;
 
 /// One library's pkg-config file, `<project>-<library>.pc`.
 struct PkgConfig {
@@ -91,7 +127,7 @@ struct Installer<'a> {
 
 /// `anvil install [targets]`: builds the targets to install (with the release profile unless `-p` names another),
 /// then copies their files into the prefix (default `out/install`), each only when it changed, and removes what the
-/// last install of this configuration copied that is no longer installed.
+/// last install of this configuration copied for these targets that is no longer installed.
 pub fn install(start_dir: &Path, build: &BuildArgs, names: &[String], prefix: Option<&Path>) -> Result<()> {
     let mut build = build.clone();
     if !build.release && build.profile.is_none() {
@@ -101,12 +137,13 @@ pub fn install(start_dir: &Path, build: &BuildArgs, names: &[String], prefix: Op
     let model = commands::load_model_naming(start_dir, &build, names)?;
     let chosen = chosen_targets(&model, names)?;
     let installed = with_needed(&model, &chosen)?;
-
-    let (model, plan) = commands::build_roots(model, &build, &installed)?;
     let prefix = match prefix {
         Some(prefix) => util::absolute(&std::env::current_dir()?, prefix),
         None => model.out_root.join("install"),
     };
+    check_prefix(&model, &prefix)?;
+
+    let (model, plan) = commands::build_roots(model, &build, &installed)?;
 
     // The targets' files, then the package files describing the libraries
     let mut installer = Installer {
@@ -125,12 +162,37 @@ pub fn install(start_dir: &Path, build: &BuildArgs, names: &[String], prefix: Op
         }
     }
 
+    // What this install answers for in the manifest: its targets, and the package files when it writes them
+    let mut scope: HashSet<String> = installed.iter().map(|index| model.targets[*index].name.clone()).collect();
     let project = model.packages[0].manifest.project.clone().unwrap_or_default();
     if project.export.unwrap_or(true) && !libraries.is_empty() {
         installer.add_package_files(&installed, &libraries)?;
+        scope.insert(PACKAGE_OWNER.to_string());
+        scope.insert(package_owner(&model.profile.name));
     }
 
-    installer.write()
+    installer.write(&scope)
+}
+
+/// The manifest's owner of a configuration's own package file, `<project>Targets-<profile>.cmake`.
+fn package_owner(profile: &str) -> String {
+    format!("(package {profile})")
+}
+
+/// Refuses a prefix holding the project or its workspace: the install would copy files onto themselves, and a later
+/// install remove the project's own.
+fn check_prefix(model: &Model, prefix: &Path) -> Result<()> {
+    for (root, what) in [(&model.packages[0].root, "project"), (&model.root, "workspace")] {
+        if util::strip_prefix_ci(root, prefix).is_some() {
+            bail!(
+                "--prefix {}: the prefix holds the {what} ({}), whose own files an install could overwrite and a later one remove; choose a folder outside it, or one inside it such as out/install (the default)",
+                slash(prefix),
+                slash(root)
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// The targets asked for, or every program and library of the project that builds by default (or says
@@ -274,18 +336,18 @@ impl Installer<'_> {
                 _ => &lib,
             };
             let location = format!("{folder}/{}", file_name(file));
-            self.add(&location, Content::Copy(file.clone()), &owner)?;
+            self.add(&location, Content::Copy(file.clone()), &owner, &target.name)?;
 
             // The PDB the link wrote beside a program or DLL
             let pdb = file.with_extension("pdb");
             if folder == &bin && toolchain.is_msvc_abi() && model.profile.debug && pdb.is_file() {
-                self.add(&format!("{bin}/{}", file_name(&pdb)), Content::Copy(pdb), &owner)?;
+                self.add(&format!("{bin}/{}", file_name(&pdb)), Content::Copy(pdb), &owner, &target.name)?;
             }
 
             // The import library users of a DLL link
             if let Some(import_library) = self.plan.import_libs.get(&index).filter(|_| target.kind == Kind::Shared) {
                 let destination = format!("{lib}/{}", file_name(import_library));
-                self.add(&destination, Content::Copy(import_library.clone()), &owner)?;
+                self.add(&destination, Content::Copy(import_library.clone()), &owner, &target.name)?;
                 library.import_library = Some(destination);
             }
 
@@ -297,10 +359,16 @@ impl Installer<'_> {
                     &format!("{runtime_folder}/{}", file_name(runtime)),
                     Content::Copy(runtime.clone()),
                     &owner,
+                    &target.name,
                 )?;
             }
             for (data, relative) in &target.data {
-                self.add(&format!("{folder}/{}", slash(relative)), Content::Copy(data.clone()), &owner)?;
+                self.add(
+                    &format!("{folder}/{}", slash(relative)),
+                    Content::Copy(data.clone()),
+                    &owner,
+                    &target.name,
+                )?;
             }
 
             library.location = Some(location);
@@ -328,16 +396,20 @@ impl Installer<'_> {
             .chain(&target.interface_include)
             .cloned()
             .collect();
+        let declared = folders.len();
         if !target.runs.is_empty() {
             folders.push(targets::gen_dir(&model.package_out_dir(target.package), &target.name));
         }
 
-        // What builds the package (source folders, private include folders, tests/), and what a walk never enters
+        // What builds the package (source folders, private include folders, tests/), and what a walk of a folder
+        // holding the rest of the package leaves out (all that, less the library's own source folders)
         let build_folders = build_folders(model, target.package);
+        let skipped_folders = skipped_folders(model, index);
         let prefix_key = util::path_key(&self.prefix);
 
         let mut seen = HashSet::new();
-        for folder in folders.into_iter().filter(|folder| seen.insert(util::path_key(folder))) {
+        let mut project_folders = Vec::new();
+        for (position, folder) in folders.into_iter().enumerate().filter(|(_, folder)| seen.insert(util::path_key(folder))) {
             // The project's own folders install (a workspace member's may lie beside it), the build's generated ones
             // too; the rest (an SDK's, vcpkg's in the output folder) stays where it is
             let generated = util::strip_prefix_ci(&folder, &model.out_dir).is_some();
@@ -348,15 +420,18 @@ impl Installer<'_> {
                 library.external_includes.push(folder);
                 continue;
             }
+            if position < declared {
+                project_folders.push(util::rel(&folder, &package.root));
+            }
 
             // A folder holding the rest of the package too (its root, the target's folder) gives its headers, also
-            // extensionless ones (Eigen/Core), but nothing of the folders that build the package
+            // extensionless ones (Eigen/Core), but nothing of the folders that build other targets or the tests
             let key = util::path_key(&folder);
             let mixed = !generated && [&package.root, &target.dir, &model.root].iter().any(|other| util::path_key(other) == key);
             let walker = walkdir::WalkDir::new(&folder).sort_by_file_name().into_iter().filter_entry(|entry| {
                 let inner_folder = entry.depth() > 0 && entry.file_type().is_dir();
                 let entry_key = util::path_key(entry.path());
-                let skipped = entry_key == prefix_key || (mixed && build_folders.contains(&entry_key));
+                let skipped = entry_key == prefix_key || (mixed && skipped_folders.contains(&entry_key));
                 !targets::is_skipped_dir(entry, &model.out_root) && !(inner_folder && skipped)
             });
             for entry in walker.flatten().filter(|entry| entry.file_type().is_file()) {
@@ -377,10 +452,22 @@ impl Installer<'_> {
                 };
                 let Ok(relative) = entry.path().strip_prefix(&folder) else { continue };
                 if wanted {
-                    self.add(&format!("include/{}", slash(relative)), Content::Copy(entry.path().to_path_buf()), &owner)?;
+                    let source = Content::Copy(entry.path().to_path_buf());
+                    self.add(&format!("include/{}", slash(relative)), source, &owner, &target.name)?;
                     library.has_headers = true;
                 }
             }
+        }
+
+        // Its users would get no include folder from the install
+        if !library.has_headers && !project_folders.is_empty() {
+            ui::warn(&format!(
+                "target `{}`: its public include folders ({}) hold no headers to install, so the installed library gives its users none; put its public headers in a folder of their own (include/{}/{}.h with public.include = [\"include\"])",
+                target.name,
+                project_folders.join(", "),
+                target.name,
+                target.name
+            ));
         }
 
         Ok(())
@@ -433,20 +520,28 @@ impl Installer<'_> {
         // The CMake package: what every configuration shares, then this configuration's files
         let owner = "the CMake package";
         let folder = format!("lib/cmake/{project}");
-        let configuration = targets::sanitize_name(&model.profile.name);
+        let targets_file = format!("{folder}/{project}Targets-{}.cmake", targets::sanitize_name(&model.profile.name));
+        let other_usage = read_other_usage(&self.prefix.join(&folder), &project, &targets_file);
         self.add(
             &format!("{folder}/{project}Config.cmake"),
-            Content::Text(export.cmake_config(model, &project)),
+            Content::Text(export.cmake_config(model, &project, &other_usage)),
             owner,
+            PACKAGE_OWNER,
         )?;
         self.add(
-            &format!("{folder}/{project}Targets-{configuration}.cmake"),
+            &targets_file,
             Content::Text(export.cmake_locations(model, &project)),
             owner,
+            &package_owner(&model.profile.name),
         )?;
         if let Some(version) = package.manifest.project.as_ref().and_then(|project| project.version.as_deref()) {
             let text = cmake_version_file(&project, version, model.toolchain.platform.cpu);
-            self.add(&format!("{folder}/{project}ConfigVersion.cmake"), Content::Text(text), owner)?;
+            self.add(
+                &format!("{folder}/{project}ConfigVersion.cmake"),
+                Content::Text(text),
+                owner,
+                PACKAGE_OWNER,
+            )?;
         }
 
         // pkg-config: one file per library, and one for them all
@@ -457,12 +552,14 @@ impl Installer<'_> {
                 &format!("{pkg_config_folder}/{project}-{}.pc", pkg_config.library),
                 Content::Text(text),
                 "the pkg-config files",
+                PACKAGE_OWNER,
             )?;
         }
         self.add(
             &format!("{pkg_config_folder}/{project}.pc"),
             Content::Text(export.pkg_config_all(model, &project)),
             "the pkg-config files",
+            PACKAGE_OWNER,
         )?;
 
         // What the package names in the build's output folder stays there
@@ -477,7 +574,7 @@ impl Installer<'_> {
     }
 
     /// Adds a file to the install; two different files for one destination are an error naming both.
-    fn add(&mut self, destination: &str, content: Content, owner: &str) -> Result<()> {
+    fn add(&mut self, destination: &str, content: Content, owner: &str, manifest_owner: &str) -> Result<()> {
         let key = util::path_key(Path::new(destination));
         let Some(existing) = self.destinations.get(&key).map(|index| &self.files[*index]) else {
             self.destinations.insert(key, self.files.len());
@@ -485,6 +582,7 @@ impl Installer<'_> {
                 destination: destination.to_string(),
                 content,
                 owner: owner.to_string(),
+                manifest_owner: manifest_owner.to_string(),
             });
             return Ok(());
         };
@@ -501,37 +599,102 @@ impl Installer<'_> {
     }
 
     /// Writes every file that is missing from the prefix or differs, removes the files the last install of this
-    /// configuration wrote that are no longer installed (as its manifest lists them), then says how many.
-    fn write(&self) -> Result<()> {
+    /// configuration wrote for the owners in `scope` (its targets, the package files) that are no longer installed,
+    /// then says how many. A file another project or the user put in the prefix is overwritten with a warning when it
+    /// differs, and never claimed, so that no install of this project removes it; files other projects' manifests list
+    /// stay too.
+    fn write(&self, scope: &HashSet<String>) -> Result<()> {
         let prefix = &self.prefix;
+        let model = self.model;
+
+        // The manifests: this configuration's, the other configuration's (a debug install shares headers and the
+        // CMake package with a release one), and other projects' in the same prefix
+        let project = targets::sanitize_name(&model.packages[0].name);
+        let manifest_path = |root: &str| prefix.join(format!("{root}share/{project}/install_manifest.txt"));
+        let other_root = if self.root.is_empty() { "debug/" } else { "" };
+        let previous = read_manifest(&manifest_path(self.root));
+        let other_configuration = read_manifest(&manifest_path(other_root));
+        let other_projects = other_projects_files(prefix, &project);
+        let owned: HashSet<String> = previous
+            .iter()
+            .chain(&other_configuration)
+            .filter(|entry| !entry.found)
+            .map(|entry| util::path_key(Path::new(&entry.path)))
+            .collect();
+
+        // Copy what changed; a file this project did not write before is used, not claimed
+        let mut entries = Vec::new();
         let mut copied = 0;
         for file in &self.files {
             let destination = prefix.join(&file.destination);
+            if let Content::Copy(source) = &file.content {
+                if util::path_key(source) == util::path_key(&destination) {
+                    continue;
+                }
+            }
+
+            let key = util::path_key(Path::new(&file.destination));
+            let found = !owned.contains(&key) && destination.exists();
+            if found && !same_as_installed(&file.content, &destination) {
+                let whose = match other_projects.get(&key) {
+                    Some(other) => format!("project `{other}` installed it"),
+                    None => "this project did not install it".to_string(),
+                };
+                ui::warn(&format!(
+                    "{} overwrites {}, which was there before ({whose}); later installs of this project leave it in place",
+                    file.owner,
+                    slash(&destination)
+                ));
+            }
             let changed = match &file.content {
                 Content::Copy(source) => copy_if_changed(source, &destination)?,
                 Content::Text(text) => util::write_if_changed(&destination, text.as_bytes())?,
             };
             copied += changed as usize;
+            entries.push(ManifestEntry {
+                path: file.destination.clone(),
+                owner: file.manifest_owner.clone(),
+                found,
+            });
         }
 
-        // The manifest of each configuration's install: the files a debug install shares with a release one stay
-        let project = targets::sanitize_name(&self.model.packages[0].name);
-        let manifest_path = |root: &str| prefix.join(format!("{root}share/{project}/install_manifest.txt"));
-        let other_root = if self.root.is_empty() { "debug/" } else { "" };
-        let installed: Vec<&str> = self.files.iter().map(|file| file.destination.as_str()).collect();
-        let kept: HashSet<String> = installed
+        // What the last install of this configuration wrote for the same owners and this one does not is removed,
+        // unless the other configuration or another project lists it; the other owners' files stay listed. An owner
+        // no target of the project has any more (a removed target) is this install's to clean up.
+        let installed: HashSet<String> = entries.iter().map(|entry| util::path_key(Path::new(&entry.path))).collect();
+        let listed_elsewhere: HashSet<String> = other_configuration
             .iter()
-            .map(|destination| destination.to_string())
-            .chain(read_manifest(&manifest_path(other_root)))
-            .map(|destination| util::path_key(Path::new(&destination)))
+            .map(|entry| util::path_key(Path::new(&entry.path)))
+            .chain(other_projects.into_keys())
+            .collect();
+        let in_scope = |owner: &str| {
+            let removed_target = !owner.is_empty() && !owner.starts_with('(') && !model.targets.iter().any(|target| target.name == owner);
+            scope.contains(owner) || removed_target
+        };
+        let sources: HashSet<String> = self
+            .files
+            .iter()
+            .filter_map(|file| match &file.content {
+                Content::Copy(source) => Some(util::path_key(source)),
+                Content::Text(_) => None,
+            })
             .collect();
         let mut removed = 0;
-        for stale in read_manifest(&manifest_path(self.root)) {
-            if !kept.contains(&util::path_key(Path::new(&stale))) {
-                removed += remove_installed(prefix, &stale)? as usize;
+        for entry in previous {
+            let key = util::path_key(Path::new(&entry.path));
+            if installed.contains(&key) {
+                continue;
+            }
+            if !in_scope(&entry.owner) {
+                entries.push(entry);
+                continue;
+            }
+            let path = prefix.join(&entry.path);
+            if !entry.found && !listed_elsewhere.contains(&key) && !sources.contains(&util::path_key(&path)) {
+                removed += remove_installed(prefix, &entry.path)? as usize;
             }
         }
-        util::write_if_changed(&manifest_path(self.root), format!("{}\n", installed.join("\n")).as_bytes())?;
+        util::write_if_changed(&manifest_path(self.root), manifest_text(&entries).as_bytes())?;
 
         let shown = util::rel(prefix, &std::env::current_dir()?);
         let unchanged = self.files.len() - copied;
@@ -542,23 +705,77 @@ impl Installer<'_> {
     }
 }
 
-/// The files an install manifest lists, relative to the prefix; only plain relative paths, so removing them never
-/// leaves the prefix.
-fn read_manifest(path: &Path) -> Vec<String> {
+/// The files an install manifest lists, relative to the prefix, with their owners (`<path>\t<owner>[\tfound]`); only
+/// plain relative paths, so removing them never leaves the prefix. A line without an owner (an older Anvil's) belongs
+/// to no install's scope, so it is never removed.
+fn read_manifest(path: &Path) -> Vec<ManifestEntry> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     text.lines()
-        .filter(|line| {
-            let path = Path::new(line);
-            !line.is_empty() && path.components().all(|component| matches!(component, std::path::Component::Normal(_)))
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let path = fields.next().unwrap_or_default();
+            let plain = Path::new(path)
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)));
+            (!path.is_empty() && plain).then(|| ManifestEntry {
+                path: path.to_string(),
+                owner: fields.next().unwrap_or_default().to_string(),
+                found: fields.next() == Some("found"),
+            })
         })
-        .map(str::to_string)
         .collect()
 }
 
-/// Removes a file an earlier install wrote, and the folders it leaves empty up to the prefix.
+fn manifest_text(entries: &[ManifestEntry]) -> String {
+    let mut text = String::new();
+    for entry in entries {
+        let found = if entry.found { "\tfound" } else { "" };
+        text.push_str(&format!("{}\t{}{found}\n", entry.path, entry.owner));
+    }
+
+    text
+}
+
+/// The files other projects' manifests in the prefix list (`share/*/install_manifest.txt`, `debug/share/*/...`), with
+/// the project each belongs to.
+fn other_projects_files(prefix: &Path, project: &str) -> HashMap<String, String> {
+    let mut files = HashMap::new();
+    for root in ["", "debug/"] {
+        let Ok(folders) = std::fs::read_dir(prefix.join(format!("{root}share"))) else {
+            continue;
+        };
+        for folder in folders.flatten() {
+            let name = folder.file_name().to_string_lossy().into_owned();
+            if name == project {
+                continue;
+            }
+            for entry in read_manifest(&folder.path().join("install_manifest.txt")) {
+                files.insert(util::path_key(Path::new(&entry.path)), name.clone());
+            }
+        }
+    }
+
+    files
+}
+
+/// The prefix holds a file with the bytes an install would write there.
+fn same_as_installed(content: &Content, destination: &Path) -> bool {
+    let Ok(existing) = std::fs::read(destination) else { return false };
+    match content {
+        Content::Copy(source) => std::fs::read(source).is_ok_and(|bytes| bytes == existing),
+        Content::Text(text) => text.as_bytes() == existing,
+    }
+}
+
+/// Removes a file an earlier install wrote, and the folders it leaves empty up to the prefix; never one a link in the
+/// prefix leads to (the project's own files, through a linked folder).
 fn remove_installed(prefix: &Path, relative: &str) -> Result<bool> {
     let path = prefix.join(relative);
-    if !path.is_file() {
+    let inside = match (path.canonicalize(), prefix.canonicalize()) {
+        (Ok(file), Ok(prefix)) => file.starts_with(prefix),
+        _ => false,
+    };
+    if !path.is_file() || !inside {
         return Ok(false);
     }
     std::fs::remove_file(&path).with_context(|| format!("removing {} (no longer installed)", slash(&path)))?;
@@ -633,6 +850,27 @@ impl Export {
                     push_once(&mut pkg_config.requires, format!("{project}-{}", dependency.name));
                 }
                 Kind::External => {
+                    // A built-in system dependency: CMake's find module, which gives its users the compiler's flags
+                    // and runtime; pkg-config the flags it builds with
+                    if let Some((package, targets)) = system_package(model, dependency, target) {
+                        links.extend(targets.into_iter().map(item));
+                        if !self.system_packages.contains(&package) {
+                            self.system_packages.push(package);
+                        }
+                        for lib in &dependency.libs {
+                            push_once(&mut pkg_config.libs, pkg_config_lib(lib));
+                        }
+                        for flag in &dependency.link_flags {
+                            push_once(&mut pkg_config.libs, pkg_config_word(flag));
+                        }
+                        if *public {
+                            for (_, flag) in &dependency.public_language_flags {
+                                push_once(&mut pkg_config.cflags, pkg_config_word(flag));
+                            }
+                        }
+                        continue;
+                    }
+
                     // A vcpkg port CMake can find: its package and targets
                     let port = dependency.vcpkg.as_ref().map(|(port, _)| port.as_str());
                     let build = crate::vcpkg_tree::BuildContext::new(&model.toolchain, &model.profile);
@@ -700,22 +938,23 @@ impl Export {
             ("INTERFACE_LINK_OPTIONS", link_options),
             ("INTERFACE_LINK_DIRECTORIES", link_dirs),
         ];
-        let mut properties = Vec::new();
+        let mut usage = Vec::new();
         for (property, mut values) in lists {
             dedup(&mut values);
-            if !values.is_empty() {
-                properties.push((property.to_string(), values.join(";")));
-            }
+            usage.push((property, values));
         }
 
-        let mut block = String::new();
+        let mut declaration = String::new();
         for note in notes {
-            block.push_str(&format!("# {note}\n"));
+            declaration.push_str(&format!("# {note}\n"));
         }
-        block.push_str(&format!("if(NOT TARGET {name})\n  add_library({name} {kind} IMPORTED)\n"));
-        block.push_str(&target_properties(&name, &properties, "  "));
-        block.push_str("endif()\n");
-        self.blocks.push(block);
+        declaration.push_str(&format!("if(NOT TARGET {name})\n  add_library({name} {kind} IMPORTED)\n"));
+        self.targets.push(CmakeTarget {
+            name: name.clone(),
+            declaration,
+            usage,
+            built: library.location.is_some(),
+        });
 
         // This configuration's files
         let Some(location) = &library.location else { return };
@@ -733,15 +972,33 @@ impl Export {
                 link_language(target).to_string(),
             ));
         }
-        let mut block = format!("set_property(TARGET {name} APPEND PROPERTY IMPORTED_CONFIGURATIONS {configuration})\n");
-        block.push_str(&target_properties(&name, &properties, ""));
+
+        // MSVC: where the other C runtime's install puts the files, which a configuration using that runtime links
+        // when it is missing, so that its link fails naming them rather than mixing the runtimes
+        if model.toolchain.is_msvc_abi() {
+            let (missing, other_root) = match model.profile.debug_runtime {
+                true => (RELEASE_RUNTIME_MISSING, ""),
+                false => (DEBUG_RUNTIME_MISSING, "debug/"),
+            };
+            let elsewhere = |file: &str| format!("${{_IMPORT_PREFIX}}/{other_root}{}", file.strip_prefix("debug/").unwrap_or(file));
+            properties.push((format!("IMPORTED_LOCATION_{missing}"), elsewhere(location)));
+            if let Some(import_library) = &library.import_library {
+                properties.push((format!("IMPORTED_IMPLIB_{missing}"), elsewhere(import_library)));
+            }
+        }
+
+        // Only for a library the package still has (a debug install's file outlives a library removed since)
+        let mut block = format!("if(TARGET {name})\n  set_property(TARGET {name} APPEND PROPERTY IMPORTED_CONFIGURATIONS {configuration})\n");
+        block.push_str(&target_properties(&name, &properties, "  "));
+        block.push_str("endif()\n");
         self.locations.push(block);
         self.built_targets.push(name);
     }
 
-    /// `<project>Config.cmake`: the dependencies found, one imported target per library, then the files of each
-    /// installed configuration, from the `<project>Targets-<profile>.cmake` files beside it.
-    fn cmake_config(&self, model: &Model, project: &str) -> String {
+    /// `<project>Config.cmake`: the dependencies found, one imported target per library (with its usage in each
+    /// installed configuration, as `other_usage` gives the others'), then the files of each installed configuration,
+    /// from the `<project>Targets-<profile>.cmake` files beside it.
+    fn cmake_config(&self, model: &Model, project: &str, other_usage: &OtherUsage) -> String {
         let toolchain = &model.toolchain;
         let mut text = format!(
             "# The {project} CMake package, written by `anvil install` ({} {}); each installed configuration's files are in a {project}Targets-<profile>.cmake beside it.\n\
@@ -750,6 +1007,15 @@ impl Export {
             toolchain.family.name(),
             toolchain.version
         );
+
+        // CMake's find modules for the system dependencies
+        if !self.system_packages.is_empty() {
+            text.push_str("include(CMakeFindDependencyMacro)\n");
+            for package in &self.system_packages {
+                text.push_str(&format!("find_dependency({package})\n"));
+            }
+            text.push('\n');
+        }
 
         // Dependencies, also from the vcpkg packages the build used when the user's paths do not find them; the
         // search path is restored before a missing one ends the file
@@ -785,9 +1051,22 @@ impl Export {
 
         // The prefix: this file is in <prefix>/lib/cmake/<project>
         text.push_str("get_filename_component(_IMPORT_PREFIX \"${CMAKE_CURRENT_LIST_DIR}/../../..\" ABSOLUTE)\n\n");
-        for block in &self.blocks {
-            text.push_str(block);
-            text.push('\n');
+        let configuration = configuration_name(&model.profile.name);
+        for target in &self.targets {
+            let others = other_usage.get(&target.name).filter(|_| target.built);
+            let mut properties = Vec::new();
+            for (property, items) in &target.usage {
+                let items = match others {
+                    Some(others) => by_configuration(property, items, &configuration, others),
+                    None => items.clone(),
+                };
+                if !items.is_empty() {
+                    properties.push((property.to_string(), items.join(";")));
+                }
+            }
+            text.push_str(&target.declaration);
+            text.push_str(&target_properties(&target.name, &properties, "  "));
+            text.push_str("endif()\n\n");
         }
 
         // Each installed configuration's files
@@ -798,20 +1077,28 @@ impl Export {
         ));
 
         // MSVC: a Debug build takes the libraries built with the debug runtime, the others those built with the
-        // release runtime; a build that would mix the two (which corrupts the heap) finds no package
+        // release runtime. Mixing the two corrupts the heap, so when the install a configuration needs is missing, a
+        // single-configuration build finds no package, and a multi-configuration one (Visual Studio, whose default
+        // build is Debug) generates with a warning and fails to link that configuration, naming the missing files
         if toolchain.is_msvc_abi() && !self.built_targets.is_empty() {
             let targets = self.built_targets.join(" ");
             text.push_str(&format!(
                 r#"if(MSVC)
-  set(_{project}_debug_map ${{_{project}_debug_runtime}} NOT_INSTALLED)
-  set(_{project}_release_map ${{_{project}_release_runtime}} NOT_INSTALLED)
+  set(_{project}_debug_map ${{_{project}_debug_runtime}} {DEBUG_RUNTIME_MISSING})
+  set(_{project}_release_map ${{_{project}_release_runtime}} {RELEASE_RUNTIME_MISSING})
   set_target_properties({targets} PROPERTIES
     MAP_IMPORTED_CONFIG_DEBUG "${{_{project}_debug_map}}"
     MAP_IMPORTED_CONFIG_RELEASE "${{_{project}_release_map}}"
     MAP_IMPORTED_CONFIG_RELWITHDEBINFO "${{_{project}_release_map}}"
     MAP_IMPORTED_CONFIG_MINSIZEREL "${{_{project}_release_map}}"
   )
-  if(NOT CMAKE_CONFIGURATION_TYPES)
+  if(CMAKE_CONFIGURATION_TYPES)
+    if(NOT {project}_FIND_QUIETLY AND NOT _{project}_debug_runtime)
+      message(WARNING "${{_IMPORT_PREFIX}} holds the {project} libraries built with the release C runtime only, and this project's Debug configuration uses the debug runtime (mixing the two corrupts the heap): Debug links them from ${{_IMPORT_PREFIX}}/debug, where they are missing; install a debug build there too (anvil install -p debug), or build the other configurations")
+    elseif(NOT {project}_FIND_QUIETLY AND NOT _{project}_release_runtime)
+      message(WARNING "${{_IMPORT_PREFIX}} holds the {project} libraries built with the debug C runtime only, and this project's Release, RelWithDebInfo and MinSizeRel configurations use the release runtime (mixing the two corrupts the heap): they link them from ${{_IMPORT_PREFIX}}/bin and /lib, where they are missing; install a release build there too (anvil install), or build Debug")
+    endif()
+  else()
     string(TOUPPER "${{CMAKE_BUILD_TYPE}}" _{project}_build_type)
     if(_{project}_build_type STREQUAL "DEBUG" AND NOT _{project}_debug_runtime)
       set({project}_NOT_FOUND_MESSAGE "this Debug build uses the debug C runtime, and ${{_IMPORT_PREFIX}} holds the {project} libraries built with the release runtime only (mixing the two corrupts the heap): install a debug build there too (anvil install -p debug), or build this project in Release")
@@ -851,10 +1138,26 @@ unset(_{project}_release_runtime)
             text.push_str(block);
             text.push('\n');
         }
+        let configuration = configuration_name(&model.profile.name);
         if toolchain.is_msvc_abi() && !self.built_targets.is_empty() {
             let runtime = if model.profile.debug_runtime { "debug" } else { "release" };
-            let configuration = configuration_name(&model.profile.name);
             text.push_str(&format!("list(APPEND _{project}_{runtime}_runtime {configuration})\n"));
+        }
+
+        // The libraries' usage here, which the next install of another configuration compares with its own
+        text.push_str(&format!(
+            "\n# Each library's usage in this configuration, which `anvil install` reads back to write {project}Config.cmake:\n"
+        ));
+        for target in self.targets.iter().filter(|target| target.built) {
+            for (property, items) in &target.usage {
+                let mut line = format!("#\t{configuration}\t{}\t{property}", target.name);
+                for item in items {
+                    line.push('\t');
+                    line.push_str(item);
+                }
+                text.push_str(&line);
+                text.push('\n');
+            }
         }
 
         text
@@ -973,6 +1276,110 @@ fn target_properties(name: &str, properties: &[(String, String)], indent: &str) 
     text
 }
 
+/// The usage the other configurations' `<project>Targets-<profile>.cmake` files in `folder` record, all but `own`'s.
+fn read_other_usage(folder: &Path, project: &str, own: &str) -> OtherUsage {
+    let own = Path::new(own)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let mut files: Vec<PathBuf> = std::fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = file_name(path);
+            name.starts_with(&format!("{project}Targets-")) && name.ends_with(".cmake") && name.to_lowercase() != own
+        })
+        .collect();
+    files.sort();
+
+    let mut usage = OtherUsage::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        for record in text.lines().filter_map(|line| line.strip_prefix("#\t")) {
+            let mut fields = record.split('\t');
+            let (Some(configuration), Some(target), Some(property)) = (fields.next(), fields.next(), fields.next()) else {
+                continue;
+            };
+            let configurations = usage.entry(target.to_string()).or_default();
+            let position = match configurations.iter().position(|(name, _)| name == configuration) {
+                Some(position) => position,
+                None => {
+                    configurations.push((configuration.to_string(), HashMap::new()));
+                    configurations.len() - 1
+                }
+            };
+            configurations[position]
+                .1
+                .insert(property.to_string(), fields.map(str::to_string).collect());
+        }
+    }
+
+    usage
+}
+
+/// A library's usage property across the installed configurations: as it is when they agree (the common case), else
+/// each configuration's items under `$<$<CONFIG:...>:...>`, which holds for the configuration CMake picks of it.
+fn by_configuration(property: &str, items: &[String], configuration: &str, others: &[(String, HashMap<String, Vec<String>>)]) -> Vec<String> {
+    let mut configurations: Vec<(&str, &[String])> = vec![(configuration, items)];
+    for (other, usage) in others.iter().filter(|(other, _)| other != configuration) {
+        configurations.push((other, usage.get(property).map(Vec::as_slice).unwrap_or_default()));
+    }
+    if configurations.iter().all(|(_, other)| *other == items) {
+        return items.to_vec();
+    }
+
+    configurations.sort_by_key(|(name, _)| *name);
+    let mut combined = Vec::new();
+    for (name, items) in configurations {
+        for item in items {
+            let item = if item.contains("$<") {
+                item.clone()
+            } else {
+                item.replace('>', "$<ANGLE-R>")
+            };
+            combined.push(format!("$<$<CONFIG:{name}>:{item}>"));
+        }
+    }
+
+    combined
+}
+
+/// A built-in system dependency (`openmp = "system"`, `threads`, `opengl`) as CMake's find module and the targets a
+/// library links: OpenMP's for the library's language (both when it has no sources), Threads::Threads, OpenGL::GL.
+fn system_package(model: &Model, dependency: &Target, library: &Target) -> Option<(&'static str, Vec<String>)> {
+    if dependency.vcpkg.is_some() {
+        return None;
+    }
+
+    // What the project made of it is what the built-in one gives
+    let build = crate::vcpkg_tree::BuildContext::new(&model.toolchain, &model.profile);
+    let usage = crate::vcpkg_tree::system_dependency(&dependency.name, &build)?;
+    let libs: Vec<String> = usage.libs.iter().map(|lib| slash(lib)).collect();
+    let built_in = dependency.libs == libs
+        && usage.link_flags.iter().all(|flag| dependency.link_flags.contains(flag))
+        && usage.language_flags.iter().all(|flag| dependency.public_language_flags.contains(flag));
+    if !built_in {
+        return None;
+    }
+
+    let package = match dependency.name.as_str() {
+        "openmp" if library.sources.is_empty() => (
+            "OpenMP",
+            vec![
+                "$<TARGET_NAME_IF_EXISTS:OpenMP::OpenMP_CXX>".to_string(),
+                "$<TARGET_NAME_IF_EXISTS:OpenMP::OpenMP_C>".to_string(),
+            ],
+        ),
+        "openmp" => ("OpenMP", vec![format!("OpenMP::OpenMP_{}", link_language(library))]),
+        "threads" => ("Threads", vec!["Threads::Threads".to_string()]),
+        _ => ("OpenGL", vec!["OpenGL::GL".to_string()]),
+    };
+
+    Some(package)
+}
+
 /// A shared library's file off Windows: `libz.so`, `libz.so.1`, `libz.dylib`.
 fn is_shared_library(path: &Path) -> bool {
     let name = file_name(path);
@@ -994,6 +1401,30 @@ fn build_folders(model: &Model, package: usize) -> HashSet<String> {
         );
     }
     folders.insert(util::path_key(&model.packages[package].root.join("tests")));
+
+    folders
+}
+
+/// The folders a walk of a library's public include folder that holds the rest of the package (its root, the target's
+/// folder) leaves out: those holding other targets' sources, private include folders and the package's tests/, but not
+/// the library's own source folders, whose headers are its own (mylib/mylib.h beside mylib/mylib.cpp).
+fn skipped_folders(model: &Model, index: usize) -> HashSet<String> {
+    let library = &model.targets[index];
+    let own: HashSet<String> = library.sources.iter().filter_map(|source| source.parent()).map(util::path_key).collect();
+
+    let mut folders = HashSet::new();
+    for target in model.targets.iter().filter(|target| target.package == library.package) {
+        folders.extend(target.sources.iter().filter_map(|source| source.parent()).map(util::path_key));
+        folders.extend(
+            target
+                .private_include
+                .iter()
+                .chain(&target.system_include)
+                .map(|folder| util::path_key(folder)),
+        );
+    }
+    folders.retain(|folder| !own.contains(folder));
+    folders.insert(util::path_key(&model.packages[library.package].root.join("tests")));
 
     folders
 }
@@ -1132,10 +1563,54 @@ mod tests {
         let folder = std::env::temp_dir().join(format!("anvil-install-manifest-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
         let manifest = folder.join("install_manifest.txt");
-        std::fs::write(&manifest, "include/a.h\n../outside.txt\n/etc/passwd\n\nbin/c.exe\n").unwrap();
+        std::fs::write(
+            &manifest,
+            "include/a.h\tcore\n../outside.txt\tcore\n/etc/passwd\n\nbin/c.exe\tapp\tfound\nlib/old.lib\n",
+        )
+        .unwrap();
 
-        assert_eq!(read_manifest(&manifest), ["include/a.h", "bin/c.exe"]);
+        let entries: Vec<(String, String, bool)> = read_manifest(&manifest)
+            .into_iter()
+            .map(|entry| (entry.path, entry.owner, entry.found))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("include/a.h".to_string(), "core".to_string(), false),
+                ("bin/c.exe".to_string(), "app".to_string(), true),
+                ("lib/old.lib".to_string(), String::new(), false),
+            ]
+        );
+        assert_eq!(
+            manifest_text(&read_manifest(&manifest)),
+            "include/a.h\tcore\nbin/c.exe\tapp\tfound\nlib/old.lib\t\n"
+        );
         assert!(read_manifest(&folder.join("missing.txt")).is_empty());
         std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn usage_differing_by_configuration_is_keyed_on_it() {
+        let items = vec!["A".to_string(), "B=x>y".to_string()];
+        let same = vec![(
+            "DEBUG".to_string(),
+            HashMap::from([("INTERFACE_COMPILE_DEFINITIONS".to_string(), items.clone())]),
+        )];
+        assert_eq!(by_configuration("INTERFACE_COMPILE_DEFINITIONS", &items, "RELEASE", &same), items);
+
+        let other = vec![(
+            "DEBUG".to_string(),
+            HashMap::from([("INTERFACE_COMPILE_DEFINITIONS".to_string(), vec!["A".to_string(), "D".to_string()])]),
+        )];
+        assert_eq!(
+            by_configuration("INTERFACE_COMPILE_DEFINITIONS", &items, "RELEASE", &other),
+            [
+                "$<$<CONFIG:DEBUG>:A>",
+                "$<$<CONFIG:DEBUG>:D>",
+                "$<$<CONFIG:RELEASE>:A>",
+                "$<$<CONFIG:RELEASE>:B=x$<ANGLE-R>y>"
+            ]
+        );
+        assert_eq!(by_configuration("INTERFACE_LINK_OPTIONS", &[], "RELEASE", &other), Vec::<String>::new());
     }
 }

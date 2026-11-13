@@ -2267,3 +2267,346 @@ fn convert_checks_gcc() {
     require!("gcc");
     convert_checks("gcc", "convert_checks_gcc");
 }
+
+// 36. anvil install never deletes or overwrites what it did not write, and a default install suits CMake's generators:
+//     headers beside a library's sources install; installing one target keeps the others' files; files another project
+//     or the user put in the prefix are never removed; a prefix holding the project is refused; a library removed
+//     since a debug install, a definition only one configuration has, and a missing configuration with a
+//     multi-configuration generator; OpenMP through CMake's find module
+
+const TWO_LIBRARIES: &str = "[project]\nname = \"pair\"\n\n\
+     [target.core]\nkind = \"static\"\nsources = [\"core/src/*.cpp\"]\npublic.include = [\"core/include\"]\n\n\
+     [target.extra]\nkind = \"static\"\nsources = [\"extra/src/*.cpp\"]\npublic.include = [\"extra/include\"]\n\n\
+     [target.app]\nkind = \"exe\"\nsources = [\"app/main.cpp\"]\ndeps = [\"core\", \"extra\"]\n";
+
+/// TWO_LIBRARIES with `extra` removed.
+fn without_extra() -> String {
+    let (start, rest) = TWO_LIBRARIES.split_once("[target.extra]").unwrap();
+    let (_, end) = rest.split_once("[target.app]").unwrap();
+    format!("{start}[target.app]{}", end.replace("\"core\", \"extra\"", "\"core\""))
+}
+
+/// A project of two static libraries and a program using both.
+fn two_libraries(test: &str) -> Project {
+    let project = Project::empty(test);
+    project.write("anvil.toml", TWO_LIBRARIES);
+    project.write("core/include/core/core.h", "int core_value();\n");
+    project.write("core/src/core.cpp", "#include <core/core.h>\nint core_value() { return 1; }\n");
+    project.write("extra/include/extra/extra.h", "int extra_value();\n");
+    project.write("extra/src/extra.cpp", "#include <extra/extra.h>\nint extra_value() { return 2; }\n");
+    project.write(
+        "app/main.cpp",
+        "#include <core/core.h>\n#include <extra/extra.h>\nint main() { return core_value() + extra_value() - 3; }\n",
+    );
+    project
+}
+
+#[test]
+fn install_takes_headers_beside_the_library_sources() {
+    require!("default");
+    let project = Project::empty("install_beside_sources");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"hdr\"\n\n[target.mylib]\nkind = \"static\"\nsources = [\"mylib/*.cpp\"]\npublic.include = [\".\"]\n\n\
+         [target.app]\nkind = \"exe\"\nsources = [\"app/main.cpp\"]\ndeps = [\"mylib\"]\n",
+    );
+    project.write("mylib/mylib.h", "#pragma once\nint mylib();\n");
+    project.write("mylib/mylib.cpp", "#include \"mylib.h\"\nint mylib() { return 0; }\n");
+    project.write("mylib/detail/d.h", "#pragma once\n");
+    project.write("app/main.cpp", "#include \"mylib/mylib.h\"\nint main() { return mylib(); }\n");
+    project.write("app/app.h", "#pragma once\n");
+
+    // The library's own source folder gives its headers; the program's folder gives nothing
+    project.anvil(&["install"]).success().lacks("warning");
+    assert_eq!(files_under(&project.path("out/install/include")), ["mylib/detail/d.h", "mylib/mylib.h"]);
+    let config = project.read("out/install/lib/cmake/hdr/hdrConfig.cmake");
+    assert!(config.contains("INTERFACE_INCLUDE_DIRECTORIES \"${_IMPORT_PREFIX}/include\""), "{config}");
+
+    // A public include folder without headers is a warning, not a silently missing include folder
+    project.edit("anvil.toml", "public.include = [\".\"]", "public.include = [\"app/none\"]");
+    project.write("app/none/notes.cpp", "\n");
+    project
+        .anvil(&["install", "mylib"])
+        .success()
+        .contains("warning: target `mylib`: its public include folders (app/none) hold no headers to install");
+}
+
+#[test]
+fn install_of_one_target_keeps_the_others_files() {
+    require!("default");
+    let project = two_libraries("install_one_target");
+    let exe = std::env::consts::EXE_SUFFIX;
+
+    project.anvil(&["install", "core"]).success();
+    project.anvil(&["install", "app"]).success().lacks("removed");
+    let files = files_under(&project.path("out/install"));
+    for expected in [
+        format!("bin/app{exe}"),
+        "include/core/core.h".into(),
+        "lib/cmake/pair/pairConfig.cmake".into(),
+    ] {
+        assert!(files.contains(&expected), "no {expected} in {files:?}");
+    }
+
+    // The manifest says whose each file is; what core no longer installs goes, app's program stays
+    let manifest = project.read("out/install/share/pair/install_manifest.txt");
+    assert!(manifest.contains("include/core/core.h\tcore\n"), "{manifest}");
+    assert!(manifest.contains(&format!("bin/app{exe}\tapp\n")), "{manifest}");
+    assert!(manifest.contains("lib/cmake/pair/pairConfig.cmake\t(package)\n"), "{manifest}");
+    project.write("core/include/core/old.h", "\n");
+    project.anvil(&["install", "core"]).success();
+    std::fs::remove_file(project.path("core/include/core/old.h")).unwrap();
+    project.anvil(&["install", "core"]).success().contains("1 removed");
+    assert!(!project.path("out/install/include/core/old.h").exists());
+    assert!(project.path(&format!("out/install/bin/app{exe}")).is_file());
+
+    // A target the project no longer has is cleaned up by the next install
+    project.anvil(&["install"]).success();
+    project.write("anvil.toml", &without_extra());
+    project.edit("app/main.cpp", "#include <extra/extra.h>\n", "");
+    project.edit("app/main.cpp", "extra_value() - 3", "1 - 3");
+    project.anvil(&["install"]).success();
+    assert!(!project.path("out/install/include/extra/extra.h").exists());
+}
+
+#[test]
+fn install_never_removes_files_it_did_not_write() {
+    require!("default");
+    let project = two_libraries("install_foreign_files");
+
+    // The user's own file in the prefix: overwritten with a warning, never claimed
+    project.write("prefix/include/extra/extra.h", "// mine\n");
+    project
+        .anvil(&["install", "--prefix", "prefix"])
+        .success()
+        .contains("warning: target `extra` overwrites")
+        .contains("which was there before (this project did not install it)");
+    assert_eq!(project.read("prefix/include/extra/extra.h"), "int extra_value();\n");
+    let manifest = project.read("prefix/share/pair/install_manifest.txt");
+    assert!(manifest.contains("include/extra/extra.h\textra\tfound\n"), "{manifest}");
+
+    // Another project in the prefix installs core's header too, and the same file a second time is quiet
+    let other = Project::empty("install_foreign_files_other");
+    other.write(
+        "anvil.toml",
+        "[project]\nname = \"other\"\n\n[target.ol]\nkind = \"static\"\npublic.include = [\"include\"]\n",
+    );
+    other.write("src/ol.cpp", "int ol() { return 0; }\n");
+    other.write("include/core/core.h", "int core_value();\n");
+    let prefix = project.path("prefix").to_string_lossy().replace('\\', "/");
+    other.anvil(&["install", "--prefix", &prefix]).success().lacks("warning");
+
+    // This project stops installing both headers: neither goes
+    project.write("core/include/core/core.h", "\n");
+    std::fs::rename(project.path("core/include/core/core.h"), project.path("core/include/core/core2.h")).unwrap();
+    std::fs::rename(project.path("extra/include/extra/extra.h"), project.path("extra/include/extra/extra2.h")).unwrap();
+    project.edit("core/src/core.cpp", "#include <core/core.h>\n", "");
+    project.edit("extra/src/extra.cpp", "#include <extra/extra.h>\n", "");
+    project.edit(
+        "app/main.cpp",
+        "#include <core/core.h>\n#include <extra/extra.h>\n",
+        "int core_value();\nint extra_value();\n",
+    );
+    project.anvil(&["install", "--prefix", "prefix"]).success();
+    assert!(
+        project.path("prefix/include/core/core.h").is_file(),
+        "another project's header was removed"
+    );
+    assert!(project.path("prefix/include/extra/extra.h").is_file(), "the user's header was removed");
+    assert!(project.path("prefix/include/core/core2.h").is_file());
+}
+
+#[test]
+fn install_refuses_a_prefix_holding_the_project() {
+    require!("default");
+    let project = two_libraries("install_prefix_project");
+    let header = "core/include/core/core.h";
+
+    for prefix in [".", ".."] {
+        project
+            .anvil(&["install", "--prefix", prefix])
+            .code(1)
+            .contains("the prefix holds the project")
+            .contains("choose a folder outside it");
+    }
+    assert!(!project.path("share").exists() && !project.path("bin").exists());
+    assert_eq!(project.read(header), "int core_value();\n");
+
+    // A workspace member's install into the workspace's folder is refused too
+    let workspace = Project::empty("install_prefix_workspace");
+    workspace.write("anvil.toml", "[workspace]\nmembers = [\"core\"]\n");
+    workspace.write("core/anvil.toml", "[project]\nname = \"core\"\n\n[target.core]\nkind = \"lib\"\n");
+    workspace.write("core/src/core.cpp", "int core() { return 1; }\n");
+    workspace
+        .anvil_in("core", &["install", "--prefix", ".."])
+        .code(1)
+        .contains("the prefix holds the");
+}
+
+/// Runs CMake in Visual Studio's x64 developer environment: whether it succeeded, and what it printed.
+#[cfg(windows)]
+fn cmake_msvc(environment: &[(String, String)], args: &[&str]) -> (bool, String) {
+    let output = Command::new("cmake")
+        .args(args)
+        .envs(environment.iter().cloned())
+        .output()
+        .expect("running cmake");
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    (output.status.success(), text)
+}
+
+const PAIR_CONSUMER: &str = "cmake_minimum_required(VERSION 3.20)\nproject(consumer CXX)\n\
+     find_package(pair CONFIG REQUIRED)\nadd_executable(app main.cpp)\ntarget_link_libraries(app PRIVATE pair::core)\n";
+
+const PAIR_CONSUMER_MAIN: &str = "#include <core/core.h>\n#include <cstdio>\nint main() {\n\
+     #ifdef CORE_DEBUG\n    std::printf(\"debug %d\\n\", core_value());\n#else\n    std::printf(\"release %d\\n\", core_value());\n#endif\n}\n";
+
+#[test]
+#[cfg(windows)]
+fn cmake_generators_use_the_installed_configurations_msvc() {
+    require!("msvc");
+    if !on_path("cmake") || !on_path("ninja") {
+        eprintln!("skipped: cmake and ninja must be on PATH");
+        return;
+    }
+
+    let project = two_libraries("install_configurations");
+    project.write(
+        "anvil.toml",
+        &format!("{TWO_LIBRARIES}\n[target.core.when.debug]\npublic.defines = [\"CORE_DEBUG\"]\n"),
+    );
+    project.write("consumer/CMakeLists.txt", PAIR_CONSUMER);
+    project.write("consumer/main.cpp", PAIR_CONSUMER_MAIN);
+    let environment = msvc_environment();
+    let prefix = project.path("out/prefix");
+    let consumer = project.path("consumer").to_string_lossy().into_owned();
+    let configure = |build: &str, generator: &[&str]| {
+        let build = project.path(build).to_string_lossy().into_owned();
+        let prefix_path = format!("-DCMAKE_PREFIX_PATH={}", prefix.to_string_lossy().replace('\\', "/"));
+        let mut args = vec![
+            "-S",
+            consumer.as_str(),
+            "-B",
+            build.as_str(),
+            "-DCMAKE_CXX_COMPILER=cl",
+            prefix_path.as_str(),
+        ];
+        args.extend(generator);
+        cmake_msvc(&environment, &args)
+    };
+    let build = |build: &str, configuration: &str| {
+        cmake_msvc(
+            &environment,
+            &["--build", &project.path(build).to_string_lossy(), "--config", configuration],
+        )
+    };
+
+    // Release only: a multi-configuration generator generates, with a warning; Release builds, Debug fails to link,
+    // naming the debug install's missing file rather than mixing the C runtimes
+    project.anvil(&["install", "--toolchain", "msvc", "--prefix", "out/prefix"]).success();
+    let (configured, output) = configure("multi", &["-G", "Ninja Multi-Config"]);
+    assert!(configured, "{output}");
+    assert!(output.contains("release C runtime only"), "{output}");
+    let (built, output) = build("multi", "Release");
+    assert!(built, "{output}");
+    assert_eq!(run_installed(&prefix, &project.path("multi/Release/app.exe")), "release 1");
+    let (built, output) = build("multi", "Debug");
+    assert!(!built, "Debug linked the release install:\n{output}");
+    assert!(output.replace('\\', "/").contains("out/prefix/debug/lib/core.lib"), "{output}");
+
+    // A debug install with a library removed since: the package still loads, each configuration links its own
+    // install, and the definition only the debug profile has reaches Debug alone
+    project.anvil(&["install", "--toolchain", "msvc", "--prefix", "out/prefix"]).success();
+    project
+        .anvil(&["install", "--toolchain", "msvc", "-p", "debug", "--prefix", "out/prefix"])
+        .success();
+    project.write(
+        "anvil.toml",
+        &format!("{}\n[target.core.when.debug]\npublic.defines = [\"CORE_DEBUG\"]\n", without_extra()),
+    );
+    project.write("app/main.cpp", "#include <core/core.h>\nint main() { return core_value() - 1; }\n");
+    project.anvil(&["install", "--toolchain", "msvc", "--prefix", "out/prefix"]).success();
+    assert!(project.read("out/prefix/lib/cmake/pair/pairTargets-debug.cmake").contains("pair::extra"));
+    let config = project.read("out/prefix/lib/cmake/pair/pairConfig.cmake");
+    assert!(config.contains("$<$<CONFIG:DEBUG>:CORE_DEBUG>"), "{config}");
+
+    let _ = std::fs::remove_dir_all(project.path("multi"));
+    let (configured, output) = configure("multi", &["-G", "Ninja Multi-Config"]);
+    assert!(configured && !output.contains("runtime only"), "{output}");
+    for (configuration, expected) in [("Debug", "debug 1"), ("Release", "release 1")] {
+        let (built, output) = build("multi", configuration);
+        assert!(built, "{output}");
+        let program = project.path(&format!("multi/{configuration}/app.exe"));
+        assert_eq!(run_installed(&prefix, &program), expected);
+
+        let single = format!("single-{configuration}");
+        let (configured, output) = configure(&single, &["-G", "Ninja", &format!("-DCMAKE_BUILD_TYPE={configuration}")]);
+        assert!(configured, "{output}");
+        let (built, output) = build(&single, configuration);
+        assert!(built, "{output}");
+        assert_eq!(run_installed(&prefix, &project.path(&format!("{single}/app.exe"))), expected);
+    }
+}
+
+#[test]
+fn cmake_project_uses_an_installed_openmp_library_gcc() {
+    require!("gcc");
+    if !on_path("cmake") || !on_path("ninja") {
+        eprintln!("skipped: cmake and ninja must be on PATH");
+        return;
+    }
+
+    let project = Project::empty("install_openmp");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"omplib\"\n\n[deps]\nopenmp = \"system\"\n\n[target.omplib]\nkind = \"static\"\npublic.deps = [\"openmp\"]\n",
+    );
+    project.write("include/omplib/l.h", "int par();\n");
+    project.write(
+        "src/l.cpp",
+        "#include <omplib/l.h>\nint par() {\n    int n = 0;\n#pragma omp parallel reduction(+ : n)\n    n += 1;\n    return n;\n}\n",
+    );
+    project.anvil(&["install", "--toolchain", "gcc", "--prefix", "out/prefix"]).success();
+
+    // CMake's find module, not raw flags; pkg-config gets the flag
+    let config = project.read("out/prefix/lib/cmake/omplib/omplibConfig.cmake");
+    assert!(config.contains("find_dependency(OpenMP)"), "{config}");
+    assert!(config.contains("INTERFACE_LINK_LIBRARIES \"OpenMP::OpenMP_CXX\""), "{config}");
+    let pkg_config = project.read("out/prefix/lib/pkgconfig/omplib-omplib.pc");
+    assert!(pkg_config.contains("Cflags: -I${includedir} -fopenmp"), "{pkg_config}");
+    assert!(pkg_config.contains(" -fopenmp\n"), "{pkg_config}");
+
+    project.write(
+        "consumer/CMakeLists.txt",
+        "cmake_minimum_required(VERSION 3.20)\nproject(consumer CXX)\nfind_package(omplib CONFIG REQUIRED)\n\
+         add_executable(app main.cpp)\ntarget_link_libraries(app PRIVATE omplib::omplib)\n",
+    );
+    project.write(
+        "consumer/main.cpp",
+        "#include <omplib/l.h>\n#include <omp.h>\n#include <cstdio>\nint main() { std::printf(\"%d\\n\", par() == omp_get_max_threads()); }\n",
+    );
+    let prefix = project.path("out/prefix");
+    let build = project.path("consumer-build");
+    for args in [
+        vec![
+            "-S".to_string(),
+            project.path("consumer").to_string_lossy().into_owned(),
+            "-B".to_string(),
+            build.to_string_lossy().into_owned(),
+            "-G".to_string(),
+            "Ninja".to_string(),
+            "-DCMAKE_CXX_COMPILER=g++".to_string(),
+            format!("-DCMAKE_PREFIX_PATH={}", prefix.to_string_lossy().replace('\\', "/")),
+        ],
+        vec!["--build".to_string(), build.to_string_lossy().into_owned()],
+    ] {
+        let output = Command::new("cmake").args(&args).output().expect("running cmake");
+        assert!(
+            output.status.success(),
+            "cmake {args:?} failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(run_installed(&prefix, &build.join(format!("app{}", std::env::consts::EXE_SUFFIX))), "1");
+}
