@@ -487,11 +487,24 @@ fn build_roots(model: Model, build: &BuildArgs, roots: &[usize]) -> Result<(Mode
     let summary = exec::execute(&plan, &model.toolchain, &model.out_dir.join(".anvil"), &options)?;
 
     if summary.failed > 0 {
+        if build.timings {
+            print_timings(&model, &summary);
+        }
         bail!("build failed ({} of {} steps)", summary.failed, summary.failed + summary.ran);
     }
     print_summary(&model, &summary);
+    if build.timings {
+        print_timings(&model, &summary);
+    }
 
     Ok((model, plan))
+}
+
+/// --timings: the slowest actions and the time per kind, and where the trace is.
+fn print_timings(model: &Model, summary: &Summary) {
+    let trace = model.out_dir.join(".anvil").join(crate::timings::TRACE_FILE);
+    let here = std::env::current_dir().unwrap_or_default();
+    crate::timings::print_report(&summary.timings, &util::rel(&trace, &here));
 }
 
 fn print_summary(model: &Model, summary: &Summary) {

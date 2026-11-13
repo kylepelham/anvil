@@ -700,4 +700,91 @@ fn missing_compiler_cache_is_an_error() {
     command.env("ANVIL_LAUNCHER", "");
     let output = command.output().expect("starting anvil");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+// 18. A build that runs something writes a Chrome trace of it, failed actions too; --timings sums it up
+
+/// The trace's complete events ("ph": "X"), from the file `--timings` names in its "Trace: <path>" line.
+#[track_caller]
+fn trace_events(project: &Project, run: &Run) -> Vec<serde_json::Value> {
+    let output = run.output();
+    let path = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Trace: "))
+        .unwrap_or_else(|| panic!("`{}` named no trace\n{output}", run.command));
+    let text = project.read(path.trim());
+
+    let trace: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|error| panic!("{path} is not JSON: {error}\n{text}"));
+    let events = trace["traceEvents"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{path} has no traceEvents\n{text}"));
+    events.iter().filter(|event| event["ph"] == "X").cloned().collect()
+}
+
+fn build_trace(toolchain: Option<&str>, test: &str) {
+    let project = Project::fixture("headers", test);
+
+    // Every action is one event with its description, kind and lane, and the report lists them
+    let first = project.anvil(&with_toolchain(toolchain, &["run", "--timings"]));
+    first
+        .success()
+        .contains("Slowest actions (4 of 4):")
+        .contains("Per kind: ")
+        .contains("compile ")
+        .contains(" (3)");
+    assert_eq!(program_output(&first), "4");
+
+    let events = trace_events(&project, &first);
+    let mut compiled: Vec<&str> = events
+        .iter()
+        .filter(|event| event["cat"] == "compile")
+        .map(|event| event["name"].as_str().unwrap())
+        .collect();
+    compiled.sort();
+    assert_eq!(
+        compiled,
+        ["Compiling src/main.c", "Compiling src/other.c", "Compiling src/third.c"],
+        "{events:?}"
+    );
+    assert_eq!(events.iter().filter(|event| event["cat"] == "link").count(), 1, "{events:?}");
+    for event in &events {
+        assert!(event["tid"].as_u64().is_some_and(|lane| lane >= 1), "{event}");
+        assert!(event["ts"].is_u64() && event["dur"].is_u64(), "{event}");
+    }
+
+    // A build with nothing to do leaves the trace alone and reports nothing
+    let trace_file = first
+        .output()
+        .lines()
+        .find_map(|line| line.strip_prefix("Trace: "))
+        .unwrap()
+        .trim()
+        .to_string();
+    let trace = project.read(&trace_file);
+    project
+        .anvil(&with_toolchain(toolchain, &["build", "--timings"]))
+        .success()
+        .up_to_date()
+        .lacks("Slowest actions");
+    assert_eq!(project.read(&trace_file), trace);
+
+    // A failed build still writes what ran, the failure marked
+    project.write("src/other.c", "int other(void) { return B_VALUE }\n");
+    let failed = project.anvil(&with_toolchain(toolchain, &["build", "--timings"]));
+    failed.code(1).contains("(failed)");
+    let events = trace_events(&project, &failed);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["name"], "Compiling src/other.c");
+    assert_eq!(events[0]["args"]["failed"], true);
+}
+
+#[test]
+fn build_writes_trace_and_timings() {
+    require!("default");
+    build_trace(None, "build_trace");
+}
+
+#[test]
+fn build_writes_trace_and_timings_gcc() {
+    require!("gcc");
+    build_trace(Some("gcc"), "build_trace_gcc");
 }
