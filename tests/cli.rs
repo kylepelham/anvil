@@ -519,6 +519,70 @@ int main(void) {
     }
 }
 
+// 14d. Converted checks, packages and standards are as CMake has them for each compiler: Clang's warnings not GCC's,
+//      flags nobody takes off, a check's main() under a platform test, an optional port off, GNU standards; a program
+//      named like a built-in dependency keeps its file name
+
+#[test]
+fn convert_checks_packages_and_names_as_cmake() {
+    require!("msvc", "gcc");
+    let project = Project::empty("convert_as_cmake");
+    let cmake = r##"cmake_minimum_required(VERSION 3.20)
+project(as_cmake C)
+include(CheckCCompilerFlag)
+include(CheckCSourceCompiles)
+set(CMAKE_C_STANDARD 11)
+find_package(Threads REQUIRED)
+find_package(ZLIB)
+check_c_compiler_flag(-Wcomma HAVE_WCOMMA)
+check_c_compiler_flag(-no-such-thing HAVE_NO_SUCH)
+check_c_source_compiles("#if defined(__EMSCRIPTEN__)\nint main(void) { return 0; }\n#endif" IS_EMSCRIPTEN)
+add_executable(threads main.c)
+target_link_libraries(threads Threads::Threads)
+if(HAVE_WCOMMA)
+  target_compile_options(threads PRIVATE -Wcomma)
+endif()
+if(HAVE_NO_SUCH)
+  target_compile_definitions(threads PRIVATE NO_SUCH)
+endif()
+if(IS_EMSCRIPTEN)
+  target_compile_definitions(threads PRIVATE EMSCRIPTEN)
+endif()
+if(ZLIB_FOUND)
+  target_compile_definitions(threads PRIVATE HAVE_ZLIB)
+endif()
+"##;
+    let main = r#"#include <stdio.h>
+int main(void) {
+#if defined(NO_SUCH) || defined(EMSCRIPTEN) || defined(HAVE_ZLIB)
+    puts("wrong");
+#else
+    puts("as cmake");
+#endif
+    return 0;
+}
+"#;
+    project.write("CMakeLists.txt", cmake);
+    project.write("main.c", main);
+    project.anvil(&["convert"]).success().contains("ZLIB_FOUND");
+    let toml = project.read("anvil.toml");
+    assert!(toml.contains("[target.threads-exe]\nkind = \"exe\"\noutput-name = \"threads\""), "{toml}");
+    assert!(toml.contains("threads = \"system\"") && toml.contains("c-std = \"gnu11\""), "{toml}");
+    assert!(toml.contains("ZLIB_FOUND = { default = false"), "{toml}");
+
+    for toolchain in ["msvc", "gcc"] {
+        let run = project.anvil(&["run", "--toolchain", toolchain]);
+        run.success();
+        assert_eq!(program_output(&run), "as cmake", "{toolchain}");
+    }
+    let program = if cfg!(windows) {
+        "out/debug-gcc/threads.exe"
+    } else {
+        "out/debug-gcc/threads"
+    };
+    assert!(project.path(program).is_file());
+}
+
 // 15. A git dependency is pinned in anvil.lock; under --locked a changed tag is an error
 
 fn git(folder: &Path, args: &[&str]) -> String {

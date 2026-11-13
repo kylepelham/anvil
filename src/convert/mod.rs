@@ -355,6 +355,65 @@ target_link_libraries(app PRIVATE OpenMP::OpenMP_CXX Threads::Threads ${OPENGL_L
     }
 
     #[test]
+    fn optional_ports_are_options_off_by_default() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(optional C)
+find_package(ZLIB)
+find_package(Threads)
+add_executable(app main.c)
+target_link_libraries(app Threads::Threads)
+if(ZLIB_FOUND)
+  target_compile_definitions(app PRIVATE HAVE_ZLIB)
+  target_link_libraries(app ZLIB::ZLIB)
+endif()
+"#;
+        let conversion = convert_files("optionalport", &[("CMakeLists.txt", cmake), ("main.c", "int main() {}\n")]);
+        let toml = conversion.toml;
+
+        assert!(toml.contains("ZLIB_FOUND = { default = false"), "{toml}");
+        assert!(toml.contains(r#"zlib = { vcpkg = "zlib", if = "ZLIB_FOUND" }"#), "{toml}");
+        assert!(
+            toml.contains("[target.app.when.ZLIB_FOUND]\ndefines = [\"HAVE_ZLIB\"]\ndeps = [\"zlib\"]"),
+            "{toml}"
+        );
+        assert!(toml.contains("threads = \"system\"") && !toml.contains("Threads_FOUND"), "{toml}");
+        assert!(
+            !conversion.warnings.iter().any(|warning| warning.contains("control nothing")),
+            "{:?}",
+            conversion.warnings
+        );
+    }
+
+    #[test]
+    fn a_target_named_like_a_dependency_is_renamed() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(glfw C)
+find_package(Threads REQUIRED)
+add_library(lib lib.c)
+target_link_libraries(lib PUBLIC Threads::Threads)
+add_executable(threads main.c)
+target_link_libraries(threads lib Threads::Threads)
+add_custom_target(run_threads COMMAND $<TARGET_FILE:threads>)
+add_dependencies(run_threads threads)
+"#;
+        let files = [("CMakeLists.txt", cmake), ("main.c", "int main() {}\n"), ("lib.c", "int f;\n")];
+        let conversion = convert_files("dependencyname", &files);
+        let toml = conversion.toml;
+
+        assert!(toml.contains("threads = \"system\""), "{toml}");
+        assert!(toml.contains("[target.threads-exe]\nkind = \"exe\"\noutput-name = \"threads\""), "{toml}");
+        assert!(toml.contains(r#"deps = ["lib", "threads"]"#), "{toml}");
+        assert!(!toml.contains("[target.threads]") && !toml.contains('\u{4}'), "{toml}");
+        assert!(
+            conversion.warnings.iter().any(|warning| warning.contains("`threads` is `threads-exe`")),
+            "{:?}",
+            conversion.warnings
+        );
+    }
+
+    #[test]
     fn configure_time_values_are_not_frozen() {
         let cmake = r#"
 cmake_minimum_required(VERSION 3.20)

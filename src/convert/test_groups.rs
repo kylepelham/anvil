@@ -359,16 +359,16 @@ impl<'a> Builder<'a> {
     fn unify_field(&mut self, key: &str, fields: &[Field]) -> Option<Field> {
         match &fields[0] {
             Field::List(_) if key == "command" => {
-                let lists: Vec<Vec<String>> = fields.iter().map(|field| list_of(field)).collect();
+                let lists: Vec<Vec<String>> = fields.iter().map(list_of).collect();
                 Some(Field::List(self.unify_list(&lists, "args", "arg")))
             }
             // Expected output that differs in a few lines, or in the test's name
             Field::List(_) if key == "expect" || key == "reject" => {
-                let lists: Vec<Vec<String>> = fields.iter().map(|field| list_of(field)).collect();
+                let lists: Vec<Vec<String>> = fields.iter().map(list_of).collect();
                 Some(Field::List(self.unify_list(&lists, key, key)))
             }
             Field::Text(_) if key == "workdir" => {
-                let texts: Vec<String> = fields.iter().map(|field| text_of(field)).collect();
+                let texts: Vec<String> = fields.iter().map(text_of).collect();
                 Some(Field::Text(self.unify_text(&texts, Some("dir"))))
             }
             Field::Env(first) => {

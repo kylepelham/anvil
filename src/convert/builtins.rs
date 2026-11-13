@@ -290,6 +290,18 @@ pub struct BuiltinState {
     pub vcpkg: Option<Option<crate::vcpkg::Instance>>,
     /// Folders find_program() searches besides PATH (the MSVC tools'), found when a program is first not on PATH.
     pub tool_folders: Option<Vec<PathBuf>>,
+    /// The `<Package>_FOUND` options optional find_package()s of vcpkg ports became.
+    pub package_options: Vec<String>,
+}
+
+/// Where an optional find_package() finds its package.
+enum PackageSource {
+    /// Anvil or the project has it: a system package, one in vcpkg.json, one fetched.
+    Project,
+    /// A vcpkg port Anvil adds where the package's option is on.
+    Port(String),
+    /// Nowhere, and why.
+    Absent(String),
 }
 
 /// A type's size by platform: `otherwise` unless one of the `cases` conditions holds (the first that does). An empty
@@ -301,6 +313,9 @@ pub struct TypeSize {
     pub cases: Vec<(String, String)>,
     pub otherwise: String,
 }
+
+/// Reads a list (list(GET), list(SUBLIST), ...): the variable it sets and its value.
+type ListRead<'a> = dyn Fn(&[String]) -> Option<(String, String)> + 'a;
 
 impl Interpreter {
     /// Runs one command: a user function, a built-in, or (when unknown) records it.
@@ -728,7 +743,7 @@ impl Interpreter {
 
     /// The options whose values change what `read` gives for a list with conditional items, or None when they change
     /// nothing.
-    fn options_changing(&self, items: &[String], read: &dyn Fn(&[String]) -> Option<(String, String)>) -> Option<String> {
+    fn options_changing(&self, items: &[String], read: &ListRead<'_>) -> Option<String> {
         let mut names: Vec<String> = Vec::new();
         for item in items {
             let Some((condition, _)) = model::split_conditional_item(item) else {
@@ -824,8 +839,8 @@ impl Interpreter {
                 Some((condition, text)) => (Some(condition), text.to_string()),
                 None => (None, item.clone()),
             };
-            let chosen = selected.as_ref().map_or(true, |indexes| indexes.contains(&index))
-                && selector_regex.as_ref().map_or(true, |pattern| pattern.is_match(&text));
+            let chosen = selected.as_ref().is_none_or(|indexes| indexes.contains(&index))
+                && selector_regex.as_ref().is_none_or(|pattern| pattern.is_match(&text));
             if !chosen {
                 continue;
             }
@@ -1229,7 +1244,7 @@ impl Interpreter {
                     .and_then(|pair| self.compile_regex(command, &pair[1]));
                 let lines: Vec<String> = text
                     .lines()
-                    .filter(|line| filter.as_ref().map_or(true, |pattern| pattern.is_match(line)))
+                    .filter(|line| filter.as_ref().is_none_or(|pattern| pattern.is_match(line)))
                     .map(|line| line.replace(';', "\\;"))
                     .collect();
                 self.set_variable(output, &lines.join(";"));
@@ -1283,7 +1298,7 @@ impl Interpreter {
                     .value("CONTENT")
                     .map(in_profile)
                     .filter(|content| !content.contains("$<") && !output.contains("$<"));
-                let known = keywords.value("INPUT").is_none() && keywords.value("CONDITION").map_or(true, |condition| condition == "1");
+                let known = keywords.value("INPUT").is_none() && keywords.value("CONDITION").is_none_or(|condition| condition == "1");
                 let path = self.resolve_output(&output);
                 match content.filter(|_| known) {
                     Some(content) if operation == "CONFIGURE" => {
@@ -1755,22 +1770,57 @@ impl Interpreter {
     fn command_find_package(&mut self, command: &Command, args: &[String]) {
         let Some(name) = args.first() else { return };
         let required = args.iter().any(|word| word == "REQUIRED");
-        let absent_because = if required { None } else { self.package_absent_because(name) };
-        let found = absent_because.is_none();
+        let source = if required {
+            PackageSource::Project
+        } else {
+            self.optional_package_source(name)
+        };
 
-        let found_value = if found { "ON" } else { "OFF" };
-        self.set_variable(&format!("{name}_FOUND"), found_value);
-        self.set_variable(&format!("{}_FOUND", name.to_uppercase()), found_value);
-        if let Some(reason) = absent_because {
-            let when = self
-                .current_condition()
-                .map(|condition| format!(" (when `{condition}`)"))
-                .unwrap_or_default();
-            self.warn(
-                command,
-                &format!("find_package({name}){when} is optional and {reason}, so it is taken as not found: what {name}_FOUND turns on is left out"),
-            );
-            return;
+        let when = self
+            .current_condition()
+            .map(|condition| format!(" (when `{condition}`)"))
+            .unwrap_or_default();
+        match source {
+            PackageSource::Absent(reason) => {
+                self.set_variable(&format!("{name}_FOUND"), "OFF");
+                self.set_variable(&format!("{}_FOUND", name.to_uppercase()), "OFF");
+                self.warn(
+                    command,
+                    &format!(
+                        "find_package({name}){when} is optional and {reason}, so it is taken as not found: what {name}_FOUND turns on is left out"
+                    ),
+                );
+                return;
+            }
+
+            // Found where the user turns it on, as CMake finds it only where it is installed
+            PackageSource::Port(port) => {
+                let option = format!("{name}_FOUND");
+                let branch = self.current_condition();
+                if self.options.contains_key(&option) {
+                    self.widen_option_condition(&option, branch);
+                } else {
+                    let description = format!("Build with the optional package {name} (vcpkg port `{port}`)");
+                    self.options.insert(option.clone(), (false, description));
+                    self.cache.insert(option.clone(), "OFF".into());
+                    if let Some(branch) = branch {
+                        self.builtin.option_conditions.insert(option.clone(), branch);
+                    }
+                    self.builtin.package_options.push(option.clone());
+                    self.warn(
+                        command,
+                        &format!("find_package({name}){when} is optional: the option {option} stands for it, off as where {name} is not installed; `-o {option}=true` builds with the port `{port}`"),
+                    );
+                }
+                let upper = format!("{}_FOUND", name.to_uppercase());
+                if upper != option {
+                    self.set_variable(&upper, &model::option_marker(&option));
+                }
+            }
+            PackageSource::Project => {
+                self.set_variable(&format!("{name}_FOUND"), "ON");
+                self.set_variable(&format!("{}_FOUND", name.to_uppercase()), "ON");
+            }
         }
         if !self.packages.contains(name) {
             self.packages.push(name.clone());
@@ -1818,9 +1868,9 @@ impl Interpreter {
         }
     }
 
-    /// Why an optional package is not one Anvil has or adds (a system package, a port it knows, one in the project's
-    /// vcpkg.json, one fetched with FetchContent or CPM, a port in the vcpkg checkout), or None when it is.
-    fn package_absent_because(&mut self, name: &str) -> Option<String> {
+    /// Where an optional package comes from: Anvil or the project (a system package, a port it knows, one in the
+    /// project's vcpkg.json, one fetched with FetchContent or CPM), a port in the vcpkg checkout, or nowhere (and why).
+    fn optional_package_source(&mut self, name: &str) -> PackageSource {
         let normalized = |text: &str| text.to_lowercase().replace(['-', '_'], "");
         let wanted = normalized(name);
 
@@ -1828,12 +1878,15 @@ impl Interpreter {
             self.builtin.manifest_ports = Some(manifest_ports(&self.root));
         }
         let in_manifest = self.builtin.manifest_ports.iter().flatten().any(|port| normalized(port) == wanted);
+        let fetched = self.fetched.keys().any(|fetched| normalized(fetched) == wanted);
+        if SYSTEM_PACKAGES.contains(&name) || in_manifest || fetched {
+            return PackageSource::Project;
+        }
         let known_port = super::emit::KNOWN_PORTS
             .iter()
-            .any(|(pattern, _)| normalized(pattern.trim_end_matches("::")) == wanted);
-        let fetched = self.fetched.keys().any(|fetched| normalized(fetched) == wanted);
-        if SYSTEM_PACKAGES.contains(&name) || in_manifest || known_port || fetched {
-            return None;
+            .find(|(pattern, _)| normalized(pattern.trim_end_matches("::")) == wanted);
+        if let Some((_, port)) = known_port {
+            return PackageSource::Port(port.to_string());
         }
 
         // A port of the package's name, as the emitter looks its imported targets up; not one that needs this project
@@ -1841,22 +1894,22 @@ impl Interpreter {
         let lower = name.to_lowercase();
         let vcpkg = self.builtin.vcpkg.get_or_insert_with(|| crate::vcpkg::Instance::select(None).ok());
         let Some(instance) = vcpkg.as_ref() else {
-            return Some("no vcpkg was found to take a port from".into());
+            return PackageSource::Absent("no vcpkg was found to take a port from".into());
         };
         let Some(port) = [lower.clone(), lower.replace('_', "-")]
             .into_iter()
             .find(|port| instance.has_port(port) == Some(true))
         else {
-            return Some("Anvil has no port for it".into());
+            return PackageSource::Absent("Anvil has no port for it".into());
         };
         let project = self.project_name.as_deref().map(normalized).unwrap_or_default();
         if port_dependencies(&instance.root, &port)
             .iter()
             .any(|dependency| normalized(dependency) == project)
         {
-            return Some(format!("its port `{port}` depends on this project"));
+            return PackageSource::Absent(format!("its port `{port}` depends on this project"));
         }
-        None
+        PackageSource::Port(port)
     }
 
     /// Is a program on PATH, in one of `folders`, or among the MSVC tools (dumpbin beside link.exe, which build steps
@@ -2284,14 +2337,19 @@ impl Interpreter {
         let arg = |index: usize| args.get(index).cloned().unwrap_or_default();
         let names = |index: usize| model::split_list(&arg(index));
 
+        // Warnings made errors (`-Werror` for GCC, `-WX` for MSVC: one branch's) fail a source check that warns
+        let required_flags = self.get_variable("CMAKE_REQUIRED_FLAGS").unwrap_or_default();
+        let warnings_fail = required_flags.split_whitespace().any(|flag| ["-Werror", "-WX", "/WX"].contains(&flag));
+
         // The result variable, and what decides it
         let (result_variable, truth) = match command.name.as_str() {
             "check_ipo_supported" => (
                 args.windows(2).find(|pair| pair[0] == "RESULT").map(|pair| pair[1].clone()),
                 Truth::Known(true),
             ),
-            "check_c_compiler_flag" | "check_cxx_compiler_flag" => (args.get(1).cloned(), flags_truth(&arg(0))),
-            "check_compiler_flag" | "check_linker_flag" => (args.get(2).cloned(), flags_truth(&arg(1))),
+            "check_c_compiler_flag" => (args.get(1).cloned(), flags_truth(&arg(0), Some("C"))),
+            "check_cxx_compiler_flag" => (args.get(1).cloned(), flags_truth(&arg(0), Some("CXX"))),
+            "check_compiler_flag" | "check_linker_flag" => (args.get(2).cloned(), flags_truth(&arg(1), Some(&arg(0)))),
             "check_include_file" | "check_include_file_cxx" | "check_include_files" => (args.get(1).cloned(), names_truth(&names(0))),
             "check_symbol_exists" | "check_cxx_symbol_exists" => {
                 let mut checked = names(1);
@@ -2309,23 +2367,39 @@ impl Interpreter {
                 (args.get(1).map(|variable| format!("HAVE_{variable}")), names_truth(&names(0)))
             }
             "check_c_source_compiles" | "check_cxx_source_compiles" | "check_c_source_runs" | "check_cxx_source_runs" => {
-                (args.get(1).cloned(), source_truth(&arg(0)))
+                (args.get(1).cloned(), source_truth(&arg(0), warnings_fail))
             }
-            "check_source_compiles" | "check_source_runs" => (args.get(2).cloned(), source_truth(&arg(1))),
+            "check_source_compiles" | "check_source_runs" => (args.get(2).cloned(), source_truth(&arg(1), warnings_fail)),
             _ => {
                 self.unknown_commands.insert(command.name.clone());
                 return;
             }
         };
+        if command.name.ends_with("_flag") {
+            let flags = if matches!(command.name.as_str(), "check_compiler_flag" | "check_linker_flag") {
+                arg(1)
+            } else {
+                arg(0)
+            };
+            for flag in unknown_flags(&flags) {
+                let variable = result_variable.clone().unwrap_or_default();
+                self.warn(
+                    command,
+                    &format!(
+                        "{}({flag}): a flag Anvil does not know, so {variable} is false; where the compiler takes it, set it by hand",
+                        command.name
+                    ),
+                );
+            }
+        }
 
         // Flags and libraries the check is made with count too, unless they work on this machine: then they may be
         // the ones the branch this machine takes set (`-WX` for MSVC where GCC gets `-Werror`), and say nothing about
         // the other platforms, which set their own
-        let required_flags = self.get_variable("CMAKE_REQUIRED_FLAGS").unwrap_or_default();
         let required_libraries = model::split_list(&self.get_variable("CMAKE_REQUIRED_LIBRARIES").unwrap_or_default());
         let required = required_libraries
             .iter()
-            .fold(flags_truth(&required_flags), |truth, library| truth.and(library_truth(library)));
+            .fold(flags_truth(&required_flags, None), |truth, library| truth.and(library_truth(library)));
         let truth = match required {
             Truth::Depends(condition) if model::holds_on_host(&condition, &|_| None) => truth,
             required => truth.and(required),
@@ -2657,7 +2731,8 @@ const PLATFORM_LIBRARIES: &[(&str, &str)] = &[
 // check_type_size()'s sizes: (types, sizes by condition (the first that holds), size otherwise). An empty size: the
 // type does not exist there. 32-bit targets are x86 and arm; Windows is LLP64 (long is 4 bytes) and MSVC's long
 // double is a double.
-const TYPE_SIZES: &[(&[&str], &[(&str, &str)], &str)] = &[
+type TypeSizeRow = (&'static [&'static str], &'static [(&'static str, &'static str)], &'static str);
+const TYPE_SIZES: &[TypeSizeRow] = &[
     (&["char", "signed char", "unsigned char", "_Bool", "bool", "int8_t", "uint8_t"], &[], "1"),
     (
         &["short", "short int", "unsigned short", "unsigned short int", "int16_t", "uint16_t"],
@@ -2739,34 +2814,187 @@ static REPLACEMENT_GROUP: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex
 // Macros a check's source tests to pick a platform's code: then its names say nothing about where it compiles
 const PLATFORM_MACROS: &[&str] = &["_WIN32", "_MSC_VER", "WIN32", "__GNUC__", "__clang__", "__MINGW32__"];
 
-/// Where compiler or linker flags pass check_*_flag() as CMake runs it: cl's options (`/W4`, and spelled with a dash,
-/// `-W4`) with MSVC, GCC's (`-Wextra`) with the rest, and a few with both. cl's options that fail its checks
-/// (CL_FAILING_FLAGS) pass nowhere when spelled with a slash.
-fn flags_truth(flags: &str) -> Truth {
+/// Where compiler or linker flags pass check_*_flag() as CMake runs it for `language` ("C", "CXX"; None for either):
+/// cl's options (`/W4`, and spelled with a dash, `-W4`) with MSVC, GCC's (`-Wextra`) with GCC and Clang, Clang's
+/// (`-Wcomma`) with Clang (not clang-cl, as GCC's), and a few with both. cl's options that fail its checks (CL_FAILING_FLAGS) pass nowhere when
+/// spelled with a slash, and flags Anvil does not know pass nowhere.
+fn flags_truth(flags: &str, language: Option<&str>) -> Truth {
     flags.split_whitespace().fold(Truth::Known(true), |truth, flag| {
-        let flag = flag.strip_prefix("LINKER:").unwrap_or(flag);
-        let single = if let Some(name) = flag.strip_prefix('/') {
-            if CL_FAILING_FLAGS.is_match(name) {
-                Truth::Known(false)
-            } else {
-                Truth::Depends("msvc".into())
-            }
-        } else if flag == "-fsanitize=address" {
-            // cl has AddressSanitizer too; MinGW's GCC has no runtime for it
-            Truth::Depends("!mingw".into())
-        } else if let Some(name) = flag.strip_prefix('-') {
-            let universal = ["D", "I", "U"].iter().any(|prefix| name.starts_with(prefix)) || BOTH_COMPILERS_FLAGS.is_match(name);
-            match (universal, is_cl_flag(name)) {
-                (true, _) => Truth::Known(true),
-                (false, true) => Truth::Depends("msvc".into()),
-                (false, false) => Truth::Depends("!msvc".into()),
-            }
-        } else {
-            Truth::Known(true)
-        };
-        truth.and(single)
+        truth.and(flag_truth(flag, language).unwrap_or(Truth::Known(false)))
     })
 }
+
+/// The flags of `flags` that flags_truth() does not know.
+fn unknown_flags(flags: &str) -> Vec<&str> {
+    flags.split_whitespace().filter(|flag| flag_truth(flag, None).is_none()).collect()
+}
+
+/// Where one flag passes check_*_flag() (see flags_truth); None when Anvil does not know it.
+fn flag_truth(flag: &str, language: Option<&str>) -> Option<Truth> {
+    let flag = flag.strip_prefix("LINKER:").unwrap_or(flag);
+    let depends = |condition: &str| Some(Truth::Depends(condition.into()));
+
+    if let Some(name) = flag.strip_prefix('/') {
+        return if CL_FAILING_FLAGS.is_match(name) {
+            Some(Truth::Known(false))
+        } else {
+            depends("msvc")
+        };
+    }
+    if flag == "-fsanitize=address" {
+        // cl has AddressSanitizer too; MinGW's GCC has no runtime for it
+        return depends("!mingw");
+    }
+    let Some(name) = flag.strip_prefix('-') else {
+        return Some(Truth::Known(true));
+    };
+
+    if ["D", "I", "U"].iter().any(|prefix| name.starts_with(prefix)) || BOTH_COMPILERS_FLAGS.is_match(name) {
+        Some(Truth::Known(true))
+    } else if is_cl_flag(name) {
+        depends("msvc")
+    } else if let Some(warning) = name.strip_prefix('W').filter(|warning| !GNU_PASS_THROUGH.is_match(warning)) {
+        depends(warning_condition(warning, language))
+    } else if CLANG_FLAGS.is_match(name) {
+        depends("clang & !msvc")
+    } else if GNU_FLAGS.is_match(name) {
+        depends("!msvc")
+    } else {
+        None
+    }
+}
+
+/// Where `-W<warning>` passes: GCC's warnings (GCC_WARNINGS, for the check's language) with GCC, and with Clang
+/// unless GCC_ONLY_WARNINGS; others are Clang's. GCC takes any `-Wno-` of a warning it does not know.
+fn warning_condition(warning: &str, language: Option<&str>) -> &'static str {
+    if warning.is_empty() || warning == "error" {
+        return "!msvc";
+    }
+    let negated = warning.strip_prefix("no-");
+    let name = negated.unwrap_or(warning);
+    let name = name.strip_prefix("error=").unwrap_or(name);
+    let (name, value) = name.split_once('=').map_or((name, None), |(name, value)| (name, Some(value)));
+
+    let listed = |list: &str| list.split_whitespace().any(|known| known == name);
+    let for_c = listed(GCC_C_WARNINGS);
+    let for_cxx = listed(GCC_CXX_WARNINGS);
+    let gcc_knows = name.starts_with("analyzer-")
+        || listed(GCC_WARNINGS)
+        || match language {
+            Some("C") => for_c,
+            Some("CXX") => for_cxx,
+            _ => for_c || for_cxx,
+        };
+    let other_language = !gcc_knows && (for_c || for_cxx);
+
+    let gcc_only = name.starts_with("analyzer-")
+        || GCC_ONLY_WARNINGS.is_match(name)
+        || value.is_some_and(|_| !["format", "frame-larger-than", "strict-overflow", "strict-aliasing"].contains(&name));
+    match (gcc_knows || (negated.is_some() && !other_language), gcc_only) {
+        (true, true) => "gcc",
+        (true, false) => "!msvc",
+        (false, _) => "clang & !msvc",
+    }
+}
+
+// `-Wl,`, `-Wa,` and `-Wp,`: options GCC and Clang hand to the linker, assembler and preprocessor
+static GNU_PASS_THROUGH: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^[lap],").unwrap());
+
+// GCC 13's warnings for C and C++ (`gcc --help=warnings,c`, `,c++`, `,common`; -Wanalyzer-* aside), then those for
+// C only and C++ only, which fail a check of the other language
+const GCC_WARNINGS: &str = concat!(
+    "NSObject-attribute abi address address-of-packed-member aggregate-return aggressive-loop-optimizations all ",
+    "alloc-size-larger-than alloc-zero alloca alloca-larger-than arith-conversion array-bounds array-compare ",
+    "array-parameter attribute-alias attribute-warning attributes bidi-chars bool-compare bool-operation ",
+    "builtin-declaration-mismatch builtin-macro-redefined cannot-profile cast-align cast-function-type cast-qual ",
+    "char-subscripts chkp clobbered comment comments complain-wrong-lang conversion coverage-invalid-line-number ",
+    "coverage-mismatch cpp dangling-else dangling-pointer date-time deprecated deprecated-declarations ",
+    "disabled-optimization div-by-zero double-promotion duplicated-branches duplicated-cond empty-body ",
+    "endif-labels enum-compare enum-conversion expansion-to-defined extra float-conversion float-equal format ",
+    "format-contains-nul format-diag format-extra-args format-nonliteral format-overflow format-security ",
+    "format-signedness format-truncation format-y2k format-zero-length frame-address frame-larger-than ",
+    "free-nonheap-object hsa if-not-aligned ignored-attributes ignored-qualifiers implicit-fallthrough ",
+    "infinite-recursion init-self inline int-in-bool-context int-to-pointer-cast invalid-memory-model invalid-pch ",
+    "invalid-utf8 larger-than logical-not-parentheses logical-op long-long lto-type-mismatch main ",
+    "maybe-uninitialized memset-elt-size memset-transposed-args misleading-indentation mismatched-dealloc ",
+    "missing-attributes missing-braces missing-declarations missing-field-initializers missing-format-attribute ",
+    "missing-include-dirs missing-noreturn missing-profile multichar multistatement-macros narrowing ",
+    "nonnull nonnull-compare normalized null-dereference odr openacc-parallelism openmp-simd ",
+    "overflow overlength-strings packed packed-bitfield-compat packed-not-aligned padded parentheses pedantic ",
+    "pedantic-ms-format pointer-arith pointer-compare pragmas prio-ctor-dtor psabi redundant-decls restrict ",
+    "return-local-addr return-type scalar-storage-order sequence-point shadow shadow-compatible-local shadow-local ",
+    "shift-count-negative shift-count-overflow shift-negative-value shift-overflow sign-compare sign-conversion ",
+    "sizeof-array-argument sizeof-array-div sizeof-pointer-div sizeof-pointer-memaccess stack-protector ",
+    "stack-usage strict-aliasing strict-flex-arrays strict-overflow string-compare stringop-overflow ",
+    "stringop-overread stringop-truncation suggest-attribute suggest-final-methods suggest-final-types switch ",
+    "switch-bool switch-default switch-enum switch-outside-range switch-unreachable sync-nand system-headers ",
+    "tautological-compare trampolines trigraphs trivial-auto-var-init tsan type-limits undef unicode uninitialized ",
+    "unknown-pragmas unreachable-code unsafe-loop-optimizations unused unused-but-set-parameter ",
+    "unused-but-set-variable unused-const-variable unused-function unused-label unused-local-typedefs ",
+    "unused-macros unused-result unused-value unused-variable use-after-free varargs variadic-macros ",
+    "vector-operation-performance vla vla-larger-than vla-parameter volatile-register-var write-strings ",
+    "xor-used-as-pow zero-length-bounds",
+);
+const GCC_C_WARNINGS: &str = concat!(
+    "absolute-value bad-function-cast c++-compat c11-c2x-compat c90-c99-compat c99-c11-compat ",
+    "declaration-after-statement designated-init discarded-array-qualifiers discarded-qualifiers ",
+    "duplicate-decl-specifier enum-int-mismatch error-implicit-function-declaration implicit ",
+    "implicit-function-declaration implicit-int incompatible-pointer-types int-conversion jump-misses-init ",
+    "missing-parameter-type missing-prototypes nested-externs old-style-declaration old-style-definition ",
+    "override-init override-init-side-effects pointer-sign pointer-to-int-cast strict-prototypes traditional ",
+    "traditional-conversion unsuffixed-float-constants",
+);
+const GCC_CXX_WARNINGS: &str = concat!(
+    "abi-tag aligned-new c++0x-compat c++11-compat c++11-extensions c++14-compat c++14-extensions c++17-compat ",
+    "c++17-extensions c++1z-compat c++20-compat c++20-extensions c++23-extensions c++2a-compat catch-value ",
+    "changes-meaning class-conversion class-memaccess comma-subscript conditionally-supported conversion-null ",
+    "ctad-maybe-unsupported ctor-dtor-privacy dangling-reference delete-incomplete delete-non-virtual-dtor ",
+    "deprecated-copy deprecated-copy-dtor deprecated-enum-enum-conversion deprecated-enum-float-conversion effc++ ",
+    "exceptions extra-semi inaccessible-base inherited-variadic-ctor init-list-lifetime interference-size ",
+    "invalid-constexpr invalid-imported-macros invalid-offsetof literal-suffix mismatched-new-delete ",
+    "mismatched-tags missing-requires missing-template-keyword multiple-inheritance namespaces noexcept ",
+    "noexcept-type non-template-friend non-virtual-dtor old-style-cast overloaded-virtual pessimizing-move ",
+    "placement-new pmf-conversions range-loop-construct redundant-move redundant-tags register reorder self-move ",
+    "sign-promo sized-deallocation strict-null-sentinel subobject-linkage suggest-override synth templates ",
+    "terminate useless-cast vexing-parse virtual-inheritance virtual-move-assign volatile ",
+    "zero-as-null-pointer-constant",
+);
+
+// GCC's warnings Clang does not know (a check with Clang fails on "unknown warning option")
+static GCC_ONLY_WARNINGS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"^(logical-op|duplicated-(cond|branches)|useless-cast|jump-misses-init|restrict|maybe-uninitialized|stringop-.+|",
+        r"suggest-attribute|noexcept|strict-null-sentinel|trampolines|class-memaccess|alloc-zero|alloca-larger-than|",
+        r"alloc-size-larger-than|use-after-free|dangling-reference|unsafe-loop-optimizations|vector-operation-performance|",
+        r"shadow-local|shadow-compatible-local|lto-type-mismatch|catch-value|conditionally-supported|subobject-linkage|",
+        r"placement-new|virtual-move-assign|literal-suffix|pmf-conversions|clobbered|multistatement-macros|format-diag)$"
+    ))
+    .unwrap()
+});
+
+// Clang's options GCC rejects
+static CLANG_FLAGS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"^(f(no-)?color-diagnostics|fansi-escape-codes|stdlib=.+|rtlib=.+|unwindlib=.+|f(no-)?standalone-debug|f(no-)?limit-debug-info|",
+        r"fprofile-instr-.+|fcoverage-mapping|fmodules.*|fexperimental-.+|Qunused-arguments|ferror-limit=.+|",
+        r"fmacro-backtrace-limit=.+|f(no-)?spell-checking|fms-compatibility.*|f(no-)?delayed-template-parsing|",
+        r"f(no-)?cxx-exceptions|fsanitize=(safe-stack|cfi.*|dataflow|memory|type|integer|implicit-.+|nullability.*|unsigned-integer-overflow)|flto=thin|fdebug-macro|",
+        r"fcomplete-member-pointers|fforce-emit-vtables|fstrict-vtable-pointers|fwhole-program-vtables)$"
+    ))
+    .unwrap()
+});
+
+// GCC's options (Clang takes them too): code generation, machine, optimization, debug, language, preprocessor and
+// linking options, and `--long` ones
+static GNU_FLAGS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"^(f[A-Za-z].*|m[A-Za-z0-9].*|O[0-3sgz]?|Ofast|g.*|ansi|pedantic(-errors)?|pthreads?|static(-.+)?|shared(-.+)?|",
+        r"rdynamic|no-?pie|pie|nostdlib.*|nostdinc.*|nodefaultlibs|nostartfiles|s|x.+|isystem.*|iquote.*|idirafter.*|",
+        r"include.+|imacros.+|L.+|l.+|Xlinker|Xassembler|coverage|pg?|undef|trigraphs|save-temps.*|specs=.+|",
+        r"print-.+|dumpmachine|dumpversion|v|E|S|c|C|P|H|M[DMGPTF]?|MMD|time|e.+|T.+|u.+|z.+|W[lap],.+|-.+)$"
+    ))
+    .unwrap()
+});
 
 /// Is a flag (without its `/` or `-`) one cl takes in check_*_flag()? Those conflicting with the /RTC1 of the Debug
 /// flags that checks compile with (/O1, /O2, /Ox) fail there.
@@ -2819,9 +3047,11 @@ fn library_truth(library: &str) -> Truth {
     }
 }
 
-/// Where a check's source compiles: GCC extensions not with cl, and the platform headers and functions it uses
-/// where they exist (unless it picks its code by platform macros).
-fn source_truth(source: &str) -> Truth {
+/// Where a check's source compiles: GCC extensions not with cl (nor a visibility attribute with MinGW's GCC, which
+/// warns about it, when warnings fail the check), its `#if` tests of platform macros (an `#error` under them, or a
+/// main() only there), and the platform headers and functions it uses where they exist (unless it picks its code by
+/// platform macros).
+fn source_truth(source: &str, warnings_fail: bool) -> Truth {
     let mut truth = Truth::Known(true);
     if ["__attribute__", "__builtin_", "__asm__", "__typeof__"]
         .iter()
@@ -2829,6 +3059,10 @@ fn source_truth(source: &str) -> Truth {
     {
         truth = Truth::Depends("!msvc".into());
     }
+    if warnings_fail && source.contains("__attribute__") && source.contains("visibility") {
+        truth = truth.and(Truth::Depends("!mingw".into()));
+    }
+    truth = truth.and(preprocessor_truth(source));
     if PLATFORM_MACROS.iter().any(|macro_name| source.contains(macro_name)) {
         return truth;
     }
@@ -2840,6 +3074,248 @@ fn source_truth(source: &str) -> Truth {
     names.dedup();
 
     truth.and(names_truth(&names))
+}
+
+/// Where a source's `#if` blocks let it compile: not where an `#error` is reached, and only where a main() is there.
+/// Conditions test platform macros (MACRO_CONDITIONS); a block testing anything else decides nothing.
+fn preprocessor_truth(source: &str) -> Truth {
+    // Each open #if: the condition of its current branch, and whether an earlier branch was taken (None: unknown)
+    let mut blocks: Vec<(Option<Truth>, Option<Truth>)> = Vec::new();
+    let mut compiles = Some(Truth::Known(true));
+    let mut main: Option<Option<Truth>> = None;
+
+    for line in source.lines() {
+        let mut active = Some(Truth::Known(true));
+        for (current, _) in &blocks {
+            active = and_maybe(active, current.clone());
+        }
+
+        // Code: where main() is
+        let Some(directive) = line.trim_start().strip_prefix('#') else {
+            if SOURCE_WORD.find_iter(line).any(|word| word.as_str() == "main") {
+                main = Some(match main {
+                    None => active,
+                    Some(earlier) => or_maybe(earlier, active),
+                });
+            }
+            continue;
+        };
+
+        // Directives
+        let directive = directive.trim_start();
+        let (word, rest) = directive.split_at(directive.find(|character: char| !character.is_alphanumeric()).unwrap_or(directive.len()));
+        let rest = rest.split("//").next().unwrap_or_default().trim();
+        match word {
+            "if" | "ifdef" | "ifndef" => {
+                let condition = match word {
+                    "if" => macro_expression(rest),
+                    "ifdef" => macro_defined(rest),
+                    _ => macro_defined(rest).map(Truth::not),
+                };
+                blocks.push((condition.clone(), condition));
+            }
+            "elif" | "else" => {
+                let Some((current, taken)) = blocks.last_mut() else {
+                    return Truth::Known(true);
+                };
+                let condition = if word == "elif" {
+                    macro_expression(rest)
+                } else {
+                    Some(Truth::Known(true))
+                };
+                *current = and_maybe(taken.clone().map(Truth::not), condition.clone());
+                *taken = or_maybe(taken.clone(), condition);
+            }
+            "endif" => {
+                blocks.pop();
+            }
+            "error" => compiles = and_maybe(compiles, active.map(Truth::not)),
+            _ => {}
+        }
+    }
+
+    // Unknown where it compiles: as if everywhere
+    let main = main.unwrap_or(Some(Truth::Known(true)));
+    let truth = and_maybe(compiles, main).unwrap_or(Truth::Known(true));
+    match truth {
+        Truth::Depends(condition) => model::simplify(&condition, None),
+        known => known,
+    }
+}
+
+/// Both, where false wins over unknown (None).
+fn and_maybe(left: Option<Truth>, right: Option<Truth>) -> Option<Truth> {
+    match (left, right) {
+        (Some(Truth::Known(false)), _) | (_, Some(Truth::Known(false))) => Some(Truth::Known(false)),
+        (Some(left), Some(right)) => Some(left.and(right)),
+        _ => None,
+    }
+}
+
+/// Either, where true wins over unknown (None).
+fn or_maybe(left: Option<Truth>, right: Option<Truth>) -> Option<Truth> {
+    match (left, right) {
+        (Some(Truth::Known(true)), _) | (_, Some(Truth::Known(true))) => Some(Truth::Known(true)),
+        (Some(left), Some(right)) => Some(left.or(right)),
+        _ => None,
+    }
+}
+
+// Platform and compiler macros as conditions; the macros of platforms Anvil does not build for are never defined
+const MACRO_CONDITIONS: &[(&str, &str)] = &[
+    ("_WIN32", "windows"),
+    ("_WIN64", "windows & (x64 | arm64)"),
+    ("WIN32", "windows"),
+    ("__WIN32__", "windows"),
+    ("_MSC_VER", "msvc"),
+    ("__GNUC__", "gnu"),
+    ("__clang__", "clang"),
+    ("__MINGW32__", "mingw"),
+    ("__MINGW64__", "mingw & x64"),
+    ("__linux__", "linux"),
+    ("__linux", "linux"),
+    ("__APPLE__", "macos"),
+    ("__MACH__", "macos"),
+    ("__unix__", "unix & !macos"),
+    ("__unix", "unix & !macos"),
+    ("__x86_64__", "x64"),
+    ("__x86_64", "x64"),
+    ("__amd64__", "x64"),
+    ("_M_X64", "x64"),
+    ("_M_AMD64", "x64"),
+    ("__i386__", "x86"),
+    ("_M_IX86", "x86"),
+    ("__aarch64__", "arm64"),
+    ("__arm64__", "arm64"),
+    ("_M_ARM64", "arm64"),
+    ("__arm__", "arm"),
+    ("_M_ARM", "arm"),
+];
+const OTHER_PLATFORM_MACROS: &[&str] = &[
+    "__EMSCRIPTEN__",
+    "__wasm__",
+    "__wasm32__",
+    "__wasm64__",
+    "__s390x__",
+    "__s390__",
+    "__powerpc__",
+    "__powerpc64__",
+    "__ppc__",
+    "__ppc64__",
+    "__PPC64__",
+    "__riscv",
+    "__mips__",
+    "__sparc__",
+    "__ia64__",
+    "__loongarch__",
+    "__hppa__",
+    "__alpha__",
+    "__m68k__",
+    "__FreeBSD__",
+    "__OpenBSD__",
+    "__NetBSD__",
+    "__DragonFly__",
+    "__ANDROID__",
+    "__CYGWIN__",
+    "__sun",
+    "__HAIKU__",
+    "__QNX__",
+    "__OS400__",
+    "__MVS__",
+    "__VMS",
+    "__INTEL_COMPILER",
+];
+
+// A token of a `#if` expression
+static PREPROCESSOR_TOKEN: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^([A-Za-z_][A-Za-z0-9_]*|\d+[A-Za-z]*|&&|\|\||[<>=!]=|[<>()!])").unwrap());
+
+/// Where a macro is defined, from MACRO_CONDITIONS; None for other macros.
+fn macro_defined(name: &str) -> Option<Truth> {
+    let name = name.trim();
+    if OTHER_PLATFORM_MACROS.contains(&name) {
+        return Some(Truth::Known(false));
+    }
+    MACRO_CONDITIONS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, condition)| Truth::Depends(condition.to_string()))
+}
+
+/// A `#if` expression of `defined`, `!`, `&&`, `||`, numbers and platform macros (compared with a number as for a
+/// current compiler: `__GNUC__ >= 4` holds where the macro is defined); None when it tests anything else.
+fn macro_expression(text: &str) -> Option<Truth> {
+    let mut tokens = Vec::new();
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        let found = PREPROCESSOR_TOKEN.find(rest)?;
+        tokens.push(found.as_str());
+        rest = rest[found.end()..].trim_start();
+    }
+
+    let mut position = 0;
+    let truth = macro_or(&tokens, &mut position)?;
+    (position == tokens.len()).then_some(truth)
+}
+
+fn macro_or(tokens: &[&str], position: &mut usize) -> Option<Truth> {
+    let mut truth = macro_and(tokens, position)?;
+    while tokens.get(*position) == Some(&"||") {
+        *position += 1;
+        truth = truth.or(macro_and(tokens, position)?);
+    }
+    Some(truth)
+}
+
+fn macro_and(tokens: &[&str], position: &mut usize) -> Option<Truth> {
+    let mut truth = macro_unary(tokens, position)?;
+    while tokens.get(*position) == Some(&"&&") {
+        *position += 1;
+        truth = truth.and(macro_unary(tokens, position)?);
+    }
+    Some(truth)
+}
+
+fn macro_unary(tokens: &[&str], position: &mut usize) -> Option<Truth> {
+    let token = *tokens.get(*position)?;
+    *position += 1;
+    match token {
+        "!" => macro_unary(tokens, position).map(Truth::not),
+        "(" => {
+            let truth = macro_or(tokens, position)?;
+            (tokens.get(*position) == Some(&")")).then(|| *position += 1)?;
+            Some(truth)
+        }
+        "defined" => {
+            let parenthesized = tokens.get(*position) == Some(&"(");
+            let name = tokens.get(*position + usize::from(parenthesized))?;
+            *position += 1 + 2 * usize::from(parenthesized);
+            if parenthesized && tokens.get(*position - 1) != Some(&")") {
+                return None;
+            }
+            macro_defined(name)
+        }
+        number if number.starts_with(|character: char| character.is_ascii_digit()) => Some(Truth::Known(
+            number.trim_end_matches(|character: char| character.is_ascii_alphabetic()) != "0",
+        )),
+        name => {
+            let defined = macro_defined(name)?;
+            let comparison = tokens
+                .get(*position)
+                .copied()
+                .filter(|token| ["<", "<=", ">", ">=", "==", "!="].contains(token));
+            let Some(comparison) = comparison else { return Some(defined) };
+            tokens
+                .get(*position + 1)
+                .filter(|value| value.starts_with(|character: char| character.is_ascii_digit()))?;
+            *position += 2;
+            match comparison {
+                "<" | "<=" => Some(Truth::Known(false)),
+                ">" | ">=" | "!=" => Some(defined),
+                _ => None,
+            }
+        }
+    }
 }
 
 /// What `render` gives under every choice of `conditions` (each true or false), the choices with the same text
@@ -3304,6 +3780,27 @@ fn math_unary(tokens: &[String], position: &mut usize) -> Option<i64> {
     }
 }
 
+// CMAKE_<LANG>_COMPILER_ID values: hashed text holding one hashes the compiler
+const COMPILER_IDS: &[&str] = &["MSVC", "GNU", "Clang", "AppleClang", "IntelLLVM", "Intel", "NVIDIA"];
+
+/// The files in the `{hash:a,b}` markers of a text, in order and once each. Commas, not semicolons: CMake would split
+/// an unquoted value at a semicolon.
+fn hashed_files(text: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("{hash:") {
+        let after = &rest[start + "{hash:".len()..];
+        let Some(end) = after.find('}') else { break };
+        for file in after[..end].split(',').filter(|file| !file.is_empty()) {
+            if !files.iter().any(|known| known == file) {
+                files.push(file.to_string());
+            }
+        }
+        rest = &after[end..];
+    }
+    files
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3564,16 +4061,64 @@ list(TRANSFORM TOOLS APPEND .c OUTPUT_VARIABLE FILES)
             ("-fPIC", depends("!msvc")),
             ("-DX=1 -Iinclude -std=c11 -MD -w", Truth::Known(true)),
             ("LINKER:--as-needed", depends("!msvc")),
+            ("-Wl,--gc-sections", depends("!msvc")),
             ("-fsanitize=address", depends("!mingw")),
+            // Clang's warnings, GCC's that Clang lacks, one language's, and flags nobody takes
+            ("-Wcomma", depends("clang & !msvc")),
+            ("-Wmissing-variable-declarations -Wused-but-marked-unused", depends("clang & !msvc")),
+            ("-Wlogical-op", depends("gcc")),
+            ("-Wimplicit-fallthrough=3", depends("gcc")),
+            ("-Wno-unknown-warning-of-clang", depends("!msvc")),
+            ("-Werror=format-security", depends("!msvc")),
+            ("-no-such-thing", Truth::Known(false)),
+            ("-fcolor-diagnostics", depends("clang & !msvc")),
+            ("-stdlib=libc++", depends("clang & !msvc")),
         ] {
-            assert_eq!(flags_truth(flags), truth, "{flags}");
+            assert_eq!(flags_truth(flags, None), truth, "{flags}");
         }
+        assert_eq!(flags_truth("-Wnon-virtual-dtor", Some("C")), depends("clang & !msvc"));
+        assert_eq!(flags_truth("-Wnon-virtual-dtor", Some("CXX")), depends("!msvc"));
+        assert_eq!(flags_truth("-Wstrict-prototypes", Some("C")), depends("!msvc"));
+        assert_eq!(unknown_flags("-Wall -no-such-thing"), vec!["-no-such-thing"]);
 
         assert_eq!(names_truth(&["intrin.h".into()]), depends("windows"));
         assert_eq!(names_truth(&["sys/file.h".into()]), depends("!msvc"));
         assert_eq!(library_truth("m"), depends("!msvc"));
         assert_eq!(library_truth("pthread"), depends("!msvc"));
         assert_eq!(library_truth("dl"), depends("!windows"));
+    }
+
+    #[test]
+    fn check_sources_follow_their_platform_tests() {
+        let depends = |condition: &str| Truth::Depends(condition.into());
+        for (source, truth) in [
+            // brotli: main() only for Emscripten
+            ("#if defined(__EMSCRIPTEN__)\n   int main() {return 0;}\n   #endif", Truth::Known(false)),
+            // zlib: an #error off s390x
+            ("#ifndef __s390x__\n    #error\n#endif\nint main() {return 0;}", Truth::Known(false)),
+            ("#ifdef _WIN32\n#error no\n#endif\nint main(void) { return 0; }", depends("!windows")),
+            (
+                "#if defined(__GNUC__) && __GNUC__ >= 4\nint main() {}\n#else\n#error old\n#endif",
+                depends("gnu"),
+            ),
+            (
+                "#if !defined(_MSC_VER) || defined(__clang__)\n#error\n#endif\nint main() {}",
+                depends("msvc & !clang"),
+            ),
+            (
+                "#ifdef _WIN32\n#include <windows.h>\n#else\n#include <unistd.h>\n#endif\nint main() {}",
+                Truth::Known(true),
+            ),
+            ("#if __has_include(<x.h>)\n#error\n#endif\nint main() {}", Truth::Known(true)),
+            ("#if 0\nint main() {}\n#endif", Truth::Known(false)),
+        ] {
+            assert_eq!(source_truth(source, false), truth, "{source}");
+        }
+
+        // zlib's visibility check made with -Werror: MinGW's GCC warns that it ignores the attribute
+        let visibility = "static void f(void) __attribute__ ((visibility(\"hidden\")));\nint main(void) {return 0;}";
+        assert_eq!(source_truth(visibility, false), depends("!msvc"));
+        assert_eq!(source_truth(visibility, true), depends("!msvc & !mingw"));
     }
 
     #[test]
@@ -3615,7 +4160,7 @@ check_c_source_compiles("int main(void) { return 0; }" HAVE_AVX2_FLAG)
 "#;
         let interpreter = run("required-flags", &[("CMakeLists.txt", cmake)]);
 
-        assert_eq!(model::marked_condition(&variable(&interpreter, "HAVE_HIDDEN")), Some("!msvc"));
+        assert_eq!(model::marked_condition(&variable(&interpreter, "HAVE_HIDDEN")), Some("!msvc & !mingw"));
         assert_eq!(variable(&interpreter, "HAVE_PLAIN"), "1");
         if cfg!(windows) {
             assert_eq!(model::marked_condition(&variable(&interpreter, "HAVE_AVX2_FLAG")), Some("!msvc"));
@@ -3686,25 +4231,4 @@ string(TOUPPER "abc" PLAIN)
         // A platform value inside longer text is this machine's already when expanded
         assert_eq!(warned, 3, "{:?}", interpreter.warnings);
     }
-}
-
-// CMAKE_<LANG>_COMPILER_ID values: hashed text holding one hashes the compiler
-const COMPILER_IDS: &[&str] = &["MSVC", "GNU", "Clang", "AppleClang", "IntelLLVM", "Intel", "NVIDIA"];
-
-/// The files in the `{hash:a,b}` markers of a text, in order and once each. Commas, not semicolons: CMake would split
-/// an unquoted value at a semicolon.
-fn hashed_files(text: &str) -> Vec<String> {
-    let mut files: Vec<String> = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("{hash:") {
-        let after = &rest[start + "{hash:".len()..];
-        let Some(end) = after.find('}') else { break };
-        for file in after[..end].split(',').filter(|file| !file.is_empty()) {
-            if !files.iter().any(|known| known == file) {
-                files.push(file.to_string());
-            }
-        }
-        rest = &after[end..];
-    }
-    files
 }

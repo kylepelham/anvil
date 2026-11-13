@@ -272,6 +272,15 @@ impl Interpreter {
         target.helper = self.call_stack.last().map(|call| call.function.clone());
         target.std = self.get_variable("CMAKE_CXX_STANDARD").and_then(|standard| standard.parse().ok());
         target.c_std = self.get_variable("CMAKE_C_STANDARD").and_then(|standard| standard.parse().ok());
+        for (variable, key) in [("CMAKE_CXX_EXTENSIONS", "cxx-extensions"), ("CMAKE_C_EXTENSIONS", "c-extensions")] {
+            if let Some(value) = self.get_variable(variable).filter(|value| !value.is_empty()) {
+                target.settings.push(Item {
+                    condition: None,
+                    public: false,
+                    value: (key, value),
+                });
+            }
+        }
         if let Some(gpus) = self.get_variable("CMAKE_CUDA_ARCHITECTURES").filter(|gpus| !gpus.is_empty()) {
             target.settings.push(Item {
                 condition: None,
@@ -308,7 +317,7 @@ impl Interpreter {
         let holds = |condition: &Option<String>| {
             condition
                 .as_ref()
-                .map_or(true, |condition| model::holds_on_host(condition, &|name| options.get(name).copied()))
+                .is_none_or(|condition| model::holds_on_host(condition, &|name| options.get(name).copied()))
         };
         let compiles = |kind: TargetKind| kind != TargetKind::Interface;
         let second_wins = (compiles(kind) && !compiles(previous)) || (holds(&only_second) && (compiles(kind) || !compiles(previous)));
@@ -735,7 +744,7 @@ impl Interpreter {
         }
 
         if condition.is_some() {
-            if current.map_or(true, |current| standard > current) {
+            if current.is_none_or(|current| standard > current) {
                 let text = if key == "std" {
                     format!("c++{standard}")
                 } else {
@@ -1050,6 +1059,20 @@ impl Interpreter {
                             converted.c_std = Some(standard);
                         }
                     }
+                }
+            }
+            "CXX_EXTENSIONS" | "C_EXTENSIONS" => {
+                let key = if base_property == "CXX_EXTENSIONS" {
+                    "cxx-extensions"
+                } else {
+                    "c-extensions"
+                };
+                for (condition, value) in self.conditional_values(Some(target), &items) {
+                    self.targets.get_mut(target).unwrap().settings.push(Item {
+                        condition,
+                        public: false,
+                        value: (key, value),
+                    });
                 }
             }
             "OUTPUT_NAME" | "RUNTIME_OUTPUT_NAME" | "ARCHIVE_OUTPUT_NAME" | "LIBRARY_OUTPUT_NAME" => {
@@ -1978,7 +2001,7 @@ impl Interpreter {
     /// The C standard a target's dependents get from it: its own public one, and what it links passes on (all its
     /// links count for the target itself, `own`; only public ones beyond).
     fn public_c_standard(&self, name: &str, visiting: &mut Vec<String>, own: bool) -> Option<u32> {
-        let Some(target) = self.targets.get(name) else { return None };
+        let target = self.targets.get(name)?;
         if visiting.iter().any(|visited| visited == name) {
             return None;
         }
@@ -2650,7 +2673,7 @@ set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -DC_DEBUG")
             toml.contains("[[target.app.file]]\nmatch = [\"**/*.c\"]\nif = \"debug\"\ndefines = [\"C_DEBUG\"]"),
             "{toml}"
         );
-        assert!(toml.contains("[defaults]\nc-std = \"c11\""), "{toml}");
+        assert!(toml.contains("[defaults]\nc-std = \"gnu11\""), "{toml}");
         assert!(
             toml.contains("[target.clib]\nkind = \"lib\"\nsources = [\"util.c\"]\ndefines = [\"C_ONLY\"]"),
             "{toml}"
@@ -2772,6 +2795,49 @@ endif()
     }
 
     #[test]
+    fn standards_keep_cmakes_gnu_extensions() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(extensions C CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_C_STANDARD 11)
+add_executable(gnu gnu.cpp)
+add_executable(strict strict.cpp)
+set_target_properties(strict PROPERTIES CXX_EXTENSIONS OFF)
+add_executable(cgnu cgnu.c)
+set(CMAKE_C_EXTENSIONS OFF)
+add_executable(cstrict cstrict.c)
+"#;
+        let main = "int main() { return 0; }\n";
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("gnu.cpp", main),
+            ("strict.cpp", main),
+            ("cgnu.c", main),
+            ("cstrict.c", main),
+        ];
+        let toml = convert_files("extensions", &files);
+
+        // CMake's default: -std=gnu++17 and -std=gnu11; with extensions off: -std=c++17 and -std=c11
+        assert!(
+            toml.contains("[target.gnu]\nkind = \"exe\"\nsources = [\"gnu.cpp\"]\nstd = \"gnu++17\""),
+            "{toml}"
+        );
+        assert!(
+            toml.contains("[target.strict]\nkind = \"exe\"\nsources = [\"strict.cpp\"]\nstd = \"c++17\""),
+            "{toml}"
+        );
+        assert!(
+            toml.contains("[target.cgnu]\nkind = \"exe\"\nsources = [\"cgnu.c\"]\nstd = \"gnu++17\"\nc-std = \"gnu11\""),
+            "{toml}"
+        );
+        assert!(
+            toml.contains("[target.cstrict]\nkind = \"exe\"\nsources = [\"cstrict.c\"]\nstd = \"gnu++17\"\nc-std = \"c11\""),
+            "{toml}"
+        );
+    }
+
+    #[test]
     fn c_standards_reach_users_and_strict_cl() {
         let cmake = r#"
 cmake_minimum_required(VERSION 3.20)
@@ -2795,7 +2861,7 @@ endif()
 
         // A C standard asked for a library's users; C89 where cl gets /Za (it takes no /std:c17 with it)
         assert!(
-            toml.contains("[target.user]\nkind = \"exe\"\nsources = [\"user.c\"]\ndeps = [\"api\"]\nc-std = \"c11\""),
+            toml.contains("[target.user]\nkind = \"exe\"\nsources = [\"user.c\"]\ndeps = [\"api\"]\nc-std = \"gnu11\""),
             "{toml}"
         );
         assert!(toml.contains("[target.strict.when.msvc]\nflags = [\"/Za\"]\nc-std = \"c89\""), "{toml}");
@@ -2985,9 +3051,9 @@ target_link_libraries(user PRIVATE iface)
 
         // An INTERFACE C standard is its users', not its own
         assert!(
-            toml.contains("[target.iface]\nkind = \"lib\"\nsources = [\"iface.c\"]\nc-std = \"c11\""),
+            toml.contains("[target.iface]\nkind = \"lib\"\nsources = [\"iface.c\"]\nc-std = \"gnu11\""),
             "{toml}"
         );
-        assert!(toml.contains("deps = [\"iface\"]\nc-std = \"c17\""), "{toml}");
+        assert!(toml.contains("deps = [\"iface\"]\nc-std = \"gnu17\""), "{toml}");
     }
 }

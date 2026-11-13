@@ -79,8 +79,9 @@ const MSVC_OPTIONS_WITH_VALUE: &[&str] = &["-sourceDependencies"];
 // cl's C runtime: compared, since the profile's `static-runtime` and `debug-runtime` must match CMake's
 const MSVC_RUNTIME_OPTIONS: &[&str] = &["-MD", "-MDd", "-MT", "-MTd"];
 
-// CMake's own source of a precompiled header (`target_precompile_headers`); Anvil compiles the header itself
-const CMAKE_PCH_SOURCES: &[&str] = &["cmake_pch.c", "cmake_pch.cxx"];
+// CMake's own source of a precompiled header (`target_precompile_headers`; `cmake_pch.hxx.cxx` with GCC); Anvil
+// compiles the header itself
+const CMAKE_PCH_SOURCE: &str = "cmake_pch.";
 
 // Files and differences listed per group before "and N more"
 const LISTED_FILES: usize = 5;
@@ -105,7 +106,13 @@ pub fn check(model: &Model) -> Result<i32> {
 
     // Both databases, by file
     let mut cmake_entries = read_database(&cmake_folder.join("compile_commands.json"), &cmake_folder, model)?;
-    cmake_entries.retain(|_, entries| !CMAKE_PCH_SOURCES.iter().any(|name| entries[0].shown_path.ends_with(&format!("/{name}"))));
+    cmake_entries.retain(|_, entries| {
+        !entries[0]
+            .shown_path
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.starts_with(CMAKE_PCH_SOURCE))
+    });
     let roots: Vec<usize> = model.default_targets(true);
     crate::plan::plan(model, None, &roots, false)?;
     let mut anvil_entries = read_database(&model.out_dir.join("compile_commands.json"), &model.out_dir, model)?;
@@ -136,9 +143,11 @@ fn configure_cmake(model: &Model, folder: &Path) -> Result<()> {
         bail!("--check needs ninja on PATH");
     }
 
-    // Configured for another compiler (--toolchain changed): CMake keeps its old compile commands, so start over
+    // Configured for another compiler (--toolchain changed): CMake keeps its old compile commands, so start over; and
+    // for another source folder (the project was copied with its out/): CMake refuses that cache
     let cache = std::fs::read_to_string(folder.join("CMakeCache.txt")).unwrap_or_default();
-    if cached_compiler(&cache).is_some_and(|compiler| util::path_key(Path::new(compiler)) != util::path_key(&model.toolchain.cc)) {
+    let differs = |name: &str, path: &Path| cached_value(&cache, name).is_some_and(|value| util::path_key(Path::new(value)) != util::path_key(path));
+    if differs("CMAKE_C_COMPILER", &model.toolchain.cc) || differs("CMAKE_HOME_DIRECTORY", &model.root) {
         std::fs::remove_dir_all(folder).with_context(|| format!("removing {}", slash(folder)))?;
     }
 
@@ -194,11 +203,11 @@ fn configure_cmake(model: &Model, folder: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The C compiler a CMakeCache.txt was configured with.
-fn cached_compiler(cache: &str) -> Option<&str> {
+/// A CMakeCache.txt entry's value (`NAME:TYPE=value`).
+fn cached_value<'a>(cache: &'a str, name: &str) -> Option<&'a str> {
     cache
         .lines()
-        .find_map(|line| line.strip_prefix("CMAKE_C_COMPILER:"))
+        .find_map(|line| line.strip_prefix(name).and_then(|rest| rest.strip_prefix(':')))
         .and_then(|rest| rest.split_once('=').map(|(_, value)| value.trim()))
         .filter(|value| !value.is_empty())
 }
@@ -643,10 +652,13 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_cached_compiler() {
-        let cache = "# comment\nCMAKE_BUILD_TYPE:STRING=Debug\nCMAKE_C_COMPILER:STRING=C:/gcc/bin/gcc.exe\n";
-        assert_eq!(cached_compiler(cache), Some("C:/gcc/bin/gcc.exe"));
-        assert_eq!(cached_compiler("CMAKE_C_COMPILER:FILEPATH=\n"), None);
-        assert_eq!(cached_compiler(""), None);
+    fn reads_the_cached_compiler_and_source_folder() {
+        let cache = "# comment\nCMAKE_BUILD_TYPE:STRING=Debug\nCMAKE_C_COMPILER:STRING=C:/gcc/bin/gcc.exe\n\
+                     CMAKE_HOME_DIRECTORY:INTERNAL=C:/old/project\n";
+        assert_eq!(cached_value(cache, "CMAKE_C_COMPILER"), Some("C:/gcc/bin/gcc.exe"));
+        assert_eq!(cached_value(cache, "CMAKE_HOME_DIRECTORY"), Some("C:/old/project"));
+        assert_eq!(cached_value("CMAKE_C_COMPILER:FILEPATH=\n", "CMAKE_C_COMPILER"), None);
+        assert_eq!(cached_value("CMAKE_C_COMPILER_ID:STRING=GNU\n", "CMAKE_C_COMPILER"), None);
+        assert_eq!(cached_value("", "CMAKE_C_COMPILER"), None);
     }
 }
