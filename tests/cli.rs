@@ -4006,3 +4006,227 @@ fn target_flag_and_unused_dependencies_name_only_what_they_should() {
     project.edit("anvil.toml", "name = \"n\"\n", "name = \"n\"\nversion = \"1.0/beta\"\n");
     project.anvil(&["build"]).code(1).contains("write a version without spaces, `/`");
 }
+
+// Installed CMake packages (`cmake = "..."`): found as find_package finds them, read as vcpkg's are
+
+/// A TOML string of a path.
+fn toml_path(path: &Path) -> String {
+    format!("\"{}\"", path.to_string_lossy().replace('\\', "/"))
+}
+
+fn cmake_package_round_trip(toolchain: Option<&str>, test: &str, shared: bool) {
+    // A library installed by `anvil install` (static or shared, release and debug)
+    let library = Project::fixture("install", test);
+    let prefix = Project::empty(&format!("{test}_prefix"));
+    let prefix_text = prefix.root.to_string_lossy().to_string();
+    let option = format!("SHARED={shared}");
+    for profile in ["release", "debug"] {
+        let args = ["install", "-p", profile, "-o", &option, "--prefix", &prefix_text];
+        library.anvil(&with_toolchain(toolchain, &args)).success();
+    }
+
+    // A project using it as an installed CMake package: its definitions, headers and library (its DLL beside the
+    // program), the configuration of each profile
+    let user = Project::empty(&format!("{test}_user"));
+    user.write(
+        "anvil.toml",
+        &format!(
+            "[project]\nname = \"user\"\n\n[deps]\ngeo = {{ cmake = \"geo\", version = \"1.0\", components = [\"core\"], prefix = {} }}\n",
+            toml_path(&prefix.root)
+        ),
+    );
+    user.write(
+        "src/main.cpp",
+        "#include \"geo/core.h\"\n#include <cstdio>\nint main() { std::printf(\"area %d\\n\", geo_area(3, 4)); }\n",
+    );
+    for profile in ["debug", "release"] {
+        let run = user.anvil(&with_toolchain(toolchain, &["run", "-p", profile]));
+        run.success();
+        assert_eq!(program_output(&run), "area 12");
+    }
+
+    // A library using it installs a CMake package that finds it again
+    user.write(
+        "anvil.toml",
+        &format!(
+            "[project]\nname = \"wrap\"\n\n[deps]\ngeo = {{ cmake = \"geo\", components = [\"core\"], prefix = {} }}\n\n\
+             [target.wrap]\nkind = \"lib\"\npublic.deps = [\"geo\"]\n",
+            toml_path(&prefix.root)
+        ),
+    );
+    user.write("include/wrap/wrap.h", "#pragma once\n#include \"geo/core.h\"\nint wrap_area();\n");
+    user.write("src/main.cpp", "#include \"wrap/wrap.h\"\nint wrap_area() { return geo_area(5, 6); }\n");
+    user.anvil(&with_toolchain(toolchain, &["install"])).success();
+    let config = user.read("out/install/lib/cmake/wrap/wrapConfig.cmake");
+    assert!(
+        config.contains("find_package(geo CONFIG ${_wrap_quiet} COMPONENTS core HINTS \""),
+        "{config}"
+    );
+    assert!(config.contains("INTERFACE_LINK_LIBRARIES \"geo::core\""), "{config}");
+
+    // An Anvil user of that package reaches geo through it
+    let second = Project::empty(&format!("{test}_second"));
+    second.write(
+        "anvil.toml",
+        &format!(
+            "[project]\nname = \"second\"\n\n[deps]\nwrap = {{ cmake = \"wrap\", prefix = {} }}\n",
+            toml_path(&user.path("out/install"))
+        ),
+    );
+    second.write(
+        "src/main.cpp",
+        "#include \"wrap/wrap.h\"\n#include <cstdio>\nint main() { std::printf(\"%d %d\\n\", wrap_area(), geo_area(1, 2)); }\n",
+    );
+    let run = second.anvil(&with_toolchain(toolchain, &["run", "-p", "release"]));
+    run.success();
+    assert_eq!(program_output(&run), "30 2");
+
+    // What it says when the package does not fit or is not there
+    let geo = |table: &str| format!("[project]\nname = \"user\"\n\n[deps]\ngeo = {table}\n");
+    let prefix_key = toml_path(&prefix.root);
+    user.write(
+        "anvil.toml",
+        &geo(&format!("{{ cmake = \"geo\", version = \"2.0\", prefix = {prefix_key} }}")),
+    );
+    user.write("src/main.cpp", "int main() {}\n");
+    user.anvil(&["build"])
+        .code(1)
+        .contains("no CMake package `geo` that suits this build")
+        .contains("version 1.2.0, and 2.0 was asked for");
+    user.write(
+        "anvil.toml",
+        &geo(&format!("{{ cmake = \"geo\", components = [\"net\"], prefix = {prefix_key} }}")),
+    );
+    user.anvil(&["build"])
+        .code(1)
+        .contains("has no component `net`")
+        .contains("it has core, util");
+    user.write(
+        "anvil.toml",
+        &geo(&format!("{{ cmake = \"geo\", targets = [\"geo::gui\"], prefix = {prefix_key} }}")),
+    );
+    user.anvil(&["build"])
+        .code(1)
+        .contains("has no target `geo::gui`; its targets: geo::core, geo::util");
+    user.write("anvil.toml", &geo("{ cmake = \"AnvilNoSuchPackage\" }"));
+    user.anvil(&["build"])
+        .code(1)
+        .contains("CMake package `AnvilNoSuchPackage` not found")
+        .contains("AnvilNoSuchPackage_ROOT");
+    user.write("anvil.toml", &geo("{ cmake = \"geo\", prefix = \"{env:ANVIL_NO_SUCH_VARIABLE}/sdk\" }"));
+    user.anvil(&["build"])
+        .code(1)
+        .contains("dependency `geo`, `prefix`: environment variable `ANVIL_NO_SUCH_VARIABLE` is not set");
+}
+
+#[test]
+fn cmake_package_from_anvil_install() {
+    require!("default");
+    cmake_package_round_trip(None, "cmake_package", false);
+}
+
+#[test]
+fn cmake_package_from_anvil_install_shared() {
+    require!("default");
+    cmake_package_round_trip(None, "cmake_package_shared", true);
+}
+
+#[test]
+fn cmake_package_from_anvil_install_gcc() {
+    require!("gcc");
+    cmake_package_round_trip(Some("gcc"), "cmake_package_gcc", true);
+}
+
+#[test]
+fn cmake_package_from_a_vcpkg_tree() {
+    require!("default", "vcpkg");
+    if !cfg!(windows) {
+        require!("gcc");
+    }
+
+    // A port installed for one project is a prefix another uses: its config file, generator expressions, OpenMP
+    // (with gcc off Windows: clang needs LLVM's libomp there)
+    let toolchain = if cfg!(windows) { None } else { Some("gcc") };
+    let ports = Project::fixture("vcpkg_overlay", "cmake_package_vcpkg");
+    let run = ports.anvil(&with_toolchain(toolchain, &["run"]));
+    run.success();
+    let expected = program_output(&run).lines().last().unwrap().to_string();
+    let installed = std::fs::read_dir(ports.path("out/vcpkg/installed"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|triplet| triplet.is_dir() && triplet.file_name().unwrap() != "vcpkg")
+        .unwrap();
+    let triplet_folder = installed.join(installed.file_name().unwrap());
+
+    let user = Project::empty("cmake_package_vcpkg_user");
+    user.write(
+        "anvil.toml",
+        &format!(
+            "[project]\nname = \"user\"\n\n[deps]\noptport = {{ cmake = \"optport\", prefix = {} }}\n",
+            toml_path(&triplet_folder)
+        ),
+    );
+    for file in ["src/main.cpp", "src/c.c"] {
+        user.write(file, &ports.read(file));
+    }
+    let run = user.anvil(&with_toolchain(toolchain, &["run"]));
+    run.success();
+    assert_eq!(program_output(&run), expected);
+}
+
+#[test]
+fn vulkan_is_built_in() {
+    require!("default");
+    if std::env::var_os("VULKAN_SDK").is_none() {
+        eprintln!("skipped: VULKAN_SDK is not set");
+        return;
+    }
+
+    let project = Project::empty("vulkan_sdk");
+    project.write("anvil.toml", "[project]\nname = \"vk\"\n\n[deps]\nvulkan = \"system\"\n");
+    project.write(
+        "src/main.cpp",
+        "#include <vulkan/vulkan.h>\n#include <cstdio>\n\
+         int main() { uint32_t version = 0; VkResult result = vkEnumerateInstanceVersion(&version);\n\
+         std::printf(\"vulkan %u\\n\", VK_API_VERSION_MAJOR(version)); return result == VK_SUCCESS ? 0 : 1; }\n",
+    );
+    let run = project.anvil(&["run"]);
+    run.success();
+    assert_eq!(program_output(&run), "vulkan 1");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn cmake_packages_of_the_system_linux() {
+    require!("default");
+    let installed = |package: &str| {
+        [
+            "/usr/share/cmake",
+            "/usr/lib/x86_64-linux-gnu/cmake",
+            "/usr/lib/aarch64-linux-gnu/cmake",
+            "/usr/lib/cmake",
+        ]
+        .iter()
+        .any(|folder| Path::new(folder).join(package).is_dir())
+    };
+    if !installed("nlohmann_json") || !installed("fmt") {
+        eprintln!("skipped: nlohmann-json3-dev and libfmt-dev are not installed");
+        return;
+    }
+
+    // Found in the system's prefixes, with no `prefix`; the system's include folder stays off the command line
+    let project = Project::empty("cmake_system_packages");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"sys\"\n\n[deps]\njson = { cmake = \"nlohmann_json\", version = \"3.2\" }\nfmt = \"cmake\"\n",
+    );
+    project.write(
+        "src/main.cpp",
+        "#include <nlohmann/json.hpp>\n#include <fmt/core.h>\n\
+         int main() { nlohmann::json value = {{\"answer\", 42}}; fmt::print(\"{}\\n\", value.dump()); }\n",
+    );
+    let run = project.anvil(&["run"]);
+    run.success();
+    assert_eq!(program_output(&run), "{\"answer\":42}");
+    assert!(!project.read("out/compile_commands.json").contains("\"/usr/include\""));
+}

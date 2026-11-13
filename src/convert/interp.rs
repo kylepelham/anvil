@@ -299,6 +299,9 @@ pub struct Interpreter {
     pub target_prefixes: HashMap<String, Vec<String>>,
     pub aliases: HashMap<String, String>,
     pub packages: Vec<String>,
+    /// The components and version each find_package asks of a package (`find_package(Qt6 6.5 REQUIRED COMPONENTS
+    /// Widgets)`), for a `cmake` dependency.
+    pub package_requests: HashMap<String, (Vec<String>, Option<String>)>,
     /// Where each found package was looked for (packages not here everywhere).
     pub(super) package_conditions: HashMap<String, Truth>,
     pub fetched: IndexMap<String, (String, Option<String>)>,
@@ -363,6 +366,7 @@ impl Interpreter {
             target_prefixes: HashMap::new(),
             aliases: HashMap::new(),
             packages: Vec::new(),
+            package_requests: HashMap::new(),
             fetched: IndexMap::new(),
             options: IndexMap::new(),
             overridden_options: HashSet::new(),

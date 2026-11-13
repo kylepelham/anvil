@@ -328,8 +328,14 @@ enum DependencyEntry {
         tag: Option<String>,
     },
     PkgConfig(String),
-    /// A dependency Anvil has built in: `openmp`, `threads`, `opengl` (`"system"`).
+    /// A dependency Anvil has built in: `openmp`, `threads`, `opengl`, `vulkan` (`"system"`).
     System,
+    /// An installed CMake package no vcpkg port stands for: its name, components and version.
+    Cmake {
+        package: String,
+        components: Vec<String>,
+        version: Option<String>,
+    },
 }
 
 /// What a link item turned out to be.
@@ -1456,6 +1462,7 @@ impl Emitter {
             "threads::threads" => Some("threads"),
             "opengl::gl" | "opengl::opengl" => Some("opengl"),
             "openmp::openmp_cxx" | "openmp::openmp_c" => Some("openmp"),
+            "vulkan::vulkan" => Some("vulkan"),
             _ => None,
         };
         if let Some(name) = system {
@@ -1568,6 +1575,22 @@ impl Emitter {
             if self.has_port(&candidate) == Some(true) {
                 return (candidate, verified(None));
             }
+        }
+
+        // A package find_package found that no port stands for: that installed CMake package
+        let found = self
+            .cmake
+            .packages
+            .iter()
+            .find(|package| normalize_name(package) == normalize_name(namespace));
+        if let Some(package) = found {
+            let (components, version) = self.cmake.package_requests.get(package).cloned().unwrap_or_default();
+            let entry = DependencyEntry::Cmake {
+                package: package.clone(),
+                components,
+                version,
+            };
+            return (package.to_lowercase(), entry);
         }
 
         (namespace.replace('_', "-"), DependencyEntry::Vcpkg { verified: false, note: None })
@@ -2472,6 +2495,21 @@ impl Emitter {
                     }
                     DependencyEntry::PkgConfig(module) => (format!("{{ pkg-config = {} }}", quote(module)), None),
                     DependencyEntry::System => ("\"system\"".to_string(), None),
+                    DependencyEntry::Cmake {
+                        package,
+                        components,
+                        version,
+                    } => {
+                        let mut value = format!("{{ cmake = {}", quote(package));
+                        if !components.is_empty() {
+                            let quoted: Vec<String> = components.iter().map(|component| quote(component)).collect();
+                            value.push_str(&format!(", components = [{}]", quoted.join(", ")));
+                        }
+                        if let Some(version) = version {
+                            value.push_str(&format!(", version = {}", quote(version)));
+                        }
+                        (format!("{value} }}"), None)
+                    }
                 };
 
                 // Needed only where the targets using it are: installed only there

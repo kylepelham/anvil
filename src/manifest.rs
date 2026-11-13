@@ -465,6 +465,14 @@ pub struct DepSpec {
     pub branch: Option<String>,
     pub rev: Option<String>,
     pub pkg_config: Option<String>,
+    /// An installed CMake package, found as find_package(<name> CONFIG) finds it: its components, the version it must
+    /// be compatible with, which of its imported targets (default: those of the components, else its libraries), and
+    /// the install prefixes to look in instead of CMake's search.
+    pub cmake: Option<String>,
+    pub components: Option<Vec<String>>,
+    pub version: Option<String>,
+    pub targets: Option<Vec<String>>,
+    pub prefix: Option<StrOrList>,
     /// For path/git packages: which of its targets (default: its library).
     pub target: Option<String>,
     #[serde(rename = "if")]
@@ -486,7 +494,7 @@ const DEFAULT_UNITY_BATCH: usize = 8;
 // The keys of an option's table form
 pub const OPTION_KEYS: &[&str] = &["default", "description"];
 
-/// Reads one `[deps]` entry, from its short form ("vcpkg", "pkg-config", "system") or its table.
+/// Reads one `[deps]` entry, from its short form ("vcpkg", "pkg-config", "cmake", "system") or its table.
 pub fn parse_dep(name: &str, value: &toml::Value) -> Result<DepSpec> {
     match value {
         toml::Value::String(short_form) => match short_form.as_str() {
@@ -498,12 +506,16 @@ pub fn parse_dep(name: &str, value: &toml::Value) -> Result<DepSpec> {
                 pkg_config: Some(name.into()),
                 ..Default::default()
             }),
+            "cmake" => Ok(DepSpec {
+                cmake: Some(name.into()),
+                ..Default::default()
+            }),
             "system" => Ok(DepSpec {
                 libs: Some(vec![name.into()]),
                 ..Default::default()
             }),
             other => bail!(
-                "dependency `{name} = \"{other}\"`: the short form is \"vcpkg\", \"pkg-config\" or \"system\"; \
+                "dependency `{name} = \"{other}\"`: the short form is \"vcpkg\", \"pkg-config\", \"cmake\" or \"system\"; \
                  otherwise use a table, e.g. {name} = {{ path = \"../{name}\" }} or {{ git = \"https://...\", tag = \"v1.0\" }}"
             ),
         },
@@ -646,15 +658,24 @@ fn parse_dep_table(name: &str, value: &toml::Value) -> Result<DepSpec> {
         .map_err(|error: toml::de::Error| anyhow::anyhow!("dependency `{name}`: {}", error.message()))?;
 
     // Exactly one origin, or a prebuilt include/libs description
-    let origins = [spec.vcpkg.is_some(), spec.path.is_some(), spec.git.is_some(), spec.pkg_config.is_some()];
-    let origin_count = origins.iter().filter(|given| **given).count();
-    if origin_count > 1 {
-        bail!("dependency `{name}`: give only one of vcpkg, path, git, pkg-config");
+    let origins = [
+        ("vcpkg", spec.vcpkg.is_some()),
+        ("path", spec.path.is_some()),
+        ("git", spec.git.is_some()),
+        ("pkg-config", spec.pkg_config.is_some()),
+        ("cmake", spec.cmake.is_some()),
+    ];
+    let given_origins: Vec<&str> = origins.iter().filter(|(_, given)| *given).map(|(key, _)| *key).collect();
+    if given_origins.len() > 1 {
+        bail!(
+            "dependency `{name}`: give only one of vcpkg, path, git, pkg-config and cmake, not {}",
+            given_origins.join(" and ")
+        );
     }
-    if origin_count == 0 && spec.include.is_none() && spec.libs.is_none() {
+    if given_origins.is_empty() && spec.include.is_none() && spec.libs.is_none() {
         bail!(
             "dependency `{name}`: say where it comes from: vcpkg = \"{name}\", path = \"...\", git = \"...\", pkg-config = \"...\", \
-             or include/libs for a prebuilt one"
+             cmake = \"<Package>\" (an installed CMake package), or include/libs for a prebuilt one"
         );
     }
 
@@ -670,6 +691,20 @@ fn parse_dep_table(name: &str, value: &toml::Value) -> Result<DepSpec> {
     }
     if spec.vcpkg.is_none() && (!spec.features.is_empty() || spec.default_features.is_some()) {
         bail!("dependency `{name}`: `features` and `default-features` are vcpkg's; this one has no `vcpkg`");
+    }
+    let cmake_keys = [
+        ("components", spec.components.is_some()),
+        ("version", spec.version.is_some()),
+        ("targets", spec.targets.is_some()),
+        ("prefix", spec.prefix.is_some()),
+    ];
+    if let (Some((key, _)), None) = (cmake_keys.iter().find(|(_, given)| *given), &spec.cmake) {
+        bail!("dependency `{name}`: `{key}` belongs to an installed CMake package; this one has no `cmake = \"<Package>\"`");
+    }
+    if let Some(version) = &spec.version {
+        if crate::cmake_package::parse_version(version).is_none() {
+            bail!("dependency `{name}`: version = \"{version}\" is not a version; write numbers such as \"1.2\" or \"6.5.3\" (the oldest compatible one)");
+        }
     }
     if !source_package {
         if spec.target.is_some() || spec.sources.is_some() {
@@ -755,6 +790,31 @@ mod tests {
         assert_eq!(parse_dep("fmt", &manifest.deps["fmt"]).unwrap().vcpkg.unwrap(), "fmt");
         assert_eq!(parse_dep("sdl3", &manifest.deps["sdl3"]).unwrap().features, vec!["vulkan"]);
         assert!(parse_dep("x", &toml::Value::String("bogus".into())).is_err());
+    }
+
+    #[test]
+    fn cmake_deps() {
+        let dep = |text: &str| {
+            let manifest = parse_str(&format!("[deps]\nx = {text}\n")).unwrap();
+            parse_dep("x", &manifest.deps["x"]).map_err(|error| error.to_string())
+        };
+
+        assert_eq!(dep("\"cmake\"").unwrap().cmake.unwrap(), "x");
+        let qt = dep("{ cmake = \"Qt6\", components = [\"Widgets\"], version = \"6.5\", prefix = \"{env:QTDIR}\" }").unwrap();
+        assert_eq!(
+            (qt.cmake.unwrap(), qt.components.unwrap()),
+            ("Qt6".to_string(), vec!["Widgets".to_string()])
+        );
+        assert!(dep("{ cmake = \"Qt6\", vcpkg = \"qtbase\" }")
+            .unwrap_err()
+            .contains("not vcpkg and cmake"));
+        assert!(dep("{ pkg-config = \"x\", components = [\"a\"] }")
+            .unwrap_err()
+            .contains("`components` belongs to an installed CMake package"));
+        assert!(dep("{ cmake = \"X\", version = \"1.x\" }").unwrap_err().contains("is not a version"));
+        assert!(dep("{ cmake = \"X\", compnents = [] }")
+            .unwrap_err()
+            .contains("unknown field `compnents`"));
     }
 
     #[test]

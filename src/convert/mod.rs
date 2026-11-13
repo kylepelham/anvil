@@ -379,6 +379,29 @@ target_link_libraries(app PRIVATE OpenMP::OpenMP_CXX Threads::Threads ${OPENGL_L
     }
 
     #[test]
+    fn installed_packages_become_cmake_dependencies() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(sdk CXX)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Widgets)
+find_package(AnvilTestSdk 1.2 CONFIG REQUIRED)
+find_package(Vulkan REQUIRED)
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE Qt6::Core Qt6::Widgets AnvilTestSdk::sdk Vulkan::Vulkan)
+"#;
+        let toml = convert_files("installed", &[("CMakeLists.txt", cmake), ("main.cpp", "int main() {}\n")]).toml;
+
+        assert!(
+            toml.contains(r#"qt6 = { cmake = "Qt6", components = ["Core", "Widgets"], version = "6.5" }"#),
+            "{toml}"
+        );
+        assert!(toml.contains(r#"anviltestsdk = { cmake = "AnvilTestSdk", version = "1.2" }"#), "{toml}");
+        assert!(toml.contains("vulkan = \"system\""), "{toml}");
+        assert!(toml.contains(r#"deps = ["qt6", "anviltestsdk", "vulkan"]"#), "{toml}");
+        assert!(!toml.contains("TODO:"), "{toml}");
+    }
+
+    #[test]
     fn optional_ports_are_options_off_by_default() {
         let cmake = r#"
 cmake_minimum_required(VERSION 3.20)

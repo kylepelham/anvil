@@ -129,6 +129,8 @@ pub struct Target {
 
     /// For External targets: the vcpkg package (name, only these libs) to fill in after install.
     pub vcpkg: Option<(String, Option<Vec<String>>)>,
+    /// For External targets: the installed CMake package it is (`cmake = "..."`), for `anvil install`'s CMake files.
+    pub cmake_package: Option<crate::vcpkg_tree::CmakePackage>,
 }
 
 /// Per-file settings, with the patterns compiled.
@@ -370,6 +372,7 @@ impl Target {
             reject: Vec::new(),
             exit_code: None,
             vcpkg: None,
+            cmake_package: None,
         }
     }
 

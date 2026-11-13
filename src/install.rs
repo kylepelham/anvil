@@ -944,10 +944,13 @@ impl Export {
                         continue;
                     }
 
-                    // A vcpkg port CMake can find: its package and targets
+                    // A vcpkg port CMake can find, or an installed CMake package (`cmake = "..."`): its package and targets
                     let port = dependency.vcpkg.as_ref().map(|(port, _)| port.as_str());
                     let build = crate::vcpkg_tree::BuildContext::new(&model.toolchain, &model.profile);
-                    let package = port.and_then(|port| vcpkg_tree.and_then(|tree| tree.cmake_package(port, &build)));
+                    let package = dependency
+                        .cmake_package
+                        .clone()
+                        .or_else(|| port.and_then(|port| vcpkg_tree.and_then(|tree| tree.cmake_package(port, &build))));
                     self.uses_build_folder |= port.is_some();
                     if let Some(package) = package {
                         links.extend(package.targets.iter().map(|target| item(target.clone())));
@@ -1103,8 +1106,15 @@ impl Export {
             ));
             for package in &self.dependencies {
                 let mode = if package.config { " CONFIG" } else { "" };
+                let mut arguments = String::new();
+                if !package.components.is_empty() {
+                    arguments.push_str(&format!(" COMPONENTS {}", package.components.join(" ")));
+                }
+                if let Some(hint) = &package.hint {
+                    arguments.push_str(&format!(" HINTS \"{}\"", cmake_escape(&slash(hint))));
+                }
                 text.push_str(&format!(
-                    "if(NOT _{project}_missing)\n  find_package({name}{mode} ${{_{project}_quiet}})\n  if(NOT {name}_FOUND)\n    set(_{project}_missing {name})\n  endif()\nendif()\n",
+                    "if(NOT _{project}_missing)\n  find_package({name}{mode} ${{_{project}_quiet}}{arguments})\n  if(NOT {name}_FOUND)\n    set(_{project}_missing {name})\n  endif()\nendif()\n",
                     name = package.name
                 ));
             }
@@ -1411,8 +1421,9 @@ fn by_configuration(property: &str, items: &[String], configuration: &str, other
     combined
 }
 
-/// A built-in system dependency (`openmp = "system"`, `threads`, `opengl`) as CMake's find module and the targets a
-/// library links: OpenMP's for the library's language (both when it has no sources), Threads::Threads, OpenGL::GL.
+/// A built-in system dependency (`openmp = "system"`, `threads`, `opengl`, `vulkan`) as CMake's find module and the
+/// targets a library links: OpenMP's for the library's language (both when it has no sources), Threads::Threads,
+/// OpenGL::GL, Vulkan::Vulkan.
 fn system_package(model: &Model, dependency: &Target, library: &Target) -> Option<(&'static str, Vec<String>)> {
     if dependency.vcpkg.is_some() {
         return None;
@@ -1439,6 +1450,7 @@ fn system_package(model: &Model, dependency: &Target, library: &Target) -> Optio
         ),
         "openmp" => ("OpenMP", vec![format!("OpenMP::OpenMP_{}", link_language(library))]),
         "threads" => ("Threads", vec!["Threads::Threads".to_string()]),
+        "vulkan" => ("Vulkan", vec!["Vulkan::Vulkan".to_string()]),
         _ => ("OpenGL", vec!["OpenGL::GL".to_string()]),
     };
 

@@ -103,8 +103,8 @@ pub fn manifest_schema() -> Value {
         (
             "deps",
             map(
-                "Dependencies: `name = \"vcpkg\"`, `\"pkg-config\"` or `\"system\"`, or a table (vcpkg, path, git, pkg-config, or a prebuilt \
-                 include/libs). Without [target] tables the main target uses them all; otherwise the targets that list them in `deps`.",
+                "Dependencies: `name = \"vcpkg\"`, `\"pkg-config\"`, `\"cmake\"` or `\"system\"`, or a table (vcpkg, path, git, pkg-config, \
+                 cmake, or a prebuilt include/libs). Without [target] tables the main target uses them all; otherwise the targets that list them in `deps`.",
                 reference("dep"),
             ),
         ),
@@ -576,6 +576,26 @@ fn dep_value() -> Value {
         ("branch", text("The git branch to follow (`anvil update` moves it on).")),
         ("rev", text("The git commit to use.")),
         ("pkg-config", text("The pkg-config package.")),
+        (
+            "cmake",
+            text("An installed CMake package (`Qt6`, `fmt`), found where find_package(<name> CONFIG) finds it."),
+        ),
+        (
+            "components",
+            texts("The CMake package's components (`[\"Core\", \"Widgets\"]`): their targets are linked."),
+        ),
+        (
+            "version",
+            text("The oldest version of the CMake package that will do (`\"6.5\"`), judged by its version file."),
+        ),
+        (
+            "targets",
+            texts("Which of the CMake package's imported targets to link (default: its components', else its libraries)."),
+        ),
+        (
+            "prefix",
+            text_or_texts("The install folders to find the CMake package in, instead of CMake's search (`\"C:/Qt/6.8.0/msvc2022_64\"`)."),
+        ),
         ("target", text("For path and git packages: which of its targets (default: its library).")),
         ("if", text("Used only when this condition holds.")),
         ("include", texts("Include folders: of a prebuilt library, or overriding a package's.")),
@@ -589,13 +609,13 @@ fn dep_value() -> Value {
     ];
 
     json!({
-        "description": "A dependency: \"vcpkg\", \"pkg-config\", \"system\", or a table.",
+        "description": "A dependency: \"vcpkg\", \"pkg-config\", \"cmake\", \"system\", or a table.",
         "anyOf": [
             {
-                "enum": ["vcpkg", "pkg-config", "system"],
-                "description": "The vcpkg port, pkg-config package or system library of this name.",
+                "enum": ["vcpkg", "pkg-config", "cmake", "system"],
+                "description": "The vcpkg port, pkg-config package, installed CMake package or system library of this name.",
             },
-            table("A dependency: one of vcpkg, path, git or pkg-config, or a prebuilt include/libs.", properties, &[]),
+            table("A dependency: one of vcpkg, path, git, pkg-config or cmake, or a prebuilt include/libs.", properties, &[]),
         ],
     })
 }

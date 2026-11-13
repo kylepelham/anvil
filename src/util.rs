@@ -297,6 +297,30 @@ pub fn expand_env(text: &str) -> Result<String> {
         }
     }
 
+    expand_env_placeholders(&expanded)
+}
+
+/// Expands `{env:NAME}` placeholders (in dependencies' definitions and flags too, where `$` is left alone). A missing
+/// variable is an error, not "".
+pub fn expand_env_placeholders(text: &str) -> Result<String> {
+    let mut expanded = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(start) = rest.find("{env:") {
+        expanded.push_str(&rest[..start]);
+        let after = &rest[start + "{env:".len()..];
+        let Some(end) = after.find('}') else {
+            bail!("`{{env:` has no closing `}}` in \"{text}\"; write {{env:NAME}}")
+        };
+        let name = &after[..end];
+        match std::env::var(name) {
+            Ok(value) => expanded.push_str(&value),
+            Err(_) => bail!("environment variable `{name}` is not set (used in \"{text}\")"),
+        }
+        rest = &after[end + 1..];
+    }
+    expanded.push_str(rest);
+
     Ok(expanded)
 }
 
@@ -487,5 +511,20 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(rel(Path::new("C:/Foo/Bar/x.h"), Path::new("c:/foo")), "Bar/x.h");
         }
+    }
+
+    #[test]
+    fn expands_environment_placeholders() {
+        let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let value = std::env::var(home).unwrap();
+        assert_eq!(expand_env_placeholders(&format!("{{env:{home}}}/sdk")).unwrap(), format!("{value}/sdk"));
+        assert_eq!(expand_env(&format!("{{env:{home}}}/a/${home}")).unwrap(), format!("{value}/a/{value}"));
+        assert_eq!(expand_env_placeholders("-DCOST=$5").unwrap(), "-DCOST=$5");
+
+        let error = expand_env_placeholders("{env:ANVIL_SURELY_UNSET_VARIABLE}/Include")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`ANVIL_SURELY_UNSET_VARIABLE` is not set"), "{error}");
+        assert!(expand_env_placeholders("{env:HOME").is_err());
     }
 }

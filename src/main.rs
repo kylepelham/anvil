@@ -1,5 +1,6 @@
 //! Anvil: a fast, zero-ceremony build system for C and C++.
 
+mod cmake_package;
 mod cmake_tool;
 mod commands;
 mod cond;
