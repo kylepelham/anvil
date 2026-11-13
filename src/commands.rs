@@ -538,7 +538,7 @@ fn print_summary(model: &Model, summary: &Summary) {
 }
 
 /// One job per CPU plus two, like Ninja: a compiler spends part of its life starting up and waiting on the disk.
-fn jobs(build: &BuildArgs) -> usize {
+pub fn jobs(build: &BuildArgs) -> usize {
     build
         .jobs
         .unwrap_or_else(|| std::thread::available_parallelism().map(|count| count.get() + 2).unwrap_or(4))

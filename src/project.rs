@@ -1390,7 +1390,7 @@ fn package_context(index: usize, name: &str, root: &Path) -> String {
     }
 }
 
-fn workspace_members(root: &Path, manifest: &Manifest) -> Result<Vec<PathBuf>> {
+pub fn workspace_members(root: &Path, manifest: &Manifest) -> Result<Vec<PathBuf>> {
     let Some(workspace) = &manifest.workspace else { return Ok(Vec::new()) };
     let out_root = util::absolute(
         root,
