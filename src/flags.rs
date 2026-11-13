@@ -134,17 +134,20 @@ impl Gui {
     }
 }
 
-/// "20", "c++20", "cxx20", "cpp20" -> "c++20"; "gnu++20" stays; C: "17", "c17" -> "c17".
+/// "20", "c++20", "cxx20", "cpp20" -> "c++20"; "gnu++20" stays; C: "17", "c17" -> "c17"; "gnu17" stays.
 pub fn normalize_standard(text: &str, language: Language) -> Result<String> {
     let lowered = text.to_ascii_lowercase();
-    let digits = lowered
+    let cxx = matches!(language, Language::Cxx | Language::ObjCxx);
+    let mut digits = lowered
         .trim_start_matches("c++")
         .trim_start_matches("cxx")
         .trim_start_matches("cpp")
-        .trim_start_matches("gnu++")
-        .trim_start_matches('c');
+        .trim_start_matches("gnu++");
+    if !cxx {
+        digits = digits.trim_start_matches("gnu");
+    }
+    let digits = digits.trim_start_matches('c');
 
-    let cxx = matches!(language, Language::Cxx | Language::ObjCxx);
     let valid = if cxx {
         ["11", "14", "17", "20", "23", "26"].contains(&digits)
     } else {
@@ -154,10 +157,12 @@ pub fn normalize_standard(text: &str, language: Language) -> Result<String> {
         if cxx {
             bail!("std = \"{text}\": C++ standards are 11, 14, 17, 20, 23 and 26 (\"c++20\", \"20\", or \"gnu++20\" with GNU extensions)");
         }
-        bail!("c-std = \"{text}\": C standards are 89, 90, 99, 11, 17, 18 and 23 (\"c17\", or \"17\")");
+        bail!("c-std = \"{text}\": C standards are 89, 90, 99, 11, 17, 18 and 23 (\"c17\", \"17\", or \"gnu17\" with GNU extensions)");
     }
 
-    Ok(if !cxx {
+    Ok(if !cxx && lowered.starts_with("gnu") {
+        format!("gnu{digits}")
+    } else if !cxx {
         format!("c{digits}")
     } else if lowered.starts_with("gnu") {
         format!("gnu++{digits}")
@@ -1042,9 +1047,9 @@ fn msvc_standard_flag(standard: &str, clang_cl: bool) -> Vec<String> {
         "c++20" | "gnu++20" => "/std:c++20",
         "c++23" | "gnu++23" if clang_cl => "/clang:-std=c++23",
         "c++23" | "gnu++23" | "c++26" | "gnu++26" => "/std:c++latest",
-        "c11" => "/std:c11",
-        "c17" | "c18" => "/std:c17",
-        "c23" => "/std:clatest",
+        "c11" | "gnu11" => "/std:c11",
+        "c17" | "c18" | "gnu17" | "gnu18" => "/std:c17",
+        "c23" | "gnu23" => "/std:clatest",
         _ => return Vec::new(),
     };
 

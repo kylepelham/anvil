@@ -238,6 +238,12 @@ const MIN_SIBLING_LINES_SAVED: usize = 4;
 // A list longer than this goes on several lines
 const INLINE_LIST_WIDTH: usize = 100;
 
+// Ends a dependency's name while a target of the project has the same name, until that target is renamed
+const DEPENDENCY_MARK: char = '\u{4}';
+
+// Keys whose items name targets or dependencies
+const LINK_KEYS: &[&str] = &["deps", "public.deps", "interface.deps", "header-deps", "needs", "whole-archive"];
+
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
     List(Vec<String>),
@@ -389,6 +395,7 @@ pub fn emit(interpreter: Interpreter) -> Result<Conversion> {
     emitter.convert_tests();
     emitter.drop_empty_custom_targets();
     emitter.factor_shared_settings();
+    emitter.separate_dependency_names();
 
     Ok(emitter.render())
 }
@@ -621,11 +628,19 @@ impl Emitter {
             .sources
             .iter()
             .any(|item| item.value.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("cu")));
+        let extensions = |key: &str| {
+            let value = target.settings.iter().rev().find(|item| item.value.0 == key);
+            value.is_none_or(|item| super::model::constant_truth(&item.value.1) != Some(false))
+        };
+        let (cxx_extensions, c_extensions) = (extensions("cxx-extensions"), extensions("c-extensions"));
         for item in &target.settings {
             let (key, value) = &item.value;
             let condition = relative_condition(&item.condition);
             match *key {
                 "cuda-arch" if !has_cuda => {}
+                "cxx-extensions" | "c-extensions" => {}
+                "std" => converted.blocks.set(condition, key, Value::Text(with_extensions(value, cxx_extensions))),
+                "c-std" => converted.blocks.set(condition, key, Value::Text(with_extensions(value, c_extensions))),
                 "link-depends" => converted.blocks.push(condition, key, self.path_text(Path::new(value), &dir)),
                 "output-dir" if value == "{out}" => {}
                 "output-dir" | "pch" => converted.blocks.set(condition, key, Value::Text(self.path_text(Path::new(value), &dir))),
@@ -813,10 +828,14 @@ impl Emitter {
 
         // Single settings
         if let Some(standard) = self.effective_standard(&target.name, &mut Vec::new()) {
-            converted.blocks.set(None, "std", Value::Text(format!("c++{standard}")));
+            converted
+                .blocks
+                .set(None, "std", Value::Text(with_extensions(&format!("c++{standard}"), cxx_extensions)));
         }
         if let Some(standard) = target.c_std {
-            converted.blocks.set(None, "c-std", Value::Text(format!("c{standard}")));
+            converted
+                .blocks
+                .set(None, "c-std", Value::Text(with_extensions(&format!("c{standard}"), c_extensions)));
         }
         if target.gui && converted.blocks.get(&None, "gui").is_none() {
             converted.blocks.set(None, "gui", Value::Bool(true));
@@ -1174,7 +1193,7 @@ impl Emitter {
             FlagMeaning::Werror => converted.blocks.set(condition.clone(), "werror", Value::Bool(true)),
             FlagMeaning::Arch(arch) => converted.blocks.set(condition.clone(), "arch", Value::Text(arch.into())),
             FlagMeaning::Standard(standard) => {
-                let key = if standard.starts_with("c++") { "std" } else { "c-std" };
+                let key = if standard.contains("++") { "std" } else { "c-std" };
                 converted.blocks.set(condition.clone(), key, Value::Text(standard))
             }
             FlagMeaning::Define(define) => converted.blocks.push(
@@ -1439,8 +1458,9 @@ impl Emitter {
             _ => None,
         };
         if let Some(name) = system {
-            self.dependencies.insert(name.to_string(), DependencyEntry::System);
-            return vec![(None, Link::Dependency(name.to_string()))];
+            let name = self.dependency_key(name);
+            self.dependencies.insert(name.clone(), DependencyEntry::System);
+            return vec![(None, Link::Dependency(name))];
         }
         match lower.as_str() {
             // The CUDA runtime links into whatever has .cu files; the toolkit's other libraries are in its lib folder
@@ -1465,15 +1485,27 @@ impl Emitter {
                 .into_iter()
                 .map(|module| {
                     let name = module.split(['>', '<', '=']).next().unwrap_or_default().trim().to_string();
-                    self.dependencies.insert(name.clone(), DependencyEntry::PkgConfig(name.clone()));
-                    (None, Link::Dependency(name))
+                    let key = self.dependency_key(&name);
+                    self.dependencies.insert(key.clone(), DependencyEntry::PkgConfig(name));
+                    (None, Link::Dependency(key))
                 })
                 .collect();
         }
 
         let (port, entry) = self.port_for(&lower, &namespace, &short);
+        let port = self.dependency_key(&port);
         self.dependencies.entry(port.clone()).or_insert(entry);
         vec![(None, Link::Dependency(port))]
+    }
+
+    /// A dependency's name in [deps], marked when a target of the project has that name too (until
+    /// `separate_dependency_names` renames the target).
+    fn dependency_key(&self, name: &str) -> String {
+        if self.cmake.targets.contains_key(name) {
+            format!("{name}{DEPENDENCY_MARK}")
+        } else {
+            name.to_string()
+        }
     }
 
     /// The vcpkg port (or git dependency) behind a package: known names, the project's vcpkg.json, FetchContent, the
@@ -1557,7 +1589,7 @@ impl Emitter {
             let missing = command
                 .commands
                 .iter()
-                .find(|words| words.first().map_or(true, |program| program.is_empty() || program.ends_with("-NOTFOUND")));
+                .find(|words| words.first().is_none_or(|program| program.is_empty() || program.ends_with("-NOTFOUND")));
             if let Some(words) = missing {
                 let program = words
                     .first()
@@ -2277,6 +2309,90 @@ impl Emitter {
         entries
     }
 
+    /// A dependency and a target of one name (glfw's test program `threads` links Threads::Threads, Anvil's built-in
+    /// `threads`): the target takes another name and keeps its file name, since a [deps] entry is known by its name.
+    fn separate_dependency_names(&mut self) {
+        let marked: Vec<String> = self
+            .dependencies
+            .keys()
+            .filter_map(|key| key.strip_suffix(DEPENDENCY_MARK))
+            .map(String::from)
+            .collect();
+
+        for name in marked {
+            let Some(target) = self.targets.get_mut(&name) else { continue };
+            target.output_name.get_or_insert_with(|| name.clone());
+            let is_test = target.kind == "test";
+
+            // `<name>-<kind>`, numbered if that is taken too
+            let base = format!("{name}-{}", target.kind);
+            let new_name = std::iter::once(base.clone())
+                .chain((2..).map(|number| format!("{base}{number}")))
+                .find(|candidate| !self.targets.contains_key(candidate) && !self.dependencies.contains_key(candidate))
+                .unwrap();
+            self.targets = std::mem::take(&mut self.targets)
+                .into_iter()
+                .map(|(key, target)| if key == name { (new_name.clone(), target) } else { (key, target) })
+                .collect();
+
+            // Its users and the commands that run it
+            let reference = format!("{{target:{name}}}");
+            let new_reference = format!("{{target:{new_name}}}");
+            self.edit_texts(&mut |key, text| {
+                let names_target = key.is_some_and(|key| LINK_KEYS.contains(&key)) || (is_test && key == Some("after"));
+                if names_target && *text == name {
+                    *text = new_name.clone();
+                } else if text.contains(&reference) {
+                    *text = text.replace(&reference, &new_reference);
+                }
+            });
+            self.warnings.push(format!(
+                "target `{name}` is `{new_name}` in anvil.toml (its files keep the name {name}): `{name}` names a dependency in [deps]"
+            ));
+        }
+
+        // The dependencies under their own names
+        self.edit_texts(&mut |_, text| text.retain(|character| character != DEPENDENCY_MARK));
+        self.dependencies = std::mem::take(&mut self.dependencies)
+            .into_iter()
+            .map(|(name, entry)| (name.trim_end_matches(DEPENDENCY_MARK).to_string(), entry))
+            .collect();
+    }
+
+    /// Calls `edit` on every text the targets, presets and tests write, with the key of settings.
+    fn edit_texts(&mut self, edit: &mut dyn FnMut(Option<&str>, &mut String)) {
+        for target in self.targets.values_mut() {
+            edit_block_texts(&mut target.blocks, edit);
+            for rule in &mut target.files {
+                rule.files
+                    .iter_mut()
+                    .chain(&mut rule.defines)
+                    .chain(&mut rule.flags)
+                    .for_each(|text| edit(None, text));
+            }
+            for run in target.runs.iter_mut().chain(&mut target.pre_build).chain(&mut target.post_build) {
+                let texts = run
+                    .for_each
+                    .iter_mut()
+                    .chain(&mut run.inputs)
+                    .chain(&mut run.outputs)
+                    .chain(&mut run.command);
+                texts.chain(&mut run.message).chain(&mut run.workdir).for_each(|text| edit(None, text));
+            }
+            target.args.iter_mut().chain(&mut target.workdir).for_each(|text| edit(None, text));
+            edit_test_texts(&mut target.test, edit);
+        }
+
+        edit_block_texts(&mut self.defaults, edit);
+        for preset in self.presets.values_mut() {
+            edit_block_texts(preset, edit);
+        }
+        for test in &mut self.tests {
+            test.command.iter_mut().chain(&mut test.workdir).for_each(|text| edit(None, text));
+            edit_test_texts(&mut test.properties, edit);
+        }
+    }
+
     // Output
 
     fn render(mut self) -> Conversion {
@@ -2313,7 +2429,7 @@ impl Emitter {
             .partition(|(name, _, _)| used_words.contains(name));
         let unused: Vec<_> = unused
             .into_iter()
-            .filter(|(name, _, _)| !self.cmake.overridden_options.contains(name))
+            .filter(|(name, _, _)| !self.cmake.overridden_options.contains(name) && !self.cmake.builtin.package_options.contains(name))
             .collect();
         if !unused.is_empty() {
             let names: Vec<&str> = unused.iter().map(|(name, _, _)| name.as_str()).collect();
@@ -2596,10 +2712,7 @@ impl Emitter {
                 if !names_it {
                     continue;
                 }
-                match super::model::and_optional(&target_condition.cloned(), condition) {
-                    Some(condition) => conditions.push(condition),
-                    None => return None,
-                }
+                conditions.push(super::model::and_optional(&target_condition.cloned(), condition)?);
             }
         }
         if conditions.is_empty() {
@@ -3051,6 +3164,16 @@ fn is_main_entry(lowercase_option: &str) -> bool {
     matches!(entry, Some("maincrtstartup" | "wmaincrtstartup"))
 }
 
+/// A CMake standard (`c++17`, `c11`) as CMake compiles it: with GNU extensions (`gnu++17`, `gnu11`) unless the target
+/// turns them off (CXX_EXTENSIONS and C_EXTENSIONS, on by default). C89 is cl's /Za, not a CMake standard.
+fn with_extensions(standard: &str, extensions: bool) -> String {
+    match (extensions && standard != "c89", standard.strip_prefix("c++"), standard.strip_prefix('c')) {
+        (true, Some(version), _) => format!("gnu++{version}"),
+        (true, None, Some(version)) => format!("gnu{version}"),
+        _ => standard.to_string(),
+    }
+}
+
 /// About how many lines settings take written in a table: a line per key, and a header (with the blank line before
 /// it) per when block or sub-table.
 fn written_lines(entries: &[Entry]) -> usize {
@@ -3062,6 +3185,28 @@ fn written_lines(entries: &[Entry]) -> usize {
         .collect();
 
     keys.len() + 2 * tables.len()
+}
+
+/// Calls `edit` on every text of the settings, with its key.
+fn edit_block_texts(blocks: &mut Blocks, edit: &mut dyn FnMut(Option<&str>, &mut String)) {
+    for block in blocks.blocks.values_mut() {
+        for (key, value) in block.iter_mut() {
+            match value {
+                Value::List(items) => items.iter_mut().for_each(|item| edit(Some(key), item)),
+                Value::Text(text) => edit(Some(key), text),
+                Value::Bool(_) => {}
+            }
+        }
+    }
+}
+
+/// Calls `edit` on the texts of a test's properties (`after` with that key).
+fn edit_test_texts(properties: &mut TestProperties, edit: &mut dyn FnMut(Option<&str>, &mut String)) {
+    properties.after.iter_mut().for_each(|name| edit(Some("after"), name));
+    let patterns = properties.expect.iter_mut().chain(&mut properties.reject);
+    patterns
+        .chain(properties.env.iter_mut().map(|(_, value)| value))
+        .for_each(|text| edit(None, text));
 }
 
 /// A program's public settings as its own: with nothing linking it, they mean the same.
@@ -3491,7 +3636,7 @@ fn merge_file_rules(rules: Vec<FileRuleOut>) -> Vec<FileRuleOut> {
 /// What a compile flag becomes.
 fn compile_flag_meaning(flag: &str) -> FlagMeaning {
     match flag {
-        "/W4" | "-Wall" | "-Wextra" | "-Wpedantic" | "-pedantic" => FlagMeaning::Warnings("high"),
+        "/W4" | "-Wall" | "-Wextra" => FlagMeaning::Warnings("high"),
         "/Wall" | "-Weverything" => FlagMeaning::Warnings("all"),
         "/W0" | "-w" => FlagMeaning::Warnings("off"),
         "/WX" | "-Werror" => FlagMeaning::Werror,
@@ -3506,7 +3651,7 @@ fn compile_flag_meaning(flag: &str) -> FlagMeaning {
         _ => {
             let standard = flag.strip_prefix("/std:").or_else(|| flag.strip_prefix("-std="));
             if let Some(standard) = standard {
-                let standard = standard.replace("gnu++", "c++").replace("c++latest", "c++23").replace("gnu", "c");
+                let standard = standard.replace("c++latest", "c++23");
                 return FlagMeaning::Standard(standard);
             }
 
@@ -3697,9 +3842,12 @@ mod tests {
     fn flags() {
         assert!(matches!(compile_flag_meaning("/W4"), FlagMeaning::Warnings("high")));
         assert!(matches!(compile_flag_meaning("/std:c++latest"), FlagMeaning::Standard(standard) if standard == "c++23"));
+        assert!(matches!(compile_flag_meaning("-std=gnu99"), FlagMeaning::Standard(standard) if standard == "gnu99"));
         assert!(matches!(compile_flag_meaning("-DFOO=1"), FlagMeaning::Define(define) if define == "FOO=1"));
         assert!(matches!(compile_flag_meaning("/utf-8"), FlagMeaning::Drop));
         assert!(matches!(compile_flag_meaning("-Wshadow"), FlagMeaning::Keep));
+        // warnings = "high" is -Wall -Wextra with GCC, without -pedantic
+        assert!(matches!(compile_flag_meaning("-pedantic"), FlagMeaning::Keep));
     }
 
     #[test]

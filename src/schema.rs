@@ -35,14 +35,14 @@ const LINKAGES: &[&str] = &["static", "dynamic"];
 const CXX_STANDARDS: &[&str] = &[
     "c++17", "c++20", "c++23", "c++26", "c++14", "c++11", "gnu++17", "gnu++20", "gnu++23", "gnu++26",
 ];
-const C_STANDARDS: &[&str] = &["c17", "c11", "c23", "c99", "c89", "c90", "c18"];
+const C_STANDARDS: &[&str] = &["c17", "c11", "c23", "c99", "c89", "c90", "c18", "gnu17", "gnu11", "gnu23", "gnu99"];
 
 // What crate::project::check_version takes
 const VERSION_PATTERN: &str = r#"^[^\s/\\";]+$"#;
 
 // Every spelling crate::flags::normalize_standard takes ("20", "cxx20", "GNU++20")
 const CXX_STANDARD_PATTERN: &str = r"^([cC]\+\+)*([cC][xX][xX])*([cC][pP][pP])*([gG][nN][uU]\+\+)*[cC]*(11|14|17|20|23|26)$";
-const C_STANDARD_PATTERN: &str = r"^([cC]\+\+)*([cC][xX][xX])*([cC][pP][pP])*([gG][nN][uU]\+\+)*[cC]*(89|90|99|11|17|18|23)$";
+const C_STANDARD_PATTERN: &str = r"^([cC]\+\+)*([cC][xX][xX])*([cC][pP][pP])*([gG][nN][uU]\+\+)*([gG][nN][uU])*[cC]*(89|90|99|11|17|18|23)$";
 
 /// The tables that take a target's keys: a target, a when block, `[defaults]` or a preset, and a when block of those.
 #[derive(Clone, Copy, PartialEq)]
@@ -218,7 +218,7 @@ fn project_table() -> Value {
             "std",
             cxx_standard("C++ standard: c++17, c++20 (default), c++23, c++26 (also \"20\", \"gnu++20\")."),
         ),
-        ("c-std", c_standard("C standard: c11, c17 (default), c23 (also \"17\", c99).")),
+        ("c-std", c_standard("C standard: c11, c17 (default), c23 (also \"17\", c99, \"gnu17\").")),
         (
             "toolchain",
             choice(
