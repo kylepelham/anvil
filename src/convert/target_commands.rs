@@ -7,7 +7,7 @@ use super::model::{self, CustomCommand, ExportHeader, Item, LanguageRule, Target
 use super::parse::Command;
 use crate::util::{self, slash};
 use indexmap::IndexMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // Languages enable_language may name that Anvil builds
@@ -334,25 +334,41 @@ impl Interpreter {
         self.targets.insert(name.to_string(), target);
     }
 
-    /// Remembers the condition words are added to a flag variable under: every branch of an if() runs, so the
-    /// variable's final value holds the words of all of them.
+    /// Remembers the condition words are added to a flag variable under. Branches this machine does not take put the
+    /// variable back afterwards, so their words are also kept apart, each after the word it followed.
     pub(super) fn note_flag_words(&mut self, name: &str, value: &str) {
         if !is_flag_variable(name) {
             return;
         }
 
-        // The words it gains (one already there counts as added again when it now appears more often). A value
-        // may be a list for a moment (separate_arguments), so `;` separates words too
+        // The words it gains (one already there counts as added again when it now appears more often), each with the
+        // word before it. A value may be a list for a moment (separate_arguments), so `;` separates words too
         let condition = self.current_condition();
         let words = |text: &str| util::split_command(&text.replace(';', " "));
         let before = words(&self.get_variable(name).unwrap_or_default());
         let after = words(value);
         let count = |words: &[String], word: &String| words.iter().filter(|other| *other == word).count();
-        let mut added: Vec<String> = after.iter().filter(|word| count(&after, word) > count(&before, word)).cloned().collect();
-        added.sort();
-        added.dedup();
+        let mut added: Vec<(Option<String>, String)> = Vec::new();
+        for (index, word) in after.iter().enumerate() {
+            let occurrence = count(&after[..=index], word);
+            if occurrence > count(&before, word) && !added.iter().any(|(_, other)| other == word) {
+                let previous = index.checked_sub(1).map(|previous| after[previous].clone());
+                added.push((previous, word.clone()));
+            }
+        }
 
-        for word in added {
+        // Added where this machine does not go: the branch's variables are put back, so keep the words
+        let options = self.option_defaults();
+        let off_host = condition
+            .as_ref()
+            .is_some_and(|condition| !model::holds_on_host(condition, &|option| options.get(option).copied()));
+        if off_host {
+            for (previous, word) in &added {
+                self.off_host_flag_words.push((name.to_string(), previous.clone(), word.clone()));
+            }
+        }
+
+        for (_, word) in added {
             let key = (name.to_string(), word);
             match &condition {
                 // Added in another branch too: under either
@@ -380,12 +396,14 @@ impl Interpreter {
     /// reads them at the folder's end, also for targets made before they were set; C flags are for C files only, C++
     /// flags for C++ files.
     pub(super) fn apply_flag_variables(&mut self, dir_id: usize) {
+        let options = self.option_defaults();
         let flag_items = |variable: &str, extra_condition: Option<&str>| -> Vec<Item<String>> {
             let mut items = Vec::new();
             for (suffix, profile) in CONFIGURATION_SUFFIXES {
                 let name = format!("{variable}{suffix}");
                 let condition = model::and_optional(&extra_condition.map(String::from), &profile.map(String::from));
                 let flags = util::split_command(&self.get_variable(&name).unwrap_or_default());
+                let flags = self.with_off_host_flag_words(&name, flags, &options);
                 items.extend(flags.into_iter().map(|flag| {
                     // The branch the word was added in, or else the compilers that take it
                     let word_condition = match self.flag_word_conditions.get(&(name.clone(), flag.clone())) {
@@ -446,6 +464,41 @@ impl Interpreter {
                 target.includes.extend(rc_includes.iter().cloned());
             }
         }
+    }
+
+    /// A flag variable's words with those that branches this machine does not take added, each after the word it
+    /// followed (at the end when that word is gone), while its condition still does not hold here.
+    fn with_off_host_flag_words(&self, name: &str, words: Vec<String>, options: &HashMap<String, bool>) -> Vec<String> {
+        let mut pending: Vec<(Option<String>, String)> = Vec::new();
+        for (variable, previous, word) in &self.off_host_flag_words {
+            let condition = self.flag_word_conditions.get(&(name.to_string(), word.clone()));
+            let off_host = condition.is_some_and(|condition| !model::holds_on_host(condition, &|option| options.get(option).copied()));
+            let known = words.contains(word) || pending.iter().any(|(_, other)| other == word);
+            if variable == name && off_host && !known {
+                pending.push((previous.clone(), word.clone()));
+            }
+        }
+        if pending.is_empty() {
+            return words;
+        }
+
+        // The words that follow one, and those that follow it in turn
+        fn place(after: Option<&String>, pending: &mut Vec<(Option<String>, String)>, result: &mut Vec<String>) {
+            while let Some(index) = pending.iter().position(|(previous, _)| previous.as_ref() == after) {
+                let (_, word) = pending.remove(index);
+                result.push(word.clone());
+                place(Some(&word), pending, result);
+            }
+        }
+
+        let mut result = Vec::new();
+        place(None, &mut pending, &mut result);
+        for word in words {
+            result.push(word.clone());
+            place(Some(&word), &mut pending, &mut result);
+        }
+        result.extend(pending.into_iter().map(|(_, word)| word));
+        result
     }
 
     fn add_sources(&mut self, name: &str, values: &[String]) {
@@ -2369,6 +2422,27 @@ add_executable(app main.c app.rc)
         assert!(toml.contains("[target.app.when.msvc]\nflags = [\"/sdl\"]\nwarnings = \"high\""), "{toml}");
         assert!(toml.contains("[target.app.when.ENABLE_SAN]\nflags = [\"-fsanitize=address\"]"), "{toml}");
         assert!(!toml.contains("/TC") && !toml.contains("-xc"), "{toml}");
+    }
+
+    #[test]
+    fn other_branches_keep_this_machines_flags() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(replaced C)
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DHOST")
+if(NOT MSVC)
+  set(CMAKE_C_FLAGS "-funroll-loops")
+endif()
+if(MSVC)
+  string(REPLACE "-DHOST" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+endif()
+add_executable(app main.c)
+"#;
+        let toml = convert_files("replaced", &[("CMakeLists.txt", cmake), ("main.c", "int main(void) { return 0; }\n")]);
+
+        // The other branch's words under its condition; the word this machine's branch removed stays gone
+        assert!(toml.contains("[target.app.when.\"!msvc\"]\nflags = [\"-funroll-loops\"]"), "{toml}");
+        assert!(!toml.contains("HOST"), "{toml}");
     }
 
     #[test]
