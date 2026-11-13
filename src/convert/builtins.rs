@@ -1953,6 +1953,14 @@ impl Interpreter {
         if !self.packages.contains(name) {
             self.packages.push(name.clone());
         }
+        let (components, version) = find_package_request(args);
+        let request = self.package_requests.entry(name.clone()).or_default();
+        for component in components {
+            if !request.0.contains(&component) {
+                request.0.push(component);
+            }
+        }
+        request.1 = request.1.take().or(version);
 
         // Variables some packages are known for
         match name.as_str() {
@@ -2007,7 +2015,7 @@ impl Interpreter {
         }
         let in_manifest = self.builtin.manifest_ports.iter().flatten().any(|port| normalized(port) == wanted);
         let fetched = self.fetched.keys().any(|fetched| normalized(fetched) == wanted);
-        if SYSTEM_PACKAGES.contains(&name) || in_manifest || fetched {
+        if SYSTEM_PACKAGES.contains(&name) || name == "Vulkan" || in_manifest || fetched {
             return PackageSource::Project;
         }
         let known_port = super::emit::KNOWN_PORTS
@@ -2707,6 +2715,47 @@ const LARGE_WRITE_LINES: usize = 200;
 const MAX_VARIANT_CONDITIONS: usize = 3;
 
 // Packages Anvil has without adding a dependency
+// find_package's keywords besides COMPONENTS and REQUIRED (and the NO_... ones), which end a list of components
+const FIND_PACKAGE_KEYWORDS: &[&str] = &[
+    "EXACT",
+    "QUIET",
+    "MODULE",
+    "CONFIG",
+    "OPTIONAL_COMPONENTS",
+    "GLOBAL",
+    "NAMES",
+    "CONFIGS",
+    "HINTS",
+    "PATHS",
+    "PATH_SUFFIXES",
+    "REGISTRY_VIEW",
+    "BYPASS_PROVIDER",
+    "CMAKE_FIND_ROOT_PATH_BOTH",
+    "ONLY_CMAKE_FIND_ROOT_PATH",
+];
+
+/// A find_package call's components (after COMPONENTS, or REQUIRED) and version (the word after the name, when it is
+/// one).
+fn find_package_request(args: &[String]) -> (Vec<String>, Option<String>) {
+    let version = args
+        .get(1)
+        .map(|word| word.split("...").next().unwrap_or(word).to_string())
+        .filter(|word| crate::cmake_package::parse_version(word).is_some());
+
+    let mut components = Vec::new();
+    let mut listing = false;
+    for word in args.iter().skip(1) {
+        match word.as_str() {
+            "COMPONENTS" | "REQUIRED" => listing = true,
+            _ if FIND_PACKAGE_KEYWORDS.contains(&word.as_str()) || word.starts_with("NO_") => listing = false,
+            _ if listing && !components.contains(word) => components.push(word.clone()),
+            _ => {}
+        }
+    }
+
+    (components, version)
+}
+
 const SYSTEM_PACKAGES: &[&str] = &[
     "Threads",
     "PkgConfig",

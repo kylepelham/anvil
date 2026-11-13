@@ -41,22 +41,43 @@ struct Package {
 
 /// An imported target from a package's CMake files.
 #[derive(Default)]
-struct ImportedTarget {
-    name: String,
-    has_library: bool,
+pub(crate) struct ImportedTarget {
+    pub(crate) name: String,
+    pub(crate) has_library: bool,
+    /// `add_library(<name> <kind> IMPORTED)`: SHARED, STATIC, UNKNOWN, INTERFACE, ...; empty when no file says.
+    pub(crate) kind: String,
     /// INTERFACE_INCLUDE_DIRECTORIES (prefixes expanded) and INTERFACE_COMPILE_DEFINITIONS as written: evaluated per
     /// language, like compile options.
     include_values: Vec<String>,
     define_values: Vec<String>,
     /// Targets its users link too (not those under $<LINK_ONLY:...>).
-    links: Vec<String>,
+    pub(crate) links: Vec<String>,
     /// Everything its users link, $<LINK_ONLY:...> too: targets, system libraries and linker flags.
-    link_items: Vec<String>,
+    pub(crate) link_items: Vec<String>,
     /// INTERFACE_COMPILE_OPTIONS as written: evaluated per language.
     compile_options: Vec<String>,
     link_options: Vec<String>,
     /// Files its users' programs need beside them (LLVM's libomp.dll).
-    runtime: Vec<PathBuf>,
+    pub(crate) runtime: Vec<PathBuf>,
+    /// Its files per configuration (IMPORTED_LOCATION_<CONFIG>, IMPORTED_IMPLIB_<CONFIG>; "" for the unsuffixed ones).
+    pub(crate) files: Vec<ImportedFiles>,
+}
+
+/// One configuration's files of an imported target: the library (a DLL for a shared one on Windows) and its import
+/// library, and the shared libraries it loads without passing them on (IMPORTED_LINK_DEPENDENT_LIBRARIES).
+#[derive(Default, Debug, Clone, PartialEq)]
+pub(crate) struct ImportedFiles {
+    pub(crate) configuration: String,
+    pub(crate) location: Option<PathBuf>,
+    pub(crate) import_library: Option<PathBuf>,
+    pub(crate) dependent_libraries: Vec<String>,
+}
+
+/// Where the `${_IMPORT_PREFIX}` of a package's files is: one folder for all (a vcpkg triplet's), or what each file
+/// computes from its own folder (`get_filename_component(_IMPORT_PREFIX ... PATH)`), else `fallback`.
+pub(crate) enum ImportPrefix {
+    Fixed(String),
+    PerFile { fallback: String },
 }
 
 /// The OpenMP runtime programs need beside them: LLVM's libomp.dll beside a clang or clang-cl that builds for the MSVC
@@ -213,12 +234,15 @@ pub struct Usage {
 }
 
 /// How CMake users find and link an installed port: `find_package(<name> [CONFIG])`, then its targets.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CmakePackage {
     pub name: String,
     /// find_package needs CONFIG (a config file only), else CMake's own Find module finds it too.
     pub config: bool,
     pub targets: Vec<String>,
+    /// For a `cmake` dependency: the components it asks for, and the folder of the config file the build used.
+    pub components: Vec<String>,
+    pub hint: Option<PathBuf>,
 }
 
 /// The build a package's generator expressions are evaluated for, in CMake's names (configuration, compiler and
@@ -227,6 +251,7 @@ pub struct CmakePackage {
 pub struct BuildContext {
     family: Family,
     os: Os,
+    cpu: Cpu,
     msvc_abi: bool,
     configuration: String,
     compiler_id: &'static str,
@@ -265,6 +290,7 @@ impl BuildContext {
         BuildContext {
             family: toolchain.family,
             os,
+            cpu: toolchain.platform.cpu,
             msvc_abi: toolchain.is_msvc_abi(),
             configuration: crate::targets::config_name(configuration),
             compiler_id,
@@ -292,6 +318,19 @@ impl BuildContext {
             Os::Linux => "Linux",
             Os::Macos => "Darwin",
         }
+    }
+
+    /// The configuration packages' files are picked for, in CMake's spelling (`Debug`, `Release`).
+    pub(crate) fn configuration(&self) -> &str {
+        &self.configuration
+    }
+
+    pub(crate) fn os(&self) -> Os {
+        self.os
+    }
+
+    pub(crate) fn is_msvc_abi(&self) -> bool {
+        self.msvc_abi
     }
 }
 
@@ -373,7 +412,7 @@ impl InstalledTree {
                     }
                     if !linked[index] && (wanted(target) || requirements.linked.contains(&target.name)) {
                         linked[index] = true;
-                        requirements.add_link(target, &known, self);
+                        requirements.add_link(target, &known, Some(self));
                     }
                 }
                 if (requirements.visible.len(), requirements.linked.len()) == named {
@@ -398,7 +437,7 @@ impl InstalledTree {
                 requirements.add_compile(&module, build);
             }
             if requirements.linked.contains(&module.name) {
-                requirements.add_link(&module, &known, self);
+                requirements.add_link(&module, &known, Some(self));
                 push_new(&mut usage.runtime, &module.runtime);
             }
         }
@@ -447,62 +486,22 @@ impl InstalledTree {
             name: config,
             config: true,
             targets,
+            ..Default::default()
         })
     }
 
     /// The imported targets a package's CMake files define, with what each gives its users for `build`.
     fn imported_targets(&self, package: &Package, build: &BuildContext) -> Vec<ImportedTarget> {
-        let prefix = slash(&self.root.join(&self.triplet));
+        let prefix = ImportPrefix::Fixed(slash(&self.root.join(&self.triplet)));
         let share = format!("{}/share/", self.triplet);
-        let link = build.for_link();
-        let mut targets: Vec<ImportedTarget> = Vec::new();
+        let cmake_files: Vec<PathBuf> = package
+            .files
+            .iter()
+            .filter(|file| file.starts_with(&share) && file.ends_with(".cmake"))
+            .map(|file| self.root.join(file))
+            .collect();
 
-        let cmake_files = package.files.iter().filter(|file| file.starts_with(&share) && file.ends_with(".cmake"));
-        for file in cmake_files {
-            let path = self.root.join(file);
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            let list_dir = slash(path.parent().unwrap());
-
-            // One target's properties may be spread over several files (its configurations' files hold the libraries)
-            for (name, properties) in target_property_blocks(&text) {
-                let index = match targets.iter().position(|target| target.name == name) {
-                    Some(index) => index,
-                    None => {
-                        targets.push(ImportedTarget {
-                            name: name.clone(),
-                            ..Default::default()
-                        });
-                        targets.len() - 1
-                    }
-                };
-                let target = &mut targets[index];
-                target.has_library |= properties.contains("IMPORTED_LOCATION") || properties.contains("IMPORTED_IMPLIB");
-
-                // Include folders and definitions may depend on the file's language too: evaluated for each
-                if let Some(value) = property_value(&properties, "INTERFACE_INCLUDE_DIRECTORIES") {
-                    target.include_values.push(expand_import_prefixes(&value, &prefix, &list_dir));
-                }
-                target.define_values.extend(property_value(&properties, "INTERFACE_COMPILE_DEFINITIONS"));
-                target.links.extend(property_values(&properties, "INTERFACE_LINK_LIBRARIES", build));
-
-                // What linking needs: every linked item, and the link options
-                for item in property_values(&properties, "INTERFACE_LINK_LIBRARIES", &link) {
-                    let item = expand_import_prefixes(&item, &prefix, &list_dir);
-                    if !item.contains("${") {
-                        target.link_items.push(item);
-                    }
-                }
-                let link_options = property_values(&properties, "INTERFACE_LINK_OPTIONS", &link);
-                target
-                    .link_options
-                    .extend(link_options.into_iter().filter(|option| !option.contains("${")));
-
-                // Compile options depend on the file's language: evaluated for each
-                target.compile_options.extend(property_value(&properties, "INTERFACE_COMPILE_OPTIONS"));
-            }
-        }
-
-        targets
+        read_imported_targets(&cmake_files, &prefix, build)
     }
 
     /// Whether the triplet's library folder holds a library named `name` (a target of a package outside the closure).
@@ -680,15 +679,20 @@ fn parse_usage(text: &str) -> Option<CmakePackage> {
         return None;
     }
 
-    Some(CmakePackage { name, config, targets })
+    Some(CmakePackage {
+        name,
+        config,
+        targets,
+        ..Default::default()
+    })
 }
 
 /// What the imported targets used so far require of their users, and the targets they name.
 #[derive(Default)]
-struct Requirements {
+pub(crate) struct Requirements {
     /// Targets named for compiling (publicly), and for linking (under $<LINK_ONLY:...> too).
-    visible: HashSet<String>,
-    linked: HashSet<String>,
+    pub(crate) visible: HashSet<String>,
+    pub(crate) linked: HashSet<String>,
 
     /// Include folders, definitions and compile options for each language of LANGUAGES, each once (options as
     /// written, `SHELL:` ones whole).
@@ -701,7 +705,7 @@ struct Requirements {
 
 impl Requirements {
     /// Adds what users compile with from `target`, and the targets it names publicly.
-    fn add_compile(&mut self, target: &ImportedTarget, build: &BuildContext) {
+    pub(crate) fn add_compile(&mut self, target: &ImportedTarget, build: &BuildContext) {
         for (index, (_, language)) in LANGUAGES.iter().enumerate() {
             let build = build.for_language(language);
             for value in &target.include_values {
@@ -731,7 +735,7 @@ impl Requirements {
 
     /// Adds what users link with from `target`: its link options, the flags and system libraries among what it links
     /// (packages' own library files, in `tree`, are linked from their file lists), and the targets it names.
-    fn add_link(&mut self, target: &ImportedTarget, known: &HashSet<&str>, tree: &InstalledTree) {
+    pub(crate) fn add_link(&mut self, target: &ImportedTarget, known: &HashSet<&str>, tree: Option<&InstalledTree>) {
         push_new(&mut self.link_options, &target.link_options);
 
         for item in &target.link_items {
@@ -742,11 +746,11 @@ impl Requirements {
                 self.linked.insert(item.clone());
             } else if item.contains('/') || item.contains('\\') {
                 // A library file elsewhere (the system's): linked when it exists here
-                let outside_tree = util::strip_prefix_ci(path, &tree.root).is_none();
+                let outside_tree = tree.is_none_or(|tree| util::strip_prefix_ci(path, &tree.root).is_none());
                 if path.is_absolute() && path.is_file() && outside_tree {
                     push_new(&mut self.system_libs, &[path.to_path_buf()]);
                 }
-            } else if !tree.has_library_named(item) {
+            } else if !tree.is_some_and(|tree| tree.has_library_named(item)) {
                 push_new(&mut self.system_libs, &[path.to_path_buf()]);
             }
         }
@@ -754,7 +758,7 @@ impl Requirements {
 
     /// Fills `usage` in: include folders, definitions and options every language's files get, then those of one
     /// language only, as flags.
-    fn fill(self, usage: &mut Usage, build: &BuildContext) {
+    pub(crate) fn fill(self, usage: &mut Usage, build: &BuildContext) {
         let (common_includes, language_includes) = split_common(&self.includes);
         push_new(&mut usage.includes, &common_includes);
         for (language, folder) in language_includes {
@@ -805,7 +809,7 @@ fn split_common<T: Clone + PartialEq>(lists: &[Vec<T>; 4]) -> (Vec<T>, Vec<(Lang
 }
 
 /// Appends the values `list` does not hold yet.
-fn push_new<T: Clone + PartialEq>(list: &mut Vec<T>, values: &[T]) {
+pub(crate) fn push_new<T: Clone + PartialEq>(list: &mut Vec<T>, values: &[T]) {
     for value in values {
         if !list.contains(value) {
             list.push(value.clone());
@@ -830,22 +834,22 @@ fn option_words(option: &str, build: &BuildContext) -> Vec<String> {
     vec![option.to_string()]
 }
 
-/// What a built-in system dependency gives its users for `build` (`[deps] openmp = "system"`, likewise `threads` and
-/// `opengl`): the same as the CMake find module targets a package links. None for other names.
+/// What a built-in system dependency gives its users for `build` (`[deps] openmp = "system"`, likewise `threads`,
+/// `opengl` and `vulkan`): the same as the CMake find module targets a package links. None for other names.
 pub fn system_dependency(name: &str, build: &BuildContext) -> Option<Usage> {
     let modules: &[&str] = match name {
         "openmp" => &["OpenMP::OpenMP_CXX", "OpenMP::OpenMP_C"],
         "threads" => &["Threads::Threads"],
         "opengl" => &["OpenGL::GL"],
+        "vulkan" => &["Vulkan::Vulkan"],
         _ => return None,
     };
 
     let mut usage = Usage::default();
     let mut requirements = Requirements::default();
-    let no_packages = InstalledTree::default();
     for module in modules.iter().filter_map(|module_name| module_target(module_name, build)) {
         requirements.add_compile(&module, build);
-        requirements.add_link(&module, &HashSet::new(), &no_packages);
+        requirements.add_link(&module, &HashSet::new(), None);
         push_new(&mut usage.runtime, &module.runtime);
     }
     requirements.fill(&mut usage, build);
@@ -855,8 +859,9 @@ pub fn system_dependency(name: &str, build: &BuildContext) -> Option<Usage> {
 
 /// An imported target of a CMake find module, with what the module gives it for `build`: FindOpenMP's flag (cl's
 /// -openmp brings its runtime; clang-cl and clang on Windows link LLVM's libomp, which Visual Studio ships, clang's
-/// driver through -fopenmp=libomp), FindThreads' -pthread outside Windows, FindOpenGL's system library.
-fn module_target(name: &str, build: &BuildContext) -> Option<ImportedTarget> {
+/// driver through -fopenmp=libomp), FindThreads' -pthread outside Windows, FindOpenGL's system library, FindVulkan's
+/// SDK or system loader.
+pub(crate) fn module_target(name: &str, build: &BuildContext) -> Option<ImportedTarget> {
     let mut target = ImportedTarget {
         name: name.to_string(),
         ..Default::default()
@@ -898,6 +903,24 @@ fn module_target(name: &str, build: &BuildContext) -> Option<ImportedTarget> {
             };
             target.link_items.push(library.into());
         }
+        "Vulkan::Vulkan" => {
+            // FindVulkan's: the SDK VULKAN_SDK names (its Lib32 for 32-bit Windows), else the system's loader
+            let sdk = std::env::var_os("VULKAN_SDK").filter(|sdk| !sdk.is_empty()).map(PathBuf::from);
+            match (sdk, build.os) {
+                (Some(sdk), Os::Windows) => {
+                    let lib_folder = if matches!(build.cpu, Cpu::X86 | Cpu::Arm) { "Lib32" } else { "Lib" };
+                    target.include_values.push(slash(&sdk.join("Include")));
+                    target.link_items.push(slash(&sdk.join(lib_folder).join("vulkan-1.lib")));
+                }
+                (Some(sdk), os) => {
+                    let library = if os == Os::Macos { "libvulkan.dylib" } else { "libvulkan.so" };
+                    target.include_values.push(slash(&sdk.join("include")));
+                    target.link_items.push(slash(&sdk.join("lib").join(library)));
+                }
+                (None, Os::Windows) => {}
+                (None, _) => target.link_items.push("vulkan".into()),
+            }
+        }
         _ => return None,
     }
 
@@ -910,6 +933,202 @@ fn warn_once(message: &str) {
     if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         crate::ui::warn(message);
     }
+}
+
+/// The imported targets CMake package files define, with what each gives its users for `build`. One target's
+/// properties may be spread over several files (its configurations' files hold the libraries).
+pub(crate) fn read_imported_targets(files: &[PathBuf], prefix: &ImportPrefix, build: &BuildContext) -> Vec<ImportedTarget> {
+    let link = build.for_link();
+    let mut targets: Vec<ImportedTarget> = Vec::new();
+
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        let list_dir = slash(path.parent().unwrap());
+        let prefix = match prefix {
+            ImportPrefix::Fixed(prefix) => prefix.clone(),
+            ImportPrefix::PerFile { fallback } => file_import_prefix(&text, path).map_or_else(|| fallback.clone(), |found| slash(&found)),
+        };
+
+        // Declarations: add_library(<name> <kind> IMPORTED), and aliases, which pass on what they name
+        for (name, kind, aliased) in imported_declarations(&text) {
+            let target = target_named(&mut targets, &name);
+            target.kind = kind;
+            if let Some(aliased) = aliased {
+                target.links.push(aliased.clone());
+                target.link_items.push(aliased);
+            }
+        }
+
+        for (name, properties) in target_property_blocks(&text) {
+            if name.contains('$') {
+                continue;
+            }
+            let target = target_named(&mut targets, &name);
+            target.has_library |= properties.contains("IMPORTED_LOCATION") || properties.contains("IMPORTED_IMPLIB");
+
+            // Include folders and definitions may depend on the file's language too: evaluated for each
+            if let Some(value) = property_value(&properties, "INTERFACE_INCLUDE_DIRECTORIES") {
+                target.include_values.push(expand_import_prefixes(&value, &prefix, &list_dir));
+            }
+            target.define_values.extend(property_value(&properties, "INTERFACE_COMPILE_DEFINITIONS"));
+            target.links.extend(property_values(&properties, "INTERFACE_LINK_LIBRARIES", build));
+
+            // What linking needs: every linked item, and the link options
+            for item in property_values(&properties, "INTERFACE_LINK_LIBRARIES", &link) {
+                let item = expand_import_prefixes(&item, &prefix, &list_dir);
+                if !item.contains("${") {
+                    target.link_items.push(item);
+                }
+            }
+            let link_options = property_values(&properties, "INTERFACE_LINK_OPTIONS", &link);
+            target
+                .link_options
+                .extend(link_options.into_iter().filter(|option| !option.contains("${")));
+
+            // Compile options depend on the file's language: evaluated for each
+            target.compile_options.extend(property_value(&properties, "INTERFACE_COMPILE_OPTIONS"));
+
+            // Its files, per configuration
+            for (property, value) in property_pairs(&properties) {
+                let value = expand_import_prefixes(&value, &prefix, &list_dir);
+                if value.contains("${") || value.contains("$<") {
+                    continue;
+                }
+                let found = ["IMPORTED_LOCATION", "IMPORTED_IMPLIB", "IMPORTED_LINK_DEPENDENT_LIBRARIES"]
+                    .into_iter()
+                    .find_map(|key| Some((key, configuration_suffix(&property, key)?)));
+                let Some((key, configuration)) = found else { continue };
+                let files = match target.files.iter().position(|files| files.configuration == configuration) {
+                    Some(index) => &mut target.files[index],
+                    None => {
+                        target.files.push(ImportedFiles {
+                            configuration,
+                            ..Default::default()
+                        });
+                        target.files.last_mut().unwrap()
+                    }
+                };
+                match key {
+                    "IMPORTED_LOCATION" => files.location = Some(util::normalize(Path::new(&value))),
+                    "IMPORTED_IMPLIB" => files.import_library = Some(util::normalize(Path::new(&value))),
+                    _ => files.dependent_libraries = value.split(';').filter(|item| !item.is_empty()).map(String::from).collect(),
+                }
+            }
+        }
+    }
+
+    targets
+}
+
+/// The target of this name in `targets`, added when it is not there yet.
+fn target_named<'a>(targets: &'a mut Vec<ImportedTarget>, name: &str) -> &'a mut ImportedTarget {
+    let index = match targets.iter().position(|target| target.name == name) {
+        Some(index) => index,
+        None => {
+            targets.push(ImportedTarget {
+                name: name.to_string(),
+                ..Default::default()
+            });
+            targets.len() - 1
+        }
+    };
+
+    &mut targets[index]
+}
+
+/// `IMPORTED_LOCATION_RELEASE` for `IMPORTED_LOCATION`: "RELEASE"; the property itself: "".
+fn configuration_suffix(property: &str, key: &str) -> Option<String> {
+    let rest = property.strip_prefix(key)?;
+    match rest.strip_prefix('_') {
+        Some(configuration) => Some(configuration.to_string()),
+        None if rest.is_empty() => Some(String::new()),
+        None => None,
+    }
+}
+
+/// Each `add_library(<name> <kind> IMPORTED)` (kind SHARED, STATIC, ...) and `add_library(<name> ALIAS <target>)` of a
+/// package file: the name, the kind, and the target an alias names.
+fn imported_declarations(text: &str) -> Vec<(String, String, Option<String>)> {
+    static IMPORTED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"add_library\(\s*([^\s)$]+)\s+(SHARED|STATIC|MODULE|UNKNOWN|INTERFACE|OBJECT)\s+IMPORTED").unwrap()
+    });
+    static ALIAS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"add_library\(\s*([^\s)$]+)\s+ALIAS\s+([^\s)$]+)\s*\)").unwrap());
+
+    let mut declarations: Vec<(String, String, Option<String>)> = IMPORTED
+        .captures_iter(text)
+        .map(|captures| (captures[1].to_string(), captures[2].to_string(), None))
+        .collect();
+    declarations.extend(
+        ALIAS
+            .captures_iter(text)
+            .map(|captures| (captures[1].to_string(), "INTERFACE".to_string(), Some(captures[2].to_string()))),
+    );
+
+    declarations
+}
+
+/// The install prefix a package file computes for `${_IMPORT_PREFIX}` or `${PACKAGE_PREFIX_DIR}`: its own folder, up as
+/// many levels as it climbs (`get_filename_component(_IMPORT_PREFIX "${_IMPORT_PREFIX}" PATH)` once per level, or
+/// `"${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE`). None when the file computes none.
+pub(crate) fn file_import_prefix(text: &str, file: &Path) -> Option<PathBuf> {
+    static RELATIVE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"get_filename_component\(\s*(?:_IMPORT_PREFIX|PACKAGE_PREFIX_DIR)\s+"\$\{CMAKE_CURRENT_LIST_DIR\}((?:/\.\.)*)/?"\s+ABSOLUTE\s*\)"#,
+        )
+        .unwrap()
+    });
+    static FROM_FILE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"get_filename_component\(\s*_IMPORT_PREFIX\s+"\$\{CMAKE_CURRENT_LIST_FILE\}"\s+PATH\s*\)"#).unwrap()
+    });
+    static UP: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"get_filename_component\(\s*_IMPORT_PREFIX\s+"\$\{_IMPORT_PREFIX\}"\s+PATH\s*\)"#).unwrap());
+
+    let folder = util::normalize(file.parent()?);
+    let levels = match RELATIVE.captures(text) {
+        Some(captures) => captures[1].matches("..").count(),
+        None if FROM_FILE.is_match(text) => UP.find_iter(text).count(),
+        None => return None,
+    };
+
+    folder.ancestors().nth(levels).map(Path::to_path_buf)
+}
+
+/// A set_target_properties body's `PROPERTY value` pairs after `PROPERTIES`, values unquoted.
+fn property_pairs(properties: &str) -> Vec<(String, String)> {
+    let Some(start) = properties.find("PROPERTIES") else { return Vec::new() };
+    let mut words = Vec::new();
+    let mut characters = properties[start + "PROPERTIES".len()..].chars().peekable();
+
+    // Words: quoted (with \" and \$ escapes) or bare
+    while let Some(character) = characters.next() {
+        if character.is_whitespace() {
+            continue;
+        }
+        let mut word = String::new();
+        if character == '"' {
+            while let Some(character) = characters.next() {
+                match character {
+                    '\\' => word.extend(characters.next()),
+                    '"' => break,
+                    _ => word.push(character),
+                }
+            }
+        } else {
+            word.push(character);
+            while let Some(character) = characters.next_if(|character| !character.is_whitespace()) {
+                word.push(character);
+            }
+        }
+        words.push(word);
+    }
+
+    words
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[property, value]| (property.clone(), value.clone()))
+        .collect()
 }
 
 /// An imported target's path with the variables package files write for the install prefix and their own folder.
@@ -1170,6 +1389,7 @@ mod tests {
         BuildContext {
             family,
             os,
+            cpu: Cpu::X64,
             msvc_abi: os == Os::Windows && family != Family::Gcc,
             configuration: configuration.into(),
             compiler_id: match family {

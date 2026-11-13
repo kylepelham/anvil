@@ -1062,34 +1062,72 @@ impl Model {
         let mut target = Target::new(name, package, Kind::External, &package_root);
         target.default = false;
 
-        // Prebuilt parts and overrides
-        let expand = |text: &String| -> Result<PathBuf> { Ok(util::absolute(&package_root, Path::new(&util::expand_env(text)?))) };
-        target.public_system_include = spec.include.iter().flatten().map(expand).collect::<Result<_>>()?;
-        target.lib_dirs = spec.lib_dirs.iter().flatten().map(expand).collect::<Result<_>>()?;
-        target.runtime_files = spec.runtime.iter().flatten().map(expand).collect::<Result<_>>()?;
+        // Prebuilt parts and overrides, with environment variables (`$NAME`, `{env:NAME}`; in definitions and flags only
+        // the latter)
+        let key_context = |key: &str| format!("dependency `{name}`, `{key}`");
+        let expand = |key: &str, values: &Option<Vec<String>>| -> Result<Vec<PathBuf>> {
+            values
+                .iter()
+                .flatten()
+                .map(|text| {
+                    Ok(util::absolute(
+                        &package_root,
+                        Path::new(&util::expand_env(text).with_context(|| key_context(key))?),
+                    ))
+                })
+                .collect()
+        };
+        let expand_words = |key: &str, values: &Option<Vec<String>>| -> Result<Vec<String>> {
+            values
+                .iter()
+                .flatten()
+                .map(|text| util::expand_env_placeholders(text).with_context(|| key_context(key)))
+                .collect()
+        };
+        target.public_system_include = expand("include", &spec.include)?;
+        target.lib_dirs = expand("lib-dirs", &spec.lib_dirs)?;
+        target.runtime_files = expand("runtime", &spec.runtime)?;
         let folders = spec.runtime.iter().flatten().zip(&target.runtime_files);
         if let Some((written, _)) = folders.into_iter().find(|(_, file)| file.is_dir() || file.file_name().is_none()) {
             bail!("dependency `{name}`: runtime = [\"{written}\"] is a folder; `runtime` lists the files copied beside the programs, such as \"bin/{name}.dll\"");
         }
-        target.public_defines = spec.defines.clone().unwrap_or_default();
-        target.public_flags = spec.flags.clone().unwrap_or_default();
-        target.link_flags = spec.link_flags.clone().unwrap_or_default();
+        target.public_defines = expand_words("defines", &spec.defines)?;
+        target.public_flags = expand_words("flags", &spec.flags)?;
+        target.link_flags = expand_words("link-flags", &spec.link_flags)?;
 
-        // `openmp`, `threads` and `opengl` = "system": what CMake's find modules give their users
+        // `openmp`, `threads`, `opengl` and `vulkan` = "system": what CMake's find modules give their users
         let build = crate::vcpkg_tree::BuildContext::new(&self.toolchain, &self.profile);
-        let system = Some(vec![name.to_string()])
-            .filter(|libs| spec.libs.as_ref() == Some(libs) && spec.vcpkg.is_none() && spec.pkg_config.is_none())
-            .and_then(|_| crate::vcpkg_tree::system_dependency(name, &build));
+        let system_form =
+            spec.libs.as_deref() == Some(&[name.to_string()]) && spec.vcpkg.is_none() && spec.pkg_config.is_none() && spec.cmake.is_none();
+        let system = system_form.then(|| crate::vcpkg_tree::system_dependency(name, &build)).flatten();
+        if name == "vulkan" && system.as_ref().is_some_and(|usage| usage.libs.is_empty()) {
+            bail!(
+                "dependency `vulkan`: the Vulkan SDK is not installed (VULKAN_SDK is not set); install it from https://vulkan.lunarg.com \
+                 (its installer sets VULKAN_SDK), or describe it with `include` and `libs`"
+            );
+        }
         if let Some(usage) = system {
+            target.public_system_include.extend(usage.includes);
             target.public_defines.extend(usage.defines);
             target.public_flags.extend(usage.flags);
             target.public_language_flags.extend(usage.language_flags);
             target.libs.extend(usage.libs.iter().map(|lib| slash(lib)));
             target.link_flags.extend(usage.link_flags);
             target.runtime_files.extend(usage.runtime);
+        } else if name == "cuda" && system_form {
+            // The CUDA toolkit's headers and libraries, its static runtime and the driver's (CMake's CUDA::cudart_static
+            // and CUDA::cuda_driver)
+            let cuda = crate::cuda::Cuda::find(&self.toolchain).context("dependency `cuda`")?;
+            target.public_system_include.push(cuda.include_dir.clone());
+            target.lib_dirs.push(cuda.lib_dir.clone());
+            target.libs.extend(cuda.runtime_libs(&self.toolchain));
+            target.libs.push("cuda".to_string());
+            if self.toolchain.is_msvc_abi() && !self.profile.static_runtime {
+                target.link_flags.push(self.toolchain.linker_option("/NODEFAULTLIB:LIBCMT"));
+            }
         } else if spec.vcpkg.is_none() {
             for lib in spec.libs.iter().flatten() {
-                let expanded = util::expand_env(lib)?;
+                let expanded = util::expand_env(lib).with_context(|| key_context("libs"))?;
                 let is_path = expanded.contains('/') || expanded.contains('\\') || Path::new(&expanded).extension().is_some();
                 let path = util::absolute(&package_root, Path::new(&expanded));
                 if is_path && (path.is_dir() || path.file_name().is_none()) {
@@ -1110,6 +1148,29 @@ impl Model {
         // pkg-config: ask it now
         if let Some(module) = &spec.pkg_config {
             apply_pkg_config(&mut target, module, &self.toolchain.platform)?;
+        }
+
+        // An installed CMake package: found now, where find_package finds it
+        if let Some(package) = &spec.cmake {
+            let prefixes = expand("prefix", &spec.prefix.as_ref().map(StrOrList::to_vec))?;
+            let request = crate::cmake_package::Request {
+                dependency: name,
+                package,
+                components: spec.components.as_deref().unwrap_or_default(),
+                version: spec.version.as_deref(),
+                targets: spec.targets.as_deref(),
+                prefixes: &prefixes,
+            };
+            let found = crate::cmake_package::find(&request, &self.toolchain, &self.profile)?;
+            let usage = found.usage;
+            target.public_system_include.extend(usage.includes);
+            target.public_defines.extend(usage.defines);
+            target.public_flags.extend(usage.flags);
+            target.public_language_flags.extend(usage.language_flags);
+            target.libs.extend(usage.libs.iter().map(|lib| slash(lib)));
+            target.link_flags.extend(usage.link_flags);
+            target.runtime_files.extend(usage.runtime);
+            target.cmake_package = Some(found.package);
         }
 
         self.targets.push(target);
