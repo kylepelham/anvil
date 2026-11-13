@@ -537,7 +537,6 @@ fn long_command_line(toolchain: &str, test: &str) {
 }
 
 #[test]
-#[ignore = "fixed in stream exec: cl's response file splits `/sourceDependencies <path>` (D8004)"]
 fn long_command_line_uses_response_file_msvc() {
     require!("msvc");
     long_command_line("msvc", "long_command_line_msvc");
@@ -552,7 +551,6 @@ fn long_command_line_uses_response_file_gcc() {
 // 17. gui = true is a WIN32 program entered through WinMain; gui = "main" keeps main()
 
 #[test]
-#[ignore = "fixed in stream flags: gui = true links /ENTRY:mainCRTStartup, so WinMain is unresolved"]
 fn gui_program_with_winmain_links_msvc() {
     require!("msvc", "windows");
     let project = Project::fixture("gui_winmain", "gui_winmain");
@@ -560,7 +558,6 @@ fn gui_program_with_winmain_links_msvc() {
 }
 
 #[test]
-#[ignore = "fixed in stream flags: gui = \"main\" (a GUI program with main()) is new"]
 fn gui_program_with_main_links_msvc() {
     require!("msvc", "windows");
     let project = Project::fixture("gui_main", "gui_main");
