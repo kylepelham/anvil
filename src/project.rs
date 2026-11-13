@@ -22,6 +22,11 @@ pub const MANIFEST_NAME: &str = "anvil.toml";
 // Files of [[test]] tables, beside what they test
 pub const TESTS_FILE_NAME: &str = "tests.toml";
 
+// What a C or C++ project's own folders hold and its build output folder never does at its top
+const OUT_REFUSED_EXTENSIONS: &[&str] = &[
+    "c", "cc", "cpp", "cxx", "c++", "cppm", "ixx", "cu", "cuh", "h", "hh", "hpp", "hxx", "h++", "inl", "ipp", "tpp",
+];
+
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
     pub start_dir: PathBuf,
@@ -151,7 +156,7 @@ impl Model {
         toolchain.adapt_profile(&mut profile)?;
 
         // Output folders: a toolchain or a target machine picked on the command line gets its own
-        let out_root = util::absolute(&root, Path::new(project.out.as_deref().unwrap_or("out")));
+        let out_root = output_root(&root, &manifest)?;
         let mut out_folder = profile.name.clone();
         if options.toolchain.is_some() {
             out_folder.push_str(&format!("-{}", toolchain.family.name()));
@@ -175,6 +180,14 @@ impl Model {
             .collect::<Result<_>>()?;
         for (member, member_manifest) in &member_manifests {
             check_member_project(&root, member, member_manifest)?;
+            if util::strip_prefix_ci(member, &out_root).is_some() {
+                bail!(
+                    "{}: [project] out = \"{}\" holds the workspace member {}; name a folder of its own for the build output, such as \"out\"",
+                    slash(&root.join(MANIFEST_NAME)),
+                    project.out.as_deref().unwrap_or("out"),
+                    util::rel(member, &root)
+                );
+            }
         }
         let package_options = std::iter::once((root.as_path(), &manifest.options)).chain(
             member_manifests
@@ -232,6 +245,9 @@ impl Model {
         model.check_output_names()?;
         model.check_data_files()?;
         model.check_sources()?;
+        if options.host_tools_dir.is_none() {
+            model.warn_unused_deps();
+        }
         model.find_cuda()?;
         let mut declared = model.declared_dependencies()?;
         if !options.list_only {
@@ -244,6 +260,9 @@ impl Model {
             lock.finish(&declared)?;
         }
         model.write_files()?;
+        if options.host_tools_dir.is_none() {
+            model.warn_missing_include_folders();
+        }
 
         Ok(model)
     }
@@ -279,10 +298,8 @@ impl Model {
             .filter(|target| target.kind != Kind::External)
             .map(|target| target.name.as_str())
             .collect();
-        let hint = util::suggest(name, names.iter().copied())
-            .map(|close| format!(" Did you mean `{close}`?"))
-            .unwrap_or_default();
-        bail!("no target named `{name}`.{hint} Targets: {}", names.join(", "))
+        let hint = util::did_you_mean(name, names.iter().copied());
+        bail!("no target named `{name}`{hint}. Targets: {}", names.join(", "))
     }
 
     /// The targets a plain `anvil build` builds: every default target of the root package and workspace members.
@@ -621,10 +638,8 @@ impl Model {
             }
 
             let known = self.condition.options.keys().chain(&declared).map(|key| key.as_str());
-            let hint = util::suggest(name, known)
-                .map(|close| format!(" Did you mean `{close}`?"))
-                .unwrap_or_default();
-            bail!("unknown option `{name}`.{hint} Declare it under [options].");
+            let hint = util::did_you_mean(name, known);
+            bail!("unknown option `{name}`{hint}. Declare it under [options].");
         }
 
         Ok(())
@@ -886,10 +901,8 @@ impl Model {
             .collect();
         known.extend(self.packages[package].manifest.deps.keys().cloned());
         known.extend(self.packages[package].manifest.dev_deps.keys().cloned());
-        let hint = util::suggest(name, known.iter().map(|known| known.as_str()))
-            .map(|close| format!(" Did you mean `{close}`?"))
-            .unwrap_or_default();
-        bail!("unknown dependency `{name}`.{hint} Declare it under [deps] (e.g. `anvil add {name}`), or name one of this package's targets.")
+        let hint = util::did_you_mean(name, known.iter().map(|known| known.as_str()));
+        bail!("unknown dependency `{name}`{hint}. Declare it under [deps] (e.g. `anvil add {name}`), or name one of this package's targets.")
     }
 
     /// The package `package/target` names: a path or git [deps] entry of that key (loaded now), a loaded package of
@@ -978,10 +991,8 @@ impl Model {
             return Ok(Some(FoundPackage::Placeholder(placeholder)));
         }
 
-        let hint = util::suggest(package_name, source_deps.iter().map(|(key, _)| key.as_str()))
-            .map(|close| format!(" Did you mean `{close}`?"))
-            .unwrap_or_default();
-        bail!("unknown package `{package_name}`.{hint} Name a path or git entry of [deps] (or its package's [project] name)")
+        let hint = util::did_you_mean(package_name, source_deps.iter().map(|(key, _)| key.as_str()));
+        bail!("unknown package `{package_name}`{hint}. Name a path or git entry of [deps] (or its package's [project] name)")
     }
 
     fn resolve_dep_spec(&mut self, package: usize, name: &str, spec: &DepSpec) -> Result<usize> {
@@ -1047,6 +1058,10 @@ impl Model {
         target.public_system_include = spec.include.iter().flatten().map(expand).collect::<Result<_>>()?;
         target.lib_dirs = spec.lib_dirs.iter().flatten().map(expand).collect::<Result<_>>()?;
         target.runtime_files = spec.runtime.iter().flatten().map(expand).collect::<Result<_>>()?;
+        let folders = spec.runtime.iter().flatten().zip(&target.runtime_files);
+        if let Some((written, _)) = folders.into_iter().find(|(_, file)| file.is_dir() || file.file_name().is_none()) {
+            bail!("dependency `{name}`: runtime = [\"{written}\"] is a folder; `runtime` lists the files copied beside the programs, such as \"bin/{name}.dll\"");
+        }
         target.public_defines = spec.defines.clone().unwrap_or_default();
         target.public_flags = spec.flags.clone().unwrap_or_default();
         target.link_flags = spec.link_flags.clone().unwrap_or_default();
@@ -1067,11 +1082,13 @@ impl Model {
             for lib in spec.libs.iter().flatten() {
                 let expanded = util::expand_env(lib)?;
                 let is_path = expanded.contains('/') || expanded.contains('\\') || Path::new(&expanded).extension().is_some();
-                target.libs.push(if is_path {
-                    slash(&util::absolute(&package_root, Path::new(&expanded)))
-                } else {
-                    expanded
-                });
+                let path = util::absolute(&package_root, Path::new(&expanded));
+                if is_path && (path.is_dir() || path.file_name().is_none()) {
+                    bail!(
+                        "dependency `{name}`: libs = [\"{lib}\"] is a folder; `libs` names libraries (\"lib/{name}.lib\", or \"{name}\" found in `lib-dirs`), and `lib-dirs` the folders"
+                    );
+                }
+                target.libs.push(if is_path { slash(&path) } else { expanded });
             }
         }
 
@@ -1167,6 +1184,12 @@ impl Model {
 
         // No anvil.toml: a library from the given include/sources, or include/ and src/
         let has_overrides = spec.include.is_some() || spec.sources.is_some();
+        if !has_overrides && folder.join("CMakeLists.txt").is_file() && self.options.host_tools_dir.is_none() {
+            let shown = util::rel(folder, &std::env::current_dir().unwrap_or_default());
+            crate::ui::warn(&format!(
+                "dependency `{name}`: {shown} has a CMakeLists.txt but no {MANIFEST_NAME}, so it builds by Anvil's layout (include/, src/), not by its CMake rules; `anvil convert {shown}` writes an {MANIFEST_NAME} that follows them"
+            ));
+        }
         let synthetic = Manifest {
             project: Some(manifest::ProjectSpec {
                 name: Some(name.to_string()),
@@ -1350,6 +1373,86 @@ impl Model {
         }
 
         Ok(())
+    }
+
+    /// `[deps]` and `[dev-deps]` entries nothing of a package with [target] tables names (its targets, presets,
+    /// defaults, steps and tests): a warning, as one left over still costs an install or a fetch. Under the layout
+    /// conventions every target uses every entry.
+    fn warn_unused_deps(&self) {
+        for package in self
+            .packages
+            .iter()
+            .filter(|package| package.member && !package.manifest.target.is_empty())
+        {
+            let manifest = &package.manifest;
+            let manifest_file = package.root.join(MANIFEST_NAME);
+
+            // Every word of the manifest outside the entries themselves, then of its tests.toml files if needed
+            let mut words = Vec::new();
+            collect_dep_words(&manifest_file, &mut words);
+            let used = |words: &[String], name: &str| {
+                let prefix = format!("{name}/");
+                let names = |word: &String| word == name || word.starts_with(&prefix);
+                words.iter().any(names) || crate::plan::target_references(words).iter().any(names)
+            };
+            let entries = || manifest.deps.keys().chain(manifest.dev_deps.keys());
+            if entries().all(|name| used(&words, name)) {
+                continue;
+            }
+            for file in tests_files(&package.root, &self.out_root) {
+                collect_dep_words(&file, &mut words);
+            }
+
+            for (table, entries, user) in [("deps", &manifest.deps, "target"), ("dev-deps", &manifest.dev_deps, "test")] {
+                for name in entries.keys().filter(|name| !used(&words, name)) {
+                    crate::ui::warn(&format!(
+                        "{}: `[{table}] {name}`: no {user} uses it; add it to a {user}'s `deps`, or remove it",
+                        slash(&manifest_file)
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Include folders of the root package and the members that do not exist: a warning, as the compiler skips them
+    /// silently. Folders under the output folder ({gen}, {vcpkg}) are made by the build, and so may those of a
+    /// package with build steps.
+    fn warn_missing_include_folders(&self) {
+        let mut missing: indexmap::IndexMap<String, (PathBuf, Vec<String>)> = indexmap::IndexMap::new();
+        let with_steps: HashSet<usize> = self
+            .targets
+            .iter()
+            .filter(|target| !target.runs.is_empty() || !target.pre_build.is_empty())
+            .map(|target| target.package)
+            .collect();
+
+        for (index, target) in self.targets.iter().enumerate() {
+            if !self.packages[target.package].member || with_steps.contains(&target.package) {
+                continue;
+            }
+            let folders = target
+                .include
+                .iter()
+                .chain(&target.private_include)
+                .chain(&target.system_include)
+                .chain(&target.public_system_include)
+                .chain(&target.interface_include);
+            for folder in folders {
+                if folder.exists() || util::strip_prefix_ci(folder, &self.out_root).is_some() {
+                    continue;
+                }
+                let users = &mut missing.entry(util::path_key(folder)).or_insert_with(|| (folder.clone(), Vec::new())).1;
+                users.push(format!("`{}`", self.qualified_name(index)));
+            }
+        }
+
+        for (folder, users) in missing.values() {
+            crate::ui::warn(&format!(
+                "include folder {} does not exist (included by {})",
+                util::rel(folder, &self.root),
+                users.join(", ")
+            ));
+        }
     }
 
     /// Two targets must not copy different data files to the same place.
@@ -1696,6 +1799,48 @@ impl Model {
 
 /// Finds the project root: the nearest anvil.toml (or the workspace that lists it). With none, a folder that
 /// looks like a C++ project builds with no manifest at all.
+/// The build output folder `[project] out` names (default `out`), refused where building and `anvil clean --all`
+/// would write over or delete the project: its own folder or one above it, a package's folder, a folder of sources.
+pub fn output_root(root: &Path, manifest: &Manifest) -> Result<PathBuf> {
+    let out = manifest.project.as_ref().and_then(|project| project.out.as_deref()).unwrap_or("out");
+    let out_root = util::absolute(root, Path::new(out));
+    let key = format!("{}: [project] out = \"{out}\"", slash(&root.join(MANIFEST_NAME)));
+    let instead = "name a folder of its own for the build output, such as \"out\"";
+
+    // The project's folder, or one holding it
+    if util::strip_prefix_ci(root, &out_root).is_some() {
+        let which = if util::path_key(root) == util::path_key(&out_root) {
+            "the project's own folder"
+        } else {
+            "a folder holding the project"
+        };
+        bail!("{key} is {which}, which `anvil clean --all` would delete; {instead}");
+    }
+
+    // A package's folder, or one with the project's sources and headers
+    if out_root.join(MANIFEST_NAME).is_file() {
+        bail!("{key} holds a package ({}); {instead}", slash(&out_root.join(MANIFEST_NAME)));
+    }
+    let mut sources: Vec<String> = std::fs::read_dir(&out_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            let extension = path.extension().map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+            extension.is_some_and(|extension| OUT_REFUSED_EXTENSIONS.contains(&extension.as_str()))
+        })
+        .map(|path| util::rel(&path, root))
+        .collect();
+    sources.sort();
+    if let Some(first) = sources.first() {
+        bail!("{key} holds C and C++ files ({first}), which `anvil clean --all` would delete; {instead}");
+    }
+
+    Ok(out_root)
+}
+
 pub fn locate(start: &Path) -> Result<(PathBuf, Manifest)> {
     let start = util::absolute(&std::env::current_dir()?, start);
 
@@ -2261,6 +2406,26 @@ fn qualify_references(text: &str, package: &str, own: &[String]) -> String {
 }
 
 /// The tests.toml files of the package at `root`, not those of packages inside it, in a stable order.
+/// The strings of a manifest or tests.toml, past its [deps] and [dev-deps] tables: where dependencies are named.
+fn collect_dep_words(file: &Path, words: &mut Vec<String>) {
+    fn collect(value: &toml::Value, words: &mut Vec<String>) {
+        match value {
+            toml::Value::String(text) => words.push(text.clone()),
+            toml::Value::Array(items) => items.iter().for_each(|item| collect(item, words)),
+            toml::Value::Table(table) => table.values().for_each(|item| collect(item, words)),
+            _ => {}
+        }
+    }
+
+    let Ok(text) = std::fs::read_to_string(file) else { return };
+    let Ok(table) = text.parse::<toml::Table>() else { return };
+    for (key, value) in &table {
+        if key != "deps" && key != "dev-deps" {
+            collect(value, words);
+        }
+    }
+}
+
 fn tests_files(root: &Path, out_root: &Path) -> Vec<PathBuf> {
     let walker = walkdir::WalkDir::new(root).sort_by_file_name().into_iter().filter_entry(|entry| {
         let other_package = entry.depth() > 0 && entry.file_type().is_dir() && entry.path().join(MANIFEST_NAME).is_file();
@@ -2364,9 +2529,7 @@ fn check_tests(tests: &mut [TestCase], origins: &[TestOrigin], package_names: &[
                 Some(other) => resolved.push(final_names[*other].clone()),
                 None if switched_off.contains(name) => {}
                 None => {
-                    let hint = util::suggest(name, final_names.iter().map(String::as_str))
-                        .map(|close| format!(" (did you mean `{close}`?)"))
-                        .unwrap_or_default();
+                    let hint = util::did_you_mean(name, final_names.iter().map(String::as_str));
                     bail!("test `{}`: after = [\"{name}\"] names no test{hint}", final_names[index]);
                 }
             }
@@ -2466,5 +2629,28 @@ mod tests {
         // Another package's target, and one already qualified, stay as they are
         assert_eq!(qualify_references("{target:other}", "b", &own), "{target:other}");
         assert_eq!(qualify_references("{target:a/gen}", "b", &own), "{target:a/gen}");
+    }
+
+    #[test]
+    fn output_folder_never_holds_the_project() {
+        let root = std::env::temp_dir().join(format!("anvil_out_root_{}", std::process::id())).join("game");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("lib/inner")).unwrap();
+        std::fs::write(root.join("src/main.cpp"), "").unwrap();
+        std::fs::write(root.join("lib/inner").join(MANIFEST_NAME), "").unwrap();
+        let out_root = |out: &str| {
+            let manifest = manifest::parse_str(&format!("[project]\nout = \"{out}\"\n")).unwrap();
+            output_root(&root, &manifest).map_err(|error| error.to_string())
+        };
+
+        assert_eq!(out_root("build").unwrap(), root.join("build"));
+        assert!(out_root(".").unwrap_err().contains("is the project's own folder"));
+        assert!(out_root("").unwrap_err().contains("is the project's own folder"));
+        assert!(out_root("..").unwrap_err().contains("is a folder holding the project"));
+        assert!(out_root("src").unwrap_err().contains("holds C and C++ files (src/main.cpp)"));
+        assert!(out_root("lib/inner").unwrap_err().contains("holds a package"));
+        assert!(output_root(&root, &Manifest::default()).is_ok());
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 }

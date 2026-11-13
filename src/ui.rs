@@ -58,7 +58,11 @@ pub fn error(message: &str) {
     print_line(&format!("{} {message}", paint(RED, "error:")));
 }
 
+/// "note: ...": something worth knowing, left out with `-q`.
 pub fn note(message: &str) {
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
     print_line(&format!("{} {message}", paint(CYAN, "note:")));
 }
 

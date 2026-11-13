@@ -959,7 +959,11 @@ impl<'a> Planner<'a> {
     fn plan_pch(&mut self, index: usize, header: &Path, inputs: &CompileInputs, barrier: &[usize]) -> Result<PrecompiledHeader> {
         let target = &self.model.targets[index];
         let pch_dir = self.object_dir(target).join("pch");
-        let header_name = header.file_name().unwrap().to_string_lossy().into_owned();
+        let header_name = header
+            .file_name()
+            .with_context(|| format!("pch = \"{}\" names no file", slash(header)))?
+            .to_string_lossy()
+            .into_owned();
 
         let settings = self.file_settings(target, &PathBuf::from("pch.cpp"), inputs);
         let spec = self.compile_spec(&settings, self.position_independent(target));
@@ -1223,7 +1227,10 @@ impl<'a> Planner<'a> {
             let folder = output.parent().unwrap().to_path_buf();
             let sanitizer_runtime = self.toolchain.sanitizer_runtime(&self.model.profile)?;
             for file in link.runtime_files.iter().chain(&sanitizer_runtime) {
-                self.plan_copy_to(file, &folder.join(file.file_name().unwrap()), false)?;
+                let name = file
+                    .file_name()
+                    .with_context(|| format!("runtime file {} names no file, for `{}`", slash(file), target.name))?;
+                self.plan_copy_to(file, &folder.join(name), false)?;
             }
             let runtime_files = link.runtime_files.iter().chain(&sanitizer_runtime).cloned().collect();
             self.runtime_files.insert(index, runtime_files);
@@ -1291,7 +1298,7 @@ impl<'a> Planner<'a> {
 
         let shown = util::strip_prefix_ci(&destination, &self.model.out_dir)
             .map(|relative| slash(&relative))
-            .unwrap_or_else(|| destination.file_name().unwrap().to_string_lossy().into_owned());
+            .unwrap_or_else(|| slash(&destination));
         let description = format!("Copying {shown}");
         let mut action = Action::new(ActionKind::Copy, description, PathBuf::new(), self.env.clone());
         action.copy_from = Some(file.to_path_buf());
@@ -1644,7 +1651,7 @@ impl<'a> Planner<'a> {
         }
 
         // Other targets' files: this machine's build of a program a cross build runs, or the target's file
-        for name in target_references(&[line.clone()]) {
+        for name in target_references(std::slice::from_ref(&line)) {
             let placeholder = format!("{{target:{name}}}");
             let value = match self.host_tools.get(&name) {
                 Some((program, _)) => path_text(program),

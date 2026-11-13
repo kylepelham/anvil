@@ -402,9 +402,7 @@ impl Target {
         accumulated.apply(defaults, scope.condition, Table::Shared).map_err(context)?;
         for preset_name in spec.preset.iter().flat_map(|names| names.to_vec()) {
             let Some(preset) = presets.get(&preset_name) else {
-                let hint = util::suggest(&preset_name, presets.keys().map(String::as_str))
-                    .map(|known| format!(" (did you mean `{known}`?)"))
-                    .unwrap_or_default();
+                let hint = util::did_you_mean(&preset_name, presets.keys().map(String::as_str));
                 return Err(context(anyhow::anyhow!(
                     "preset = \"{preset_name}\": there is no [preset.{preset_name}]{hint}"
                 )));
@@ -680,8 +678,14 @@ impl Target {
 
         self.pch = settings.pch.map(|pch| paths(&[pch]).map(|mut list| list.remove(0))).transpose()?;
         if let Some(pch) = &self.pch {
+            if pch.is_dir() {
+                bail!(
+                    "pch = \"{}\" is a folder; pch names a header, such as \"src/pch.h\"",
+                    util::rel(pch, &dir)
+                );
+            }
             if !pch.is_file() {
-                bail!("pch = \"{}\" does not exist", slash(pch));
+                bail!("pch = \"{}\" does not exist", util::rel(pch, &dir));
             }
         }
 
@@ -748,9 +752,7 @@ pub fn check_package(manifest: &Manifest, condition: &CondContext) -> Result<()>
         }
         for preset_name in spec.preset.iter().flat_map(|names| names.to_vec()) {
             if !manifest.preset.contains_key(&preset_name) {
-                let hint = util::suggest(&preset_name, manifest.preset.keys().map(String::as_str))
-                    .map(|known| format!(" (did you mean `{known}`?)"))
-                    .unwrap_or_default();
+                let hint = util::did_you_mean(&preset_name, manifest.preset.keys().map(String::as_str));
                 return Err(anyhow::anyhow!("preset = \"{preset_name}\": there is no [preset.{preset_name}]{hint}")).with_context(context);
             }
         }
@@ -1278,7 +1280,11 @@ fn expand_lib(lib: &str, dir: &Path, scope: &PackageScope, target_name: &str) ->
     let is_path = separators || (Path::new(&expanded).extension().is_some() && !expanded.ends_with(".framework"));
 
     if is_path && !expanded.starts_with('-') {
-        Ok(slash(&util::absolute(dir, Path::new(&expanded))))
+        let path = util::absolute(dir, Path::new(&expanded));
+        if (path.is_dir() || path.file_name().is_none()) && !expanded.ends_with(".framework") {
+            bail!("libs = [\"{lib}\"] is a folder; `libs` names libraries (a file, or a name found in `lib-dirs`), and `lib-dirs` the folders");
+        }
+        Ok(slash(&path))
     } else {
         Ok(expanded)
     }

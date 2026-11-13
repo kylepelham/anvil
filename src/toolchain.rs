@@ -17,6 +17,9 @@ const PROBE_SOURCE: &str = "int main() { return 0; }\n";
 // Names the compiler cache compiles run through, over the project's `launcher` (for CI)
 const LAUNCHER_VARIABLE: &str = "ANVIL_LAUNCHER";
 
+// Environment variables a toolchain's programs run with, as (name, value)
+type Environment = Vec<(String, String)>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Family {
     Msvc,
@@ -526,9 +529,20 @@ fn detect_msvc(platform: &Platform) -> Result<Toolchain> {
     let search_path = environment_value(&environment, "PATH").unwrap_or_default();
 
     // The tools, from the captured PATH
-    let cl = find_in(&search_path, "cl.exe").context("cl.exe not found in the Visual Studio environment")?;
-    let linker = find_in(&search_path, "link.exe").context("link.exe not found")?;
-    let archiver = find_in(&search_path, "lib.exe").context("lib.exe not found")?;
+    let missing = |program: &str| {
+        let folder = visual_studio
+            .as_deref()
+            .map(|folder| format!(" of {}", slash(folder)))
+            .unwrap_or_default();
+        format!(
+            "{program} not found on the PATH of the Visual Studio environment{folder} for {}; install or repair the \"Desktop development with C++\" workload (MSVC build tools for {}) in the Visual Studio Installer",
+            platform.cpu.name(),
+            platform.cpu.name()
+        )
+    };
+    let cl = find_in(&search_path, "cl.exe").with_context(|| missing("cl.exe"))?;
+    let linker = find_in(&search_path, "link.exe").with_context(|| missing("link.exe"))?;
+    let archiver = find_in(&search_path, "lib.exe").with_context(|| missing("lib.exe"))?;
     let resource_compiler = find_in(&search_path, "rc.exe");
 
     let version = msvc_version(&cl, &environment).unwrap_or_else(|| "unknown".into());
@@ -573,12 +587,18 @@ fn detect_clang_cl(platform: &Platform, named: Option<&NamedCompiler>) -> Result
     let llvm_bin = clang_cl.parent().unwrap().to_path_buf();
 
     // LLVM's linker and archiver beside it, else Microsoft's
+    let missing = |what: &str, llvm: &str, microsoft: &str| {
+        format!(
+            "no {what}: neither {llvm} beside {} nor {microsoft} on the PATH of the Visual Studio environment; install LLVM (with its {llvm}) or Visual Studio's \"Desktop development with C++\" workload",
+            slash(&clang_cl)
+        )
+    };
     let linker = existing(llvm_bin.join("lld-link.exe"))
         .or_else(|| find_in(&search_path, "link.exe"))
-        .context("no linker found")?;
+        .with_context(|| missing("linker", "lld-link.exe", "link.exe"))?;
     let archiver = existing(llvm_bin.join("llvm-lib.exe"))
         .or_else(|| find_in(&search_path, "lib.exe"))
-        .context("no archiver found")?;
+        .with_context(|| missing("archiver", "llvm-lib.exe", "lib.exe"))?;
     let resource_compiler = find_in(&search_path, "rc.exe").or_else(|| existing(llvm_bin.join("llvm-rc.exe")));
 
     let version = clang_version(&clang_cl, &[]).unwrap_or_else(|| "unknown".into());
@@ -646,9 +666,12 @@ fn detect_clang(platform: &Platform, named: Option<&NamedCompiler>) -> Result<To
         .and_then(|named| named.cc.clone())
         .or_else(|| existing(bin.join(sibling_program(&clang, "clang"))))
         .unwrap_or_else(|| clang.clone());
-    let archiver = existing(bin.join(exe("llvm-ar")))
-        .or_else(|| util::which("ar"))
-        .context("no archiver (llvm-ar or ar) found")?;
+    let archiver = existing(bin.join(exe("llvm-ar"))).or_else(|| util::which("ar")).with_context(|| {
+        format!(
+            "no archiver: neither llvm-ar beside {} nor ar on PATH; install LLVM with its tools, or binutils",
+            slash(&clang)
+        )
+    })?;
     let resource_compiler = if platform.os == Os::Windows {
         existing(bin.join(exe("llvm-rc")))
     } else {
@@ -888,7 +911,7 @@ fn check_mingw_headers(clang: &Path, target_flags: &[String], platform: &Platfor
 
 /// The environment of a Visual Studio developer prompt building for `cpu`: the current one when we are in one for
 /// that processor, else vcvarsall's.
-fn msvc_environment(cpu: Cpu) -> Result<(Vec<(String, String)>, Option<PathBuf>)> {
+fn msvc_environment(cpu: Cpu) -> Result<(Environment, Option<PathBuf>)> {
     // Already inside a developer prompt for the same processor
     let prompt_cpu = std::env::var("VSCMD_ARG_TGT_ARCH").unwrap_or_else(|_| Platform::host().cpu.name().to_string());
     let in_prompt = std::env::var_os("INCLUDE").is_some() && std::env::var_os("VCToolsInstallDir").is_some();

@@ -281,7 +281,7 @@ fn read_database(file: &Path, build_folder: &Path, model: &Model) -> Result<Data
             }
         });
 
-        files.entry(comparable_path(&source, &prefixes)).or_insert_with(Vec::new).push(flags);
+        files.entry(comparable_path(&source, &prefixes)).or_default().push(flags);
     }
 
     Ok(files)
@@ -357,10 +357,12 @@ fn read_flags(words: &[String], found: &mut dyn FnMut(FlagKind, &str)) {
             let with_value = if msvc { MSVC_OPTIONS_WITH_VALUE } else { GNU_OPTIONS_WITH_VALUE };
             if with_value.contains(&option.as_str()) {
                 index += 1;
-            } else if msvc && MSVC_RUNTIME_OPTIONS.contains(&option.as_str()) {
-                found(FlagKind::Option, &option);
-            } else if !OWN_OPTIONS.iter().any(|own| matches_pattern(own, &option)) {
-                found(FlagKind::Option, &option);
+            } else {
+                // cl's runtime is compared though GCC's `-MD` (a dependency file) is each side's own
+                let runtime = msvc && MSVC_RUNTIME_OPTIONS.contains(&option.as_str());
+                if runtime || !OWN_OPTIONS.iter().any(|own| matches_pattern(own, &option)) {
+                    found(FlagKind::Option, &option);
+                }
             }
             continue;
         };

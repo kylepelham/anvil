@@ -49,12 +49,15 @@ pub struct AddArgs {
     #[arg(long, value_name = "URL", group = "source")]
     pub git: Option<String>,
 
+    /// The git tag to check out.
     #[arg(long, requires = "git", conflicts_with_all = ["branch", "rev"])]
     pub tag: Option<String>,
 
+    /// The git branch to follow (anvil.lock pins its commit).
     #[arg(long, requires = "git", conflicts_with = "rev")]
     pub branch: Option<String>,
 
+    /// The git commit to check out.
     #[arg(long, requires = "git")]
     pub rev: Option<String>,
 
@@ -289,10 +292,8 @@ pub fn remove(start_dir: &Path, name: &str) -> Result<()> {
     }
     let Some((table_name, port)) = removed else {
         let declared: Vec<&String> = manifest.deps.keys().chain(manifest.dev_deps.keys()).collect();
-        let hint = util::suggest(name, declared.iter().map(|name| name.as_str()))
-            .map(|close| format!(" Did you mean `{close}`?"))
-            .unwrap_or_default();
-        bail!("`{name}` is not in [deps] or [dev-deps] of {}.{hint}", slash(&manifest_path));
+        let hint = util::did_you_mean(name, declared.iter().map(|name| name.as_str()));
+        bail!("`{name}`{hint} is not in [deps] or [dev-deps] of {}", slash(&manifest_path));
     };
 
     // Its uses: targets (and their when blocks), [defaults] and presets
@@ -684,10 +685,8 @@ fn choose_users(document: &toml_edit::DocumentMut, args: &AddArgs) -> Result<Vec
         for name in &args.to {
             if !targets.contains_key(name) {
                 let names: Vec<&str> = targets.iter().map(|(name, _)| name).collect();
-                let hint = util::suggest(name, names.iter().copied())
-                    .map(|close| format!(" Did you mean `{close}`?"))
-                    .unwrap_or_default();
-                bail!("--to {name}: there is no [target.{name}].{hint} Targets: {}", names.join(", "));
+                let hint = util::did_you_mean(name, names.iter().copied());
+                bail!("--to {name}: there is no [target.{name}]{hint}. Targets: {}", names.join(", "));
             }
             let is_test = targets.get(name).and_then(|target| target.get("kind")).and_then(|kind| kind.as_str()) == Some("test");
             if args.dev && !is_test {
