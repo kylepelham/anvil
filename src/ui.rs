@@ -51,6 +51,9 @@ pub fn status(verb: &str, message: &str) {
 }
 
 pub fn warn(message: &str) {
+    if crate::lsp::session::capture_warning(message) {
+        return;
+    }
     print_line(&format!("{} {message}", paint(YELLOW, "warning:")));
 }
 
