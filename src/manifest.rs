@@ -200,6 +200,8 @@ pub struct TargetSpec {
     pub data: Option<Vec<String>>,
     /// `anvil install` installs it (default: whether it is a default target; tests never).
     pub install: Option<bool>,
+    /// Qt's moc, uic and rcc for a target that uses Qt (default true); false leaves its files to build steps.
+    pub qt: Option<bool>,
 
     #[serde(default)]
     pub when: IndexMap<String, TargetSpec>,

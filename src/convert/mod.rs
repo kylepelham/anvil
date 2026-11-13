@@ -6,6 +6,7 @@ mod emit;
 mod interp;
 mod model;
 mod parse;
+mod qt_commands;
 mod target_commands;
 mod test_groups;
 
@@ -399,6 +400,123 @@ target_link_libraries(app PRIVATE Qt6::Core Qt6::Widgets AnvilTestSdk::sdk Vulka
         assert!(toml.contains("vulkan = \"system\""), "{toml}");
         assert!(toml.contains(r#"deps = ["qt6", "anviltestsdk", "vulkan"]"#), "{toml}");
         assert!(!toml.contains("TODO:"), "{toml}");
+    }
+
+    #[test]
+    fn qt_creator_projects_become_qt_targets() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.16)
+project(demo VERSION 0.1 LANGUAGES CXX)
+set(CMAKE_AUTOUIC ON)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets)
+find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets)
+set(PROJECT_SOURCES main.cpp window.cpp window.h window.ui)
+if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
+    qt_add_executable(demo MANUAL_FINALIZATION ${PROJECT_SOURCES} icons.qrc)
+else()
+    add_executable(demo ${PROJECT_SOURCES} icons.qrc)
+endif()
+target_link_libraries(demo PRIVATE Qt${QT_VERSION_MAJOR}::Widgets)
+set_target_properties(demo PROPERTIES WIN32_EXECUTABLE TRUE)
+if(QT_VERSION_MAJOR EQUAL 6)
+    qt_finalize_executable(demo)
+endif()
+"#;
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("main.cpp", "int main() {}\n"),
+            ("window.cpp", "\n"),
+            ("window.h", "\n"),
+            ("window.ui", "<ui/>\n"),
+            ("icons.qrc", "<RCC/>\n"),
+        ];
+        let conversion = convert_files("qtcreator", &files);
+        let toml = conversion.toml;
+
+        // Qt 6 as the installed package; the .ui and .qrc files are where the convention finds them
+        assert!(toml.contains(r#"qt6 = { cmake = "Qt6", components = ["Widgets"] }"#), "{toml}");
+        assert!(toml.contains("deps = [\"qt6\"]\ngui = \"main\""), "{toml}");
+        assert!(!toml.contains("sources") && !toml.contains("vcpkg") && !toml.contains("TODO:"), "{toml}");
+        assert!(
+            !conversion.warnings.iter().any(|warning| warning.contains("qt_")),
+            "{:?}",
+            conversion.warnings
+        );
+    }
+
+    #[test]
+    fn qt_wrap_commands_list_their_files_as_sources() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.16)
+project(multi CXX)
+find_package(Qt5 REQUIRED COMPONENTS Widgets Network)
+qt5_wrap_ui(FORMS app/window.ui)
+qt5_add_resources(RESOURCES app/icons.qrc OPTIONS -compress 9)
+qt5_wrap_cpp(MOCS lib/model.h)
+add_library(model STATIC lib/model.cpp ${MOCS})
+target_link_libraries(model PUBLIC Qt5::Core Qt5::Network)
+add_executable(app app/main.cpp app/window.cpp ${FORMS} ${RESOURCES})
+target_link_libraries(app PRIVATE model Qt5::Widgets)
+add_executable(gen gen/gen.cpp gen/moc_by_hand.cpp)
+target_link_libraries(gen PRIVATE Qt5::Core)
+set_target_properties(gen PROPERTIES AUTOMOC OFF)
+"#;
+        let mut files = vec![("CMakeLists.txt", cmake)];
+        for file in [
+            "app/main.cpp",
+            "app/window.cpp",
+            "app/window.ui",
+            "app/icons.qrc",
+            "lib/model.cpp",
+            "lib/model.h",
+            "gen/gen.cpp",
+            "gen/moc_by_hand.cpp",
+        ] {
+            files.push((file, "\n"));
+        }
+        let toml = convert_files("qtwrap", &files).toml;
+
+        assert!(toml.contains(r#"qt5 = { cmake = "Qt5", components = ["Widgets", "Network"] }"#), "{toml}");
+        assert!(toml.contains(r#"sources = ["app/**/*.{cpp,qrc,ui}"]"#), "{toml}");
+        assert!(toml.contains(r#"sources = ["lib/model.cpp"]"#), "{toml}");
+        assert!(
+            toml.contains("[target.gen]\nkind = \"exe\"\nsources = [\"gen/**/*.cpp\"]\ndeps = [\"qt5\"]\nqt = false"),
+            "{toml}"
+        );
+        assert!(!toml.contains("TODO:"), "{toml}");
+    }
+
+    #[test]
+    fn qt_quick_modules_and_resource_lists_are_noted() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.21)
+project(quickapp VERSION 1.0 LANGUAGES CXX)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Quick)
+qt_standard_project_setup(REQUIRES 6.5)
+qt_add_executable(appquick main.cpp)
+qt_add_qml_module(appquick URI quickapp VERSION 1.0 QML_FILES Main.qml SOURCES backend.cpp backend.h)
+qt_add_resources(appquick "images" PREFIX "/img" FILES logo.png)
+target_link_libraries(appquick PRIVATE Qt::Quick)
+qt_add_library(helper helper.cpp)
+target_link_libraries(helper PUBLIC Qt6::Core)
+"#;
+        let mut files = vec![("CMakeLists.txt", cmake)];
+        for file in ["main.cpp", "backend.cpp", "backend.h", "helper.cpp", "Main.qml", "logo.png"] {
+            files.push((file, "\n"));
+        }
+        let toml = convert_files("qtquick", &files).toml;
+
+        // Versionless Qt::Quick is the Qt 6 package; the module's C++ sources are the program's
+        assert!(
+            toml.contains(r#"qt6 = { cmake = "Qt6", components = ["Quick"], version = "6.5" }"#),
+            "{toml}"
+        );
+        assert!(toml.contains(r#"sources = ["main.cpp", "backend.cpp"]"#), "{toml}");
+        assert!(toml.contains("TODO: qt_add_qml_module(URI quickapp) is not converted"), "{toml}");
+        assert!(toml.contains("write images.qrc listing logo.png under prefix \"/img\""), "{toml}");
+        assert!(toml.contains("[target.helper]\nkind = \"shared\""), "{toml}");
     }
 
     #[test]

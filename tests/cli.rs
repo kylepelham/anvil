@@ -4230,3 +4230,87 @@ fn cmake_packages_of_the_system_linux() {
     assert_eq!(program_output(&run), "{\"answer\":42}");
     assert!(!project.read("out/compile_commands.json").contains("\"/usr/include\""));
 }
+
+// Qt: moc, uic and rcc as planned steps of the targets that use Qt
+
+const QT_WIDGETS_OUTPUT: &str = "counter: 2 Counter\nform: Hello from the form\nresource: hello from the resource\nsource moc: worker";
+
+#[test]
+fn qt_widgets_build_and_rebuild_what_changed() {
+    require!("default", "qt");
+
+    // A header's class, a class in a source with `#include "main.moc"`, a form and a resource; nothing to do again
+    let project = Project::fixture("qt_widgets", "qt_widgets");
+    let run = project.anvil(&["run"]);
+    run.success();
+    assert_eq!(program_output(&run), QT_WIDGETS_OUTPUT);
+    project.anvil(&["build"]).success().up_to_date();
+    let commands = project.read("out/compile_commands.json").replace("\\\\", "/");
+    assert!(commands.contains("qt/qtdemo/include"), "{commands}");
+
+    // A header: its moc and the files that include it, no other tool
+    project.edit("src/counter.h", "void increment();", "void increment();\n    void reset() { count = 0; }");
+    let run = project.anvil(&["build"]);
+    run.success();
+    let actions = run.actions();
+    for expected in ["Running moc counter.h", "Compiling src/counter.cpp"] {
+        assert!(actions.iter().any(|action| action == expected), "no `{expected}` in {actions:?}");
+    }
+    for unexpected in ["Running uic", "Running rcc", "Compiling src/mainwindow.cpp"] {
+        assert!(
+            !actions.iter().any(|action| action.starts_with(unexpected)),
+            "`{unexpected}` in {actions:?}"
+        );
+    }
+    project.anvil(&["build"]).success().up_to_date();
+
+    // A form: uic and the source that includes its header
+    project.edit("src/mainwindow.ui", "Hello from the form", "Hi from the form");
+    let run = project.anvil(&["run"]);
+    run.success().contains("form: Hi from the form");
+    let actions = run.actions();
+    assert!(actions.iter().any(|action| action == "Running uic mainwindow.ui"), "{actions:?}");
+    assert!(actions.iter().any(|action| action == "Compiling src/mainwindow.cpp"), "{actions:?}");
+    assert!(
+        !actions
+            .iter()
+            .any(|action| action.starts_with("Running moc") || action == "Compiling src/counter.cpp"),
+        "{actions:?}"
+    );
+
+    // A file a resource lists: rcc again
+    project.write("src/data/hello.txt", "hello again\n");
+    let run = project.anvil(&["run"]);
+    run.success().contains("resource: hello again");
+    let actions = run.actions();
+    assert!(actions.iter().any(|action| action == "Running rcc resources.qrc"), "{actions:?}");
+    assert!(
+        !actions
+            .iter()
+            .any(|action| action.starts_with("Running uic") || action.starts_with("Running moc")),
+        "{actions:?}"
+    );
+    project.anvil(&["build"]).success().up_to_date();
+}
+
+#[test]
+fn qt_files_need_qt() {
+    require!("default");
+
+    // A form in a target without Qt, and in one with `qt = false`
+    let project = Project::empty("qt_files_need_qt");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"noqt\"\n\n[target.noqt]\nkind = \"exe\"\nsources = [\"src/main.cpp\", \"src/form.ui\"]\n",
+    );
+    project.write("src/main.cpp", "int main() { return 0; }\n");
+    project.write("src/form.ui", "<ui version=\"4.0\"/>\n");
+    let run = project.anvil(&["build"]);
+    assert_ne!(run.code, 0, "{}", run.output());
+    run.contains("src/form.ui: .ui files are built by Qt's tools, and `noqt` uses no Qt");
+
+    project.edit("anvil.toml", "kind = \"exe\"", "kind = \"exe\"\nqt = false");
+    let run = project.anvil(&["build"]);
+    assert_ne!(run.code, 0, "{}", run.output());
+    run.contains("which `qt = false` turns off for `noqt`");
+}

@@ -75,6 +75,11 @@ pub fn find(request: &Request, toolchain: &Toolchain, profile: &Profile) -> Resu
         Ok(located) => located,
         Err(rejected) => bail!("{}", not_found_message(request, &places, &rejected)),
     };
+
+    // Qt 5's packages are written by hand, with variables only running them fills in: read by their own rules
+    if crate::qt::is_qt5_package(request.package) {
+        return crate::qt::read_qt5(request, located.config_file.parent().unwrap(), toolchain, profile);
+    }
     let main = reader.read_package(&located);
 
     // The targets its users link, then what they need
@@ -280,6 +285,10 @@ impl Reader {
             format!("{namespace}{short}"),
             format!("{}_{}", namespace.to_lowercase(), short.to_lowercase()),
         ]);
+        // Qt's versionless targets (Qt::Core, which Debian's Qt 6.4 packages link) are defined beside Qt6::Core
+        if namespace == "Qt" {
+            candidates.extend(["Qt6", "Qt5"].map(|major| format!("{major}{short}")));
+        }
         candidates.extend(named);
 
         for candidate in candidates {
@@ -451,13 +460,16 @@ impl Reader {
                 }
             }
 
-            let unknown: Vec<String> = requirements
+            // In a fixed order (the sets have none): the order packages are read in is the order of what users get
+            let mut unknown: Vec<String> = requirements
                 .visible
                 .iter()
                 .chain(&requirements.linked)
                 .filter(|name| name.contains("::") && !known.contains(name.as_str()) && !tried.contains(*name))
                 .cloned()
                 .collect();
+            unknown.sort();
+            unknown.dedup();
             for name in unknown {
                 tried.insert(name.clone());
                 self.read_package_of(&name);
@@ -469,7 +481,8 @@ impl Reader {
 
         // The targets of CMake's find modules they name (Threads::Threads, OpenGL::GL)
         let mut usage = Usage::default();
-        let named: Vec<String> = requirements.visible.union(&requirements.linked).cloned().collect();
+        let mut named: Vec<String> = requirements.visible.union(&requirements.linked).cloned().collect();
+        named.sort();
         for name in &named {
             if self.has_target(name) {
                 continue;

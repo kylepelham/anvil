@@ -111,6 +111,9 @@ pub struct Target {
     pub data: Vec<(PathBuf, PathBuf)>,
     pub install: Option<bool>,
 
+    /// Qt's code generators run for it when it uses Qt (crate::qt).
+    pub qt: bool,
+
     // Test settings
     pub args: Vec<String>,
     pub workdir: Option<PathBuf>,
@@ -221,6 +224,7 @@ struct Accumulated {
     /// `data` from [defaults] and presets, which only targets that copy files beside their own take.
     shared_data: Vec<String>,
     install: Option<bool>,
+    qt: Option<bool>,
     file_rules: Vec<FileRule>,
     runs: Vec<RunSpec>,
     pre_build: Vec<StepSpec>,
@@ -357,6 +361,7 @@ impl Target {
             output_dir: None,
             data: Vec::new(),
             install: None,
+            qt: true,
             args: Vec::new(),
             workdir: None,
             timeout: None,
@@ -664,6 +669,7 @@ impl Target {
         }
         self.data = resolve_data(&data, &dir, scope, &self.name, self.kind)?;
         self.install = settings.install;
+        self.qt = settings.qt.unwrap_or(true);
 
         // The export header is on the public include path, and exports while the target builds as a shared library
         if let Some((_, macro_name)) = &self.export_header {
@@ -962,6 +968,7 @@ impl Accumulated {
         set_if_some(&mut self.output_suffix, &spec.output_suffix);
         set_if_some(&mut self.output_dir, &spec.output_dir);
         set_if_some(&mut self.install, &spec.install);
+        set_if_some(&mut self.qt, &spec.qt);
         set_if_some(&mut self.workdir, &spec.workdir);
         set_if_some(&mut self.timeout, &spec.timeout);
         set_if_some(&mut self.will_fail, &spec.will_fail);

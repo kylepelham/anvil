@@ -1,0 +1,5 @@
+[project]
+name = "qtdemo"
+
+[deps]
+qt = { cmake = "Qt6", components = ["Widgets"] }

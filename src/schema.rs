@@ -423,6 +423,10 @@ fn target_table(kind: Table) -> Value {
             flag("`anvil install` installs it (default: whether it is a default target; tests never)."),
         ),
         (
+            "qt",
+            flag("Run Qt's moc, uic and rcc for this target when it uses Qt (default true); false leaves its files to build steps."),
+        ),
+        (
             "when",
             map(
                 "Settings that apply when a condition holds: `[target.x.when.\"windows & msvc\"]`.",

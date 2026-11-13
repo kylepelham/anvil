@@ -422,6 +422,14 @@ impl Installer<'_> {
                     &target.name,
                 )?;
             }
+            let runtime_files = self.plan.runtime_files.get(&index).cloned().unwrap_or_default();
+            for (plugin, relative) in crate::qt::windows_plugins(model, index, &runtime_files) {
+                let destination = format!("{folder}/{}", slash(&relative));
+                self.add(&destination, Content::Copy(plugin), &owner, &target.name)?;
+            }
+            if let Some(text) = crate::qt::windows_qt_conf(model, index, &runtime_files) {
+                self.add(&format!("{folder}/qt.conf"), Content::Text(text), &owner, &target.name)?;
+            }
             for (data, relative) in &target.data {
                 self.add(
                     &format!("{folder}/{}", slash(relative)),

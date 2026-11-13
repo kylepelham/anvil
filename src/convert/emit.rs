@@ -655,7 +655,7 @@ impl Emitter {
                         converted.blocks.set(condition, key, Value::Bool(true));
                     }
                 }
-                "gui" | "default" => converted.blocks.set(condition, key, Value::Bool(value == "true")),
+                "gui" | "default" | "qt" => converted.blocks.set(condition, key, Value::Bool(value == "true")),
                 _ => converted.blocks.set(condition, key, Value::Text(value.clone())),
             }
         }
@@ -847,9 +847,13 @@ impl Emitter {
             converted.blocks.set(None, "gui", Value::Bool(true));
         }
 
-        // A windows-subsystem program entered through main() (/ENTRY:mainCRTStartup), not WinMain
+        // A windows-subsystem program entered through main() (/ENTRY:mainCRTStartup), not WinMain; Qt's too, whose
+        // WinMain (Qt's entry-point library in CMake) calls main()
         let options = target.link_options.iter().chain(&target.links);
-        if options.map(|item| item.value.to_lowercase()).any(|option| is_main_entry(&option)) {
+        if options
+            .map(|item| item.value.to_lowercase())
+            .any(|option| is_main_entry(&option) || super::qt_commands::is_qt_link(&option))
+        {
             for block in converted.blocks.blocks.values_mut() {
                 if let Some(gui @ Value::Bool(true)) = block.get_mut("gui") {
                     *gui = Value::Text("main".into());
@@ -987,7 +991,11 @@ impl Emitter {
 
     fn convert_sources(&mut self, target: &Target, converted: &mut TargetOut, relative_condition: &dyn Fn(&Option<String>) -> Option<String>) {
         let dir = &target.dir;
-        let compiled: Vec<&Item<PathBuf>> = target.sources.iter().filter(|item| is_compiled(&item.value)).collect();
+        let compiled: Vec<&Item<PathBuf>> = target
+            .sources
+            .iter()
+            .filter(|item| is_compiled(&item.value) || is_qt_file(&item.value))
+            .collect();
 
         let always: Vec<PathBuf> = compiled
             .iter()
@@ -1044,13 +1052,15 @@ impl Emitter {
         let conventional: HashSet<&String> = if source_dir.is_dir() {
             self.all_files
                 .iter()
-                .filter(|(key, path)| key.starts_with(&source_key) && is_compiled(path) && !is_resource(path))
+                .filter(|(key, path)| key.starts_with(&source_key) && (is_compiled(path) || is_qt_file(path)) && !is_resource(path))
                 .map(|(key, _)| key)
                 .collect()
         } else {
             self.all_files
                 .iter()
-                .filter(|(_, path)| path.parent().is_some_and(|parent| util::path_key(parent) == dir_key) && is_default_extension(path))
+                .filter(|(_, path)| {
+                    path.parent().is_some_and(|parent| util::path_key(parent) == dir_key) && (is_default_extension(path) || is_qt_file(path))
+                })
                 .map(|(key, _)| key)
                 .collect()
         };
@@ -1521,6 +1531,11 @@ impl Emitter {
     fn port_for(&self, full: &str, namespace: &str, short: &str) -> (String, DependencyEntry) {
         let verified = |note: Option<String>| DependencyEntry::Vcpkg { verified: true, note };
 
+        // Qt (versionless Qt::Widgets too): the Qt package find_package found
+        if let Some(package) = super::qt_commands::qt_package(namespace, &self.cmake.packages) {
+            return (package.to_lowercase(), self.cmake_entry(package));
+        }
+
         // Known names
         for (pattern, port) in KNOWN_PORTS {
             let matches = match pattern.strip_suffix("::") {
@@ -1584,16 +1599,20 @@ impl Emitter {
             .iter()
             .find(|package| normalize_name(package) == normalize_name(namespace));
         if let Some(package) = found {
-            let (components, version) = self.cmake.package_requests.get(package).cloned().unwrap_or_default();
-            let entry = DependencyEntry::Cmake {
-                package: package.clone(),
-                components,
-                version,
-            };
-            return (package.to_lowercase(), entry);
+            return (package.to_lowercase(), self.cmake_entry(package));
         }
 
         (namespace.replace('_', "-"), DependencyEntry::Vcpkg { verified: false, note: None })
+    }
+
+    /// An installed CMake package find_package found, with the components and version it asked for.
+    fn cmake_entry(&self, package: &str) -> DependencyEntry {
+        let (components, version) = self.cmake.package_requests.get(package).cloned().unwrap_or_default();
+        DependencyEntry::Cmake {
+            package: package.to_string(),
+            components,
+            version,
+        }
     }
 
     fn has_port(&self, name: &str) -> Option<bool> {
@@ -3730,6 +3749,11 @@ fn collect_files(root: &Path) -> Vec<(String, PathBuf)> {
 fn is_compiled(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| util::is_source_ext(&extension.to_string_lossy()))
+}
+
+/// Qt's forms and resources, which Anvil generates code from (crate::qt).
+fn is_qt_file(path: &Path) -> bool {
+    matches!(extension_of(path).as_str(), "ui" | "qrc")
 }
 
 fn is_resource(path: &Path) -> bool {
