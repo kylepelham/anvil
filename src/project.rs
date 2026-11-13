@@ -328,10 +328,33 @@ impl Model {
         targets::package_out_dir(&self.out_dir, package, &self.packages[package].name)
     }
 
-    /// A test, or a library only tests use (directly, or through libraries only tests use): not what the project
-    /// ships, so `anvil install` leaves it out unless named.
+    /// A test, or a test-support library: one that reaches [dev-deps] and only tests use. Not what the project
+    /// ships, so `anvil install` leaves it out unless named. A library its own tests use still ships.
     pub fn only_for_tests(&self, index: usize) -> bool {
-        self.shipping_reason(index, &mut Vec::new()).is_none()
+        if self.targets[index].kind == Kind::Test {
+            return true;
+        }
+
+        self.reaches_dev_deps(index, &mut Vec::new()) && self.shipping_reason(index, &mut Vec::new()).is_none()
+    }
+
+    /// Whether a target, or a target it uses, names a [dev-deps] entry.
+    fn reaches_dev_deps(&self, index: usize, visiting: &mut Vec<usize>) -> bool {
+        if self.dev_dep_uses.iter().any(|(user, _)| *user == index) {
+            return true;
+        }
+
+        visiting.push(index);
+        let target = &self.targets[index];
+        let used = target
+            .deps
+            .iter()
+            .map(|(dependency, _)| *dependency)
+            .chain(target.header_deps.iter().copied())
+            .chain(target.needs.iter().copied());
+        let used: Vec<usize> = used.collect();
+        used.into_iter()
+            .any(|dependency| !visiting.contains(&dependency) && self.reaches_dev_deps(dependency, visiting))
     }
 
     fn add_package(&mut self, root: &Path, manifest: Manifest, member: bool) -> Result<usize> {
