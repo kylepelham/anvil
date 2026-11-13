@@ -300,7 +300,7 @@ impl Interpreter {
             return Ok(Flow::Normal);
         }
 
-        let mut args = self.evaluate_args(&command.args);
+        let mut args = self.command_args(command);
 
         // Commands that read their arguments as one list: a generator expression the parser cut at whitespace is one
         // item again
@@ -2004,7 +2004,7 @@ impl Interpreter {
                     (false, true) => "1",
                     (false, false) => "",
                 };
-                (on, text.to_string())
+                (on, self.chosen_text(value.as_deref(), text, choice))
             }
             Truth::Known(on) => (on, self.host_text(&value.unwrap_or_default())),
         }

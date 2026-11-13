@@ -408,6 +408,12 @@ mod tests {
 
         let texts: Vec<&str> = command.args.iter().map(|arg| arg.text.as_str()).collect();
         assert_eq!(texts, vec!["a", "xy", "raw"]);
+
+        // CMake reads a line end inside a quoted or bracket argument as `\n` too (`string(HEX)` shows 0a, no 0d)
+        let nodes = parse("set(a \"x\r\ny\" [[p\r\nq]])\r\n");
+        let Node::Command(command) = &nodes[0] else { panic!() };
+        let texts: Vec<&str> = command.args.iter().map(|arg| arg.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "x\ny", "p\nq"]);
     }
 
     #[test]

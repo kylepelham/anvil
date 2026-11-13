@@ -2,6 +2,7 @@
 //! generator expressions become Anvil conditions (`windows`, `msvc`, `debug`) instead of being decided for one
 //! machine.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 /// The result of a condition: decided, or depending on the platform, compiler, profile or an option.
@@ -193,6 +194,44 @@ impl Target {
         qualify(&mut self.link_options, condition);
         qualify(&mut self.lib_dirs, condition);
         qualify(&mut self.settings, condition);
+    }
+
+    /// Calls `visit` with each item's condition.
+    pub fn each_condition<'a>(&'a self, visit: &mut dyn FnMut(&'a String)) {
+        fn each<'a, T>(items: &'a [Item<T>], visit: &mut dyn FnMut(&'a String)) {
+            items.iter().filter_map(|item| item.condition.as_ref()).for_each(visit);
+        }
+
+        each(&self.sources, visit);
+        each(&self.includes, visit);
+        each(&self.defines, visit);
+        each(&self.interface_defines, visit);
+        each(&self.interface_includes, visit);
+        each(&self.interface_options, visit);
+        each(&self.options, visit);
+        each(&self.links, visit);
+        each(&self.link_options, visit);
+        each(&self.lib_dirs, visit);
+        each(&self.settings, visit);
+    }
+
+    /// Keeps the items `keep` (which may change their condition) says to.
+    pub fn retain_items(&mut self, keep: &mut dyn FnMut(&mut Option<String>) -> bool) {
+        fn retain<T>(items: &mut Vec<Item<T>>, keep: &mut dyn FnMut(&mut Option<String>) -> bool) {
+            items.retain_mut(|item| keep(&mut item.condition));
+        }
+
+        retain(&mut self.sources, keep);
+        retain(&mut self.includes, keep);
+        retain(&mut self.defines, keep);
+        retain(&mut self.interface_defines, keep);
+        retain(&mut self.interface_includes, keep);
+        retain(&mut self.interface_options, keep);
+        retain(&mut self.options, keep);
+        retain(&mut self.links, keep);
+        retain(&mut self.link_options, keep);
+        retain(&mut self.lib_dirs, keep);
+        retain(&mut self.settings, keep);
     }
 
     pub fn new(name: &str, kind: TargetKind, dir: PathBuf, dir_id: usize, condition: Option<String>) -> Target {
@@ -794,6 +833,9 @@ const COMPILER_VERSION_MARKER: &str = "\u{1}compiler-version\u{2}";
 // $<TARGET_OBJECTS:x> as a value: `{objects:x}`, a dependency on the object library x
 pub const OBJECTS_PREFIX: &str = "{objects:";
 
+// Starts the condition word of a `$<TARGET_EXISTS:...>` that is decided once every target is known
+const TARGET_EXISTS_PREFIX: &str = "target-exists.";
+
 // The version each compiler family is assumed to have (a current one), for version tests
 const CURRENT_COMPILER_VERSIONS: &[(&str, &str)] = &[("cl", "19.44"), ("gcc", "14.2"), ("clang", "19.1")];
 
@@ -1082,9 +1124,50 @@ fn condition_expression(name: &str, arguments: &[Alternatives], target_exists: O
                 _ => Truth::Known(equal(&left, &right)),
             }
         }
-        "TARGET_EXISTS" => Truth::Known(target_exists?(&flat(0))),
+        // A target made later in the project counts too: undecided until every target is known
+        "TARGET_EXISTS" => match target_exists?(&flat(0)) {
+            true => Truth::Known(true),
+            false => Truth::Depends(target_exists_condition(&flat(0))),
+        },
         _ => return None,
     })
+}
+
+/// The condition word `$<TARGET_EXISTS:name>` stands for until the targets are known (the name in hex: a
+/// condition word has no `:`).
+fn target_exists_condition(name: &str) -> String {
+    let hex: String = name.bytes().map(|byte| format!("{byte:02x}")).collect();
+    format!("{TARGET_EXISTS_PREFIX}{hex}")
+}
+
+/// The target names a condition's `$<TARGET_EXISTS:...>` words ask about.
+pub fn target_exists_names(condition: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for (start, _) in condition.match_indices(TARGET_EXISTS_PREFIX) {
+        let hex: String = condition[start + TARGET_EXISTS_PREFIX.len()..]
+            .chars()
+            .take_while(|character| character.is_ascii_hexdigit())
+            .collect();
+        let bytes: Vec<u8> = (0..hex.len() / 2)
+            .filter_map(|index| u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok())
+            .collect();
+        names.push(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    names
+}
+
+/// A condition with its `$<TARGET_EXISTS:...>` words decided by `exists`.
+pub fn decide_target_exists(condition: &str, exists: &dyn Fn(&str) -> bool) -> Truth {
+    if !condition.contains(TARGET_EXISTS_PREFIX) {
+        return Truth::Depends(condition.to_string());
+    }
+
+    let mut decided = condition.to_string();
+    for name in target_exists_names(condition) {
+        let word = if exists(&name) { "true" } else { "false" };
+        decided = decided.replacen(&target_exists_condition(&name), word, 1);
+    }
+    simplify(&decided, None)
 }
 
 /// $<COMPILE_LANGUAGE:...> of one language: the language's condition word; languages Anvil passes no flags to are
@@ -1204,7 +1287,89 @@ pub fn split_conditional_item(text: &str) -> Option<(String, &str)> {
     let rest = text.strip_prefix("$<$<BOOL:")?.strip_prefix(OPTION_MARKER)?;
     let (condition, rest) = rest.split_once(OPTION_MARKER_END)?;
     let item = rest.strip_prefix(">:")?.strip_suffix('>')?;
+
+    // The closing `>` must be this expression's (not `$<$<BOOL:a>:x>$<$<BOOL:b>:y>`)
+    let mut depth = 0usize;
+    let bytes = item.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'$' if bytes.get(index + 1) == Some(&b'<') => depth += 1,
+            b'>' if depth == 0 => return None,
+            b'>' => depth -= 1,
+            _ => {}
+        }
+    }
     Some((condition.replace(MARKER_SPACE, " "), item))
+}
+
+/// A list with choose_conditional_items applied to each element, dropping elements that are conditional items
+/// `holds` rules out.
+pub fn choose_list_items<'a>(value: &'a str, holds: &dyn Fn(&str) -> bool) -> Cow<'a, str> {
+    if !value.contains("$<$<BOOL:\u{1}option-") {
+        return Cow::Borrowed(value);
+    }
+
+    let elements = list_elements(value);
+    let chosen = elements.iter().filter_map(|element| match split_conditional_item(element) {
+        Some((condition, _)) if !holds(&condition) => None,
+        _ => Some(choose_conditional_items(element, holds).into_owned()),
+    });
+    Cow::Owned(chosen.collect::<Vec<_>>().join(";"))
+}
+
+/// Text with each conditional_item in it (whole or inside longer text) replaced by its item where `holds` says its
+/// condition holds, and by nothing elsewhere.
+pub fn choose_conditional_items<'a>(text: &'a str, holds: &dyn Fn(&str) -> bool) -> Cow<'a, str> {
+    // How a conditional_item starts
+    const OPENING: &str = "$<$<BOOL:\u{1}option-";
+    if !text.contains(OPENING) {
+        return Cow::Borrowed(text);
+    }
+
+    let mut result = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(OPENING) {
+        result.push_str(&rest[..start]);
+        let candidate = &rest[start..];
+
+        // The expression's end: its `>` at depth zero
+        let mut depth = 0usize;
+        let mut end = None;
+        let bytes = candidate.as_bytes();
+        for (index, byte) in bytes.iter().enumerate() {
+            match byte {
+                b'$' if bytes.get(index + 1) == Some(&b'<') => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(index + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            result.push_str(candidate);
+            return Cow::Owned(result);
+        };
+
+        match split_conditional_item(&candidate[..end]) {
+            Some((condition, item)) => {
+                if holds(&condition) {
+                    result.push_str(&choose_conditional_items(item, holds));
+                }
+                rest = &candidate[end..];
+            }
+            None => {
+                result.push_str(&candidate[..OPENING.len()]);
+                rest = &candidate[OPENING.len()..];
+            }
+        }
+    }
+    result.push_str(rest);
+
+    Cow::Owned(result)
 }
 
 /// Text with its option and platform markers written as the `${NAME}` they stand for, to show in a comment.
@@ -1456,7 +1621,18 @@ mod tests {
             expand_genex("$<$<TARGET_EXISTS:real>:real>", &mut unknown, Some(&exists)),
             vec![(Truth::Known(true), "real".to_string())]
         );
-        assert!(expand_genex("$<$<TARGET_EXISTS:nosuch>:nosuch>", &mut unknown, Some(&exists)).is_empty());
+        let later = expand_genex("$<$<TARGET_EXISTS:later::lib>:later>", &mut unknown, Some(&exists));
+        let [(Truth::Depends(condition), text)] = later.as_slice() else {
+            panic!("{later:?}")
+        };
+        assert_eq!(text, "later");
+        assert_eq!(target_exists_names(condition), vec!["later::lib"]);
+        assert_eq!(decide_target_exists(condition, &|name| name == "later::lib"), Truth::Known(true));
+        assert_eq!(decide_target_exists(&format!("msvc & {condition}"), &|_| false), Truth::Known(false));
+        assert_eq!(
+            decide_target_exists(&format!("msvc | {condition}"), &|_| false),
+            Truth::Depends("msvc".into())
+        );
         assert!(unknown.is_empty(), "{unknown:?}");
         expand_genex("$<$<TARGET_EXISTS:real>:real>", &mut unknown, None);
         assert_eq!(unknown, vec!["$<$<TARGET_EXISTS:real>:real>"]);
@@ -1531,5 +1707,20 @@ mod tests {
         assert_eq!(text(simplify("(false) | (msvc)", None)), "msvc");
         assert_eq!(text(simplify("windows & !unix", None)), "windows");
         assert_eq!(text(simplify("cl & gcc", None)), "false");
+    }
+
+    #[test]
+    fn conditional_items_inside_text() {
+        let (windows, other) = (conditional_item("windows", "win"), conditional_item("!windows", "posix"));
+        let joined = format!("src/{windows}{other}/x.c");
+
+        // Two in a row are not one item; this machine's choice of each, whole or inside text
+        assert_eq!(split_conditional_item(&windows), Some(("windows".to_string(), "win")));
+        assert_eq!(split_conditional_item(&format!("{windows}{other}")), None);
+        let holds = |condition: &str| condition == "windows";
+        assert_eq!(choose_conditional_items(&joined, &holds), "src/win/x.c");
+        assert_eq!(choose_conditional_items(&format!("a;{other}"), &holds), "a;");
+        assert!(matches!(choose_conditional_items("plain", &holds), Cow::Borrowed("plain")));
+        assert_eq!(choose_list_items(&format!("{other};{windows};a"), &holds), "win;a");
     }
 }

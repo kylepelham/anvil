@@ -6,6 +6,7 @@
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 
 /// A test that ran a check script, as a test of the command the script ran.
 #[derive(Debug, PartialEq)]
@@ -87,6 +88,13 @@ pub(super) fn convert(words: &[String], read: &dyn Fn(&str) -> Option<String>) -
     })
 }
 
+/// A pattern of Shape::read, compiled once (each test reads its script again).
+fn compiled(source: &str) -> Regex {
+    static COMPILED: LazyLock<Mutex<HashMap<String, Regex>>> = LazyLock::new(Default::default);
+    let mut compiled = COMPILED.lock().unwrap();
+    compiled.entry(source.to_string()).or_insert_with(|| Regex::new(source).unwrap()).clone()
+}
+
 /// The variables a check script reads, and how it splits them.
 struct Shape {
     command: String,
@@ -108,7 +116,7 @@ struct Shape {
 impl Shape {
     fn read(text: &str) -> Option<Shape> {
         let text = strip_comments(text);
-        let pattern = |source: &str| Regex::new(source).unwrap();
+        let pattern = compiled;
 
         // A macro that only escapes a variable's regex characters (`string(REGEX REPLACE "([.+*?^$()])" "\\\\\\1" ...)`)
         let escaping_macro = pattern(
