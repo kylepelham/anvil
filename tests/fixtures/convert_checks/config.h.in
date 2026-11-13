@@ -1,0 +1,4 @@
+#define SIZEOF_LONG @SIZEOF_LONG@
+#define SIZEOF_WCHAR_T @SIZEOF_WCHAR_T@
+#define FOO_VALUE "@FOO_VALUE@"
+#cmakedefine01 HAVE_DASH_W4

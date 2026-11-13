@@ -1515,3 +1515,34 @@ command = ["cmake", "-E", "copy", "{root}/in.txt", "{output}"]
         .code(1)
         .contains("the step succeeded but did not write out/debug/gen/app/d.txt");
 }
+
+// 31. Converted configure checks give each compiler what CMake gives it: type sizes by platform, cl's dash-spelled
+// flags, a value an option's branch sets, an option declared for Unix only
+
+fn convert_checks(toolchain: &str, test: &str) {
+    let project = Project::fixture("convert_checks", test);
+    project.anvil(&["convert"]).success();
+    let toml = project.read("anvil.toml");
+    assert!(toml.contains(r#"when."USE_X11 & unix""#), "{toml}");
+
+    let w4 = if toolchain == "msvc" { 1 } else { 0 };
+    let run = project.anvil(&["run", "--toolchain", toolchain]);
+    run.success();
+    assert_eq!(program_output(&run), format!("sizes=1 foo= w4={w4}"));
+
+    let run = project.anvil(&["run", "--toolchain", toolchain, "-o", "USE_FOO"]);
+    run.success();
+    assert_eq!(program_output(&run), format!("sizes=1 foo=42 w4={w4}"));
+}
+
+#[test]
+fn convert_checks_msvc() {
+    require!("msvc");
+    convert_checks("msvc", "convert_checks_msvc");
+}
+
+#[test]
+fn convert_checks_gcc() {
+    require!("gcc");
+    convert_checks("gcc", "convert_checks_gcc");
+}
