@@ -743,7 +743,9 @@ impl Model {
                     continue;
                 }
             }
-            let Some(loaded) = self.load_dep_package(package, key, spec)? else { continue };
+            let Some(loaded) = self.load_dep_package(package, key, spec)? else {
+                continue;
+            };
             if self.packages[loaded].name == package_name {
                 return Ok(Some(FoundPackage::Package(loaded)));
             }
