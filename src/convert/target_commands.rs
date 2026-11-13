@@ -206,10 +206,19 @@ impl Interpreter {
             explicit_kind |= !matches!(word.as_str(), "UNKNOWN" | "GLOBAL" | "EXCLUDE_FROM_ALL");
         }
 
+        // Shared where this definition's branch is taken and BUILD_SHARED_LIBS holds (a definition in another branch
+        // adds its own)
         self.create_target(name, kind, &sources);
         if let (false, Truth::Depends(condition)) = (explicit_kind, shared_by_default) {
+            let here = model::and_optional(&self.current_condition(), &Some(condition)).unwrap();
             if let Some(target) = self.targets.get_mut(name.as_str()) {
-                target.shared_condition = Some(condition);
+                target.shared_condition = match target.shared_condition.take() {
+                    Some(previous) => match Truth::Depends(previous).or(Truth::Depends(here)) {
+                        Truth::Depends(either) => Some(either),
+                        Truth::Known(_) => None,
+                    },
+                    None => Some(here),
+                };
             }
         }
     }
@@ -511,10 +520,15 @@ impl Interpreter {
                 continue;
             }
 
+            // Only a header where HEADER_FILE_ONLY was set: a source everywhere else
             let path = self.resolve_path(&value);
-            if self.header_only_sources.contains(&util::path_key(&path)) {
-                continue;
-            }
+            let condition = match self.header_only_sources.get(&util::path_key(&path)) {
+                None => condition,
+                Some(header_only) => match outside(&condition, header_only) {
+                    Some(condition) => condition,
+                    None => continue,
+                },
+            };
             self.targets.get_mut(name).unwrap().sources.push(Item {
                 condition,
                 public: false,
@@ -686,16 +700,16 @@ impl Interpreter {
         let Some((name, rest)) = args.split_first() else { return };
         let Some(target) = self.find_target(command, name) else { return };
 
-        for (public, raw) in self.split_visibility(&target, rest) {
+        for (public, raw, only_users) in self.split_scopes(&target, rest) {
             for (condition, feature) in self.conditional_values(Some(&target), &[raw]) {
-                self.apply_compile_feature(&target, &feature, public, condition);
+                self.apply_compile_feature(&target, &feature, Scope { public, only_users }, condition);
             }
         }
     }
 
-    /// cxx_std_NN and c_std_NN: the target's standard (the highest asked for), its dependents' too when public. One
-    /// asked for under a condition holds there, when it is higher.
-    fn apply_compile_feature(&mut self, target: &str, feature: &str, public: bool, condition: Option<String>) {
+    /// cxx_std_NN and c_std_NN: the target's standard (the highest asked for), its dependents' too when public, only
+    /// theirs when INTERFACE. One asked for under a condition holds there, when it is higher.
+    fn apply_compile_feature(&mut self, target: &str, feature: &str, scope: Scope, condition: Option<String>) {
         let (key, number) = match (feature.strip_prefix("cxx_std_"), feature.strip_prefix("c_std_")) {
             (Some(number), _) => ("std", number),
             (_, Some(number)) => ("c-std", number),
@@ -707,6 +721,18 @@ impl Interpreter {
         }
         let converted = self.targets.get_mut(target).unwrap();
         let current = if key == "std" { converted.std } else { converted.c_std };
+        let public = scope.public;
+
+        // Its users' only: the target keeps its own
+        if scope.only_users {
+            if condition.is_none() && key == "std" {
+                converted.public_std = Some(converted.public_std.map_or(standard, |current| current.max(standard)));
+            }
+            if condition.is_none() && key == "c-std" {
+                converted.public_c_std = Some(converted.public_c_std.map_or(standard, |current| current.max(standard)));
+            }
+            return;
+        }
 
         if condition.is_some() {
             if current.map_or(true, |current| standard > current) {
@@ -1000,7 +1026,7 @@ impl Interpreter {
             }
             "COMPILE_FEATURES" => {
                 for (condition, feature) in self.conditional_values(Some(target), &items) {
-                    self.apply_compile_feature(target, &feature, public, condition);
+                    self.apply_compile_feature(target, &feature, Scope { public, only_users }, condition);
                 }
             }
             "CXX_STANDARD" | "C_STANDARD" => {
@@ -1051,6 +1077,8 @@ impl Interpreter {
                     self.targets.get_mut(target).unwrap().notes.push(note.into());
                 }
             }
+            // The top folder's CMAKE_MSVC_RUNTIME_LIBRARY becomes the profiles' runtime; another one is a note
+            "MSVC_RUNTIME_LIBRARY" if self.current_dir_id() == 0 && self.get_variable("CMAKE_MSVC_RUNTIME_LIBRARY") == Some(items.join(";")) => {}
             "MSVC_RUNTIME_LIBRARY" => {
                 let note = format!(
                     "MSVC_RUNTIME_LIBRARY {}: use `static-runtime = true` in a profile for the static runtime",
@@ -1243,14 +1271,39 @@ impl Interpreter {
             .map(|file| self.resolve_path(&file))
             .collect();
 
-        // A file that is only a header: no target compiles it
+        // A file that is only a header: no target compiles it where the property is set (if(NOT WIN32) for the
+        // Windows file), the targets listing it compile it everywhere else
         if property == "HEADER_FILE_ONLY" {
             if model::constant_truth(&items.join(";")) == Some(true) {
+                let condition = self.current_condition();
                 let keys: HashSet<String> = paths.iter().map(|path| util::path_key(path)).collect();
                 for target in self.targets.values_mut() {
-                    target.sources.retain(|item| !keys.contains(&util::path_key(&item.value)));
+                    target.sources.retain_mut(|item| {
+                        if !keys.contains(&util::path_key(&item.value)) {
+                            return true;
+                        }
+                        match outside(&item.condition, &condition) {
+                            Some(kept) => {
+                                item.condition = kept;
+                                true
+                            }
+                            None => false,
+                        }
+                    });
                 }
-                self.header_only_sources.extend(keys);
+
+                // Set again under another condition: a header under either
+                for key in keys {
+                    let combined = match (self.header_only_sources.get(&key), &condition) {
+                        (Some(Some(previous)), Some(condition)) => match Truth::Depends(previous.clone()).or(Truth::Depends(condition.clone())) {
+                            Truth::Depends(either) => Some(either),
+                            Truth::Known(_) => None,
+                        },
+                        (Some(None), _) | (_, None) => None,
+                        (None, Some(condition)) => Some(condition.clone()),
+                    };
+                    self.header_only_sources.insert(key, combined);
+                }
             }
             return;
         }
@@ -1552,7 +1605,16 @@ impl Interpreter {
             .filter(|words| !words.is_empty())
             .collect();
 
+        // Without ALL, built only when asked for or needed
         self.create_target(name, TargetKind::Custom, &[]);
+        if !keywords.has("ALL") {
+            let condition = self.current_condition();
+            self.targets.get_mut(name.as_str()).unwrap().settings.push(Item {
+                condition,
+                public: false,
+                value: ("default", "false".into()),
+            });
+        }
         let depends: Vec<String> = self
             .plain_words(&keywords.list("DEPENDS"))
             .iter()
@@ -1746,6 +1808,7 @@ impl Interpreter {
             target.c_std = target.c_std.max(passed_on);
         }
 
+        self.pass_on_language_settings(project_language);
         for target in self.targets.values_mut() {
             resolve_languages(target, project_language);
             define_export_symbol(target);
@@ -1780,6 +1843,121 @@ impl Interpreter {
                 }
             }
         }
+    }
+
+    /// Public definitions and flags for one language (`$<$<COMPILE_LANGUAGE:C>:X>` on a C++ library its C programs
+    /// use) are decided by the files of each target compiling with them, not by the target's: where those disagree,
+    /// the target and each one using it (directly, or through public links) get them as their own.
+    fn pass_on_language_settings(&mut self, project_language: &'static str) {
+        let languages: HashMap<String, Vec<&'static str>> = self
+            .targets
+            .iter()
+            .map(|(name, target)| {
+                let mut languages: Vec<&'static str> = target.sources.iter().filter_map(|item| source_language(&item.value)).collect();
+                languages.sort();
+                languages.dedup();
+                (name.clone(), languages)
+            })
+            .collect();
+
+        // Who uses each target, and under which condition
+        let mut users: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+        for name in self.targets.keys() {
+            for item in &self.targets[name].links {
+                let mut visiting = vec![name.clone()];
+                self.collect_used(&self.resolve_alias(&item.value), &item.condition, name, &mut visiting, &mut users);
+            }
+        }
+
+        let names: Vec<String> = self.targets.keys().cloned().collect();
+        for owner in &names {
+            let main = match languages[owner].as_slice() {
+                [] => project_language,
+                [only] => only,
+                _ => model::LANGUAGE_CXX,
+            };
+            let owner_users = users.get(owner).cloned().unwrap_or_default();
+
+            // The items each one compiling with them would decide differently
+            let decides_alike = |condition: &str, own: bool| {
+                let expected = decide_language(condition, main);
+                let owner_languages = if own { languages[owner].clone() } else { Vec::new() };
+                let user_languages = owner_users.iter().flat_map(|(user, _)| languages[user].iter().copied());
+                owner_languages
+                    .into_iter()
+                    .chain(user_languages)
+                    .all(|language| decide_language(condition, language) == expected)
+            };
+
+            let mut moved: Vec<(TargetList, Item<String>)> = Vec::new();
+            let target = self.targets.get_mut(owner).unwrap();
+            let compiles = !languages[owner].is_empty();
+            for (list, own) in [
+                (TargetList::Defines, true),
+                (TargetList::Options, true),
+                (TargetList::Defines, false),
+                (TargetList::Options, false),
+            ] {
+                let items = list.of_users(target, !own);
+                items.retain_mut(|item| {
+                    let Some(condition) = item
+                        .condition
+                        .as_ref()
+                        .filter(|_| item.public && model::mentions_language(&item.condition))
+                    else {
+                        return true;
+                    };
+                    if decides_alike(condition, own) {
+                        return true;
+                    }
+
+                    moved.push((list, item.clone()));
+                    item.public = false;
+                    own && compiles
+                });
+            }
+
+            // (those compiling nothing pass them on, and their users have them already)
+            for (list, item) in moved {
+                for (user, link_condition) in owner_users.iter().filter(|(user, _)| !languages[user].is_empty()) {
+                    let condition = model::and_optional(link_condition, &item.condition);
+                    let user = self.targets.get_mut(user).unwrap();
+                    list.of_target(user).push(Item {
+                        condition,
+                        public: false,
+                        value: item.value.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Records `user` as a user of `name` and of what `name` links publicly, each under the conditions of the links
+    /// leading there.
+    fn collect_used(
+        &self,
+        name: &str,
+        condition: &Option<String>,
+        user: &str,
+        visiting: &mut Vec<String>,
+        users: &mut HashMap<String, Vec<(String, Option<String>)>>,
+    ) {
+        let Some(target) = self.targets.get(name) else { return };
+        if visiting.iter().any(|visited| visited == name) {
+            return;
+        }
+        visiting.push(name.to_string());
+
+        let known = users.entry(name.to_string()).or_default();
+        if !known.iter().any(|(other, other_condition)| other == user && other_condition == condition) {
+            known.push((user.to_string(), condition.clone()));
+        }
+        for item in target.links.iter().filter(|item| item.public) {
+            let combined = model::and_optional(condition, &item.condition);
+            self.collect_used(&self.resolve_alias(&item.value), &combined, user, visiting, users);
+        }
+
+        visiting.pop();
     }
 
     // Helpers
@@ -1946,10 +2124,21 @@ impl Interpreter {
         util::normalize(Path::new(&format!("{binary_dir}/{text}")))
     }
 
-    /// A DEPENDS entry: a target name stays a name, a file becomes a full path.
+    /// A DEPENDS entry: a target name stays a name, a file becomes a full path (a relative one names a build step's
+    /// output in the current build folder when there is one, as in CMake).
     fn resolve_dependency(&self, text: &str) -> String {
         if self.target_exists(text) || text.starts_with("{out}") {
             return text.to_string();
+        }
+
+        let output = self.resolve_output(text);
+        let output_key = util::path_key(&output);
+        let is_output = self
+            .custom_commands
+            .iter()
+            .any(|command| command.outputs.iter().any(|existing| util::path_key(existing) == output_key));
+        if !Path::new(text).is_absolute() && is_output {
+            return slash(&output);
         }
 
         slash(&self.resolve_path(text))
@@ -2012,6 +2201,26 @@ fn extend_or_replace(list: &mut Vec<String>, items: &[String], append: bool) {
         list.clear();
     }
     list.extend(items.iter().cloned());
+}
+
+/// Where an item under `condition` still holds outside `excluded` (None: always excluded): None when nowhere, else
+/// the condition left (None: always).
+fn outside(condition: &Option<String>, excluded: &Option<String>) -> Option<Option<String>> {
+    let Some(excluded) = excluded else { return None };
+    let kept = condition
+        .clone()
+        .map_or(Truth::Known(true), Truth::Depends)
+        .and(Truth::Depends(excluded.clone()).not());
+    let kept = match kept {
+        Truth::Depends(condition) => model::simplify(&condition, None),
+        known => known,
+    };
+
+    match kept {
+        Truth::Known(false) => None,
+        Truth::Known(true) => Some(None),
+        Truth::Depends(condition) => Some(Some(condition)),
+    }
 }
 
 /// Is this a target property that changes nothing Anvil builds?
@@ -2441,8 +2650,9 @@ set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -DC_DEBUG")
             toml.contains("[[target.app.file]]\nmatch = [\"**/*.c\"]\nif = \"debug\"\ndefines = [\"C_DEBUG\"]"),
             "{toml}"
         );
+        assert!(toml.contains("[defaults]\nc-std = \"c11\""), "{toml}");
         assert!(
-            toml.contains("[target.clib]\nkind = \"lib\"\nsources = [\"util.c\"]\ndefines = [\"C_ONLY\"]\nc-std = \"c11\""),
+            toml.contains("[target.clib]\nkind = \"lib\"\nsources = [\"util.c\"]\ndefines = [\"C_ONLY\"]"),
             "{toml}"
         );
         assert!(!toml.contains("language."), "{toml}");
@@ -2652,5 +2862,132 @@ add_executable(app main.cpp $<TARGET_OBJECTS:objects>)
         assert!(toml.contains("defines = [\"LIB_BUILDING\"]"), "{toml}");
         assert!(toml.contains("# TODO: WINDOWS_EXPORT_ALL_SYMBOLS"), "{toml}");
         assert!(toml.contains("deps = [\"objects\"]"), "{toml}");
+    }
+
+    #[test]
+    fn header_only_under_a_condition_is_a_source_elsewhere() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(platform C)
+set(SOURCES main.c win.c posix.c always_header.c)
+set_source_files_properties(always_header.c PROPERTIES HEADER_FILE_ONLY ON)
+if(NOT WIN32)
+  set_source_files_properties(win.c PROPERTIES HEADER_FILE_ONLY ON)
+else()
+  set_source_files_properties(posix.c PROPERTIES HEADER_FILE_ONLY ON)
+endif()
+add_executable(app ${SOURCES})
+"#;
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("main.c", "int main(void) { return 0; }\n"),
+            ("win.c", "\n"),
+            ("posix.c", "\n"),
+            ("always_header.c", "\n"),
+        ];
+        let toml = convert_files("header-only", &files);
+
+        // Each platform file where the other branch was taken; the file that is always a header nowhere
+        assert!(toml.contains("[target.app.when.windows]\nsources = [\"win.c\"]"), "{toml}");
+        assert!(toml.contains("[target.app.when.\"!windows\"]\nsources = [\"posix.c\"]"), "{toml}");
+        assert!(!toml.contains("always_header"), "{toml}");
+    }
+
+    #[test]
+    fn custom_targets_own_their_relative_outputs() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(docs CXX)
+add_executable(app main.cpp)
+add_custom_command(OUTPUT html COMMAND tool ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp html DEPENDS main.cpp)
+add_custom_target(doc DEPENDS html)
+add_custom_command(OUTPUT stamp COMMAND tool stamp)
+add_custom_target(always ALL DEPENDS stamp)
+"#;
+        let toml = convert_files("docs", &[("CMakeLists.txt", cmake), ("main.cpp", "int main() {}\n")]);
+
+        // The step making `html` is the doc target's, which CMake builds only when asked for (no ALL)
+        assert!(
+            toml.contains("[target.doc]\nkind = \"custom\"\ndefault = false\n\n[[target.doc.run]]\ninputs = [\"main.cpp\"]\noutput = \"{out}/html\""),
+            "{toml}"
+        );
+        assert!(toml.contains("[target.always]\nkind = \"custom\"\n\n[[target.always.run]]"), "{toml}");
+        assert!(!toml.contains("[[target.app.run]]"), "{toml}");
+    }
+
+    #[test]
+    fn build_shared_libs_holds_in_its_branch_only() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(branches C)
+option(BUILD_SHARED_LIBS "shared" OFF)
+option(FORCE_STATIC "static" OFF)
+if(FORCE_STATIC)
+  add_library(core STATIC core.c)
+elseif(WIN32)
+  add_library(core core.c)
+else()
+  add_library(core SHARED core.c)
+endif()
+set_target_properties(core PROPERTIES DEFINE_SYMBOL CORE_BUILDING)
+"#;
+        let toml = convert_files("shared-branch", &[("CMakeLists.txt", cmake), ("core.c", "int core;\n")]);
+
+        // FORCE_STATIC keeps it static even with BUILD_SHARED_LIBS; the export symbol follows
+        assert!(
+            toml.contains("[target.core.when.\"!FORCE_STATIC & windows & BUILD_SHARED_LIBS\"]\nkind = \"shared\""),
+            "{toml}"
+        );
+        assert!(!toml.contains("[target.core.when.BUILD_SHARED_LIBS]"), "{toml}");
+        assert!(
+            toml.contains("[target.core.when.\"(!FORCE_STATIC & !windows) | (!FORCE_STATIC & BUILD_SHARED_LIBS)\"]\ndefines = [\"CORE_BUILDING\"]"),
+            "{toml}"
+        );
+    }
+
+    #[test]
+    fn public_language_settings_follow_the_users_files() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(users C CXX)
+set(CMAKE_C_STANDARD 11)
+add_library(lib STATIC lib.cpp)
+target_compile_definitions(lib PUBLIC $<$<COMPILE_LANGUAGE:CXX>:LIB_CXX_ONLY> $<$<COMPILE_LANGUAGE:C>:LIB_C_ONLY>)
+target_compile_options(lib INTERFACE $<$<COMPILE_LANGUAGE:C>:-DIFACE_C_OPT>)
+add_library(middle INTERFACE)
+target_link_libraries(middle INTERFACE lib)
+add_executable(app main.c)
+target_link_libraries(app PRIVATE middle)
+add_library(iface STATIC iface.c)
+target_compile_features(iface INTERFACE c_std_17)
+add_executable(user user.c)
+target_link_libraries(user PRIVATE iface)
+"#;
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("lib.cpp", "\n"),
+            ("main.c", "int main(void) { return 0; }\n"),
+            ("iface.c", "\n"),
+            ("user.c", "int main(void) { return 0; }\n"),
+        ];
+        let toml = convert_files("language-users", &files);
+
+        // The C++ library its C++ definition, the C program (through a public link) the C ones
+        assert!(
+            toml.contains("[target.lib]\nkind = \"lib\"\nsources = [\"lib.cpp\"]\ndefines = [\"LIB_CXX_ONLY\"]\n\n"),
+            "{toml}"
+        );
+        assert!(toml.contains("defines = [\"LIB_C_ONLY\", \"IFACE_C_OPT\"]"), "{toml}");
+        assert!(
+            !toml.contains("[target.lib.public]") && !toml.contains("[target.middle]\nkind = \"headers\"\ndefines"),
+            "{toml}"
+        );
+
+        // An INTERFACE C standard is its users', not its own
+        assert!(
+            toml.contains("[target.iface]\nkind = \"lib\"\nsources = [\"iface.c\"]\nc-std = \"c11\""),
+            "{toml}"
+        );
+        assert!(toml.contains("deps = [\"iface\"]\nc-std = \"c17\""), "{toml}");
     }
 }

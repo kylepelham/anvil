@@ -174,6 +174,7 @@ const FACTORED_KEYS: &[&str] = &[
     "flags",
     "link-flags",
     "std",
+    "c-std",
     "warnings",
     "werror",
     "arch",
@@ -212,6 +213,7 @@ const SIBLING_KEYS: &[&str] = &[
     "flags",
     "link-flags",
     "std",
+    "c-std",
     "warnings",
     "werror",
     "arch",
@@ -624,7 +626,7 @@ impl Emitter {
                         converted.blocks.set(condition, key, Value::Bool(true));
                     }
                 }
-                "gui" => converted.blocks.set(condition, key, Value::Bool(value == "true")),
+                "gui" | "default" => converted.blocks.set(condition, key, Value::Bool(value == "true")),
                 _ => converted.blocks.set(condition, key, Value::Text(value.clone())),
             }
         }
@@ -878,13 +880,14 @@ impl Emitter {
         let mut seen_notes = HashSet::new();
         converted.notes.retain(|note| seen_notes.insert(note.clone()));
 
-        // Custom targets only order the build: they keep nothing but their dependencies
+        // Custom targets only order the build: they keep nothing but their dependencies (and whether they are built by
+        // default)
         if converted.kind == "custom" {
             converted
                 .blocks
                 .blocks
                 .values_mut()
-                .for_each(|block| block.retain(|key, _| matches!(*key, "deps" | "public.deps" | "needs")));
+                .for_each(|block| block.retain(|key, _| matches!(*key, "deps" | "public.deps" | "needs" | "default")));
         }
 
         // A program's settings are its own when nothing links it; then the include folders the convention gives anyway
@@ -1761,9 +1764,7 @@ impl Emitter {
             let input_text = self.path_text(&input, &dir);
             let stem = input.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
             let template_word = |word: &String| -> String {
-                let replaced = word
-                    .replace(&self.command_word(&slash(&input)), "{input}")
-                    .replace(&input_text, "{input}");
+                let replaced = replace_whole_path(&word.replace(&self.command_word(&slash(&input)), "{input}"), &input_text, "{input}");
 
                 // The stem only as a whole file name part (`shade` must not touch `shaders`)
                 let with_stem = replaced.replace(&format!("/{stem}."), "/{stem}.");
@@ -2374,6 +2375,14 @@ impl Emitter {
             render_blocks(&mut output, &format!("preset.{}", key(name)), preset);
         }
 
+        // [profile.debug] and [profile.release] with CMAKE_MSVC_RUNTIME_LIBRARY's runtime (the others inherit release's)
+        for (profile, keys) in self.runtime_profiles() {
+            let _ = writeln!(output, "\n[profile.{profile}]");
+            for (key, value) in keys {
+                let _ = writeln!(output, "{key} = {value}");
+            }
+        }
+
         // [profile.x] for configurations other than debug and release
         for profile in self.profiles() {
             let _ = writeln!(output, "\n[profile.{}]\ninherits = \"release\"", key(&profile));
@@ -2590,6 +2599,51 @@ impl Emitter {
         condition_text(&Some(any), None)
     }
 
+    /// CMAKE_MSVC_RUNTIME_LIBRARY as the built-in profiles' `static-runtime` and `debug-runtime`, where they differ
+    /// from Anvil's (the DLL runtime, the debug one in debug builds). A value depending on an option or the platform
+    /// is taken as on this machine with the options' defaults (a profile has no conditions), with a warning.
+    fn runtime_profiles(&mut self) -> Vec<(&'static str, Vec<(&'static str, bool)>)> {
+        let Some(value) = self.cmake.get_variable("CMAKE_MSVC_RUNTIME_LIBRARY").filter(|value| !value.is_empty()) else {
+            return Vec::new();
+        };
+
+        let options = self.cmake.option_defaults();
+        let host = |word: &str| super::model::holds_on_host(word, &|option| options.get(option).copied());
+        let mut profiles = Vec::new();
+        let mut depends_on_host = false;
+        for profile in KNOWN_PROFILES {
+            let runtime = msvc_runtime(&value, profile, &host, &mut depends_on_host);
+            let Some((static_runtime, debug_runtime)) = runtime else {
+                self.warnings.push(format!(
+                    "CMAKE_MSVC_RUNTIME_LIBRARY \"{}\" is not converted: set `static-runtime` and `debug-runtime` in [profile.debug] \
+                     and [profile.release] by hand",
+                    super::model::readable(&value)
+                ));
+                return Vec::new();
+            };
+
+            let mut keys = Vec::new();
+            if static_runtime {
+                keys.push(("static-runtime", true));
+            }
+            if debug_runtime != (*profile == "debug") {
+                keys.push(("debug-runtime", debug_runtime));
+            }
+            if !keys.is_empty() {
+                profiles.push((*profile, keys));
+            }
+        }
+        if depends_on_host {
+            self.warnings.push(format!(
+                "CMAKE_MSVC_RUNTIME_LIBRARY \"{}\" depends on options or the platform; [profile.debug] and [profile.release] \
+                 have the runtime it picks on this machine with the options' defaults",
+                super::model::readable(&value)
+            ));
+        }
+
+        profiles
+    }
+
     /// Profile names used in conditions or listed in CMAKE_CONFIGURATION_TYPES, other than debug and release.
     fn profiles(&self) -> Vec<String> {
         let option_names: HashSet<&str> = self.cmake.options.keys().map(String::as_str).collect();
@@ -2686,6 +2740,56 @@ impl Emitter {
             Some(version) if version.contains('.') => replace_version(&text, version),
             _ => text,
         }
+    }
+}
+
+/// `text` with each `path` in it replaced, but not where it ends a longer path (`{out}/tests/data/x.txt` holds the
+/// relative input `data/x.txt` only as the end of an output path).
+fn replace_whole_path(text: &str, path: &str, replacement: &str) -> String {
+    if path.is_empty() {
+        return text.to_string();
+    }
+
+    let mut result = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(path) {
+        let ends_longer_path = rest[..start].ends_with(|character: char| character.is_alphanumeric() || "/\\._-}".contains(character));
+        result.push_str(&rest[..start]);
+        result.push_str(if ends_longer_path { path } else { replacement });
+        rest = &rest[start + path.len()..];
+    }
+    result.push_str(rest);
+
+    result
+}
+
+/// The C runtime a CMAKE_MSVC_RUNTIME_LIBRARY value picks in a profile, as (static, debug); None when it is not one
+/// of CMake's four. Words other than the profile's are decided by `host`, noted in `depends_on_host`.
+fn msvc_runtime(value: &str, profile: &str, host: &dyn Fn(&str) -> bool, depends_on_host: &mut bool) -> Option<(bool, bool)> {
+    let consulted = std::cell::Cell::new(false);
+    let lookup = |word: &str| match word {
+        "debug" | "release" => Some(word == profile),
+        _ => {
+            consulted.set(true);
+            Some(host(word))
+        }
+    };
+    let alternatives = super::model::expand_genex(value, &mut Vec::new(), None);
+    let chosen = alternatives.iter().find_map(|(truth, text)| {
+        let holds = match truth {
+            super::model::Truth::Known(holds) => *holds,
+            super::model::Truth::Depends(condition) => crate::cond::parse(condition).ok()?.eval(&lookup).ok()?,
+        };
+        holds.then_some(text.as_str())
+    })?;
+    *depends_on_host |= consulted.get();
+
+    match chosen {
+        "MultiThreaded" => Some((true, false)),
+        "MultiThreadedDebug" => Some((true, true)),
+        "MultiThreadedDLL" => Some((false, false)),
+        "MultiThreadedDebugDLL" => Some((false, true)),
+        _ => None,
     }
 }
 
@@ -3581,6 +3685,35 @@ mod tests {
         assert!(matches!(compile_flag_meaning("-DFOO=1"), FlagMeaning::Define(define) if define == "FOO=1"));
         assert!(matches!(compile_flag_meaning("/utf-8"), FlagMeaning::Drop));
         assert!(matches!(compile_flag_meaning("-Wshadow"), FlagMeaning::Keep));
+    }
+
+    #[test]
+    fn msvc_runtimes_per_profile() {
+        let mut depends_on_host = false;
+        let mut runtime = |value: &str, profile: &str| msvc_runtime(value, profile, &|_| false, &mut depends_on_host);
+        let static_debug_follows = "MultiThreaded$<$<CONFIG:Debug>:Debug>";
+        assert_eq!(runtime(static_debug_follows, "debug"), Some((true, true)));
+        assert_eq!(runtime(static_debug_follows, "release"), Some((true, false)));
+        assert_eq!(runtime("MultiThreaded", "debug"), Some((true, false)));
+        assert_eq!(runtime("MultiThreadedDLL", "release"), Some((false, false)));
+        assert_eq!(runtime("MultiThreaded$<$<CONFIG:Debug>:Debug>DLL", "debug"), Some((false, true)));
+        assert_eq!(runtime("Something", "debug"), None);
+        assert!(!depends_on_host);
+
+        // An option decides it (yaml-cpp's YAML_MSVC_SHARED_RT): as with its default here
+        let shared_rt = "MultiThreaded$<$<CONFIG:Debug>:Debug>$<$<BOOL:\u{1}option-SHARED_RT\u{2}>:DLL>";
+        assert_eq!(msvc_runtime(shared_rt, "debug", &|_| false, &mut depends_on_host), Some((true, true)));
+        assert!(depends_on_host);
+    }
+
+    #[test]
+    fn input_paths_only_where_they_are_whole() {
+        assert_eq!(replace_whole_path("data/a.txt", "data/a.txt", "{input}"), "{input}");
+        assert_eq!(replace_whole_path("--in=data/a.txt", "data/a.txt", "{input}"), "--in={input}");
+        assert_eq!(
+            replace_whole_path("{out}/tests/data/a.txt", "data/a.txt", "{input}"),
+            "{out}/tests/data/a.txt"
+        );
     }
 
     #[test]

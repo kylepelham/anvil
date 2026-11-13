@@ -34,10 +34,83 @@ pub fn convert(folder: &Path) -> Result<Conversion> {
     interpreter.run_root()?;
     interpreter.finish_targets();
 
-    let conversion = emit::emit(interpreter)?;
+    let mut conversion = emit::emit(interpreter)?;
+    unmark_values(&mut conversion, folder);
     check_output(&conversion)?;
 
     Ok(conversion)
+}
+
+// Values named in one warning before "and N more"
+const LISTED_VALUES: usize = 3;
+
+/// Values holding the converter's own markers (a platform value or check result it lost track of, `SYS_${SYS}` after
+/// string(TOUPPER)): a warning per file, and written as the `${NAME}` they stand for rather than as control characters.
+fn unmark_values(conversion: &mut Conversion, folder: &Path) {
+    let marker = regex::Regex::new(r"\\u0001(?i:option-|symbol-|sym:)?([A-Za-z0-9_]*)(?:\\u0002)?").unwrap();
+    let mut files: Vec<(String, &mut String)> = vec![("anvil.toml".to_string(), &mut conversion.toml)];
+    files.extend(
+        conversion
+            .tests_files
+            .iter_mut()
+            .map(|(path, text)| (crate::util::rel(path, folder), text)),
+    );
+
+    for (file, text) in files {
+        let Ok(document) = toml::from_str::<toml::Value>(text) else { continue };
+        let mut found = Vec::new();
+        find_markers(&document, "", &mut found);
+        let Some((place, _)) = found.first() else { continue };
+
+        // Each value once
+        let mut values: Vec<String> = Vec::new();
+        for (_, value) in &found {
+            let value = format!("`{}`", readable_markers(value));
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
+        let count = values.len();
+        if count > LISTED_VALUES {
+            values.truncate(LISTED_VALUES);
+            values.push(format!("and {} more", count - LISTED_VALUES));
+        }
+        let (holds, what) = if count == 1 {
+            ("holds a value", "it is")
+        } else {
+            ("hold values", "they are")
+        };
+        conversion.warnings.push(format!(
+            "{file}, [{place}]: {} {holds} the converter could not work out; write what {what} on each platform",
+            values.join(", ")
+        ));
+
+        *text = marker.replace_all(text, "$${$1}").replace("\\u0002", "").replace("\\u0003", " ");
+    }
+}
+
+/// A value with its markers written as `${NAME}`.
+fn readable_markers(text: &str) -> String {
+    let marker = regex::Regex::new("\u{1}(?i:option-|symbol-|sym:)?([A-Za-z0-9_]*)\u{2}?").unwrap();
+    marker.replace_all(text, "$${$1}").replace('\u{2}', "").replace('\u{3}', " ")
+}
+
+/// Every string or key in a TOML document holding a marker character, with the table it is in.
+fn find_markers(value: &toml::Value, place: &str, found: &mut Vec<(String, String)>) {
+    match value {
+        toml::Value::String(text) if text.contains(MARKER_CHARACTERS) => found.push((place.to_string(), text.clone())),
+        toml::Value::Table(table) => {
+            for (key, child) in table {
+                if key.contains(MARKER_CHARACTERS) {
+                    found.push((place.to_string(), key.clone()));
+                }
+                let child_place = if place.is_empty() { key.clone() } else { format!("{place}.{key}") };
+                find_markers(child, &child_place, found);
+            }
+        }
+        toml::Value::Array(items) => items.iter().for_each(|item| find_markers(item, place, found)),
+        _ => {}
+    }
 }
 
 /// The written files must load: valid TOML, keys Anvil knows, and conditions over words it knows. Anything else is a
@@ -62,9 +135,18 @@ fn check_output(conversion: &Conversion) -> Result<()> {
         files.push((slash(path), text.as_str()));
     }
 
-    // Every condition, in every file
+    // Every condition, in every file; no value may hold the converter's own markers (a platform value or check result
+    // it lost track of)
     for (file, text) in files {
         let document: toml::Value = toml::from_str(text)?;
+        let mut found = Vec::new();
+        find_markers(&document, "", &mut found);
+        if let Some((place, value)) = found.first() {
+            bail!(
+                "the converted {file}, [{place}]: `{}` holds a platform value or check result the converter lost track of ({BUG})",
+                readable_markers(value)
+            );
+        }
         let mut conditions = Vec::new();
         collect_conditions(&document, "", &mut conditions);
 
@@ -80,8 +162,17 @@ fn check_output(conversion: &Conversion) -> Result<()> {
         }
     }
 
+    for (path, text) in &conversion.files {
+        if text.contains(MARKER_CHARACTERS) {
+            bail!("the converted {}: a value the converter could not work out ({BUG})", slash(path));
+        }
+    }
+
     Ok(())
 }
+
+// The characters the converter marks options, platform values and spaces with inside values
+const MARKER_CHARACTERS: [char; 3] = ['\u{1}', '\u{2}', '\u{3}'];
 
 /// Every condition in a TOML document with the table it is in: `if` values, and the keys of `when` tables.
 fn collect_conditions(value: &toml::Value, place: &str, conditions: &mut Vec<(String, String)>) {
@@ -128,6 +219,57 @@ fn condition_words(condition: &crate::cond::Cond, words: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn msvc_runtime_library_becomes_profile_settings() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(runtime CXX)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_executable(app main.cpp)
+"#;
+        let conversion = convert_files("runtime", &[("CMakeLists.txt", cmake), ("main.cpp", "int main() {}\n")]);
+        let toml = &conversion.toml;
+
+        assert!(
+            toml.contains("[profile.debug]\nstatic-runtime = true\n\n[profile.release]\nstatic-runtime = true\n"),
+            "{toml}"
+        );
+    }
+
+    #[test]
+    fn markers_never_reach_the_output() {
+        let conversion = Conversion {
+            toml: "[project]\nname = \"p\"\n\n[target.app]\nkind = \"exe\"\ndefines = [\"SYS_\\u0001SYM:CMAKE_SYSTEM_NAME\"]\n".into(),
+            warnings: Vec::new(),
+            target_count: 1,
+            dependency_count: 0,
+            todo_count: 0,
+            files: Vec::new(),
+            tests_files: Vec::new(),
+        };
+
+        let error = check_output(&conversion).unwrap_err().to_string();
+        assert!(
+            error.contains("[target.app.defines]") && error.contains("`SYS_${CMAKE_SYSTEM_NAME}`"),
+            "{error}"
+        );
+
+        // Converting writes them as the variable they stand for, with a warning
+        let mut conversion = conversion;
+        unmark_values(&mut conversion, Path::new("C:/p"));
+        assert!(
+            conversion.toml.contains(r#"defines = ["SYS_${CMAKE_SYSTEM_NAME}"]"#),
+            "{}",
+            conversion.toml
+        );
+        assert!(
+            conversion.warnings[0].starts_with("anvil.toml, [target.app.defines]: `SYS_${CMAKE_SYSTEM_NAME}` holds a value"),
+            "{:?}",
+            conversion.warnings
+        );
+        check_output(&conversion).unwrap();
+    }
 
     /// Converts a project made of the given files, in a fresh temporary folder.
     fn convert_files(name: &str, files: &[(&str, &str)]) -> Conversion {

@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.20)
+project(platform C CXX)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+add_library(lib STATIC lib.cpp)
+target_compile_definitions(lib PUBLIC $<$<COMPILE_LANGUAGE:CXX>:LIB_CXX_ONLY> $<$<COMPILE_LANGUAGE:C>:LIB_C_ONLY>)
+
+set(SOURCES main.c win.c posix.c)
+if(NOT WIN32)
+  set_source_files_properties(win.c PROPERTIES HEADER_FILE_ONLY ON)
+else()
+  set_source_files_properties(posix.c PROPERTIES HEADER_FILE_ONLY ON)
+endif()
+add_executable(app ${SOURCES})
+target_link_libraries(app PRIVATE lib)
