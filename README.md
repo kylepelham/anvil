@@ -27,7 +27,7 @@ anvil add fmt --to hello # vcpkg port, added to vcpkg.json and [deps]
 | `anvil build [targets]` (`b`) | Build everything but tests. `--all` adds tests. |
 | `anvil run [target] -- args` (`r`) | Build and run a program. |
 | `anvil test [filter] -- args` (`t`) | Build and run tests; arguments after `--` go to the tests whose command starts with `{target:...}`. `--list` names the tests without building; `--rerun-failed` runs those that failed last time; `--show-output` prints passing tests' output too; `--junit <file>` writes a JUnit report. |
-| `anvil install [targets]` | Build, then copy programs, libraries and headers into a prefix (`--prefix <dir>`, default `out/install`). See Installing. |
+| `anvil install [targets]` | Build (release, unless `-p` names another profile), then copy programs, libraries and headers into a prefix (`--prefix <dir>`, default `out/install`). See Installing. |
 | `anvil clean [--all]` | Delete the profile's output (or everything, vcpkg packages included). |
 | `anvil new <name> [--lib]` | Create a project folder. |
 | `anvil init` | Create `anvil.toml` (and `.gitignore`) for the sources here: the conventions when they fit, else a program per folder with a main file and a library of the rest. Converts the `CMakeLists.txt` here instead when there is one. |
@@ -56,7 +56,7 @@ Build options shared by `build`, `run`, `test`, `install` and the commands that 
 | `-o name=true\|false` | Set an option (`-o name`, `-o !name` work too). |
 | `-j <n>`, `-k` | Parallel jobs (default: one per core plus two); keep going after a failure. |
 | `-v`, `--explain` | Print every command; say why each action runs (which argument, file or output changed). |
-| `--timings` | After the build, print the 10 slowest actions and the time per kind of action. |
+| `--timings` | After the build, print the 10 slowest actions and the time per kind of action; with nothing to do, says so and names the last trace. |
 | `--low-priority` | Run compilers at below-normal priority. |
 
 Every command takes `-C <dir>` (run as if started in that folder, like `git -C`; `anvil run`'s program starts there too) and `-q` (no progress lines; vcpkg's output only when it fails).
@@ -71,7 +71,7 @@ With no `[target]` tables, a package builds from its layout:
 
 - `src/` with a `main` file is a program; otherwise `src/` is a static library. With no `src/`, the `*.cpp` files beside `anvil.toml` form a program.
 - `include/` holds public headers (passed on to dependents), `src/` is a private include folder.
-- `tests/`: one test per file, or one test program from all of `tests/` when it has a `main`. Tests link the library and use `[dev-deps]`. A test named like the main target becomes `test_<name>`.
+- `tests/`: one test per file, or one test program from all of `tests/` when it has a `main`. Tests link the library and use `[dev-deps]`. A test named like the main target becomes `test_<name>`; another file's test also named `test_<name>` is then an error.
 - Every `[deps]` entry is used by the main target.
 - Output goes to `out/<profile>/` (`[project] out` changes the folder). Targets of other packages build into `out/<profile>/packages/<package>/`; their programs and shared libraries still go to `out/<profile>/`.
 
@@ -84,7 +84,7 @@ Files a `when` block lists in `sources` belong to that block: they leave the def
 ```toml
 [project]
 name = "game"
-version = "1.4.0"        # {version}
+version = "1.4.0"        # {version}; one to four numbers
 std = "c++23"            # c++17 | c++20 (default) | c++23 | c++26
 c-std = "c17"
 toolchain = "msvc"       # default: the best installed
@@ -189,7 +189,7 @@ overlay-ports = ["ports"]
 | `if` | The target exists only when this condition holds. |
 | `default` | Built by a plain `anvil build` (default true; tests false). |
 | `preset` | A `[preset.<name>]` or a list of them, applied before the target's own settings. |
-| `sources` | Globs; `!pattern` excludes. C, C++, CUDA (`.cu`), Objective-C (`.m`, `.mm`; clang and gcc), `.rc`, and assembly (`.asm` with MSVC through ml64, `.s`/`.S` with GCC and Clang). `.def` and `.manifest` files go to the link (a manifest with the MSVC ABI only) and relink when they change; headers (`.h`, `.inl`, `.ipp`, ...) are ignored; C++20 module files (`.cppm`, `.ixx`) are an error. |
+| `sources` | Globs; `!pattern` excludes. C, C++, CUDA (`.cu`), Objective-C (`.m`, `.mm`; clang and gcc), `.rc` (with `_DEBUG` under the MSVC ABI's debug runtime, as cl), and assembly (`.asm` with MSVC through ml64, `.s`/`.S` with GCC and Clang). `.def` and `.manifest` files go to the link (a manifest with the MSVC ABI only) and relink when they change; headers (`.h`, `.inl`, `.ipp`, ...) are ignored; C++20 module files (`.cppm`, `.ixx`) are an error. |
 | `include`, `system-include` | Include folders, the second with warnings silenced (default: `src/`). |
 | `defines`, `flags`, `link-flags` | Definitions; raw compiler and linker settings. `{target:X}` in `link-flags` is X's file, linked first. |
 | `deps` | Targets and `[deps]` entries this one uses; `pkg/target` names a target of a path or git dependency. |
@@ -203,15 +203,15 @@ overlay-ports = ["ports"]
 | `exports` | A program that exports symbols for the modules it loads (an import library on Windows, `-rdynamic` on ELF); modules link against it. |
 | `link-depends` | Files whose change relinks the target (a `.def` file, a linker script). |
 | `output-name`, `output-prefix`, `output-suffix`, `output-dir` | The output file's name, prefix (`lib`), extension (`.dll`, `.mod`) and folder. |
-| `data` | Globs (relative to `dir`) copied beside the program or shared library, at their path under `dir`, when they change. |
-| `install` | Whether `anvil install` takes it (default: whether it is a default target; tests never). |
+| `data` | Globs (relative to `dir`) copied beside the program or shared library, at their path under `dir`, when they change. From `[defaults]` and presets only programs, tests and shared libraries take it; a list of only `!` patterns is an error. |
+| `install` | Whether `anvil install` takes it (default: a default target, less test-support libraries: those that reach `[dev-deps]` and that only tests use; tests never). |
 | `pch`, `unity` | Precompiled header; unity builds (`true`, or files per unity source, 2 or more). |
 | `warnings`, `werror` | `off`, `default`, `high`, `all`; warnings as errors. |
 | `arch` | `avx`, `avx2`, `avx512`, `native`. |
 | `cuda-arch`, `cuda-flags` | GPUs `.cu` files compile for, as CMake's `CUDA_ARCHITECTURES` reads them (`"native"`, `"all"`, `"86"` for code and PTX, `"86-real"`, `"86-virtual"`, a list or `"75;86"`); extra nvcc options. |
 | `std`, `c-std` | Per-target language standard. |
 | `gui` | Windows GUI program: `true` for one entered through `WinMain` (CMake's `WIN32`), `"main"` for one with `main()`. A link that misses `WinMain` says so. |
-| `when.<condition>` | A table of the same keys (`kind` too: `when.SHARED_LIBS` with `kind = "shared"`) that applies when the condition holds. |
+| `when.<condition>` | A table of the same keys (`kind` too: `when.SHARED_LIBS` with `kind = "shared"`; not in the `when` blocks of `[defaults]` and presets) that applies when the condition holds. |
 | `file` | `[[...file]]` rules: `match`, `if`, `defines`, `flags`, `warnings`, `arch`, `opt`. |
 | `run`, `pre-build`, `post-build` | Build steps (below). |
 | `args`, `workdir`, `timeout`, `env` | Only for `kind = "test"` (and `[[test]]`). |
@@ -223,9 +223,11 @@ Settings are the target's own unless they are under `public` or `interface`; onl
 
 ### Dependencies
 
-A `[deps]` entry is `"vcpkg"`, `"pkg-config"`, `"system"`, or a table with one of `vcpkg` (with `features`, `default-features`), `git` (with one of `tag`, `branch`, `rev`; submodules are fetched too), `path` or `pkg-config`. A path or git dependency is an Anvil package, or a folder described by `include`, `sources` and `defines`; `libs`, `lib-dirs`, `flags`, `link-flags` and `runtime` (files copied beside the programs) describe vcpkg and prebuilt libraries. Only the targets of a dependency that yours reach are resolved; its `[[write]]` files are written. A dependency may declare `[options]` too, which `-o` sets.
+A `[deps]` entry is `"vcpkg"`, `"pkg-config"`, `"system"`, or a table with one of `vcpkg` (with `features`, `default-features`), `git` (with one of `tag`, `branch`, `rev`; submodules are fetched too), `path` or `pkg-config`. A path or git dependency is an Anvil package, or a folder described by `include`, `sources` and `defines`; `libs`, `lib-dirs`, `flags`, `link-flags` and `runtime` (files copied beside the programs) describe vcpkg and prebuilt libraries. Only the targets of a dependency that yours reach (or that tests and the command line name: `anvil run dep/tool`) are resolved; its `[[write]]` files are written. A dependency may declare `[options]` too, which `-o` sets, also while the dependency is off.
 
-`[dev-deps]` takes the same entries, for tests only: a program, or a library that something other than tests uses, cannot name them.
+`openmp`, `threads` and `opengl` = `"system"` are built in, as CMake's find modules: the compiler's OpenMP flag (LLVM's libomp for clang and clang-cl on Windows, its DLL copied beside the programs), `-pthread` outside Windows, `opengl32`/`GL`/`OpenGL.framework`. With a condition: `openmp = { libs = ["openmp"], if = "..." }`.
+
+`[dev-deps]` takes the same entries, for tests only: a program, or a library that something other than tests uses, cannot name them. Every package's `[dev-deps]` are checked like its `[deps]`.
 
 ### Tests
 
@@ -284,6 +286,8 @@ In paths, `defines`, `flags`, `link-flags` (of targets, file rules and profiles)
 | `{cxx}`, `{cc}` | The compilers' paths. |
 | `{hash:a,b,...}` | 16 hex digits that change when what it lists does, computed at each build: a cache key in a define (`BVH_HASH=0x{hash:compiler,flags,src/bvh.cpp,{root}/external/bvh/*.h}ull`). Items are files and globs (relative to the target's `dir`), `compiler` (the compiler, its version and the machine built for) and `flags` (everything the target's files compile with: definitions, flags, standard, optimization, file rules; not include folders or the hashes themselves). A file that cannot be read or a glob that matches nothing is an error. In target `defines` and `flags`. |
 
+In a package other than the root, `{target:X}` means that package's own X when it has one; `{target:pkg/X}` names another package's.
+
 Tests and `[[write]]` take `{root}`, `{out}`, `{profile}`, `{config}`, `{version}` and `{vcpkg}`; tests with a matrix also take their parameters and `{name}`. Build steps also take `{input}`, `{stem}`, `{filename}` (with `for-each`), `{inputs}`, `{output}`, `{outputs}`, `{depfile}`, and `{target:X}` (target X's file; also makes the step wait for X).
 
 ### Build steps
@@ -294,7 +298,7 @@ Tests and `[[write]]` take `{root}`, `{out}`, `{profile}`, `{config}`, `{version
 
 Steps that run `cmake -E` (`copy`, `copy_if_different`, `copy_directory`, `copy_directory_if_different`, `make_directory`, `remove`, `rm`, `remove_directory`, `rename`, `touch`, `touch_nocreate`, `echo`, `echo_append`, `env`, `chdir`, `sleep`, `create_symlink`, `compare_files`, `cat`, `md5sum`, `sha1sum`, `sha224sum`, `sha256sum`, `sha384sum`, `sha512sum`, `true`, `false`), as converted CMake projects do, are run by Anvil itself, so no CMake needs to be installed; other `cmake` commands still run cmake.
 
-`[[write]]` writes a file before the build (`path`, `text`, `if`), and rewrites it only when its text changes, so nothing rebuilds for nothing. It is what CMake's configure-time `file(WRITE)` and `configure_file` become.
+`[[write]]` writes a file before the build (`path`, `text`, `if`), and rewrites it only when its text changes, so nothing rebuilds for nothing. It is what CMake's configure-time `file(WRITE)` and `configure_file` become. Two packages writing different text to one file is an error, and so is writing into a git dependency's checkout: write under `{out}`.
 
 ### Profiles
 
@@ -339,7 +343,7 @@ target = "x86"
 members = ["engine", "tools/*", "game"]
 ```
 
-Members are ordinary Anvil packages that depend on each other with `path` deps. Each member pattern must match a folder with an `anvil.toml`. Members may declare `[options]`; `-o` sets them.
+Members are ordinary Anvil packages that depend on each other with `path` deps. Each member pattern must match a folder with an `anvil.toml`. Members may declare `[options]`; `-o` sets them. `[project]` `toolchain`, `launcher`, `out`, `default-run` and `export` apply to the whole workspace, from the root's manifest; in a member's they are an error. Run inside a member, Anvil builds the whole workspace (a workspace manifest above that does not load is skipped with a warning).
 
 ## vcpkg
 
@@ -348,7 +352,7 @@ There is nothing to set up. Anvil looks for vcpkg in `VCPKG_ROOT`, on `PATH`, in
 - installs the ports this build uses from `[deps]` (and the project's `vcpkg.json`, if there is one, which installs even with no vcpkg `[deps]`) into `out/vcpkg/installed/<triplet>`, skipping vcpkg entirely when nothing changed, and waiting when another vcpkg run holds its lock;
 - with a `vcpkg.json` (`[vcpkg] manifest` names its folder when it is not the project's), checks that the features `[deps]` asks for are on in it (an entry whose `"platform"` holds, or the port's default features), turns on the manifest features that list a port `[deps]` uses only there, and accepts a port that a listed one brings in (`vulkan-headers` through `volk`); a port no target on this platform links may be missing;
 - picks the triplet from the toolchain and profile (`x64-windows`, `x64-windows-static` with `static-runtime`; `x64-mingw-dynamic` for gcc on Windows, `x64-mingw-static` with `static-runtime`). `[vcpkg] linkage = "static"` or `"dynamic"` picks static libraries or DLLs for each machine and compiler (`x64-windows-static-md`). `[vcpkg] triplet` names one instead, which must fit the build, and whose C runtime must match the profile's `static-runtime` (a custom triplet's `VCPKG_CRT_LINKAGE` is read from its file); `triplet` and `linkage` together are an error;
-- gives each port's users what its CMake package exports: include subfolders (`include/vma`), definitions (`FMT_SHARED`), compile and link options, and link-only system libraries, through the packages it links publicly, as CMake would, with generator expressions evaluated for the toolchain, profile and language; CMake's `OpenMP`, `Threads` and `OpenGL` targets become the matching flags and libraries;
+- gives each port's users what its CMake package exports: include subfolders (`include/vma`), definitions (`FMT_SHARED`), compile and link options, and link-only system libraries, through the packages it links publicly, as CMake would, with generator expressions evaluated for the toolchain, the configuration (`Debug` exactly when debug libraries are linked) and each file's language; CMake's `OpenMP`, `Threads` and `OpenGL` targets become the matching flags and libraries;
 - links each port's libraries (debug ones in debug builds), `lib/manual-link` libraries after them, and copies DLLs beside the programs;
 - pins a `builtin-baseline` (the checkout's commit, or for Visual Studio's registry-only vcpkg the registry's) and keeps it in `anvil.lock`.
 
@@ -375,7 +379,7 @@ The converter runs the CMake language itself (variables, functions, macros, `if`
 - writes targets, their includes, defines, flags and dependencies, with `when` blocks for platform- and option-dependent settings (`kind`, `pch`, `std`, `gui` and the output name too); generator expressions become conditions, and a dependency used only under a condition gets `if`;
 - leaves out what the conventions already cover, and turns long file lists back into globs;
 - maps compiler flags to Anvil settings (`/W4` and `-Wall -Wextra` to `warnings = "high"`, `/arch:AVX2` and `-mavx2` to `arch = "avx2"`, ...); flags for one language (`$<COMPILE_LANGUAGE:C>`, `CMAKE_C_FLAGS`) become `[[file]]` rules by extension, or plain flags when the target has one language; C standards become `c-std`;
-- maps `find_package`, `FetchContent` and CPM dependencies to vcpkg ports, git deps or pkg-config; a `find_package` without `REQUIRED` finds only what Anvil can supply, and old-style `<PKG>_LIBRARIES` and `<PKG>_INCLUDE_DIRS` map to the dependency;
+- maps `find_package`, `FetchContent` and CPM dependencies to vcpkg ports, git deps or pkg-config (`OpenMP`, `Threads` and `OpenGL` to `openmp`, `threads` and `opengl` = `"system"`); a `find_package` without `REQUIRED` finds only what Anvil can supply, and old-style `<PKG>_LIBRARIES` and `<PKG>_INCLUDE_DIRS` map to the dependency;
 - turns `check_*` results (`check_include_file`, ...) into conditions (`!msvc`, `!windows`) instead of this machine's answer, and keeps a `cmake_dependent_option`'s dependencies in the option's condition;
 - converts `add_custom_command` into build steps (`PRE_BUILD`, `PRE_LINK` and `POST_BUILD` into pre- and post-build steps; `cmake -E echo` into a file becomes `[[write]]`, shell operators `shell = true`; a step running a program `find_program` did not find is dropped with a warning), and `add_dependencies` into `needs`;
 - converts `configure_file`, `file(CONFIGURE)`, and configure-time `file(WRITE/GENERATE)` with known text into `[[write]]`, with `@VAR@`, `${VAR}`, `#cmakedefine` and `#cmakedefine01` applied: platform-dependent results become `#if` blocks in C and C++ files, option-dependent ones one `[[write]]` per variant; large unchanged copies become a copy step, and install-only files are skipped;
@@ -385,6 +389,7 @@ The converter runs the CMake language itself (variables, functions, macros, `if`
 - writes paths without `dir/..` steps (`{root}/cmake/../docs` becomes `{root}/docs`);
 - converts `generate_export_header` into `export-header` (or a header written into the project), an option `BUILD_SHARED_LIBS` into `when.BUILD_SHARED_LIBS` with `kind = "shared"`, and `DEFINE_SYMBOL` (or `<target>_EXPORTS`, when the code uses it) into a definition while the library is shared;
 - reads vcpkg settings (triplet, overlay ports and triplets) from `CMakePresets.json`;
+- turns `CMAKE_MSVC_RUNTIME_LIBRARY` into `static-runtime` and `debug-runtime` in `[profile.debug]` and `[profile.release]`, `HEADER_FILE_ONLY` set under a condition into sources under the opposite one, and custom targets without `ALL` into `default = false`;
 - turns `CMAKE_SIZEOF_VOID_P` and `CMAKE_SYSTEM_PROCESSOR` tests into `x64`/`x86`/`arm64` conditions, and CUDA (`LANGUAGES CUDA`, `CUDA_ARCHITECTURES`, `CUDA::` libraries) into `.cu` sources with `cuda-arch`;
 - moves settings every target shares into `[defaults]`, settings most targets share into `[preset.common]`, and settings the targets of one helper function share into a preset named after it (`my_add_plugin()` -> `[preset.my-add-plugin]`);
 - turns `-Wl,--whole-archive ... -Wl,--no-whole-archive` and `/WHOLEARCHIVE:` into `whole-archive`, `/ENTRY:mainCRTStartup` into `gui = "main"`, and a `for-each` over what a `file(GLOB)` found back into its pattern;
@@ -399,7 +404,7 @@ anvil convert --check                        # with the default options
 anvil convert --check -o BUILD_TESTS=true    # or others
 ```
 
-`--check` configures the CMake project with Ninja, the same compiler, options and vcpkg packages (into `out/convert-check`), plans the Anvil build without running it, and compares the two `compile_commands.json` file by file (`.rc` files too). It lists the files only one side compiles, and for the rest each difference in definitions, include folders, language standard and other compile options, grouped by what differs; what each side adds by itself (optimization, debug information, runtime, warning level, output and dependency files) is left out. It exits with 1 when anything differs. It needs `cmake` and `ninja`.
+`--check` configures the CMake project with Ninja, the same compiler, the options given with `-o` (the others keep CMake's defaults) and vcpkg packages (into `out/convert-check`, started over when the compiler changes), plans the Anvil build without running it, and compares the two `compile_commands.json` file by file (`.rc` files too). It lists the files only one side compiles, and for the rest each difference in definitions, include folders, language standard and other compile options, grouped by what differs; what each side adds by itself (optimization, debug information, warning level, output and dependency files) is left out; MSVC's runtime (`/MD`, `/MT`, ...) is compared. It exits with 1 when anything differs. It needs `cmake` and `ninja`.
 
 Limitations: when a variable is set differently in `if` branches that depend on the platform or an option, only this machine's branch sets it; items the other branches append to a list are kept under their condition. CMake scripts run by build steps and tests (`cmake -P`), other than the check scripts above, still need cmake on `PATH` (`cmake -E` does not). Values computed at configure time from `execute_process` output cannot be converted; the converter says where they are.
 
@@ -410,7 +415,8 @@ Limitations: when a variable is set differently in `if` branches that depend on 
 ## Installing
 
 ```sh
-anvil install -r                         # every default program and library, into out/install
+anvil install                            # every default program and library, release, into out/install
+anvil install -p debug                   # beside it, under debug/ (MSVC's debug runtime)
 anvil install core --prefix D:/sdk/game
 ```
 
@@ -418,19 +424,21 @@ anvil install core --prefix D:/sdk/game
 
 - `bin/`: programs and DLLs, with the DLLs Anvil copies beside them (their dependencies', the sanitizer's), their `data` files, and their PDBs when the profile has debug information;
 - `lib/`: static and import libraries, `.so` and `.dylib` files;
-- `include/`: each library's public include folders, and the headers its `export-header` and build steps generate.
+- `include/`: each library's public include folders, and the headers its `export-header` and build steps generate. A folder of its own installs whole (less source files); the package root or `src/` gives only its headers (extensionless ones too, `Eigen/Core`), leaving out source folders, private include folders, `tests/`, the output folder and the prefix. Folders outside the project stay where they are, named by path.
 
-The libraries the installed ones need come along; tests never install; a target's `install` key overrides the default. Linux and macOS programs find their libraries in `../lib`. For the libraries it writes `lib/cmake/<project>/<project>Config.cmake` (with `<project>ConfigVersion.cmake` when `[project] version` is set) and `lib/pkgconfig/<project>.pc`; `[project] export = false` leaves them out. An install holds one configuration: the profile it built.
+The libraries the installed ones need come along; tests, and libraries only tests use that reach `[dev-deps]`, are left out; a target's `install` key overrides the default. Linux and macOS programs find their libraries in `../lib`. For the libraries it writes `lib/cmake/<project>/<project>Config.cmake` with a `<project>Targets-<profile>.cmake` per configuration (and `<project>ConfigVersion.cmake` when `[project] version` is set), and `lib/pkgconfig/<project>-<library>.pc` per library plus `<project>.pc` for all; `[project] export = false` leaves them out. Libraries that use vcpkg ports refer to them in `out/vcpkg`, which is not copied (Anvil warns).
+
+A profile with the debug runtime installs its programs and libraries under `debug/` (`debug/bin`, `debug/lib`), as vcpkg does, so a release and a debug install share one prefix, headers and CMake package. `share/<project>/install_manifest.txt` lists each configuration's files, and the next install of it removes those no longer installed. With MSVC, a CMake Debug build of a consumer links the debug install and other configurations the release one; when the one it needs is missing, `find_package` fails with a message saying so instead of mixing runtimes (with a single-configuration generator).
 
 ## Compiler cache
 
-`[project] launcher = "sccache"` (or `"ccache"`, or a path) runs every C and C++ compile through a compiler cache. The `ANVIL_LAUNCHER` environment variable overrides it, for one machine or CI; set empty, it turns the cache off. A launcher that is not there is an error, not a quietly slow build. It is not part of the command line: turning it on or off rebuilds nothing, and `compile_commands.json` leaves it out.
+`[project] launcher = "sccache"` (or `"ccache"`, or a path) runs every C and C++ compile through a compiler cache. The `ANVIL_LAUNCHER` environment variable overrides it, for one machine or CI; set empty, it turns the cache off. A launcher that is not there is an error, not a quietly slow build; only commands that compile look for it (`targets`, `compdb`, `tidy` work without). A compile whose command line passes 30,000 characters runs without it on Windows (`-v` says so), as do cl's precompiled header compiles with sccache. ccache before 4.10 caches nothing for cl: Anvil warns. It is not part of the command line: turning it on or off rebuilds nothing, and `compile_commands.json` leaves it out.
 
 ## Formatting and checking
 
-`anvil fmt` formats the packages' C and C++ files (or the `paths` given) with clang-format, as their `.clang-format` says; a file with none in its folder or above is an error, since clang-format would rewrite it in its own style. `.clang-format-ignore` files are respected, and output folders skipped. `--check` changes nothing: it lists the files that are not formatted and exits with 1 when there are any.
+`anvil fmt` formats the packages' C and C++ files (or the `paths` given) with clang-format, as their `.clang-format` says; a file with none in its folder or above is an error, since clang-format would rewrite it in its own style. `.clang-format-ignore` files are read as the clang-format found reads them (up to 22 the first pattern that decides wins, so a lone `!` pattern leaves out every file it does not match; from 23 the last match wins), and output folders skipped. Files go through as bytes, in any encoding and line ending; an empty result for a non-empty file is an error, never written. `--check` changes nothing: it lists the files that are not formatted and exits with 1 when there are any.
 
-`anvil tidy` runs clang-tidy (as the project's `.clang-tidy` says) over the targets' sources with the profile's compile commands, for cl and GNU toolchains alike, a precompiled header replaced by its header. A warning in a header shows once; `--fix` applies the fixes. It exits with 1 when it reports anything.
+`anvil tidy` runs clang-tidy (as the project's `.clang-tidy` says) over the targets' sources with the profile's compile commands, for cl and GNU toolchains alike, a precompiled header replaced by its header; the build steps the sources need (generated headers) run first. A warning in a header shows once; `--fix` applies the fixes. It exits with 1 when it reports anything.
 
 Both find their tool on `PATH`, in Visual Studio's `VC/Tools/Llvm`, or in LLVM's install folder.
 
