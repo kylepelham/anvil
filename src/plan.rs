@@ -332,7 +332,7 @@ pub fn artifact_path(model: &Model, target: &Target) -> Option<PathBuf> {
     let (default_folder, (prefix, suffix)) = match target.kind {
         Kind::Exe | Kind::Test => (model.out_dir.clone(), toolchain.executable_affixes()),
         Kind::Shared => (model.out_dir.clone(), toolchain.shared_lib_affixes()),
-        Kind::Static => (model.out_dir.join("lib"), toolchain.static_lib_affixes()),
+        Kind::Static => (model.package_out_dir(target.package).join("lib"), toolchain.static_lib_affixes()),
         _ => return None,
     };
     let folder = target.output_dir.clone().unwrap_or(default_folder);
@@ -495,7 +495,7 @@ impl<'a> Planner<'a> {
 
         // The export header, written only when it changes so nothing rebuilds for it
         if let Some((path, macro_name)) = &target.export_header {
-            let file = targets::gen_dir(&self.model.out_dir, &target.name).join(path);
+            let file = targets::gen_dir(&self.model.package_out_dir(target.package), &target.name).join(path);
             util::write_if_changed(&file, crate::export_header::text(macro_name, "").as_bytes())?;
         }
 
@@ -609,7 +609,10 @@ impl<'a> Planner<'a> {
     }
 
     fn object_dir(&self, target: &Target) -> PathBuf {
-        self.model.out_dir.join("obj").join(targets::sanitize_name(&target.name))
+        self.model
+            .package_out_dir(target.package)
+            .join("obj")
+            .join(targets::sanitize_name(&target.name))
     }
 
     /// Generation actions of the target and everything it depends on (headers they write may be included), and the
@@ -1018,7 +1021,7 @@ impl<'a> Planner<'a> {
                 .toolchain
                 .shared_lib_names(&targets::sanitize_name(&target.name))
                 .1
-                .map(|name| self.model.out_dir.join("lib").join(name)),
+                .map(|name| self.model.package_out_dir(target.package).join("lib").join(name)),
             false => None,
         };
 
@@ -1338,7 +1341,9 @@ impl<'a> Planner<'a> {
         inputs.includes.extend(target.private_include.iter().cloned());
         inputs.includes.extend(target.include.iter().cloned());
         if !target.runs.is_empty() {
-            inputs.includes.push(targets::gen_dir(&self.model.out_dir, &target.name));
+            inputs
+                .includes
+                .push(targets::gen_dir(&self.model.package_out_dir(target.package), &target.name));
         }
         inputs.system_includes.extend(target.system_include.iter().cloned());
         inputs.system_includes.extend(target.public_system_include.iter().cloned());
@@ -1374,7 +1379,9 @@ impl<'a> Planner<'a> {
         inputs.includes.extend(target.include.iter().cloned());
         inputs.includes.extend(target.interface_include.iter().cloned());
         if !target.runs.is_empty() {
-            inputs.includes.push(targets::gen_dir(&self.model.out_dir, &target.name));
+            inputs
+                .includes
+                .push(targets::gen_dir(&self.model.package_out_dir(target.package), &target.name));
         }
         inputs.system_includes.extend(target.public_system_include.iter().cloned());
         inputs.defines.extend(target.public_defines.iter().cloned());

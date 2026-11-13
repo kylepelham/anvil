@@ -247,15 +247,19 @@ pub struct InterfaceSpec {
 }
 
 /// `export-header = "lib/export.h"` or `{ path = "lib/export.h", macro = "LIB_API" }`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum ExportHeaderSpec {
     Path(String),
-    Table {
-        path: String,
-        #[serde(rename = "macro")]
-        macro_name: Option<String>,
-    },
+    Table { path: String, macro_name: Option<String> },
+}
+
+/// The table form of `export-header`, which rejects unknown keys like every other table.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportHeaderTable {
+    path: String,
+    #[serde(rename = "macro")]
+    macro_name: Option<String>,
 }
 
 /// A pre-build or post-build command: no outputs, it runs when the target's sources (pre) or file (post) change.
@@ -340,8 +344,7 @@ pub struct TestSpec {
     pub exit_code: Option<i32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum StrOrList {
     Str(String),
     List(Vec<String>),
@@ -367,6 +370,71 @@ impl StrOrList {
             StrOrList::Str(command_line) => crate::util::split_command(command_line),
             StrOrList::List(words) => words.clone(),
         }
+    }
+}
+
+// Written by hand: an untagged enum's error says only "data did not match any variant"
+impl<'de> Deserialize<'de> for StrOrList {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct TextOrTexts;
+
+        impl<'de> serde::de::Visitor<'de> for TextOrTexts {
+            type Value = StrOrList;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a text or a list of texts")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> std::result::Result<StrOrList, E> {
+                Ok(StrOrList::Str(text.to_string()))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> std::result::Result<StrOrList, A::Error> {
+                let mut list = Vec::new();
+                while let Some(item) = sequence.next_element::<toml::Value>()? {
+                    match item {
+                        toml::Value::String(text) => list.push(text),
+                        other => {
+                            return Err(serde::de::Error::custom(format!(
+                                "expected a text or a list of texts, found {} in the list",
+                                other.type_str()
+                            )))
+                        }
+                    }
+                }
+                Ok(StrOrList::List(list))
+            }
+        }
+
+        deserializer.deserialize_any(TextOrTexts)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExportHeaderSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct PathOrTable;
+
+        impl<'de> serde::de::Visitor<'de> for PathOrTable {
+            type Value = ExportHeaderSpec;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a header path, or a table with `path` and `macro`")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> std::result::Result<ExportHeaderSpec, E> {
+                Ok(ExportHeaderSpec::Path(text.to_string()))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> std::result::Result<ExportHeaderSpec, A::Error> {
+                let table = ExportHeaderTable::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(ExportHeaderSpec::Table {
+                    path: table.path,
+                    macro_name: table.macro_name,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(PathOrTable)
     }
 }
 
@@ -402,6 +470,9 @@ pub struct DepSpec {
 
 const DEFAULT_UNITY_BATCH: usize = 8;
 
+// The keys of an option's table form
+const OPTION_KEYS: &[&str] = &["default", "description"];
+
 /// Reads one `[deps]` entry, from its short form ("vcpkg", "pkg-config", "system") or its table.
 pub fn parse_dep(name: &str, value: &toml::Value) -> Result<DepSpec> {
     match value {
@@ -435,10 +506,19 @@ pub fn parse_options(options: &IndexMap<String, toml::Value>) -> Result<IndexMap
     for (name, value) in options {
         let default = match value {
             toml::Value::Boolean(default) => *default,
-            toml::Value::Table(table) => match table.get("default") {
-                Some(toml::Value::Boolean(default)) => *default,
-                _ => bail!("option `{name}`: expected `{name} = true|false` or `{name} = {{ default = true, description = \"...\" }}`"),
-            },
+            toml::Value::Table(table) => {
+                for key in table.keys().filter(|key| !OPTION_KEYS.contains(&key.as_str())) {
+                    let hint = crate::util::suggest(key, OPTION_KEYS.iter().copied())
+                        .map(|close| format!(" (did you mean `{close}`?)"))
+                        .unwrap_or_default();
+                    bail!("option `{name}`: unknown key `{key}`{hint}; an option takes `default` and `description`");
+                }
+                match (table.get("default"), table.get("description")) {
+                    (_, Some(description)) if !description.is_str() => bail!("option `{name}`: description must be a text"),
+                    (Some(toml::Value::Boolean(default)), _) => *default,
+                    _ => bail!("option `{name}`: expected `{name} = true|false` or `{name} = {{ default = true, description = \"...\" }}`"),
+                }
+            }
             _ => bail!("option `{name}`: expected true or false"),
         };
         parsed.insert(name.clone(), default);
@@ -453,7 +533,7 @@ pub fn parse_unity(value: &toml::Value) -> Result<Option<usize>> {
         toml::Value::Boolean(true) => Ok(Some(DEFAULT_UNITY_BATCH)),
         toml::Value::Boolean(false) => Ok(None),
         toml::Value::Integer(batch) if *batch >= 2 => Ok(Some(*batch as usize)),
-        toml::Value::Integer(_) => Ok(None),
+        toml::Value::Integer(batch) => bail!("unity = {batch}: a batch holds 2 files or more; write unity = false to turn it off"),
         _ => bail!("unity: expected true, false or a number of files per batch"),
     }
 }
@@ -526,6 +606,39 @@ fn parse_dep_table(name: &str, value: &toml::Value) -> Result<DepSpec> {
             "dependency `{name}`: say where it comes from: vcpkg = \"{name}\", path = \"...\", git = \"...\", pkg-config = \"...\", \
              or include/libs for a prebuilt one"
         );
+    }
+
+    // Keys that belong to one kind of dependency
+    let source_package = spec.path.is_some() || spec.git.is_some();
+    let references = [("tag", &spec.tag), ("branch", &spec.branch), ("rev", &spec.rev)];
+    let given: Vec<&str> = references.iter().filter(|(_, value)| value.is_some()).map(|(key, _)| *key).collect();
+    if given.len() > 1 {
+        bail!("dependency `{name}`: give one of tag, branch and rev, not {}", given.join(" and "));
+    }
+    if let (Some(key), None) = (given.first(), &spec.git) {
+        bail!("dependency `{name}`: `{key}` picks a commit of a git dependency; this one has no `git`");
+    }
+    if spec.vcpkg.is_none() && (!spec.features.is_empty() || spec.default_features.is_some()) {
+        bail!("dependency `{name}`: `features` and `default-features` are vcpkg's; this one has no `vcpkg`");
+    }
+    if !source_package {
+        if spec.target.is_some() || spec.sources.is_some() {
+            bail!("dependency `{name}`: `target` and `sources` belong to a path or git dependency");
+        }
+    } else {
+        let prebuilt_keys = [
+            ("libs", spec.libs.is_some()),
+            ("lib-dirs", spec.lib_dirs.is_some()),
+            ("flags", spec.flags.is_some()),
+            ("link-flags", spec.link_flags.is_some()),
+            ("runtime", spec.runtime.is_some()),
+        ];
+        if let Some((key, _)) = prebuilt_keys.iter().find(|(_, given)| *given) {
+            bail!(
+                "dependency `{name}`: `{key}` describes a prebuilt or vcpkg library, not a path or git package; \
+                 put it in the package's anvil.toml (a target's public settings) instead"
+            );
+        }
     }
 
     Ok(spec)

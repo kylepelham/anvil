@@ -127,7 +127,11 @@ impl Model {
         };
 
         // Toolchain: command line, then project, then the user's default, then the best installed
-        let requested = options.toolchain.clone().or(project.toolchain.clone()).or(Settings::load().toolchain);
+        let requested = options
+            .toolchain
+            .clone()
+            .or(project.toolchain.clone())
+            .or_else(|| Settings::load().toolchain);
         let toolchain = Toolchain::find(requested.as_deref(), &platform)?;
 
         // Output folders: a toolchain or a target machine picked on the command line gets its own
@@ -149,17 +153,25 @@ impl Model {
             .unwrap_or_else(|| vcpkg::default_triplet(&toolchain, profile.static_runtime));
         let vcpkg_dir = out_root.join("vcpkg").join("installed").join(&vcpkg_triplet).join(&vcpkg_triplet);
 
-        let profile_names: Vec<String> = manifest.profile.keys().cloned().collect();
-        let option_names: Vec<String> = manifest.options.keys().cloned().collect();
-        crate::cond::check_names(&profile_names, &option_names)?;
-
+        // Options of the root package and the workspace members, with the command line's values; dependencies add
+        // theirs as they load
+        let members = workspace_members(&root, &manifest)?;
+        let member_manifests: Vec<(PathBuf, Manifest)> = members
+            .into_iter()
+            .map(|member| Ok((member.clone(), manifest::load(&member.join(MANIFEST_NAME))?)))
+            .collect::<Result<_>>()?;
+        let package_options = std::iter::once((root.as_path(), &manifest.options)).chain(
+            member_manifests
+                .iter()
+                .map(|(member, member_manifest)| (member.as_path(), &member_manifest.options)),
+        );
         let lock = LockFile::load(&root, options.locked, options.refresh.clone())?;
         let condition = CondContext {
             family: toolchain.family,
             platform: platform.clone(),
             profiles: profile.chain.clone(),
             all_profiles: manifest.profile.keys().cloned().collect(),
-            options: resolve_options(&manifest, &options.options)?,
+            options: resolve_options(package_options, &options.options)?,
         };
 
         let mut model = Model {
@@ -186,19 +198,14 @@ impl Model {
         };
 
         // Root package and workspace members
-        let members = workspace_members(&root, &manifest)?;
         model.add_package(&root, manifest, true)?;
-        for member in members {
-            let member_manifest = manifest::load(&member.join(MANIFEST_NAME))?;
+        for (member, member_manifest) in member_manifests {
             model.add_package(&member, member_manifest, true)?;
         }
 
-        // Dependencies (this may load more packages, which append targets: iterate by index)
-        let mut index = 0;
-        while index < model.targets.len() {
-            model.link_target(index)?;
-            index += 1;
-        }
+        // Dependencies (this may load more packages); of other packages, only the targets ours reach stay
+        model.link_reachable()?;
+        model.check_option_overrides()?;
 
         model.check_cycles()?;
         model.check_output_names()?;
@@ -287,15 +294,38 @@ impl Model {
         order
     }
 
+    /// Where a package's objects, generated files and static libraries go (see `targets::package_out_dir`).
+    pub fn package_out_dir(&self, package: usize) -> PathBuf {
+        targets::package_out_dir(&self.out_dir, package, &self.packages[package].name)
+    }
+
     fn add_package(&mut self, root: &Path, manifest: Manifest, member: bool) -> Result<usize> {
         let name = package_name(root, &manifest);
         let index = self.packages.len();
         self.package_dirs.insert(util::path_key(root), index);
 
-        // Options declared by members join the root's
-        for (option, value) in manifest::parse_options(&manifest.options)? {
-            self.condition.options.entry(option).or_insert(value);
+        // Options declared by members and dependencies join the root's, with the command line's values
+        let declared = manifest::parse_options(&manifest.options).with_context(|| package_context(index, &name, root))?;
+        let option_names: Vec<String> = declared.keys().cloned().collect();
+        crate::cond::check_names(&self.condition.all_profiles, &option_names).with_context(|| package_context(index, &name, root))?;
+        for (option, default) in declared {
+            let given = self
+                .options
+                .options
+                .iter()
+                .rev()
+                .find(|(given, _)| *given == option)
+                .map(|(_, value)| *value);
+            self.condition.options.entry(option).or_insert(given.unwrap_or(default));
         }
+
+        // Every table once, whether or not it applies here
+        let check = || -> Result<()> {
+            targets::check_package(&manifest, &self.condition)?;
+            Profile::check_all(&manifest.profile)?;
+            check_deps(&manifest, &self.condition)
+        };
+        check().with_context(|| package_context(index, &name, root))?;
 
         self.packages.push(Package {
             name,
@@ -357,6 +387,94 @@ impl Model {
         Ok(())
     }
 
+    /// Resolves the dependencies of the root package's and the members' targets, then of every target they reach in
+    /// other packages (through dependencies, or `{target:X}` in build steps and link flags). Targets of other
+    /// packages nothing reaches are dropped unresolved, so a dependency's examples and tools cost nothing.
+    fn link_reachable(&mut self) -> Result<()> {
+        let mut reached = vec![false; self.targets.len()];
+        let mut pending: std::collections::VecDeque<usize> = (0..self.targets.len())
+            .filter(|index| self.packages[self.targets[*index].package].member)
+            .collect();
+
+        while let Some(index) = pending.pop_front() {
+            reached.resize(self.targets.len(), false);
+            if reached[index] {
+                continue;
+            }
+            reached[index] = true;
+            self.link_target(index)?;
+
+            let target = &self.targets[index];
+            pending.extend(target.deps.iter().map(|(dependency, _)| *dependency));
+            pending.extend(target.header_deps.iter().chain(&target.needs).chain(&target.whole_archive).copied());
+
+            let steps = target.pre_build.iter().chain(&target.post_build).map(|step| step.command.to_command());
+            let mut words: Vec<String> = target.runs.iter().map(|run| run.command.to_command()).chain(steps).flatten().collect();
+            words.extend(target.link_flags.iter().cloned());
+            for name in crate::plan::target_references(&words) {
+                pending.extend(self.find_target(&name).ok());
+            }
+        }
+
+        reached.resize(self.targets.len(), false);
+        self.drop_unreached(&reached);
+        Ok(())
+    }
+
+    /// Keeps only the reached targets, renumbering what refers to them.
+    fn drop_unreached(&mut self, reached: &[bool]) {
+        if reached.iter().all(|reached| *reached) {
+            return;
+        }
+
+        let mut new_index = vec![usize::MAX; reached.len()];
+        let mut kept = Vec::new();
+        for (index, target) in std::mem::take(&mut self.targets).into_iter().enumerate() {
+            if reached[index] {
+                new_index[index] = kept.len();
+                kept.push(target);
+            }
+        }
+
+        for target in &mut kept {
+            for (dependency, _) in &mut target.deps {
+                *dependency = new_index[*dependency];
+            }
+            for dependency in target.header_deps.iter_mut().chain(&mut target.needs).chain(&mut target.whole_archive) {
+                *dependency = new_index[*dependency];
+            }
+        }
+        self.externals.retain(|_, index| reached[*index]);
+        for index in self.externals.values_mut() {
+            *index = new_index[*index];
+        }
+
+        self.targets = kept;
+    }
+
+    /// Every `-o name=value` names an option some loaded package declares.
+    fn check_option_overrides(&self) -> Result<()> {
+        for (name, _) in &self.options.options {
+            if !self.condition.options.contains_key(name) {
+                let hint = util::suggest(name, self.condition.options.keys().map(|key| key.as_str()))
+                    .map(|close| format!(" Did you mean `{close}`?"))
+                    .unwrap_or_default();
+                bail!("unknown option `{name}`.{hint} Declare it under [options].");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// A target's name for messages: `package/target` outside the root package.
+    fn qualified_name(&self, index: usize) -> String {
+        let target = &self.targets[index];
+        match target.package {
+            0 => target.name.clone(),
+            package => format!("{}/{}", self.packages[package].name, target.name),
+        }
+    }
+
     /// Resolves the dependency names of one target.
     fn link_target(&mut self, index: usize) -> Result<()> {
         let dep_names = self.targets[index].dep_names.clone();
@@ -366,7 +484,7 @@ impl Model {
         for (name, public) in dep_names {
             let resolved = self
                 .resolve_dep(package, &name)
-                .with_context(|| format!("in target `{}`", self.targets[index].name))?;
+                .with_context(|| format!("in target `{}`", self.qualified_name(index)))?;
             if let Some(dependency) = resolved {
                 if dependency == index {
                     bail!("target `{name}` depends on itself");
@@ -380,7 +498,7 @@ impl Model {
         for name in self.targets[index].header_dep_names.clone() {
             let resolved = self
                 .resolve_dep(package, &name)
-                .with_context(|| format!("in target `{}` (header-deps)", self.targets[index].name))?;
+                .with_context(|| format!("in target `{}` (header-deps)", self.qualified_name(index)))?;
             if let Some(dependency) = resolved.filter(|dependency| *dependency != index) {
                 header_deps.push(dependency);
             }
@@ -391,7 +509,7 @@ impl Model {
         for name in self.targets[index].need_names.clone() {
             let resolved = self
                 .resolve_dep(package, &name)
-                .with_context(|| format!("in target `{}` (needs)", self.targets[index].name))?;
+                .with_context(|| format!("in target `{}` (needs)", self.qualified_name(index)))?;
             if let Some(dependency) = resolved.filter(|dependency| *dependency != index) {
                 needs.push(dependency);
             }
@@ -402,7 +520,7 @@ impl Model {
         for name in self.targets[index].whole_archive_names.clone() {
             let resolved = self
                 .resolve_dep(package, &name)
-                .with_context(|| format!("in target `{}` (whole-archive)", self.targets[index].name))?;
+                .with_context(|| format!("in target `{}` (whole-archive)", self.qualified_name(index)))?;
             if let Some(dependency) = resolved {
                 if !matches!(
                     self.targets[dependency].kind,
@@ -424,15 +542,12 @@ impl Model {
     /// A dependency name to a target: a local target, a [deps] entry, a workspace member, or "package/target".
     /// None when the [deps] entry's `if` is false.
     fn resolve_dep(&mut self, package: usize, name: &str) -> Result<Option<usize>> {
-        // package/target
+        // package/target: a target of a [deps] entry's package (loading it), else of a loaded package by its name
         if let Some((package_name, target_name)) = name.split_once('/') {
-            let found = self
-                .targets
-                .iter()
-                .position(|target| target.name == target_name && self.packages[target.package].name == package_name);
-            return found
-                .map(Some)
-                .with_context(|| format!("no target `{target_name}` in package `{package_name}`"));
+            let Some(found) = self.find_dep_package(package, package_name)? else {
+                return Ok(None);
+            };
+            return self.main_target(found, Some(target_name)).map(Some);
         }
 
         // A target of the same package
@@ -474,19 +589,77 @@ impl Model {
         bail!("unknown dependency `{name}`.{hint} Declare it under [deps] (e.g. `anvil add {name}`), or name one of this package's targets.")
     }
 
+    /// The package `package/target` names: a path or git [deps] entry of that key (loaded now), a loaded package of
+    /// that name, or a [deps] package whose [project] name it is. None when the entry's `if` is false.
+    fn find_dep_package(&mut self, package: usize, package_name: &str) -> Result<Option<usize>> {
+        let source_deps: Vec<(String, DepSpec)> = self.packages[package]
+            .manifest
+            .deps
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), manifest::parse_dep(key, value)?)))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(_, spec)| spec.path.is_some() || spec.git.is_some())
+            .collect();
+
+        // By [deps] key
+        if let Some((key, spec)) = source_deps.iter().find(|(key, _)| key == package_name) {
+            if let Some(condition) = &spec.cond {
+                if !self.condition.test(condition)? {
+                    return Ok(None);
+                }
+            }
+            return self.load_dep_package(package, key, spec).map(Some);
+        }
+        if self.packages[package].manifest.deps.contains_key(package_name) {
+            bail!("`{package_name}/...`: [deps] {package_name} is not a path or git package, so it has no targets to pick from");
+        }
+
+        // By package name: one loaded already, else one of this package's path or git dependencies
+        if let Some(found) = self.packages.iter().position(|candidate| candidate.name == package_name) {
+            return Ok(Some(found));
+        }
+        for (key, spec) in &source_deps {
+            if let Some(condition) = &spec.cond {
+                if !self.condition.test(condition)? {
+                    continue;
+                }
+            }
+            let loaded = self.load_dep_package(package, key, spec)?;
+            if self.packages[loaded].name == package_name {
+                return Ok(Some(loaded));
+            }
+        }
+
+        let hint = util::suggest(package_name, source_deps.iter().map(|(key, _)| key.as_str()))
+            .map(|close| format!(" Did you mean `{close}`?"))
+            .unwrap_or_default();
+        bail!("unknown package `{package_name}`.{hint} Name a path or git entry of [deps] (or its package's [project] name)")
+    }
+
+    /// The package of a path or git dependency, loaded once.
+    fn load_dep_package(&mut self, package: usize, name: &str, spec: &DepSpec) -> Result<usize> {
+        let package_root = self.packages[package].root.clone();
+        let folder = match (&spec.path, &spec.git) {
+            (Some(path), _) => util::absolute(&package_root, Path::new(&util::expand_env(path)?)),
+            (None, Some(url)) => fetch_git(name, url, spec, self.lock.as_mut().unwrap())?,
+            (None, None) => bail!("dependency `{name}` is not a path or git package"),
+        };
+        self.load_source_folder(name, &folder, spec)
+    }
+
     fn resolve_dep_spec(&mut self, package: usize, name: &str, spec: &DepSpec) -> Result<usize> {
-        let key = (package, name.to_string());
+        let key = match &spec.target {
+            Some(target) => (package, format!("{name}/{target}")),
+            None => (package, name.to_string()),
+        };
         if let Some(existing) = self.externals.get(&key) {
             return Ok(*existing);
         }
 
-        let package_root = self.packages[package].root.clone();
-        let resolved = if let Some(path) = &spec.path {
-            let folder = util::absolute(&package_root, Path::new(&util::expand_env(path)?));
-            self.load_source_package(name, &folder, spec)?
-        } else if let Some(url) = &spec.git {
-            let folder = fetch_git(name, url, spec, self.lock.as_mut().unwrap())?;
-            self.load_source_package(name, &folder, spec)?
+        let resolved = if spec.path.is_some() || spec.git.is_some() {
+            let loaded = self.load_dep_package(package, name, spec)?;
+            self.main_target(loaded, spec.target.as_deref())?
         } else {
             self.add_external(package, name, spec)?
         };
@@ -558,20 +731,31 @@ impl Model {
     }
 
     /// A source package from a path or git checkout: its anvil.toml, or a library made from its layout.
-    fn load_source_package(&mut self, name: &str, folder: &Path, spec: &DepSpec) -> Result<usize> {
+    fn load_source_folder(&mut self, name: &str, folder: &Path, spec: &DepSpec) -> Result<usize> {
         if !folder.is_dir() {
             bail!("dependency `{name}`: folder {} does not exist", slash(folder));
         }
 
         // Already loaded (shared by several packages, or a workspace member)
         if let Some(existing) = self.package_dirs.get(&util::path_key(folder)).copied() {
-            return self.main_target(existing, spec.target.as_deref());
+            return Ok(existing);
         }
 
         let manifest_file = folder.join(MANIFEST_NAME);
         if manifest_file.is_file() {
-            let package = self.add_package(folder, manifest::load(&manifest_file)?, false)?;
-            return self.main_target(package, spec.target.as_deref());
+            let overrides = [
+                ("include", spec.include.is_some()),
+                ("sources", spec.sources.is_some()),
+                ("defines", spec.defines.is_some()),
+            ];
+            if let Some((key, _)) = overrides.iter().find(|(_, given)| *given) {
+                bail!(
+                    "dependency `{name}`: `{key}` describes a folder without an anvil.toml, and {} has one; \
+                     set it in that package's targets instead",
+                    slash(folder)
+                );
+            }
+            return self.add_package(folder, manifest::load(&manifest_file)?, false);
         }
 
         // No anvil.toml: a library from the given include/sources, or include/ and src/
@@ -586,11 +770,19 @@ impl Model {
             } else {
                 Default::default()
             },
+
+            // Without include/sources, the defines go to the targets the layout makes
+            defaults: manifest::TargetSpec {
+                public: (!has_overrides).then(|| manifest::PublicSpec {
+                    defines: spec.defines.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
-        let package = self.add_package(folder, synthetic, false)?;
-        self.main_target(package, spec.target.as_deref())
+        self.add_package(folder, synthetic, false)
     }
 
     /// The library a package offers to dependents: the named one, the one named like the package, or its only one.
@@ -672,14 +864,14 @@ impl Model {
     /// A target that compiles must have something to compile here: sources, a build step that makes them, or object
     /// libraries it takes in. Otherwise its sources are all under conditions that do not hold.
     fn check_sources(&self) -> Result<()> {
-        for target in &self.targets {
+        for (index, target) in self.targets.iter().enumerate() {
             let compiles = matches!(target.kind, Kind::Exe | Kind::Test | Kind::Static | Kind::Shared | Kind::Object);
             let takes_objects = target.deps.iter().any(|(dependency, _)| self.targets[*dependency].kind == Kind::Object);
             if compiles && target.sources.is_empty() && target.runs.is_empty() && !takes_objects {
                 bail!(
                     "target `{}` has nothing to compile for this platform: its sources are all under `when` blocks that do not \
                      hold, or its patterns match no files. Give it sources here, or an `if` so it exists only where it has some",
-                    target.name
+                    self.qualified_name(index)
                 );
             }
         }
@@ -687,19 +879,63 @@ impl Model {
         Ok(())
     }
 
-    /// Two targets must not write the same file.
+    /// Two targets must not write the same file, nor share an object or generated-files folder (or nest one in the
+    /// other's), nor write a file where such a folder goes.
     fn check_output_names(&self) -> Result<()> {
-        let mut seen: HashMap<String, &str> = HashMap::new();
+        let mut files: HashMap<String, (usize, PathBuf)> = HashMap::new();
+        let mut folders: Vec<(String, PathBuf, &str, usize)> = Vec::new();
 
-        for target in &self.targets {
+        for (index, target) in self.targets.iter().enumerate() {
+            if target.kind == Kind::External {
+                continue;
+            }
+
+            let package_out = self.package_out_dir(target.package);
+            for (folder, what) in [
+                (package_out.join("obj").join(targets::sanitize_name(&target.name)), "object folder"),
+                (targets::gen_dir(&package_out, &target.name), "generated-files folder"),
+            ] {
+                folders.push((format!("{}/", util::path_key(&folder)), folder, what, index));
+            }
+
             let Some(file) = crate::plan::artifact_path(self, target) else {
                 continue;
             };
-            if let Some(other) = seen.insert(util::path_key(&file), &target.name) {
+            if let Some((other, _)) = files.insert(util::path_key(&file), (index, file.clone())) {
                 bail!(
-                    "targets `{other}` and `{}` would both write {}; give one an `output-name` or an `output-dir`",
-                    target.name,
+                    "targets `{}` and `{}` would both write {}; give one an `output-name` or an `output-dir`",
+                    self.qualified_name(other),
+                    self.qualified_name(index),
                     slash(&file)
+                );
+            }
+        }
+
+        // Sorted, a folder comes right before those inside it
+        folders.sort_by(|left, right| left.0.cmp(&right.0));
+        for pair in folders.windows(2) {
+            let ((first, folder, what, first_index), (second, _, _, second_index)) = (&pair[0], &pair[1]);
+            if second.starts_with(first.as_str()) {
+                bail!(
+                    "targets `{}` and `{}` would share the {what} {}; rename one of them",
+                    self.qualified_name(*first_index),
+                    self.qualified_name(*second_index),
+                    slash(folder)
+                );
+            }
+        }
+
+        // A program without an extension named like a folder Anvil writes
+        for (key, (index, file)) in &files {
+            let inside = format!("{key}/");
+            let after = folders.partition_point(|(folder_key, ..)| folder_key.as_str() < inside.as_str());
+            if let Some((_, folder, what, other)) = folders.get(after).filter(|(folder_key, ..)| folder_key.starts_with(&inside)) {
+                bail!(
+                    "target `{}` would write {}, which the {what} of `{}` ({}) needs as a folder; rename one of them",
+                    self.qualified_name(*index),
+                    slash(file),
+                    self.qualified_name(*other),
+                    slash(folder)
                 );
             }
         }
@@ -819,9 +1055,15 @@ impl Model {
         Ok(())
     }
 
-    /// [[write]] files of the root package and workspace members, rewritten only when their text changed.
+    /// [[write]] files of every package that builds something here, rewritten only when their text changed.
     fn write_files(&self) -> Result<()> {
-        for package in self.packages.iter().filter(|package| package.member) {
+        let mut used = vec![false; self.packages.len()];
+        for target in &self.targets {
+            used[target.package] = true;
+        }
+
+        let packages = self.packages.iter().enumerate().filter(|(index, package)| package.member || used[*index]);
+        for (_, package) in packages {
             for spec in &package.manifest.write {
                 if let Some(condition) = &spec.cond {
                     if !self.condition.test(condition).with_context(|| format!("[[write]] {}", spec.path))? {
@@ -829,7 +1071,7 @@ impl Model {
                     }
                 }
 
-                let fill = |text: &str| fill_test_text(text, package, &self.out_dir, &self.vcpkg_dir);
+                let fill = |text: &str| fill_test_text(text, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name);
                 let path = util::absolute(&package.root, Path::new(&fill(&spec.path)));
                 let text = fill(&spec.text);
 
@@ -860,7 +1102,7 @@ impl Model {
                 continue;
             }
 
-            let fill = |text: &String| fill_test_text(text, package, &self.out_dir, &self.vcpkg_dir);
+            let fill = |text: &String| fill_test_text(text, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name);
             let mut command = vec![format!("{{target:{}}}", target.name)];
             command.extend(target.args.iter().map(fill));
 
@@ -927,16 +1169,18 @@ pub fn locate(start: &Path) -> Result<(PathBuf, Manifest)> {
         return zero_config(&start);
     };
 
-    // A workspace further up that includes this package is the real root
+    // A workspace further up that includes this package is the real root; other manifests up there (broken ones,
+    // or packages that are not workspaces) are not this project's business
     for ancestor in nearest.ancestors().skip(1) {
         let candidate = ancestor.join(MANIFEST_NAME);
         if !candidate.is_file() {
             continue;
         }
 
-        let manifest = manifest::load(&candidate)?;
+        let Ok(manifest) = manifest::load(&candidate) else { continue };
         if manifest.workspace.is_some()
-            && workspace_members(ancestor, &manifest)?
+            && workspace_members(ancestor, &manifest)
+                .unwrap_or_default()
                 .iter()
                 .any(|member| util::path_key(member) == util::path_key(&nearest))
         {
@@ -978,48 +1222,97 @@ fn package_name(root: &Path, manifest: &Manifest) -> String {
     })
 }
 
+/// Where a package's errors come from: its anvil.toml, and its name outside the root package.
+fn package_context(index: usize, name: &str, root: &Path) -> String {
+    let file = slash(&root.join(MANIFEST_NAME));
+    match index {
+        0 => file,
+        _ => format!("package `{name}` ({file})"),
+    }
+}
+
 fn workspace_members(root: &Path, manifest: &Manifest) -> Result<Vec<PathBuf>> {
     let Some(workspace) = &manifest.workspace else { return Ok(Vec::new()) };
+    let out_root = util::absolute(
+        root,
+        Path::new(manifest.project.as_ref().and_then(|project| project.out.as_deref()).unwrap_or("out")),
+    );
     let mut members = Vec::new();
 
     for pattern in &workspace.members {
-        // A plain folder, or a glob over folders
-        if !pattern.contains(['*', '?', '[', '{']) {
-            let folder = util::absolute(root, Path::new(pattern));
-            if !folder.join(MANIFEST_NAME).is_file() {
+        // A plain folder
+        let (base, glob) = targets::split_pattern(root, pattern);
+        let Some(glob) = glob else {
+            if !base.join(MANIFEST_NAME).is_file() {
                 bail!("workspace member \"{pattern}\" has no {MANIFEST_NAME}");
             }
-            members.push(folder);
+            members.push(base);
             continue;
-        }
+        };
 
-        let matcher = targets::compile_glob(&slash(&util::absolute(root, Path::new(pattern))))?.compile_matcher();
-        for entry in walkdir::WalkDir::new(root).max_depth(4).into_iter().flatten() {
-            if entry.file_type().is_dir() && matcher.is_match(slash(entry.path())) && entry.path().join(MANIFEST_NAME).is_file() {
-                members.push(entry.path().to_path_buf());
+        // A glob over folders: walk from its literal part only as deep as it reaches
+        let matcher = targets::compile_glob(&glob)
+            .with_context(|| format!("workspace member \"{pattern}\": bad pattern"))?
+            .compile_matcher();
+        let max_depth = if glob.contains("**") { usize::MAX } else { glob.split('/').count() };
+        let walker = walkdir::WalkDir::new(&base)
+            .min_depth(1)
+            .max_depth(max_depth)
+            .into_iter()
+            .filter_entry(|entry| !targets::is_skipped_dir(entry, &out_root));
+
+        let mut found = false;
+        for entry in walker.flatten() {
+            let Ok(relative) = entry.path().strip_prefix(&base) else { continue };
+            if entry.file_type().is_dir() && matcher.is_match(slash(relative)) && entry.path().join(MANIFEST_NAME).is_file() {
+                members.push(util::normalize(entry.path()));
+                found = true;
             }
+        }
+        if !found {
+            bail!("workspace member \"{pattern}\" matches no folder with an {MANIFEST_NAME}");
         }
     }
 
-    members.retain(|member| util::path_key(member) != util::path_key(root));
+    // Each member once (`b` and `./b`), never the root itself
+    let mut seen = std::collections::HashSet::new();
+    members.retain(|member| util::path_key(member) != util::path_key(root) && seen.insert(util::path_key(member)));
     Ok(members)
 }
 
-/// [options] defaults with `-o name=value` overrides from the command line.
-fn resolve_options(manifest: &Manifest, overrides: &[(String, bool)]) -> Result<indexmap::IndexMap<String, bool>> {
-    let mut options = manifest::parse_options(&manifest.options)?;
+/// [options] defaults of the root package and the members, with `-o name=value` overrides from the command line.
+/// An override no package here declares may belong to a dependency (`check_option_overrides`).
+fn resolve_options<'a>(
+    package_options: impl Iterator<Item = (&'a Path, &'a indexmap::IndexMap<String, toml::Value>)>,
+    overrides: &[(String, bool)],
+) -> Result<indexmap::IndexMap<String, bool>> {
+    let mut options = indexmap::IndexMap::new();
+    for (root, declared) in package_options {
+        let parsed = manifest::parse_options(declared).with_context(|| slash(&root.join(MANIFEST_NAME)))?;
+        for (name, default) in parsed {
+            options.entry(name).or_insert(default);
+        }
+    }
 
     for (name, value) in overrides {
-        if !options.contains_key(name) {
-            let hint = util::suggest(name, options.keys().map(|key| key.as_str()))
-                .map(|close| format!(" Did you mean `{close}`?"))
-                .unwrap_or_default();
-            bail!("unknown option `{name}`.{hint} Declare it under [options].");
+        if let Some(option) = options.get_mut(name) {
+            *option = *value;
         }
-        options.insert(name.clone(), *value);
     }
 
     Ok(options)
+}
+
+/// Every [deps] entry, used or not: its form, its keys, its condition's words.
+fn check_deps(manifest: &Manifest, condition: &CondContext) -> Result<()> {
+    for (name, value) in &manifest.deps {
+        let spec = manifest::parse_dep(name, value)?;
+        if let Some(text) = &spec.cond {
+            condition.check(text).with_context(|| format!("dependency `{name}`"))?;
+        }
+    }
+
+    Ok(())
 }
 
 /// The [deps] names whose `if` holds (conventional targets use all of them).
@@ -1275,7 +1568,7 @@ fn test_from_spec(spec: &TestSpec, package: &Package, out_dir: &Path, vcpkg_dir:
         }
     }
 
-    let fill = |text: &String| fill_test_text(text, package, out_dir, vcpkg_dir);
+    let fill = |text: &String| fill_test_text(text, package, out_dir, vcpkg_dir, &condition.profiles[0]);
     let workdir = match &spec.workdir {
         Some(workdir) => util::absolute(&package.root, Path::new(&util::expand_env(&fill(workdir))?)),
         None => package.root.clone(),
@@ -1301,19 +1594,16 @@ fn test_from_spec(spec: &TestSpec, package: &Package, out_dir: &Path, vcpkg_dir:
     }))
 }
 
-/// Placeholders in test commands, folders and environment values: {root} {out} {profile} {version}.
 /// {root}, {out}, {profile}, {config}, {version} and {vcpkg} in a test's or written file's text.
-fn fill_test_text(text: &str, package: &Package, out_dir: &Path, vcpkg_dir: &Path) -> String {
+fn fill_test_text(text: &str, package: &Package, out_dir: &Path, vcpkg_dir: &Path, profile: &str) -> String {
     if !text.contains('{') {
         return text.to_string();
     }
 
-    let profile = out_dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-    let base_profile = profile.split('-').next().unwrap_or_default();
     text.replace("{root}", &slash(&package.root))
         .replace("{out}", &slash(out_dir))
-        .replace("{profile}", &profile)
-        .replace("{config}", &crate::targets::config_name(base_profile))
+        .replace("{profile}", profile)
+        .replace("{config}", &crate::targets::config_name(profile))
         .replace("{version}", package.version())
         .replace("{vcpkg}", &slash(vcpkg_dir))
 }
