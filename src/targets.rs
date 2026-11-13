@@ -1221,6 +1221,35 @@ fn folder_has_source(folder: &Path, main_only: bool) -> bool {
     })
 }
 
+/// Of the conventional targets, the test of tests/<main>.c becomes `test_<main>` (<main>: the main target's name),
+/// which must not be another file's test too.
+pub fn check_renamed_test(targets: &[Target], main_name: &str, root: &Path) -> Result<()> {
+    let renamed = format!("test_{main_name}");
+    let source = |test: &Target| test.sources.first().cloned().unwrap_or_default();
+    let is_own = |test: &Target| source(test).file_stem().is_some_and(|stem| stem.to_string_lossy() == main_name);
+
+    let named: Vec<&Target> = targets
+        .iter()
+        .filter(|target| target.kind == Kind::Test && target.name == renamed)
+        .collect();
+    let (Some(own), Some(other)) = (named.iter().find(|test| is_own(test)), named.iter().find(|test| !is_own(test))) else {
+        return Ok(());
+    };
+
+    let extension = source(own)
+        .extension()
+        .map(|extension| extension.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let example = source(own).with_file_name(format!("{main_name}_tests.{extension}"));
+    bail!(
+        "{} and {} would both be the test `{renamed}`: a test named like the package's main target `{main_name}` gets a `test_` prefix. Rename one of the files (for example {} to {})",
+        util::rel(&source(own), root),
+        util::rel(&source(other), root),
+        util::rel(&source(own), root),
+        util::rel(&example, root)
+    )
+}
+
 /// A lib entry: a name ("user32", "Cocoa.framework") stays; a path (has a slash or an extension) becomes absolute.
 fn expand_lib(lib: &str, dir: &Path, scope: &PackageScope, target_name: &str) -> Result<String> {
     let expanded = expand_path_text(lib, scope, target_name)?;
@@ -1370,5 +1399,27 @@ mod tests {
         let patterns = ["src/*.cpp".to_string(), "!src/win/**".to_string()];
         assert_eq!(split_excludes(&patterns), (vec!["src/*.cpp".to_string()], vec!["src/win/**".to_string()]));
         assert_eq!(escape_glob("C:/a[1]/{b}"), "C:/a[[]1[]]/[{]b[}]");
+    }
+
+    #[test]
+    fn renamed_test_must_not_take_another_tests_name() {
+        let root = Path::new("/project");
+        let test = |name: &str, file: &str| {
+            let mut target = Target::new(name, 0, Kind::Test, root);
+            target.sources = vec![root.join(file)];
+            target
+        };
+        let main = Target::new("foo", 0, Kind::Exe, root);
+
+        // tests/foo.c is the test `test_foo`, beside tests/bar.c: fine; beside tests/test_foo.c: an error naming both
+        let fine = [main.clone(), test("test_foo", "tests/foo.c"), test("bar", "tests/bar.c")];
+        assert!(check_renamed_test(&fine, "foo", root).is_ok());
+        let clash = [main, test("test_foo", "tests/test_foo.c"), test("test_foo", "tests/foo.c")];
+        let error = check_renamed_test(&clash, "foo", root).unwrap_err().to_string();
+        assert!(
+            error.starts_with("tests/foo.c and tests/test_foo.c would both be the test `test_foo`"),
+            "{error}"
+        );
+        assert!(error.contains("for example tests/foo.c to tests/foo_tests.c"), "{error}");
     }
 }

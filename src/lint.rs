@@ -106,7 +106,7 @@ pub fn format(start_dir: &Path, check: bool, paths: &[PathBuf]) -> Result<i32> {
 /// `anvil tidy [--fix] [targets]`: clang-tidy over the targets' C and C++ sources with the profile's compile commands
 /// (planned first, so they are current); returns 1 when it reports anything.
 pub fn tidy(start_dir: &Path, build: &BuildArgs, fix: bool, names: &[String]) -> Result<i32> {
-    let model = commands::load_model(start_dir, build)?;
+    let model = commands::load_model_naming(start_dir, build, names)?;
 
     // The targets: those named, else every one of the project's
     let roots = if names.is_empty() {

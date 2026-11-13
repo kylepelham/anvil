@@ -441,26 +441,45 @@ fn git(folder: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// Deletes the checkouts of these commits from anvil's shared git cache (`<user data>/anvil/git/<name>-<key>`) when
-/// the test ends, found by the commit each records in `.anvil-ready`.
-struct GitCheckouts(Vec<String>);
+/// Anvil's shared git cache: `<user data>/anvil/git`.
+fn git_cache() -> Option<PathBuf> {
+    let user_data = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+    };
+    user_data.map(|folder| folder.join("anvil").join("git"))
+}
+
+/// Deletes the checkouts of the test's repositories from anvil's shared git cache (`<user data>/anvil/git/<name>-<key>`)
+/// when the test ends: those whose remote is inside the test's folder, so another test's checkouts of a repository
+/// with the same commit stay.
+struct GitCheckouts(PathBuf);
+
+impl GitCheckouts {
+    fn of(project: &Project) -> GitCheckouts {
+        GitCheckouts(project.root.clone())
+    }
+}
 
 impl Drop for GitCheckouts {
     fn drop(&mut self) {
-        let user_data = if cfg!(windows) {
-            std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-        } else {
-            std::env::var_os("XDG_CACHE_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        };
-        let Some(cache) = user_data.map(|folder| folder.join("anvil").join("git")) else {
-            return;
-        };
+        let Some(cache) = git_cache() else { return };
 
+        // "url = file:///C:/..." in the checkout's .git/config, compared without the scheme, slashes one way
+        let comparable = |text: &str| {
+            text.trim_start_matches("file://")
+                .trim_start_matches('/')
+                .replace('\\', "/")
+                .to_lowercase()
+        };
+        let ours = format!("{}/", comparable(&self.0.display().to_string()));
         for entry in std::fs::read_dir(cache).into_iter().flatten().flatten() {
-            let commit = std::fs::read_to_string(entry.path().join(".anvil-ready")).unwrap_or_default();
-            if self.0.iter().any(|ours| *ours == commit.trim()) {
+            let config = std::fs::read_to_string(entry.path().join(".git").join("config")).unwrap_or_default();
+            let remote = config.lines().find_map(|line| line.trim().strip_prefix("url = "));
+            if remote.is_some_and(|url| comparable(url).starts_with(&ours)) {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
@@ -486,7 +505,7 @@ fn lock_file_pins_git_dependency() {
     git(&dependency, &["tag", "v2"]);
     let v1 = git(&dependency, &["rev-parse", "v1^{commit}"]);
     let v2 = git(&dependency, &["rev-parse", "v2^{commit}"]);
-    let _checkouts = GitCheckouts(vec![v1.clone(), v2.clone()]);
+    let _checkouts = GitCheckouts::of(&project);
 
     let url = format!("file:///{}", dependency.display().to_string().replace('\\', "/").trim_start_matches('/'));
     project.write(
@@ -871,8 +890,9 @@ fn tidy_reports_and_fixes_findings_gcc() {
 // 21. Dependencies: anvil.lock keeps only the pins something declares; dev-deps; anvil remove, init, completions
 
 /// A git repository at `<project>/<folder>` holding a static library `<name>` (and a second one, `<name>_extra`),
-/// tagged v1: its file:/// url and commit.
-fn git_library(project: &Project, folder: &str, name: &str) -> (String, String) {
+/// tagged v1: its file:/// url. The commit names the repository's folder, so two tests never make the same
+/// one (and share a checkout in anvil's cache).
+fn git_library(project: &Project, folder: &str, name: &str) -> String {
     project.write(
         &format!("{folder}/anvil.toml"),
         &format!(
@@ -885,20 +905,19 @@ fn git_library(project: &Project, folder: &str, name: &str) -> (String, String) 
     let repository = project.path(folder);
     git(&repository, &["init", "--quiet"]);
     git(&repository, &["add", "-A"]);
-    git(&repository, &["commit", "--quiet", "-m", "one"]);
+    git(&repository, &["commit", "--quiet", "-m", &format!("one, in {}", repository.display())]);
     git(&repository, &["tag", "v1"]);
 
-    let url = format!("file:///{}", repository.display().to_string().replace('\\', "/").trim_start_matches('/'));
-    (url, git(&repository, &["rev-parse", "v1^{commit}"]))
+    format!("file:///{}", repository.display().to_string().replace('\\', "/").trim_start_matches('/'))
 }
 
 #[test]
 fn lock_keeps_only_declared_pins() {
     require!("default", "git");
     let project = Project::empty("lock_declared");
-    let (alpha, alpha_commit) = git_library(&project, "alpha", "alpha");
-    let (beta, beta_commit) = git_library(&project, "beta", "beta");
-    let _checkouts = GitCheckouts(vec![alpha_commit, beta_commit]);
+    let alpha = git_library(&project, "alpha", "alpha");
+    let beta = git_library(&project, "beta", "beta");
+    let _checkouts = GitCheckouts::of(&project);
 
     // `opt` (a path dependency behind an option) declares `beta`; the project itself `alpha`
     project.write(
@@ -943,8 +962,8 @@ fn lock_keeps_only_declared_pins() {
 fn targets_lists_package_targets_of_unfetched_git_dependency() {
     require!("default", "git");
     let project = Project::empty("list_unfetched");
-    let (alpha, alpha_commit) = git_library(&project, "alpha", "alpha");
-    let _checkouts = GitCheckouts(vec![alpha_commit]);
+    let alpha = git_library(&project, "alpha", "alpha");
+    let _checkouts = GitCheckouts::of(&project);
 
     project.write(
         "app/anvil.toml",
@@ -1514,4 +1533,215 @@ command = ["cmake", "-E", "copy", "{root}/in.txt", "{output}"]
         .anvil_in("a&b dir", &["build"])
         .code(1)
         .contains("the step succeeded but did not write out/debug/gen/app/d.txt");
+}
+
+// 31. The project model: what tests and the command line name in a dependency stays; `{target:X}` in a member means
+//     its own X; dependencies' [[write]] files never clash; options of dependencies that are off; a member's broken
+//     workspace; a test-only library is not installed; a renamed conventional test
+
+#[test]
+fn dependency_targets_named_by_tests_and_the_command_line_stay() {
+    require!("default");
+    let project = Project::empty("model_references");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"app\"\n\n[deps]\ndep = { path = \"dep\" }\n\n\
+         [target.app]\nkind = \"exe\"\nsources = [\"src/main.c\"]\ndeps = [\"dep\"]\n\n\
+         [target.t]\nkind = \"test\"\nsources = [\"tests/t.c\"]\ndeps = [\"dep/z_support\"]\n\n\
+         [[test]]\nname = \"check\"\ncommand = [\"{target:dep/checker}\"]\nexpect = [\"checked\"]\n",
+    );
+    project.write("src/main.c", "int dep_value(void);\nint main(void) { return dep_value(); }\n");
+    project.write("tests/t.c", "int support_value(void);\nint main(void) { return support_value(); }\n");
+
+    // The dependency's test-support library uses its dev-deps, after targets nothing reaches
+    project.write(
+        "dep/anvil.toml",
+        "[project]\nname = \"dep\"\n\n[dev-deps]\nhdr = { path = \"../hdr\" }\n\n\
+         [target.a_unused]\nkind = \"exe\"\nsources = [\"unused.c\"]\n\n\
+         [target.z_support]\nkind = \"lib\"\nsources = [\"support.c\"]\ndeps = [\"hdr\"]\n\n\
+         [target.dep]\nkind = \"lib\"\nsources = [\"dep.c\"]\n\n\
+         [target.checker]\nkind = \"exe\"\nsources = [\"checker.c\"]\n\n\
+         [target.a_unused2]\nkind = \"exe\"\nsources = [\"unused.c\"]\noutput-name = \"unused2\"\n",
+    );
+    project.write("dep/unused.c", "int main(void) { return 0; }\n");
+    project.write("dep/support.c", "#include \"hdr.h\"\nint support_value(void) { return HDR_ZERO; }\n");
+    project.write("dep/dep.c", "int dep_value(void) { return 0; }\n");
+    project.write(
+        "dep/checker.c",
+        "#include <stdio.h>\nint main(void) { printf(\"checked\\n\"); return 0; }\n",
+    );
+    project.write("hdr/include/hdr.h", "#define HDR_ZERO 0\n");
+
+    project.anvil(&["test"]).success().contains("test check ... ok").contains("test t ... ok");
+    let run = project.anvil(&["run", "dep/checker"]);
+    run.success();
+    assert_eq!(program_output(&run), "checked");
+    project.anvil(&["build", "dep/a_unused"]).success();
+}
+
+#[test]
+fn member_target_references_mean_its_own_targets() {
+    require!("default");
+    let project = Project::empty("model_same_names");
+    let unit = |text: &str| format!("#include <stdio.h>\nint main(void) {{ printf(\"{text}\\n\"); return 0; }}\n");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"root\"\n\n[workspace]\nmembers = [\"b\"]\n\n\
+         [target.unit]\nkind = \"test\"\nsources = [\"unit.c\"]\noutput-name = \"root_unit\"\nexpect = [\"ROOT UNIT\"]\n",
+    );
+    project.write("unit.c", &unit("ROOT UNIT"));
+    project.write(
+        "b/anvil.toml",
+        "[project]\nname = \"b\"\n\n\
+         [target.unit]\nkind = \"test\"\nsources = [\"unit.c\"]\noutput-name = \"b_unit\"\nexpect = [\"B UNIT\"]\n\n\
+         [[test]]\nname = \"again\"\ncommand = [\"{target:unit}\"]\nexpect = [\"B UNIT\"]\n",
+    );
+    project.write("b/unit.c", &unit("B UNIT"));
+
+    project
+        .anvil(&["test"])
+        .success()
+        .contains("test b/unit ... ok")
+        .contains("Passed 3 of 3");
+}
+
+#[test]
+fn written_files_never_clash_nor_land_in_git_checkouts() {
+    require!("default");
+    let project = Project::empty("model_writes");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"app\"\n\n[deps]\na = { path = \"a\" }\nb = { path = \"b\" }\n\n\
+         [target.app]\nkind = \"exe\"\nsources = [\"src/main.c\"]\ndeps = [\"a\", \"b\"]\n",
+    );
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+    for name in ["a", "b"] {
+        project.write(
+            &format!("{name}/anvil.toml"),
+            &format!(
+                "[project]\nname = \"{name}\"\n\n[[write]]\npath = \"{{out}}/config.h\"\ntext = \"#define VALUE 1\\n\"\n\n\
+                 [target.{name}]\nkind = \"lib\"\nsources = [\"{name}.c\"]\n"
+            ),
+        );
+        project.write(&format!("{name}/{name}.c"), &format!("int {name}_value(void) {{ return 0; }}\n"));
+    }
+
+    // The same text twice is one file; different text is an error naming both packages
+    project.anvil(&["targets"]).success();
+    project.edit("b/anvil.toml", "VALUE 1", "VALUE 2");
+    project
+        .anvil(&["targets"])
+        .code(1)
+        .contains("both [[write]] out/debug/config.h, with different text");
+
+    // Nothing writes into anvil's git cache, which other projects share (refused before anything is written)
+    let Some(cache) = git_cache() else { return };
+    let checkout = cache.join("anvil-it-model-writes");
+    let inside = checkout.join("config.h").display().to_string().replace('\\', "/");
+    project.edit("b/anvil.toml", "{out}/config.h", &inside);
+    let refused = project.anvil(&["targets"]);
+    let _ = std::fs::remove_dir_all(&checkout);
+    refused.code(1).contains("inside a git checkout Anvil's cache shares between projects");
+}
+
+#[test]
+fn options_of_dependencies_that_are_off_are_known() {
+    require!("default");
+    let project = Project::empty("model_options");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"app\"\n\n[options]\nwithx = false\n\n[deps]\nx = { path = \"x\", if = \"withx\" }\n",
+    );
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+    project.write(
+        "x/anvil.toml",
+        "[project]\nname = \"x\"\n\n[options]\nx_fast = false\n\n[target.x]\nkind = \"lib\"\nsources = [\"x.c\"]\n",
+    );
+    project.write("x/x.c", "int x_value(void) { return 0; }\n");
+
+    project.anvil(&["targets", "-o", "x_fast"]).success();
+    project
+        .anvil(&["targets", "-o", "x_fastt"])
+        .code(1)
+        .contains("unknown option `x_fastt`. Did you mean `x_fast`?");
+}
+
+#[test]
+fn member_reports_its_workspace_errors() {
+    require!("default");
+    let project = Project::empty("model_workspace");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"root\"\n\n[workspace]\nmembers = [\"libs/*\", \"tools/*\"]\n\n[options]\nshared_opt = true\n",
+    );
+    project.write(
+        "libs/a/anvil.toml",
+        "[project]\nname = \"a\"\n\n[target.a]\nkind = \"lib\"\nsources = [\"src/*.c\"]\nwhen.shared_opt.defines = [\"X\"]\n",
+    );
+    project.write("libs/a/src/a.c", "int a_value(void) { return 0; }\n");
+
+    // The workspace's error, not one about the member alone
+    project
+        .anvil_in("libs/a", &["targets"])
+        .code(1)
+        .contains("in the workspace")
+        .contains("workspace member \"tools/*\" matches no folder");
+
+    // A manifest above that does not load: a warning, and the member alone
+    project.write("anvil.toml", "[project]\nname = \"root\"\nnot_a_key = 1\n");
+    project.edit("libs/a/anvil.toml", "when.shared_opt.", "");
+    project
+        .anvil_in("libs/a", &["targets"])
+        .success()
+        .contains("warning: not checking whether")
+        .contains("is a workspace holding this package");
+}
+
+#[test]
+fn install_leaves_out_libraries_only_tests_use() {
+    require!("default");
+    let project = Project::empty("model_install");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"app\"\n\n[dev-deps]\nhelper = { path = \"helper\" }\n\n\
+         [target.app]\nkind = \"exe\"\nsources = [\"src/main.c\"]\n\n\
+         [target.support]\nkind = \"lib\"\nsources = [\"support/support.c\"]\ndeps = [\"helper\"]\n\n\
+         [target.t]\nkind = \"test\"\nsources = [\"tests/t.c\"]\ndeps = [\"support\"]\n",
+    );
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+    project.write(
+        "support/support.c",
+        "int helper_value(void);\nint support_value(void) { return helper_value(); }\n",
+    );
+    project.write("tests/t.c", "int support_value(void);\nint main(void) { return support_value(); }\n");
+    project.write(
+        "helper/anvil.toml",
+        "[project]\nname = \"helper\"\n\n[target.helper]\nkind = \"lib\"\nsources = [\"*.c\"]\n",
+    );
+    project.write("helper/helper.c", "int helper_value(void) { return 0; }\n");
+
+    project.anvil(&["install"]).success();
+    let files = files_under(&project.path("out/install"));
+    assert!(
+        !files.iter().any(|file| file.contains("support") || file.contains("helper")),
+        "a test-only library was installed: {files:?}"
+    );
+}
+
+#[test]
+fn conventional_test_named_like_another_is_an_error() {
+    require!("default");
+    let project = Project::empty("model_convention");
+    project.write("anvil.toml", "[project]\nname = \"foo\"\n");
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+    project.write("tests/foo.c", "int main(void) { return 0; }\n");
+    project.write("tests/test_foo.c", "int main(void) { return 0; }\n");
+
+    project
+        .anvil(&["targets"])
+        .code(1)
+        .contains("tests/foo.c and tests/test_foo.c would both be the test `test_foo`")
+        .contains("for example tests/foo.c to tests/foo_tests.c");
+    std::fs::rename(project.path("tests/foo.c"), project.path("tests/foo_tests.c")).unwrap();
+    project.anvil(&["test"]).success().contains("Passed 2 of 2");
 }

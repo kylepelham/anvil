@@ -72,7 +72,7 @@ struct Installer<'a> {
 /// `anvil install [targets]`: builds the targets to install, then copies their files into the prefix (default
 /// `out/install`), each only when it changed.
 pub fn install(start_dir: &Path, build: &BuildArgs, names: &[String], prefix: Option<&Path>) -> Result<()> {
-    let model = commands::load_model(start_dir, build)?;
+    let model = commands::load_model_naming(start_dir, build, names)?;
     let chosen = chosen_targets(&model, names)?;
     let installed = with_needed(&model, &chosen)?;
 
@@ -106,7 +106,7 @@ pub fn install(start_dir: &Path, build: &BuildArgs, names: &[String], prefix: Op
 }
 
 /// The targets asked for, or every program and library of the project that builds by default (or says
-/// `install = true`) and does not say `install = false`.
+/// `install = true`) and does not say `install = false`, less libraries only tests use.
 fn chosen_targets(model: &Model, names: &[String]) -> Result<Vec<usize>> {
     let members = || model.targets.iter().filter(|target| model.packages[target.package].member);
     for target in members().filter(|target| target.install == Some(true)) {
@@ -124,7 +124,7 @@ fn chosen_targets(model: &Model, names: &[String]) -> Result<Vec<usize>> {
     let chosen: Vec<usize> = (0..model.targets.len())
         .filter(|index| {
             let target = &model.targets[*index];
-            let wanted = target.install.unwrap_or(target.default);
+            let wanted = target.install.unwrap_or(target.default && !model.only_for_tests(*index));
             model.packages[target.package].member && installable(target.kind) && wanted
         })
         .collect();

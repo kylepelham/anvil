@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 const OUT_MARKER: &str = ".anvil-out";
 
 pub fn build(start_dir: &Path, build: &BuildArgs, names: &[String], include_tests: bool) -> Result<(Model, Plan)> {
-    let model = load_model(start_dir, build)?;
+    let model = load_model_naming(start_dir, build, names)?;
 
     // What to build
     let roots = if names.is_empty() {
@@ -35,7 +35,8 @@ pub fn build(start_dir: &Path, build: &BuildArgs, names: &[String], include_test
 }
 
 pub fn run(start_dir: &Path, build: &BuildArgs, name: Option<&str>, args: &[String]) -> Result<i32> {
-    let model = load_model(start_dir, build)?;
+    let names: Vec<String> = name.iter().map(|name| name.to_string()).collect();
+    let model = load_model_naming(start_dir, build, &names)?;
     let target = choose_program(&model, name)?;
     check_runs_here(&model, "run")?;
 
@@ -404,7 +405,7 @@ pub fn update(start_dir: &Path, build: &BuildArgs, names: &[String]) -> Result<(
         );
     }
 
-    let model = load_model_with(start_dir, build, refresh, false)?;
+    let model = load_model_with(start_dir, build, refresh, false, &[])?;
     let after = std::fs::read_to_string(&lock_file).ok();
     if after.is_none() {
         ui::status("Updated", "nothing to lock (no git or vcpkg dependencies)");
@@ -428,15 +429,20 @@ pub fn update(start_dir: &Path, build: &BuildArgs, names: &[String]) -> Result<(
 
 /// Loads the model for the command line's profile, toolchain and options.
 pub fn load_model(start_dir: &Path, build: &BuildArgs) -> Result<Model> {
-    load_model_with(start_dir, build, Refresh::Nothing, false)
+    load_model_with(start_dir, build, Refresh::Nothing, false, &[])
+}
+
+/// Loads the model keeping the targets `names` name, though nothing of the project reaches them (`dep/tool`).
+pub fn load_model_naming(start_dir: &Path, build: &BuildArgs, names: &[String]) -> Result<Model> {
+    load_model_with(start_dir, build, Refresh::Nothing, false, names)
 }
 
 /// Loads the model to list what it holds: no vcpkg install, no git fetch, anvil.lock untouched.
 pub fn load_model_for_listing(start_dir: &Path, build: &BuildArgs) -> Result<Model> {
-    load_model_with(start_dir, build, Refresh::Nothing, true)
+    load_model_with(start_dir, build, Refresh::Nothing, true, &[])
 }
 
-fn load_model_with(start_dir: &Path, build: &BuildArgs, refresh: Refresh, list_only: bool) -> Result<Model> {
+fn load_model_with(start_dir: &Path, build: &BuildArgs, refresh: Refresh, list_only: bool, named_targets: &[String]) -> Result<Model> {
     let profile = match (&build.profile, build.release) {
         (Some(profile), _) => profile.clone(),
         (None, true) => "release".to_string(),
@@ -453,6 +459,7 @@ fn load_model_with(start_dir: &Path, build: &BuildArgs, refresh: Refresh, list_o
         refresh,
         host_tools_dir: None,
         list_only,
+        named_targets: named_targets.to_vec(),
     })
 }
 
