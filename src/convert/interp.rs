@@ -8,6 +8,7 @@ use crate::util::{self, slash};
 use anyhow::Result;
 use indexmap::{IndexMap, IndexSet};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -18,6 +19,9 @@ const MAX_DEPTH: usize = 64;
 
 // A while() that loops this often is assumed not to terminate in conversion
 const MAX_WHILE_ITERATIONS: usize = 10_000;
+
+// Most versions one text may have, from values set per condition inside it; past this it reads as this machine's
+const MAX_TEXT_VERSIONS: usize = 32;
 
 // Words that commands read as keywords: a branch that sets a variable to one chooses how a command runs, and keeps
 // no list item
@@ -70,7 +74,6 @@ const HOST_CHOICE_COMMANDS: &[&str] = &[
     "file",
     "get_filename_component",
     "cmake_path",
-    "math",
     "set_tests_properties",
     "add_dependencies",
     "get_target_property",
@@ -292,6 +295,8 @@ pub struct Interpreter {
     pub target_prefixes: HashMap<String, Vec<String>>,
     pub aliases: HashMap<String, String>,
     pub packages: Vec<String>,
+    /// Where each found package was looked for (packages not here everywhere).
+    pub(super) package_conditions: HashMap<String, Truth>,
     pub fetched: IndexMap<String, (String, Option<String>)>,
     pub options: IndexMap<String, (bool, String)>,
     pub(super) overridden_options: HashSet<String>,
@@ -324,6 +329,11 @@ pub struct Interpreter {
     /// What each file(GLOB) found: its pattern and files (absolute), to turn hashed file lists back into globs.
     pub(super) glob_results: Vec<(String, Vec<String>)>,
     pub unknown_genex: Vec<String>,
+    /// Warnings about the running command, given its location once it ran (expanding its arguments may add some).
+    pub(super) command_warnings: RefCell<Vec<String>>,
+    /// Each option's defaults as declared, under the branch of each declaration (None: everywhere), and whether one
+    /// whose branch holds on this machine set its default.
+    pub(super) option_declarations: HashMap<String, (Vec<(Option<String>, bool)>, bool)>,
     pub(super) unknown_commands: IndexSet<String>,
     /// What the built-in commands keep besides variables (builtins.rs).
     pub(super) builtin: super::builtins::BuiltinState,
@@ -370,6 +380,9 @@ impl Interpreter {
             loops: Vec::new(),
             glob_results: Vec::new(),
             unknown_genex: Vec::new(),
+            command_warnings: RefCell::new(Vec::new()),
+            option_declarations: HashMap::new(),
+            package_conditions: HashMap::new(),
             unknown_commands: IndexSet::new(),
             builtin: Default::default(),
         };
@@ -387,8 +400,26 @@ impl Interpreter {
         self.finish_directory(0);
         self.finish_builtins();
         self.decide_target_exists();
+        self.drop_unsatisfiable();
 
         Ok(())
+    }
+
+    /// Leaves out what is set under a condition that cannot hold (`a & !a`, or `!a` on a target made under `a`).
+    fn drop_unsatisfiable(&mut self) {
+        let possible = |condition: &Option<String>, within: &Option<String>| match model::and_optional(within, condition) {
+            Some(both) => model::satisfiable(&both),
+            None => true,
+        };
+
+        for target in self.targets.values_mut() {
+            let own = target.condition.clone();
+            target.language_rules.retain(|rule| possible(&rule.condition, &own));
+            target.retain_items(&mut |condition| possible(condition, &own));
+        }
+        self.tests.retain(|test| possible(&test.condition, &None));
+        self.custom_commands.retain(|command| possible(&command.condition, &None));
+        self.configure_writes.retain(|write| possible(&write.condition, &None));
     }
 
     /// Decides the `$<TARGET_EXISTS:...>` tests in conditions now that every target is known (a target made later in
@@ -411,12 +442,12 @@ impl Interpreter {
         if names.is_empty() {
             return;
         }
-        let existing: HashSet<String> = names.into_iter().filter(|name| self.target_exists(name)).collect();
+        let existing: HashMap<String, Truth> = names.into_iter().map(|name| (name.clone(), self.target_existence(&name))).collect();
 
         // Each condition decided; what can no longer hold goes
         let decide = |condition: &mut Option<String>| -> bool {
             let Some(text) = condition.as_deref() else { return true };
-            match model::decide_target_exists(text, &|name| existing.contains(name)) {
+            match model::decide_target_exists(text, &|name| existing.get(name).cloned().unwrap_or(Truth::Known(false))) {
                 Truth::Known(holds) => {
                     *condition = None;
                     holds
@@ -514,6 +545,14 @@ impl Interpreter {
             .fold(None, |combined, condition| model::and_optional(&combined, &Some(condition.clone())))
     }
 
+    /// Can `truth` hold together with the conditions being run under?
+    fn possible_here(&self, truth: &Truth) -> bool {
+        match (truth, self.current_condition()) {
+            (Truth::Depends(condition), Some(current)) => model::satisfiable(&model::and(&current, condition)),
+            (truth, _) => *truth != Truth::Known(false),
+        }
+    }
+
     /// The condition of something set on a target now: the part not already implied by the target's own.
     pub fn condition_for_target(&self, target: &str) -> Option<String> {
         let prefix = self.target_prefixes.get(target).cloned().unwrap_or_default();
@@ -529,6 +568,10 @@ impl Interpreter {
     }
 
     pub fn warn(&mut self, command: &Command, message: &str) {
+        // Nothing runs where the conditions it is under cannot hold
+        if self.current_condition().is_some_and(|condition| !model::satisfiable(&condition)) {
+            return;
+        }
         let location = self.location(command);
         self.warnings.push(format!("{location}: {message}"));
     }
@@ -549,6 +592,28 @@ impl Interpreter {
                 ArgKind::Bracket => values.push(arg.text.clone()),
                 ArgKind::Quoted => values.push(self.expand_argument(&arg.text)),
                 ArgKind::Unquoted => values.extend(model::split_list(&self.expand_argument(&arg.text))),
+            }
+        }
+
+        values
+    }
+
+    /// A function or macro call's arguments: as evaluate_args, but a value with one item per condition is one
+    /// argument, as it is in each configuration CMake makes.
+    pub(super) fn evaluate_call_args(&mut self, args: &[Arg]) -> Vec<String> {
+        let mut values = Vec::new();
+
+        for arg in args {
+            match arg.kind {
+                ArgKind::Unquoted => {
+                    let value = self.expand_argument(&arg.text);
+                    if per_condition_value(&value).is_some() {
+                        values.push(value);
+                    } else {
+                        values.extend(model::split_list(&value));
+                    }
+                }
+                _ => values.extend(self.evaluate_args(std::slice::from_ref(arg))),
             }
         }
 
@@ -594,6 +659,8 @@ impl Interpreter {
         let characters: Vec<char> = text.chars().collect();
         let mut output = String::new();
         let mut position = 0;
+        // How many versions the text has so far, from values with one item per condition
+        let mut versions = 1;
 
         while position < characters.len() {
             let character = characters[position];
@@ -667,7 +734,18 @@ impl Interpreter {
                         // One value per condition, inside longer text: the text under each (`-D$<c:a>$<!c:b>`)
                         let value = self.resolve_conditional_items(value);
                         match per_condition_value(&value) {
-                            Some(_) if !whole => output.push_str(&model::list_elements(&value).concat()),
+                            Some(alternatives) if !whole && versions * alternatives.len() > MAX_TEXT_VERSIONS => {
+                                let host = self.host_text(&value);
+                                self.command_warnings.borrow_mut().push(format!(
+                                    "`${{{name}}}` has a value per condition, too many to combine with the rest of the text \
+                                     (over {MAX_TEXT_VERSIONS} versions); converted with this machine's: `{host}`"
+                                ));
+                                output.push_str(&host);
+                            }
+                            Some(alternatives) if !whole => {
+                                versions *= alternatives.len();
+                                output.push_str(&model::list_elements(&value).concat());
+                            }
                             _ => output.push_str(&value),
                         }
                         position = end + 1;
@@ -708,6 +786,60 @@ impl Interpreter {
             .into_owned()
     }
 
+    /// Records where a find_package() just run looked for its package, so the targets it provides exist there.
+    fn note_package_condition(&mut self, command: &Command) {
+        let Some(first) = command.args.first() else { return };
+        let name = self.expand_argument(&first.text);
+        if !self.packages.contains(&name) {
+            return;
+        }
+        let here = match self.current_condition() {
+            Some(condition) => Truth::Depends(condition),
+            None => Truth::Known(true),
+        };
+        let existing = self.package_conditions.get(&name).cloned().unwrap_or(Truth::Known(false));
+        let either = match existing.or(here) {
+            Truth::Depends(condition) => model::simplify(&condition, None),
+            known => known,
+        };
+        self.package_conditions.insert(name, either);
+    }
+
+    /// A command-line string's words (COMPILE_FLAGS); in text set per condition, each word under the conditions of
+    /// the versions that have it.
+    pub(super) fn command_words(&self, text: &str) -> Vec<String> {
+        let versions = text_versions(text).unwrap_or_else(|| vec![(Truth::Known(true), self.host_text(text))]);
+        let mut words: Vec<(String, Truth)> = Vec::new();
+        for (condition, version) in versions {
+            for word in util::split_command(&version) {
+                match words.iter_mut().find(|(known, _)| *known == word) {
+                    Some((_, either)) => *either = either.clone().or(condition.clone()),
+                    None => words.push((word, condition.clone())),
+                }
+            }
+        }
+
+        words
+            .into_iter()
+            .filter_map(|(word, condition)| match condition {
+                Truth::Depends(condition) => match model::simplify(&condition, None) {
+                    Truth::Depends(condition) => Some(model::conditional_item(&condition, &word)),
+                    Truth::Known(holds) => holds.then_some(word),
+                },
+                Truth::Known(holds) => holds.then_some(word),
+            })
+            .collect()
+    }
+
+    /// Versions (`text_versions`) with this machine's last, so what running them leaves behind is its.
+    pub(super) fn host_version_last<T>(&self, versions: &mut [(Truth, T)]) {
+        let holds = |truth: &Truth| match truth {
+            Truth::Known(known) => *known,
+            Truth::Depends(condition) => model::holds_on_host(condition, &|name| self.options.get(name).map(|(default, _)| *default)),
+        };
+        versions.sort_by_key(|(condition, _)| holds(condition));
+    }
+
     /// A variable's text in a configured file where its truth depends on a condition: for a value branches set
     /// under conditions, its items under those `choice` takes; otherwise `text` (1 for a check's result).
     pub(super) fn chosen_text(&self, value: Option<&str>, text: &str, choice: &dyn Fn(&str) -> bool) -> String {
@@ -730,7 +862,12 @@ impl Interpreter {
         let mut flow = Flow::Normal;
 
         for node in nodes {
-            match self.run_node(node)? {
+            // A return under a condition that holds everywhere returns
+            let result = match self.run_node(node)? {
+                Flow::Return(Truth::Depends(condition)) => Flow::Return(model::simplify(&condition, None)),
+                other => other,
+            };
+            match result {
                 Flow::Normal => {}
                 Flow::Return(Truth::Known(true)) => {
                     flow = Flow::Return(Truth::Known(true));
@@ -919,6 +1056,43 @@ impl Interpreter {
         }
     }
 
+    /// Where this target exists: a real one or an alias under the condition it was made under, one a found package
+    /// provides where the package was looked for.
+    pub fn target_existence(&self, name: &str) -> Truth {
+        let mut name = name;
+        for _ in 0..MAX_DEPTH {
+            match self.aliases.get(name) {
+                Some(aliased) if aliased != name => name = aliased,
+                _ => break,
+            }
+        }
+        if let Some(target) = self.targets.get(name) {
+            return match &target.condition {
+                Some(condition) => model::simplify(condition, None),
+                None => Truth::Known(true),
+            };
+        }
+        if !self.target_exists(name) {
+            return Truth::Known(false);
+        }
+
+        let Some((namespace, short)) = name.split_once("::") else {
+            return Truth::Known(true);
+        };
+        let normalized = |text: &str| text.to_lowercase().replace(['-', '_'], "");
+        let mut existence = Truth::Known(false);
+        for package in &self.packages {
+            if normalized(package) == normalized(namespace) || normalized(package) == normalized(short) {
+                existence = existence.or(self.package_conditions.get(package).cloned().unwrap_or(Truth::Known(true)));
+            }
+        }
+        match existence {
+            Truth::Depends(condition) => model::simplify(&condition, None),
+            Truth::Known(false) => Truth::Known(true),
+            known => known,
+        }
+    }
+
     /// Does this target exist (a real one, an alias, or one a found package provides)?
     pub fn target_exists(&self, name: &str) -> bool {
         if self.targets.contains_key(name) || self.aliases.contains_key(name) || name == "Threads::Threads" {
@@ -1044,7 +1218,16 @@ impl Interpreter {
 
     fn run_node(&mut self, node: &Node) -> Result<Flow> {
         match node {
-            Node::Command(command) => self.run_command(command),
+            Node::Command(command) => {
+                let flow = self.run_command(command);
+                if command.name == "find_package" {
+                    self.note_package_condition(command);
+                }
+                for message in self.command_warnings.take() {
+                    self.warn(command, &message);
+                }
+                flow
+            }
             Node::If { branches, otherwise } => self.run_if(branches, otherwise.as_ref()),
             Node::Foreach { args, body } => self.run_foreach(args, body),
             Node::While { args, body } => self.run_while(args, body),
@@ -1075,8 +1258,12 @@ impl Interpreter {
         let mut chosen: Vec<(Truth, &Vec<Node>)> = Vec::new();
         for (args, body) in branches {
             let truth = self.evaluate_condition(args);
-            let effective = taken.clone().not().and(truth.clone());
-            if effective != Truth::Known(false) {
+            // Its own condition and no earlier one's, worked out once for the whole chain
+            let effective = match taken.clone().not().and(truth.clone()) {
+                Truth::Depends(condition) => model::simplify(&condition, None),
+                known => known,
+            };
+            if effective != Truth::Known(false) && self.possible_here(&effective) {
                 chosen.push((effective, body));
             }
 
@@ -1085,13 +1272,19 @@ impl Interpreter {
                 break;
             }
         }
-        // Where no branch runs (no else())
+        // Where no branch runs: the else() branch, if any
+        let rest = match taken.clone().not() {
+            Truth::Depends(condition) => model::simplify(&condition, None),
+            known => known,
+        };
         let uncovered = match otherwise {
             Some(_) => Truth::Known(false),
-            None => taken.clone().not(),
+            None => rest.clone(),
         };
         if let (Some(body), false) = (otherwise, taken == Truth::Known(true)) {
-            chosen.push((taken.not(), body));
+            if self.possible_here(&rest) {
+                chosen.push((rest, body));
+            }
         }
 
         // Only this machine's branch keeps the variables it sets: the others run from the state before the if() (their
@@ -1262,9 +1455,10 @@ impl Interpreter {
 
         let mut merged: Vec<(VariableKey, String)> = Vec::new();
         for (key, before) in variables {
-            // CMake's own variables (flags, module paths) are read at configure time
+            // CMake's own variables (flags, module paths) are read at configure time; an option's cache entry is the
+            // option, whichever branch declared it
             let (VariableKey::Scope(_, name) | VariableKey::Cache(name)) = key;
-            if name.starts_with("CMAKE_") {
+            if name.starts_with("CMAKE_") || (matches!(key, VariableKey::Cache(_)) && self.options.contains_key(name)) {
                 continue;
             }
 
@@ -1515,10 +1709,21 @@ impl Interpreter {
                     }
                 }
             }
-            "TARGET" => Truth::Known(self.target_exists(&operand)),
-            "EXISTS" => Truth::Known(!operand.contains("{out}") && !operand.is_empty() && Path::new(&operand).exists()),
-            "IS_DIRECTORY" => Truth::Known(!operand.is_empty() && Path::new(&operand).is_dir()),
-            "IS_ABSOLUTE" => Truth::Known(Path::new(&operand).is_absolute()),
+            "TARGET" => self.target_existence(&operand),
+            // A path holding values set per condition: tested under each
+            "EXISTS" | "IS_DIRECTORY" | "IS_ABSOLUTE" => {
+                let test = |path: &str| match operator {
+                    "EXISTS" => !path.contains("{out}") && !path.is_empty() && Path::new(path).exists(),
+                    "IS_DIRECTORY" => !path.is_empty() && Path::new(path).is_dir(),
+                    _ => Path::new(path).is_absolute(),
+                };
+                match text_versions(&operand) {
+                    Some(versions) => versions.into_iter().fold(Truth::Known(false), |result, (condition, path)| {
+                        result.or(condition.and(Truth::Known(test(&path))))
+                    }),
+                    None => Truth::Known(test(&self.host_text(&operand))),
+                }
+            }
             "COMMAND" => Truth::Known(self.functions.contains_key(&operand.to_lowercase()) || super::builtins::is_builtin(&operand.to_lowercase())),
             "POLICY" => Truth::Known(true),
             "TEST" => Truth::Known(self.tests.iter().any(|test| test.name == operand)),
@@ -1550,9 +1755,19 @@ impl Interpreter {
             return Truth::Known(false);
         }
 
-        // A variable name: platform symbols, options, or its value
+        // A variable name: platform symbols, options, or its value. An option a branch set (as a normal variable)
+        // under a condition is that value there and the option elsewhere
         if let Some(truth) = self.option_truth(text) {
-            return truth;
+            let normal = self.scopes.iter().rev().find_map(|scope| scope.get(text)).filter(|value| *value != UNSET);
+            let Some(alternatives) = normal.and_then(|value| per_condition_value(value)) else {
+                return truth;
+            };
+            let covered = alternatives
+                .iter()
+                .fold(Truth::Known(false), |result, (condition, _)| result.or(Truth::Depends(condition.clone())));
+            return alternatives.into_iter().fold(covered.not().and(truth), |result, (condition, value)| {
+                result.or(Truth::Depends(condition).and(self.truthiness(&value, false)))
+            });
         }
         match self.get_variable(text) {
             Some(value) if value.starts_with(SYMBOL_PREFIX) => model::symbol_truth(&value[SYMBOL_PREFIX.len()..]),
@@ -1595,26 +1810,19 @@ impl Interpreter {
             }
         }
 
-        // One value per condition: compared under each condition (and as empty where none holds)
+        // Values set per condition, whole or inside longer text: compared under each condition (and as empty where
+        // none holds)
         for (alternatives_on_left, value) in [(true, &left_value), (false, &right_value)] {
-            let Some(mut alternatives) = per_condition_value(value).filter(|_| alternatives_on_left || operator != "IN_LIST") else {
+            if !value.contains("$<$<BOOL:") || (!alternatives_on_left && operator == "IN_LIST") {
                 continue;
-            };
-            let covered = alternatives
-                .iter()
-                .fold(Truth::Known(false), |result, (condition, _)| result.or(Truth::Depends(condition.clone())));
-            if let Truth::Depends(covered) = covered {
-                if let Truth::Depends(uncovered) = model::simplify(&model::negate(&covered), None) {
-                    alternatives.push((uncovered, String::new()));
-                }
             }
-
+            let alternatives = text_versions(value).unwrap_or_else(|| vec![(Truth::Known(true), self.host_text(value))]);
             return alternatives.into_iter().fold(Truth::Known(false), |result, (condition, text)| {
                 let truth = match alternatives_on_left {
                     true => self.compare(&(text, true), operator, right),
                     false => self.compare(left, operator, &(text, true)),
                 };
-                result.or(Truth::Depends(condition).and(truth))
+                result.or(condition.and(truth))
             });
         }
 
@@ -1791,6 +1999,141 @@ fn conditional_value_truth(value: &str) -> Option<Truth> {
     })
 }
 
+/// A command naming targets some of which are conditional items: its arguments for the plain ones (under no
+/// condition), then for each conditional one alone (under its condition). None when it names none.
+pub(super) fn conditional_target_runs(name: &str, args: &[String]) -> Option<Vec<(Option<String>, Vec<String>)>> {
+    // Where the target names are
+    let (start, end) = match name {
+        "set_target_properties" => (0, args.iter().position(|arg| arg == "PROPERTIES")?),
+        "set_property" if args.first().map(String::as_str) == Some("TARGET") => {
+            let end = args
+                .iter()
+                .position(|arg| matches!(arg.as_str(), "APPEND" | "APPEND_STRING" | "PROPERTY"))?;
+            (1, end)
+        }
+        _ if name.starts_with("target_") && !args.is_empty() => (0, 1),
+        _ => return None,
+    };
+    let names = &args[start..end];
+    if !names.iter().any(|name| model::split_conditional_item(name).is_some()) {
+        return None;
+    }
+
+    let with_names = |names: Vec<String>| [&args[..start], &names[..], &args[end..]].concat();
+    let plain: Vec<String> = names
+        .iter()
+        .filter(|name| model::split_conditional_item(name).is_none())
+        .cloned()
+        .collect();
+    let mut runs = Vec::new();
+    if !plain.is_empty() {
+        runs.push((None, with_names(plain)));
+    }
+    for (condition, target) in names.iter().filter_map(|name| model::split_conditional_item(name)) {
+        runs.push((Some(condition), with_names(vec![target.to_string()])));
+    }
+    Some(runs)
+}
+
+/// The versions of a text holding conditional items (items of a list, or inside longer text): each one's condition
+/// and the text there, the conditions excluding each other and covering every case; one version, under no condition,
+/// when it holds none. None when it has more than MAX_TEXT_VERSIONS.
+pub(super) fn text_versions(text: &str) -> Option<Vec<(Truth, String)>> {
+    let versions = texts_versions(&[text])?;
+    Some(versions.into_iter().map(|(condition, mut texts)| (condition, texts.remove(0))).collect())
+}
+
+/// text_versions of several texts together: in each version, each text as it is there.
+pub(super) fn texts_versions(texts: &[&str]) -> Option<Vec<(Truth, Vec<String>)>> {
+    if !texts.iter().any(|text| text.contains("$<$<BOOL:")) {
+        return Some(vec![(Truth::Known(true), texts.iter().map(|text| text.to_string()).collect())]);
+    }
+
+    // The conditions in them, nested ones too
+    let conditions: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    for text in texts {
+        let _ = model::choose_list_items(text, &|condition| {
+            let mut conditions = conditions.borrow_mut();
+            if !conditions.iter().any(|known| known == condition) {
+                conditions.push(condition.to_string());
+            }
+            true
+        });
+    }
+
+    // The cases they make: every way they can hold together
+    let mut cases = vec![Truth::Known(true)];
+    for condition in conditions.into_inner() {
+        let mut split = Vec::new();
+        for case in &cases {
+            for part in [Truth::Depends(condition.clone()), Truth::Depends(model::negate(&condition))] {
+                let both = match case.clone().and(part) {
+                    Truth::Depends(both) => model::simplify(&both, None),
+                    known => known,
+                };
+                if both != Truth::Known(false) {
+                    split.push(both);
+                }
+            }
+        }
+        if split.len() > MAX_TEXT_VERSIONS {
+            return None;
+        }
+        cases = split;
+    }
+
+    // The texts in each, cases with the same texts joined
+    let mut versions: Vec<(Truth, Vec<String>)> = Vec::new();
+    for case in cases {
+        let holds = |condition: &str| match &case {
+            Truth::Depends(case) => model::simplify(condition, Some(case)) == Truth::Known(true),
+            Truth::Known(_) => model::simplify(condition, None) == Truth::Known(true),
+        };
+        let chosen: Vec<String> = texts.iter().map(|text| model::choose_list_items(text, &holds).into_owned()).collect();
+        match versions.iter_mut().find(|(_, texts)| *texts == chosen) {
+            Some((joined, _)) => {
+                *joined = match joined.clone().or(case) {
+                    Truth::Depends(either) => model::simplify(&either, None),
+                    known => known,
+                }
+            }
+            None => versions.push((case, chosen)),
+        }
+    }
+    Some(versions)
+}
+
+/// A value from what it is in each version (`text_versions`' conditions): plain where they agree, else one item per
+/// condition (none where it is empty).
+pub(super) fn versions_value(results: Vec<(Truth, String)>) -> String {
+    let mut joined: Vec<(Truth, String)> = Vec::new();
+    for (condition, text) in results {
+        match joined.iter_mut().find(|(_, other)| *other == text) {
+            Some((either, _)) => {
+                *either = match either.clone().or(condition) {
+                    Truth::Depends(either) => model::simplify(&either, None),
+                    known => known,
+                }
+            }
+            None => joined.push((condition, text)),
+        }
+    }
+
+    if let [(_, text)] = joined.as_slice() {
+        return text.clone();
+    }
+    joined
+        .into_iter()
+        .filter(|(_, text)| !text.is_empty())
+        .filter_map(|(condition, text)| match condition {
+            Truth::Depends(condition) => Some(model::conditional_item(&condition, &text)),
+            Truth::Known(true) => Some(text),
+            Truth::Known(false) => None,
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 /// A value with one item per condition (a variable branches set differently): its conditions and items, when the
 /// conditions exclude each other.
 fn per_condition_value(value: &str) -> Option<Vec<(String, String)>> {
@@ -1920,11 +2263,16 @@ fn merged_value(before: &Option<String>, outcomes: &[(Truth, Option<String>, boo
         return Some(items.join(";"));
     }
 
-    // A single value set differently: one item per value, under the conditions it has
+    // A single value set differently (flags with spaces are one value too): one item per value, under the conditions
+    // it has, when it reads back from one (text with a stray `>` does not)
     let changed = outcomes.iter().filter(|(_, _, changed)| *changed).count();
     let single = |value: &Option<String>| {
         let items = elements(value);
-        items.len() <= 1 && items.iter().all(is_value)
+        items.len() <= 1
+            && items.iter().all(|item| {
+                let encoded = model::conditional_item("x", item);
+                !COMMAND_KEYWORDS.contains(&item.as_str()) && model::split_conditional_item(&encoded).map(|(_, read)| read) == Some(item.as_str())
+            })
     };
     if changed >= 2 && single(before) && outcomes.iter().all(|(_, value, _)| single(value)) {
         let mut values: Vec<(String, Truth)> = Vec::new();
@@ -2510,5 +2858,334 @@ set(b $<$<STREQUAL:${CMAKE_CXX_COMPILER_ID},GNU>:-Wshadow>)
         let b = model::expand_genex(&variable(&interpreter, "b"), &mut unknown, None);
         assert_eq!(b, vec![(Truth::Depends("gcc".into()), "-Wshadow".to_string())]);
         assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn long_elseif_chains_and_deep_branches_stay_fast() {
+        // if(O0) ... elseif(O12) ... else() with the value used twenty times
+        let mut cmake = String::from("project(chain C)\n");
+        for index in 0..13 {
+            cmake += &format!("option(O{index} \"o\" OFF)\n");
+        }
+        for index in 0..13 {
+            cmake += &format!("{}(O{index})\n  set(V v{index})\n", if index == 0 { "if" } else { "elseif" });
+        }
+        cmake += "else()\n  set(V none)\nendif()\nadd_executable(app main.c)\n";
+        for index in 0..20 {
+            cmake += &format!("target_compile_definitions(app PRIVATE \"D{index}=${{V}}_x\")\n");
+        }
+        let started = std::time::Instant::now();
+        let interpreter = run("chain", &cmake);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+
+        // Each value under its own branch's condition, worked out once
+        let defines: Vec<(Option<String>, String)> = interpreter.targets["app"]
+            .defines
+            .iter()
+            .filter(|item| item.value.starts_with("D0="))
+            .map(|item| (item.condition.clone(), item.value.clone()))
+            .collect();
+        assert_eq!(defines.len(), 14, "{defines:?}");
+        assert_eq!(defines[0], (Some("O0".to_string()), "D0=v0_x".to_string()));
+        assert_eq!(defines[2], (Some("!O0 & !O1 & O2".to_string()), "D0=v2_x".to_string()));
+
+        // Nested if/else ten deep, each arm adding to a list
+        let mut cmake = String::from("project(nest C)\nset(V base)\nadd_executable(app main.c)\n");
+        for index in 0..10 {
+            cmake += &format!("option(O{index} \"o\" OFF)\n");
+        }
+        for index in 0..10 {
+            cmake += &format!("if(O{index})\n  list(APPEND V x{index})\n");
+        }
+        for index in (0..10).rev() {
+            cmake += &format!("else()\n  list(APPEND V y{index})\nendif()\n");
+        }
+        cmake += "target_compile_definitions(app PRIVATE \"V=${V}\")\n";
+        let started = std::time::Instant::now();
+        let interpreter = run("nest", &cmake);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        let defines: Vec<(Option<String>, String)> = interpreter.targets["app"]
+            .defines
+            .iter()
+            .map(|item| (item.condition.clone(), item.value.clone()))
+            .collect();
+        assert_eq!(defines.len(), 21, "{defines:?}");
+        assert!(defines.contains(&(Some("O0 & O1 & O2".to_string()), "x2".to_string())), "{defines:?}");
+        assert!(defines.contains(&(Some("O0 & !O1".to_string()), "y1".to_string())), "{defines:?}");
+    }
+
+    #[test]
+    fn text_with_too_many_versions_reads_as_this_machines() {
+        let mut cmake = String::from("project(versions C)\n");
+        let mut text = String::new();
+        for index in 0..8 {
+            cmake += &format!("option(O{index} \"o\" OFF)\n");
+            cmake += &format!("if(O{index})\n  set(V{index} a{index})\nelse()\n  set(V{index} b{index})\nendif()\n");
+            text += &format!("${{V{index}}}");
+        }
+        cmake += &format!("set(ALL \"{text}\")\n");
+        let interpreter = run("text-versions", &cmake);
+
+        let mut unknown = Vec::new();
+        let alternatives = model::expand_genex(&variable(&interpreter, "ALL"), &mut unknown, None);
+        assert_eq!(alternatives.len(), 32, "{alternatives:?}");
+        assert!(alternatives.iter().all(|(_, text)| text.ends_with("b5b6b7")), "{alternatives:?}");
+        assert_eq!(interpreter.warnings.len(), 3, "{:?}", interpreter.warnings);
+    }
+
+    #[test]
+    fn string_operations_and_path_tests_run_per_condition() {
+        let cmake = r#"
+if(WIN32)
+  set(PLAT win)
+else()
+  set(PLAT posix)
+endif()
+string(LENGTH "${PLAT}" PLAT_LEN)
+string(REPLACE "o" "0" PLAT_R "${PLAT}")
+string(SUBSTRING "${PLAT}" 0 1 INITIAL)
+string(TOUPPER "${PLAT}" UP)
+string(APPEND PLAT_SUFFIXED "-${PLAT}")
+set(SAME "${PLAT}")
+string(REGEX REPLACE "[a-z]" "x" MASKED "${SAME}")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/${PLAT}/impl.c")
+  set(IMPL_EXISTS 1)
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/${PLAT}/other.c")
+  set(OTHER_EXISTS 1)
+endif()
+"#;
+        let folder = std::env::temp_dir().join(format!("anvil-interp-strings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        for platform in ["win", "posix"] {
+            std::fs::create_dir_all(folder.join("src").join(platform)).unwrap();
+            std::fs::write(folder.join("src").join(platform).join("impl.c"), "").unwrap();
+        }
+        std::fs::create_dir_all(folder.join("src/posix")).unwrap();
+        std::fs::write(folder.join("src/posix/other.c"), "").unwrap();
+        std::fs::write(folder.join("CMakeLists.txt"), cmake).unwrap();
+        let mut interpreter = Interpreter::new(&folder);
+        interpreter.run_root().unwrap();
+        let _ = std::fs::remove_dir_all(&folder);
+
+        assert_eq!(items(&interpreter, "PLAT_LEN"), ["windows: 3", "!windows: 5"]);
+        assert_eq!(items(&interpreter, "PLAT_R"), ["windows: win", "!windows: p0six"]);
+        assert_eq!(items(&interpreter, "INITIAL"), ["windows: w", "!windows: p"]);
+        assert_eq!(items(&interpreter, "UP"), ["windows: WIN", "!windows: POSIX"]);
+        assert_eq!(items(&interpreter, "PLAT_SUFFIXED"), ["windows: -win", "!windows: -posix"]);
+        assert_eq!(variable(&interpreter, "MASKED").matches("$<$<BOOL:").count(), 2);
+        assert_eq!(variable(&interpreter, "IMPL_EXISTS"), "1");
+        assert_eq!(items(&interpreter, "OTHER_EXISTS"), ["!windows: 1"]);
+        assert!(interpreter.warnings.is_empty(), "{:?}", interpreter.warnings);
+    }
+
+    #[test]
+    fn configured_files_and_math_keep_values_per_condition() {
+        let cmake = r#"
+project(configured C)
+include(CheckTypeSize)
+check_type_size("long" TOP_LONG)
+set(ALIAS_LONG ${TOP_LONG})
+math(EXPR BITS_LONG "${TOP_LONG} * 8")
+if(TOP_LONG EQUAL 8)
+  set(LONG64 1)
+endif()
+if(MSVC)
+  set(KIND cl)
+else()
+  set(KIND gnu)
+endif()
+set(COMBINED "${KIND}-${TOP_LONG}")
+configure_file(cfg.h.in cfg.h)
+"#;
+        let template = "#define ALIAS_LONG @ALIAS_LONG@\n#define BITS_LONG @BITS_LONG@\n#cmakedefine LONG64\n#define COMBINED \"@COMBINED@\"\n";
+        let interpreter = run_files("configured-versions", &[("CMakeLists.txt", cmake), ("cfg.h.in", template)]);
+        let text: String = interpreter.configure_writes.iter().filter_map(|write| write.text.clone()).collect();
+
+        for line in [
+            "#define ALIAS_LONG 4\n",
+            "#define ALIAS_LONG 8\n",
+            "#define BITS_LONG 32\n",
+            "#define BITS_LONG 64\n",
+            "#define LONG64\n",
+            "/* #undef LONG64 */\n",
+            "#define COMBINED \"cl-4\"\n",
+            "#define COMBINED \"gnu-4\"\n",
+            "#define COMBINED \"gnu-8\"\n",
+        ] {
+            assert!(text.contains(line), "{line} in {text}");
+        }
+        assert!(interpreter.warnings.is_empty(), "{:?}", interpreter.warnings);
+    }
+
+    #[test]
+    fn values_with_spaces_set_per_branch_keep_their_conditions() {
+        let cmake = r#"
+if(MSVC)
+  set(cxx_base_flags "-GS -W4 -WX -wd4251")
+  set(header_text "builds/<system> only")
+elseif(CMAKE_COMPILER_IS_GNUCXX)
+  set(cxx_base_flags "-Wall -Wshadow")
+  set(header_text "unix builds")
+endif()
+set(cxx_exception_flags "${cxx_base_flags} -EHsc")
+"#;
+        let interpreter = run("spaces", cmake);
+
+        assert_eq!(
+            items(&interpreter, "cxx_base_flags"),
+            ["msvc: -GS -W4 -WX -wd4251", "gcc: -Wall -Wshadow"]
+        );
+        let mut unknown = Vec::new();
+        let alternatives = model::expand_genex(&variable(&interpreter, "cxx_exception_flags"), &mut unknown, None);
+        assert!(
+            alternatives.contains(&(Truth::Depends("msvc".into()), "-GS -W4 -WX -wd4251 -EHsc".into())),
+            "{alternatives:?}"
+        );
+        assert!(
+            alternatives.contains(&(Truth::Depends("gcc".into()), "-Wall -Wshadow -EHsc".into())),
+            "{alternatives:?}"
+        );
+
+        // Text that a conditional item cannot hold is this machine's
+        let header_text = if cfg!(windows) { "builds/<system> only" } else { "unix builds" };
+        assert_eq!(variable(&interpreter, "header_text"), header_text);
+    }
+
+    #[test]
+    fn options_declared_with_defaults_per_condition_take_this_machines() {
+        let cmake = r#"
+project(defaults C)
+if(MSVC)
+  option(USE_FAST "fast" ON)
+else()
+  option(USE_FAST "fast" OFF)
+endif()
+option(BIG "big" OFF)
+option(TOP_SHARED "top shared" ON)
+if(BIG)
+  set(SUB_SHARED ${TOP_SHARED} CACHE BOOL "")
+endif()
+option(SUB_SHARED "sub shared" OFF)
+configure_file(cfg.h.in cfg.h)
+if(APPLE)
+  option(FRAMEWORK "framework" ON)
+else()
+  option(FRAMEWORK "framework (not here)" OFF)
+endif()
+if(FRAMEWORK AND NOT APPLE)
+  set(FRAMEWORK OFF)
+endif()
+if(FRAMEWORK)
+  add_library(framework SHARED f.c)
+endif()
+"#;
+        let interpreter = run_files("defaults", &[("CMakeLists.txt", cmake), ("cfg.h.in", "#define SUB \"@SUB_SHARED@\"\n")]);
+
+        assert_eq!(interpreter.options["USE_FAST"].0, cfg!(windows));
+        assert!(!interpreter.options["SUB_SHARED"].0);
+        let warned = |name: &str| {
+            interpreter
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(&format!("option {name} has a default per condition")))
+        };
+        assert!(warned("USE_FAST") && warned("SUB_SHARED"), "{:?}", interpreter.warnings);
+        assert!(!warned("BIG"));
+
+        // The configured file reads the option's value as ON or OFF
+        let texts: Vec<String> = interpreter.configure_writes.iter().filter_map(|write| write.text.clone()).collect();
+        assert!(texts.contains(&"#define SUB \"OFF\"\n".to_string()), "{texts:?}");
+        assert!(texts.contains(&"#define SUB \"ON\"\n".to_string()), "{texts:?}");
+
+        // An option forced off under a condition is off there, and the option elsewhere
+        let framework = model::simplify(interpreter.targets["framework"].condition.as_deref().unwrap(), None);
+        assert_eq!(framework, Truth::Depends("FRAMEWORK & macos".into()));
+    }
+
+    #[test]
+    fn nothing_is_kept_under_a_condition_that_cannot_hold() {
+        let cmake = r#"
+project(unsatisfiable C)
+option(A "a" OFF)
+option(B "b" OFF)
+if(NOT A)
+  set(V x)
+endif()
+if(A)
+  configure_file(t.in t.txt)
+  add_library(lib STATIC lib.c)
+  if(NOT A AND B)
+    target_compile_definitions(lib PRIVATE NEVER)
+  endif()
+endif()
+"#;
+        let interpreter = run_files("unsatisfiable", &[("CMakeLists.txt", cmake), ("t.in", "v=@V@ b=@B@\n")]);
+
+        let writes: Vec<(Option<String>, Option<String>)> = interpreter
+            .configure_writes
+            .iter()
+            .map(|write| (write.condition.clone(), write.text.clone()))
+            .collect();
+        assert_eq!(writes.len(), 2, "{writes:?}");
+        assert!(writes.iter().all(|(condition, text)| {
+            let condition = condition.clone().unwrap_or_default();
+            model::satisfiable(&condition) && text.as_deref().is_some_and(|text| text.starts_with("v= "))
+        }));
+        assert!(interpreter.targets["lib"].defines.is_empty(), "{:?}", interpreter.targets["lib"].defines);
+    }
+
+    #[test]
+    fn values_per_condition_as_arguments_and_target_names() {
+        let cmake = r#"
+project(arguments C)
+option(BUILD_CLI "cli" ON)
+macro(shy_set var default cache type)
+  if(NOT ${cache} STREQUAL "CACHE")
+    message(SEND_ERROR "Macro usage is: shy_set(var default CACHE type)")
+  endif()
+  set(${var} ${default})
+endmacro()
+if(WIN32)
+  set(DEFAULT_VALUE ON)
+else()
+  set(DEFAULT_VALUE OFF)
+endif()
+shy_set(PICKED ${DEFAULT_VALUE} CACHE BOOL)
+add_library(core STATIC core.c)
+if(BUILD_CLI)
+  set(PROGRAMS cli)
+  add_executable(cli main.c)
+endif()
+set_property(TARGET core ${PROGRAMS} APPEND PROPERTY COMPILE_DEFINITIONS THREADS=0)
+function(guarded)
+  if(MSVC)
+    return()
+  elseif(NOT MSVC)
+    return()
+  endif()
+  find_program(NEVER_FOUND never-there-tool)
+endfunction()
+guarded()
+"#;
+        let interpreter = run("arguments", cmake);
+
+        assert!(interpreter.warnings.is_empty(), "{:?}", interpreter.warnings);
+        assert_eq!(items(&interpreter, "PICKED"), ["windows: ON", "!windows: OFF"]);
+        let defines = |target: &str| -> Vec<(Option<String>, String)> {
+            interpreter.targets[target]
+                .defines
+                .iter()
+                .map(|item| (item.condition.clone(), item.value.clone()))
+                .collect()
+        };
+        assert_eq!(defines("core"), [(None, "THREADS=0".to_string())]);
+        assert_eq!(defines("cli").len(), 1, "{:?}", defines("cli"));
+        assert_eq!(defines("cli")[0].1, "THREADS=0");
+
+        // A condition shown in a message reads as a condition, not as a variable
+        let marker = model::option_marker("STATIC_CRT & msvc");
+        assert_eq!(model::readable(&format!("$<BOOL:{marker}>")), "$<BOOL:(STATIC_CRT & msvc)>");
+        assert_eq!(model::readable(&format!("$<BOOL:{}>", model::option_marker("OPT"))), "$<BOOL:${OPT}>");
     }
 }

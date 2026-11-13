@@ -519,6 +519,64 @@ int main(void) {
     }
 }
 
+// 14d. Values a branch sets per compiler or platform stay per condition through string(), math(), copies, configured
+//      files and command-line strings
+
+#[test]
+fn convert_keeps_values_per_condition_through_operations() {
+    require!("msvc", "gcc");
+    let project = Project::empty("convert_values");
+    let cmake = r#"cmake_minimum_required(VERSION 3.20)
+project(values C)
+include(CheckTypeSize)
+check_type_size("long" SIZEOF_LONG)
+set(LONG_COPY ${SIZEOF_LONG})
+math(EXPR LONG_BITS "${SIZEOF_LONG} * 8")
+if(MSVC)
+  set(KIND cl)
+  set(EXTRA_DEFS "-DA_CL -DB_CL")
+else()
+  set(KIND gnu)
+  set(EXTRA_DEFS "-DA_GNU -DB_GNU")
+endif()
+string(LENGTH "${KIND}" KIND_LEN)
+string(TOUPPER "${KIND}" KIND_UP)
+set(COMBINED "${KIND}-${SIZEOF_LONG}")
+configure_file(config.h.in config.h)
+add_executable(app main.c)
+target_include_directories(app PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_compile_definitions(app PRIVATE KIND_LEN=${KIND_LEN} KIND_${KIND_UP})
+set_target_properties(app PROPERTIES COMPILE_FLAGS "${EXTRA_DEFS}")
+"#;
+    let main = r#"#include <stdio.h>
+#include "config.h"
+int main(void) {
+#if defined(KIND_CL) && defined(A_CL) && defined(B_CL)
+    const char *kind = "cl";
+#elif defined(KIND_GNU) && defined(A_GNU) && defined(B_GNU)
+    const char *kind = "gnu";
+#else
+    const char *kind = "?";
+#endif
+    printf("%s %s %d %d %d\n", kind, COMBINED, LONG_COPY == (int)sizeof(long), LONG_BITS == 8 * (int)sizeof(long), KIND_LEN);
+    return 0;
+}
+"#;
+    project.write("CMakeLists.txt", cmake);
+    project.write(
+        "config.h.in",
+        "#define COMBINED \"@COMBINED@\"\n#define LONG_COPY @LONG_COPY@\n#define LONG_BITS @LONG_BITS@\n",
+    );
+    project.write("main.c", main);
+    project.anvil(&["convert"]).success();
+
+    for (toolchain, expected) in [("msvc", "cl cl-4 1 1 2"), ("gcc", "gnu gnu-4 1 1 3")] {
+        let run = project.anvil(&["run", "--toolchain", toolchain]);
+        run.success();
+        assert_eq!(program_output(&run), expected, "{toolchain}");
+    }
+}
+
 // 15. A git dependency is pinned in anvil.lock; under --locked a changed tag is an error
 
 fn git(folder: &Path, args: &[&str]) -> String {
