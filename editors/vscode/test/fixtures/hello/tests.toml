@@ -1,0 +1,3 @@
+[[test]]
+name = "from_tests_file"
+command = ["{target:game}", "x"]

@@ -1,0 +1,14 @@
+[project]
+name = "real"
+version = "0.1.0"
+
+[target.app]
+kind = "exe"
+
+[[test]]
+name = "app_runs"
+command = ["{target:app}", "ok"]
+
+[[test]]
+name = "app_fails"
+command = ["{target:app}", "fail"]

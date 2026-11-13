@@ -1,0 +1,21 @@
+{
+  "profiles": ["debug", "release", "shipping"],
+  "toolchain": "msvc",
+  "default_run": "game",
+  "targets": [
+    { "name": "game", "package": "hello", "qualified": "game", "kind": "exe", "default": true, "runnable": true,
+      "output": "{out}/game{exe}", "workdir": "{root}", "args": ["--level", "1"], "env": { "GAME_DATA": "{root}/data" },
+      "dir": "{root}", "gui": false },
+    { "name": "tool", "package": "hello", "qualified": "tool", "kind": "exe", "default": true, "runnable": true,
+      "output": "{out}/tool{exe}", "workdir": "{root}/tool", "args": [], "env": {}, "dir": "{root}/tool", "gui": false },
+    { "name": "core", "package": "hello", "qualified": "core", "kind": "lib", "default": true, "runnable": false,
+      "output": "{out}/core.lib", "workdir": "{root}", "args": [], "env": {}, "dir": "{root}", "gui": false },
+    { "name": "plugin", "package": "dep", "qualified": "dep/plugin", "kind": "exe", "default": false, "runnable": true,
+      "output": "{out}/plugin{exe}", "workdir": "{root}", "args": [], "env": {}, "dir": "{root}/dep", "gui": true }
+  ],
+  "tests": [
+    { "name": "smoke", "program": "game", "command": ["{out}/game{exe}", "--smoke"], "workdir": "{root}" },
+    { "name": "fails_on_purpose", "program": "game", "command": ["{out}/game{exe}", "fail"], "workdir": "{root}" },
+    { "name": "dep/lint", "program": null, "command": ["python", "lint.py"], "workdir": "{root}/dep" }
+  ]
+}

@@ -1,0 +1,21 @@
+[project]
+name = "hello"
+version = "0.1.0"
+
+[target.game]
+kind = "exe"
+
+[target.tool]
+kind = "exe"
+dir = "tool"
+
+[target.core]
+kind = "lib"
+
+[[test]]
+name = "smoke"
+command = ["{target:game}", "--smoke"]
+
+[[test]]
+name = "fails_on_purpose"
+command = ["{target:game}", "fail"]

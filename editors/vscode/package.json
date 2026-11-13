@@ -1,0 +1,302 @@
+{
+  "name": "anvil",
+  "displayName": "Anvil",
+  "description": "Build, run, debug and test C and C++ projects with Anvil: open a folder with anvil.toml and press F5.",
+  "version": "0.1.0",
+  "publisher": "anvil",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Debuggers",
+    "Testing",
+    "Other"
+  ],
+  "keywords": [
+    "c++",
+    "c",
+    "build",
+    "anvil",
+    "toml"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "workspaceContains:**/anvil.toml",
+    "onDebugDynamicConfigurations:anvil",
+    "onDebugResolve:anvil"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Anvil",
+      "properties": {
+        "anvil.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Path of the `anvil` program. Empty: `anvil` on `PATH`, else `~/.cargo/bin`. `~` and `${workspaceFolder}` are expanded."
+        },
+        "anvil.configureIntelliSense": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Point clangd (`clangd.arguments`) and the C/C++ extension (`C_Cpp.default.compileCommands`) at Anvil's `compile_commands.json`, in the workspace settings, when they are not set already."
+        },
+        "anvil.debug.console": {
+          "type": "string",
+          "enum": [
+            "integratedTerminal",
+            "internalConsole",
+            "externalTerminal"
+          ],
+          "default": "integratedTerminal",
+          "markdownDescription": "Where a debugged program's console goes (`console` of `cppvsdbg`; `cppdbg` uses the Debug Console unless `externalTerminal`)."
+        }
+      }
+    },
+    "commands": [
+      { "command": "anvil.build", "title": "Build", "category": "Anvil", "icon": "$(tools)" },
+      { "command": "anvil.buildTarget", "title": "Build Selected Target", "category": "Anvil" },
+      { "command": "anvil.run", "title": "Run", "category": "Anvil", "icon": "$(play)" },
+      { "command": "anvil.test", "title": "Test", "category": "Anvil", "icon": "$(beaker)" },
+      { "command": "anvil.clean", "title": "Clean", "category": "Anvil" },
+      { "command": "anvil.debugTarget", "title": "Debug Target", "category": "Anvil", "icon": "$(debug-alt)" },
+      { "command": "anvil.selectProfile", "title": "Select Profile", "category": "Anvil" },
+      { "command": "anvil.selectTarget", "title": "Select Target", "category": "Anvil" },
+      { "command": "anvil.selectToolchain", "title": "Select Toolchain", "category": "Anvil" },
+      { "command": "anvil.refresh", "title": "Refresh", "category": "Anvil", "icon": "$(refresh)" },
+      { "command": "anvil.openManifest", "title": "Open anvil.toml", "category": "Anvil" },
+      { "command": "anvil.convert", "title": "Convert CMake Project", "category": "Anvil" }
+    ],
+    "menus": {
+      "commandPalette": [
+        { "command": "anvil.build", "when": "anvil.active" },
+        { "command": "anvil.buildTarget", "when": "anvil.active" },
+        { "command": "anvil.run", "when": "anvil.active" },
+        { "command": "anvil.test", "when": "anvil.active" },
+        { "command": "anvil.clean", "when": "anvil.active" },
+        { "command": "anvil.debugTarget", "when": "anvil.active" },
+        { "command": "anvil.selectProfile", "when": "anvil.active" },
+        { "command": "anvil.selectTarget", "when": "anvil.active" },
+        { "command": "anvil.selectToolchain", "when": "anvil.active" },
+        { "command": "anvil.openManifest", "when": "anvil.active" }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "anvil.debugTarget",
+        "key": "f5",
+        "when": "anvil.active && !inDebugMode && !debugConfigurationType"
+      },
+      {
+        "command": "anvil.run",
+        "key": "ctrl+f5",
+        "mac": "cmd+f5",
+        "when": "anvil.active && !inDebugMode && !debugConfigurationType"
+      }
+    ],
+    "taskDefinitions": [
+      {
+        "type": "anvil",
+        "required": [
+          "command"
+        ],
+        "properties": {
+          "command": {
+            "type": "string",
+            "enum": [
+              "build",
+              "run",
+              "test",
+              "clean"
+            ],
+            "description": "The anvil command."
+          },
+          "target": {
+            "type": "string",
+            "description": "Target to build or run (build: all but tests when empty; run: the selected target when empty). For test: a filter (tests whose name contains it)."
+          },
+          "profile": {
+            "type": "string",
+            "description": "Profile (debug, release or a [profile.X]); default: the one selected in the status bar."
+          },
+          "toolchain": {
+            "type": "string",
+            "description": "msvc, clang-cl, clang or gcc; default: the one selected in the status bar, else the project's."
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "More arguments for anvil (for run and test, put program arguments after \"--\")."
+          }
+        }
+      }
+    ],
+    "problemPatterns": [
+      {
+        "name": "anvil-msvc",
+        "regexp": "^\\s*(?:\\d+>)?(\\S.*?)\\((\\d+|\\d+,\\d+|\\d+,\\d+,\\d+,\\d+)\\)\\s*:\\s+((?:fatal +)?error|warning|info)(?:\\s+(\\w+\\d+))?\\s*:\\s*(.*)$",
+        "kind": "location",
+        "file": 1,
+        "location": 2,
+        "severity": 3,
+        "code": 4,
+        "message": 5
+      },
+      {
+        "name": "anvil-gcc",
+        "regexp": "^(.*?):(\\d+):(\\d*):?\\s+(?:fatal\\s+)?(warning|error):\\s+(.*)$",
+        "kind": "location",
+        "file": 1,
+        "line": 2,
+        "column": 3,
+        "severity": 4,
+        "message": 5
+      }
+    ],
+    "problemMatchers": [
+      {
+        "name": "anvil-msvc",
+        "label": "Anvil: cl and clang-cl diagnostics",
+        "owner": "anvil",
+        "source": "anvil",
+        "pattern": "$anvil-msvc",
+        "fileLocation": [
+          "autoDetect",
+          "${workspaceFolder}"
+        ]
+      },
+      {
+        "name": "anvil-gcc",
+        "label": "Anvil: gcc and clang diagnostics",
+        "owner": "anvil",
+        "source": "anvil",
+        "pattern": "$anvil-gcc",
+        "fileLocation": [
+          "autoDetect",
+          "${workspaceFolder}"
+        ]
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "anvil",
+        "label": "Anvil",
+        "languages": [
+          "c",
+          "cpp"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "target": {
+                "type": "string",
+                "description": "The program target to build and debug (default: the one selected in the status bar)."
+              },
+              "test": {
+                "type": "string",
+                "description": "Debug this test's program, with the test's arguments and folder, instead of a target."
+              },
+              "profile": {
+                "type": "string",
+                "description": "Profile to build (default: the one selected in the status bar)."
+              },
+              "toolchain": {
+                "type": "string",
+                "description": "Toolchain to build with (default: the one selected in the status bar, else the project's)."
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Program arguments, in place of those `anvil run` would pass."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Folder the program starts in, in place of the one `anvil run` uses."
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Environment variables added to those `anvil run` sets."
+              },
+              "build": {
+                "type": "boolean",
+                "default": true,
+                "description": "Build the target before starting."
+              },
+              "stopAtEntry": {
+                "type": "boolean",
+                "default": false
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "anvil",
+            "request": "launch",
+            "name": "Anvil: debug selected target"
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Anvil: debug a target",
+            "description": "Build an Anvil target and debug it like `anvil run` runs it.",
+            "body": {
+              "type": "anvil",
+              "request": "launch",
+              "name": "Anvil: ${1:target}",
+              "target": "${1:target}"
+            }
+          },
+          {
+            "label": "Anvil: debug a test",
+            "description": "Build a test's program and debug it with the test's arguments.",
+            "body": {
+              "type": "anvil",
+              "request": "launch",
+              "name": "Anvil test: ${1:name}",
+              "test": "${1:name}"
+            }
+          }
+        ]
+      }
+    ],
+    "tomlValidation": [
+      {
+        "fileMatch": "anvil.toml",
+        "url": "https://anvil.invalid/schema/anvil.schema.json"
+      },
+      {
+        "fileMatch": "tests.toml",
+        "url": "https://anvil.invalid/schema/tests.schema.json"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p . --noEmit && node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "compile-tests": "tsc -p test",
+    "pretest": "npm run compile && npm run compile-tests",
+    "test": "node out/test/runTest.js",
+    "package": "vsce package --no-dependencies --allow-missing-repository --skip-license"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.17.0",
+    "@types/vscode": "~1.95.0",
+    "@vscode/test-electron": "^2.4.1",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.24.0",
+    "mocha": "^10.8.2",
+    "typescript": "^5.6.3"
+  }
+}
