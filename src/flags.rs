@@ -12,6 +12,10 @@ const WINDOWS_DEFAULT_LIBS: &[&str] = &[
     "kernel32", "user32", "gdi32", "winspool", "shell32", "ole32", "oleaut32", "uuid", "comdlg32", "advapi32",
 ];
 
+// The folders the dynamic loader searches by itself (Linux's, with their multiarch subfolders, and macOS's): a shared
+// library in them needs no rpath
+const SYSTEM_LIBRARY_FOLDERS: &[&str] = &["/lib", "/lib64", "/usr/lib", "/usr/lib64", "/System/Library"];
+
 // clang records the time stamps of the headers a precompiled header was made from and refuses it once one is touched;
 // Anvil rebuilds it when their content changes, so the stamps are left out
 const NO_PCH_TIMESTAMP: &[&str] = &["-Xclang", "-fno-pch-timestamp"];
@@ -830,6 +834,14 @@ impl Toolchain {
             args.push("-Wl,-rpath,@loader_path/../lib".into());
         }
 
+        // Shared libraries linked from folders of their own (pkg-config's, prebuilt ones, a dynamic vcpkg triplet's)
+        // are found where they are, as in CMake's build tree
+        if linux || macos {
+            for folder in shared_library_folders(spec) {
+                args.push(format!("-Wl,-rpath,{}", path_text(&folder)));
+            }
+        }
+
         // The target's and profile's options go before the inputs, as CMake puts them (-Wl,--as-needed); the libraries
         // among them after the objects, since GNU ld only resolves a library against what came before it
         let (flag_options, flag_libraries) = split_link_flags(spec.flags);
@@ -1088,6 +1100,60 @@ fn msvc_subsystem(gui: Gui) -> &'static [&'static str] {
     }
 }
 
+/// The folders of the shared libraries a link names (in `libs` or among its flags), by path or by name in one of its
+/// library folders, other than the output's folder and the system's; each once.
+fn shared_library_folders(spec: &LinkSpec) -> Vec<PathBuf> {
+    let is_shared = |name: &str| name.ends_with(".so") || name.contains(".so.") || name.ends_with(".dylib");
+    let output_folder = spec.output.parent().map(crate::util::normalize);
+    let mut folders: Vec<PathBuf> = Vec::new();
+    let mut add = |folder: &Path| {
+        let folder = crate::util::normalize(folder);
+        let system = SYSTEM_LIBRARY_FOLDERS.iter().any(|system| folder.starts_with(system));
+        if !system && Some(&folder) != output_folder.as_ref() && !folders.contains(&folder) {
+            folders.push(folder);
+        }
+    };
+
+    // The library folders: the link's, and -L ones among its flags
+    let mut library_folders: Vec<PathBuf> = spec.lib_dirs.to_vec();
+    library_folders.extend(
+        spec.flags
+            .iter()
+            .filter_map(|flag| flag.strip_prefix("-L"))
+            .filter(|folder| !folder.is_empty())
+            .map(PathBuf::from),
+    );
+
+    let mut previous: Option<&String> = None;
+    for word in spec.libs.iter().chain(spec.flags) {
+        // A flag's value ("-framework", "Cocoa"), or another flag
+        let is_value = previous.is_some_and(|flag| takes_value(flag));
+        previous = Some(word);
+        let name = match word.strip_prefix("-l") {
+            Some(name) => name,
+            None if is_value || word.starts_with('-') => continue,
+            None => word.as_str(),
+        };
+
+        // A file, or a name found in one of the library folders
+        let path = Path::new(name);
+        if path.is_absolute() && is_shared(name) {
+            add(path.parent().unwrap_or(path));
+        } else if !name.contains(['/', '\\', '.']) {
+            let holds = |folder: &&PathBuf| {
+                ["so", "dylib"]
+                    .iter()
+                    .any(|extension| folder.join(format!("lib{name}.{extension}")).is_file())
+            };
+            if let Some(folder) = library_folders.iter().find(holds) {
+                add(folder);
+            }
+        }
+    }
+
+    folders
+}
+
 /// "pthread" -> "-lpthread"; "Cocoa.framework" -> "-framework Cocoa" (a path to one also gets its folder searched);
 /// paths and flags pass through.
 fn gnu_lib_arguments(lib: &str) -> Vec<String> {
@@ -1215,6 +1281,58 @@ mod tests {
         let args = link_libs(&macos, false, Gui::Off, false, &libs);
         assert!(args.windows(2).any(|pair| pair == ["-framework", "Cocoa"]));
         assert!(args.windows(2).any(|pair| pair == ["-framework", "Metal"]));
+    }
+
+    #[test]
+    fn shared_libraries_from_other_folders_are_found_where_they_are() {
+        // A prebuilt library by path, a name in a library folder, the program's own folder, the system's, one in the
+        // link flags (as pkg-config gives it)
+        let root = std::env::temp_dir().join(format!("anvil_rpath_{}", std::process::id()));
+        let named = root.join("named").join("lib");
+        std::fs::create_dir_all(&named).unwrap();
+        std::fs::write(named.join("libbar.so"), "").unwrap();
+        let output = root.join("out/app");
+        let libs = [
+            path_text(&root.join("sdk/lib/../lib/libfoo.so.1")),
+            "bar".to_string(),
+            path_text(&root.join("out/libown.so")),
+            "/usr/lib/x86_64-linux-gnu/libz.so".to_string(),
+            "-framework".to_string(),
+            "Cocoa".to_string(),
+        ];
+        let flags = ["-Wl,--as-needed".to_string(), path_text(&root.join("flagged").join("libbaz.so"))];
+        let profile = Profile::resolve("debug", &Default::default()).unwrap();
+        let spec = LinkSpec {
+            profile: &profile,
+            shared: false,
+            gui: Gui::Off,
+            exports: false,
+            uses_program_exports: false,
+            objects: &[PathBuf::from("main.o")],
+            libs: &libs,
+            whole: &[],
+            lib_dirs: &[root.join("empty"), named.clone()],
+            flags: &flags,
+            output: &output,
+            import_lib: None,
+        };
+
+        let linux = Toolchain::for_tests(Family::Gcc, platform(Cpu::X64, Os::Linux), false);
+        let args = linux.link_args(&spec);
+        let rpaths: Vec<&String> = args.iter().filter(|arg| arg.starts_with("-Wl,-rpath,")).collect();
+        let expected = [
+            "-Wl,-rpath,$ORIGIN".to_string(),
+            "-Wl,-rpath,$ORIGIN/../lib".to_string(),
+            format!("-Wl,-rpath,{}", path_text(&root.join("sdk").join("lib"))),
+            format!("-Wl,-rpath,{}", path_text(&named)),
+            format!("-Wl,-rpath,{}", path_text(&root.join("flagged"))),
+        ];
+        assert_eq!(rpaths, expected.iter().collect::<Vec<_>>());
+
+        // Windows programs find DLLs on PATH or beside them
+        let mingw = Toolchain::for_tests(Family::Gcc, platform(Cpu::X64, Os::Windows), false);
+        assert!(!mingw.link_args(&spec).iter().any(|arg| arg.starts_with("-Wl,-rpath,")));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

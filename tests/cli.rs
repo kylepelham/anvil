@@ -273,6 +273,277 @@ fn shared_library_runs_beside_its_program_gcc() {
     shared_library(Some("gcc"), "shared_gcc");
 }
 
+// 9b. Off Windows: a shared library is found through its soname and the program's RUNPATH ($ORIGIN, $ORIGIN/../lib),
+//     so a copy of the program's folder and a moved install run without LD_LIBRARY_PATH; gcc and clang builds of one
+//     project stay apart; threads get -pthread; AddressSanitizer reports; a shared library installed elsewhere and
+//     found through pkg-config runs without LD_LIBRARY_PATH; `anvil run` names a crash
+
+/// What `readelf -d` says of an ELF file's dynamic section.
+#[cfg(target_os = "linux")]
+fn dynamic_section(file: &Path) -> String {
+    let output = Command::new("readelf").arg("-d").arg(file).output().expect("running readelf (binutils)");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Runs a program without LD_LIBRARY_PATH: what it printed.
+#[cfg(unix)]
+fn run_alone(program: &Path) -> String {
+    let output = Command::new(program)
+        .env_remove("LD_LIBRARY_PATH")
+        .output()
+        .unwrap_or_else(|error| panic!("starting {}: {error}", program.display()));
+    assert!(
+        output.status.success(),
+        "{} failed: {}",
+        program.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn shared_library_by_runpath(toolchain: &str, test: &str) {
+    let project = Project::fixture("shared", test);
+    let run = project.anvil(&["run", "app", "--toolchain", toolchain]);
+    run.success();
+
+    // The library is known by its file name, which the program looks for beside itself and in ../lib
+    let program = project.root.join(run.program());
+    let folder = program.parent().unwrap().to_path_buf();
+    let library = dynamic_section(&folder.join("libmylib.so"));
+    assert!(library.contains("Library soname: [libmylib.so]"), "{library}");
+    let program_section = dynamic_section(&program);
+    assert!(program_section.contains("Shared library: [libmylib.so]"), "{program_section}");
+    assert!(program_section.contains("[$ORIGIN:$ORIGIN/../lib]"), "{program_section}");
+
+    // A copy of the two elsewhere runs
+    let copy = project.path("copy");
+    std::fs::create_dir_all(&copy).unwrap();
+    for name in ["app", "libmylib.so"] {
+        std::fs::copy(folder.join(name), copy.join(name)).unwrap();
+    }
+    assert_eq!(run_alone(&copy.join("app")), "answer 42");
+
+    // So does an install, moved after installing
+    project.anvil(&["install", "--toolchain", toolchain, "--prefix", "out/prefix"]).success();
+    assert!(project.path("out/prefix/lib/libmylib.so").is_file());
+    std::fs::rename(project.path("out/prefix"), project.path("moved")).unwrap();
+    assert_eq!(run_alone(&project.path("moved/bin/app")), "answer 42");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn shared_library_is_found_by_runpath_gcc() {
+    require!("gcc");
+    shared_library_by_runpath("gcc", "runpath_gcc");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn shared_library_is_found_by_runpath_clang() {
+    require!("clang");
+    shared_library_by_runpath("clang", "runpath_clang");
+}
+
+#[test]
+fn gcc_and_clang_builds_of_one_project_stay_apart() {
+    require!("gcc", "clang");
+    let project = Project::fixture("shared", "gcc_and_clang");
+
+    let gcc = project.anvil(&["run", "app", "--toolchain", "gcc"]);
+    gcc.success();
+    assert_eq!(program_output(&gcc), "answer 42");
+    let clang = project.anvil(&["run", "app", "--toolchain", "clang"]);
+    clang.success();
+    assert_eq!(program_output(&clang), "answer 42");
+    assert!(gcc.program().contains("debug-gcc/"), "{}", gcc.program());
+    assert!(clang.program().contains("debug-clang/"), "{}", clang.program());
+
+    // Neither build undoes the other
+    project.anvil(&["build", "--toolchain", "gcc"]).success().up_to_date();
+    project.anvil(&["build", "--toolchain", "clang"]).success().up_to_date();
+}
+
+#[cfg(unix)]
+fn threads_get_pthread(toolchain: &str, test: &str) {
+    let project = Project::empty(test);
+    project.write("anvil.toml", "[project]\nname = \"worker\"\n\n[deps]\nthreads = \"system\"\n");
+    project.write(
+        "src/main.c",
+        "#include <pthread.h>\n#include <stdio.h>\n\
+         static void *work(void *value) { *(int *)value *= 2; return NULL; }\n\
+         int main(void) {\n    int value = 21;\n    pthread_t thread;\n    pthread_create(&thread, NULL, work, &value);\n\
+         \x20   pthread_join(thread, NULL);\n    printf(\"%d\\n\", value);\n    return 0;\n}\n",
+    );
+
+    // Compiled and linked with -pthread
+    let build = project.anvil(&["build", "-v", "--toolchain", toolchain]);
+    build.success();
+    let with_flag = build
+        .output()
+        .lines()
+        .filter(|line| line.split(' ').any(|word| word == "-pthread"))
+        .count();
+    assert_eq!(with_flag, 2, "{}", build.output());
+
+    let run = project.anvil(&["run", "--toolchain", toolchain]);
+    run.success();
+    assert_eq!(program_output(&run), "42");
+}
+
+#[test]
+#[cfg(unix)]
+fn threads_compile_and_link_with_pthread_gcc() {
+    require!("gcc");
+    threads_get_pthread("gcc", "pthread_gcc");
+}
+
+#[test]
+#[cfg(unix)]
+fn threads_compile_and_link_with_pthread_clang() {
+    require!("clang");
+    threads_get_pthread("clang", "pthread_clang");
+}
+
+#[cfg(target_os = "linux")]
+fn address_sanitizer(toolchain: &str, test: &str) {
+    let project = Project::empty(test);
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"asan\"\n\n[profile.asan]\ninherits = \"debug\"\nsanitize = [\"address\", \"undefined\"]\n",
+    );
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\n#include <stdlib.h>\nint main(int argc, char **argv) {\n    int *values = malloc(4 * sizeof(int));\n    int index = argc > 1 ? 4 : 3;\n    values[index] = 1;\n    printf(\"wrote %d\\n\", index);\n    free(values);\n    return 0;\n}\n",
+    );
+
+    let clean = project.anvil(&["run", "-p", "asan", "--toolchain", toolchain]);
+    clean.success();
+    assert_eq!(program_output(&clean), "wrote 3");
+
+    let overflow = project.anvil(&["run", "-p", "asan", "--toolchain", toolchain, "--", "overflow"]);
+    assert_ne!(overflow.code, 0, "{}", overflow.output());
+    overflow
+        .contains("ERROR: AddressSanitizer: heap-buffer-overflow")
+        .contains("main.c:6")
+        .lacks("wrote 4");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn address_sanitizer_reports_heap_overflow_gcc() {
+    require!("gcc");
+    address_sanitizer("gcc", "asan_gcc");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn address_sanitizer_reports_heap_overflow_clang() {
+    require!("clang");
+    address_sanitizer("clang", "asan_clang");
+}
+
+#[test]
+#[cfg(unix)]
+fn pkg_config_dependency_links_an_installed_library() {
+    require!("default");
+    let project = Project::empty("pkg_config_dep");
+    if !Command::new("pkg-config")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipped: pkg-config is not on PATH");
+        return;
+    }
+
+    // A shared library installed with its .pc files
+    project.write(
+        "calc/anvil.toml",
+        "[project]\nname = \"calc\"\nversion = \"1.0.0\"\n\n[target.calc]\nkind = \"shared\"\nexport-header = \"calc/export.h\"\n",
+    );
+    project.write(
+        "calc/include/calc/calc.h",
+        "#pragma once\n#include \"calc/export.h\"\nCALC_EXPORT int triple(int value);\n",
+    );
+    project.write(
+        "calc/src/calc.c",
+        "#include \"calc/calc.h\"\nint triple(int value) { return 3 * value; }\n",
+    );
+    let prefix = project.path("prefix").to_string_lossy().into_owned();
+    project.anvil_in("calc", &["install", "--prefix", &prefix]).success();
+
+    // A program using it through pkg-config
+    project.write(
+        "app/anvil.toml",
+        "[project]\nname = \"app\"\n\n[deps]\ncalc = { pkg-config = \"calc\" }\n",
+    );
+    project.write(
+        "app/src/main.c",
+        "#include <stdio.h>\n#include \"calc/calc.h\"\nint main(void) { printf(\"%d\\n\", triple(14)); return 0; }\n",
+    );
+    let search_path = format!("{prefix}/lib/pkgconfig");
+    let run = project.anvil_with("app", &[("PKG_CONFIG_PATH", &search_path)], &["run"]);
+    run.success();
+    assert_eq!(program_output(&run), "42");
+
+    // The program finds the library where it is installed, by itself
+    assert_eq!(run_alone(&project.root.join("app").join(run.program())), "42");
+}
+
+/// Whether a process is gone (or a zombie nobody reaped).
+#[cfg(target_os = "linux")]
+fn process_ended(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map(|stat| stat.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('Z')))
+        .unwrap_or(true)
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn killing_anvil_ends_the_program_it_runs() {
+    use std::io::BufRead;
+    require!("default");
+    let project = Project::empty("run_killed");
+    project.write("anvil.toml", "[project]\nname = \"sleeper\"\n");
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\n#include <unistd.h>\n\
+         int main(void) { printf(\"%d\\n\", (int)getpid()); fflush(stdout); sleep(60); return 0; }\n",
+    );
+    project.anvil(&["build"]).success();
+
+    // Killed while its program runs, as an IDE's stop button does
+    let mut anvil = Command::new(common::ANVIL)
+        .args(["-C", &project.root.to_string_lossy(), "run"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut first_line = String::new();
+    std::io::BufReader::new(anvil.stdout.take().unwrap()).read_line(&mut first_line).unwrap();
+    let program: u32 = first_line.trim().parse().expect("the program's process id");
+    anvil.kill().unwrap();
+    anvil.wait().unwrap();
+
+    let started = std::time::Instant::now();
+    while !process_ended(program) && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(process_ended(program), "the program outlived anvil");
+}
+
+#[test]
+#[cfg(unix)]
+fn run_names_a_crash_and_exits_as_a_shell_would() {
+    require!("default");
+    let project = Project::empty("run_crash");
+    project.write("anvil.toml", "[project]\nname = \"crash\"\n");
+    project.write("src/main.c", "#include <stdlib.h>\nint main(void) { abort(); }\n");
+
+    project.anvil(&["run"]).code(134).contains("was killed by SIGABRT: abort");
+}
+
 // 10. Test keys: expect, reject, exit-code, will-fail, after, serial pass; failures say why; a timeout kills
 
 #[test]
@@ -1980,7 +2251,7 @@ fn build_steps_that_rewrite_files_settle() {
     project.write("data/source.txt", "two\n");
     let edited = project.anvil(&["build", "--explain"]);
     edited.success();
-    assert_eq!(project.read("out/debug/gen/app/table.h"), "two\n");
+    assert_eq!(project.read("out/debug/generated/app/table.h"), "two\n");
     project.anvil(&["build"]).success().up_to_date();
 }
 
@@ -2034,8 +2305,8 @@ command = ["cmake", "-E", "copy", "{root}/in.txt", "{output}"]
     project.write("a&b dir/in.txt", "in\n");
 
     project.anvil_in("a&b dir", &["build"]).success();
-    assert_eq!(project.read("a&b dir/out/debug/gen/app/a.txt").trim(), "hello");
-    assert_eq!(project.read("a&b dir/out/debug/gen/app/b.txt"), "in\n");
+    assert_eq!(project.read("a&b dir/out/debug/generated/app/a.txt").trim(), "hello");
+    assert_eq!(project.read("a&b dir/out/debug/generated/app/b.txt"), "in\n");
     project.anvil_in("a&b dir", &["build"]).success().up_to_date();
 
     let missing = "\n[[target.app.run]]\noutputs = [\"{gen}/c.txt\", \"{gen}/d.txt\"]\ncommand = [\"cmake\", \"-E\", \"touch\", \"{output}\"]\n";
@@ -2043,7 +2314,7 @@ command = ["cmake", "-E", "copy", "{root}/in.txt", "{output}"]
     project
         .anvil_in("a&b dir", &["build"])
         .code(1)
-        .contains("the step succeeded but did not write out/debug/gen/app/d.txt");
+        .contains("the step succeeded but did not write out/debug/generated/app/d.txt");
 }
 
 // 31. The project model: what tests and the command line name in a dependency stays; `{target:X}` in a member means
@@ -2368,14 +2639,16 @@ fn convert_checks(toolchain: &str, test: &str) {
     let toml = project.read("anvil.toml");
     assert!(toml.contains(r#"when."USE_X11 & unix""#), "{toml}");
 
+    // USE_X11 is declared (and on) for Unix only
     let w4 = if toolchain == "msvc" { 1 } else { 0 };
+    let x11 = if cfg!(unix) { "x11\n" } else { "" };
     let run = project.anvil(&["run", "--toolchain", toolchain]);
     run.success();
-    assert_eq!(program_output(&run), format!("sizes=1 foo= w4={w4}"));
+    assert_eq!(program_output(&run), format!("{x11}sizes=1 foo= w4={w4}"));
 
     let run = project.anvil(&["run", "--toolchain", toolchain, "-o", "USE_FOO"]);
     run.success();
-    assert_eq!(program_output(&run), format!("sizes=1 foo=42 w4={w4}"));
+    assert_eq!(program_output(&run), format!("{x11}sizes=1 foo=42 w4={w4}"));
 }
 
 #[test]
@@ -2552,7 +2825,12 @@ fn folders_where_files_go_are_errors() {
     project.write("inc/x.h", "\n");
     let deps = |key: &str| format!("[project]\nname = \"f\"\n[deps]\nx = {{ include = [\"inc\"], {key} }}\n");
 
-    for entry in ["runtime = [\"src\"]", "runtime = [\"C:/\"]", "runtime = [\"/\"]"] {
+    // C:/ is a drive on Windows only (elsewhere a relative path)
+    let mut entries = vec!["runtime = [\"src\"]", "runtime = [\"/\"]"];
+    if cfg!(windows) {
+        entries.push("runtime = [\"C:/\"]");
+    }
+    for entry in entries {
         project.write("anvil.toml", &deps(entry));
         project
             .anvil(&["build"])
@@ -3683,9 +3961,11 @@ fn cmake_msvc(environment: &[(String, String)], args: &[&str]) -> (bool, String)
     (output.status.success(), text)
 }
 
+#[cfg(windows)]
 const PAIR_CONSUMER: &str = "cmake_minimum_required(VERSION 3.20)\nproject(consumer CXX)\n\
      find_package(pair CONFIG REQUIRED)\nadd_executable(app main.cpp)\ntarget_link_libraries(app PRIVATE pair::core)\n";
 
+#[cfg(windows)]
 const PAIR_CONSUMER_MAIN: &str = "#include <core/core.h>\n#include <cstdio>\nint main() {\n\
      #ifdef CORE_DEBUG\n    std::printf(\"debug %d\\n\", core_value());\n#else\n    std::printf(\"release %d\\n\", core_value());\n#endif\n}\n";
 

@@ -33,6 +33,9 @@ const FORMAT_STYLE_FILES: &[&str] = &[".clang-format", "_clang-format"];
 const TIDY_CONFIG_FILES: &[&str] = &[".clang-tidy"];
 const FORMAT_IGNORE_FILE: &str = ".clang-format-ignore";
 
+// Warnings in every header but the system's, clang-tidy's own default from version 19 (none before)
+const ALL_HEADERS_FILTER: &str = "--header-filter=.*";
+
 /// `anvil fmt [--check] [paths]`: formats the files in place, or with `check` lists those that are not formatted and
 /// returns 1 when there are any.
 pub fn format(start_dir: &Path, check: bool, paths: &[PathBuf]) -> Result<i32> {
@@ -216,6 +219,9 @@ pub fn tidy(start_dir: &Path, build: &BuildArgs, fix: bool, names: &[String]) ->
                 .current_dir(&model.root);
             if fix {
                 command.arg(format!("--export-fixes={}", fixes_dir.join(format!("{index}.yaml")).display()));
+            }
+            if !sets_header_filter(file) {
+                command.arg(ALL_HEADERS_FILTER);
             }
             let output = command.arg(file).output();
 
@@ -452,6 +458,25 @@ fn tidy_arguments(toolchain: &toolchain::Toolchain, database_dir: &Path) -> Vec<
     arguments
 }
 
+/// Does the .clang-tidy that applies to a file set HeaderFilterRegex (itself, or a parent one it inherits)?
+fn sets_header_filter(file: &Path) -> bool {
+    let inherits = regex::Regex::new(r"(?m)^\s*InheritParentConfig:\s*true").unwrap();
+
+    for folder in file.ancestors().skip(1) {
+        let Ok(text) = std::fs::read_to_string(folder.join(".clang-tidy")) else {
+            continue;
+        };
+        if text.contains("HeaderFilterRegex") {
+            return true;
+        }
+        if !inherits.is_match(&text) {
+            return false;
+        }
+    }
+
+    false
+}
+
 /// Applies the fixes the runs exported, each once, with clang-apply-replacements (beside clang-tidy, else as clang is
 /// found).
 fn apply_fixes(clang_tidy: &Path, fixes_dir: &Path) -> Result<()> {
@@ -464,11 +489,14 @@ fn apply_fixes(clang_tidy: &Path, fixes_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // Beside clang-tidy, or beside the program it links to (Debian's /usr/bin/clang-tidy is /usr/lib/llvm-18/bin's)
     let name = format!("clang-apply-replacements{}", std::env::consts::EXE_SUFFIX);
-    let beside = clang_tidy
-        .parent()
-        .map(|folder| folder.join(&name))
-        .filter(|candidate| candidate.is_file());
+    let real_clang_tidy = std::fs::canonicalize(clang_tidy).ok();
+    let beside = [Some(clang_tidy), real_clang_tidy.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|program| program.parent().map(|folder| folder.join(&name)))
+        .find(|candidate| candidate.is_file());
     let program = match beside {
         Some(found) => found,
         None => toolchain::find_llvm_program("clang-apply-replacements")?,

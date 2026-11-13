@@ -1,0 +1,92 @@
+# Builds Anvil and runs its unit and integration tests on Linux (gcc and clang), Windows (MSVC and MinGW gcc) and
+# macOS (Apple clang). ANVIL_IT_TOOLCHAINS makes a missing compiler a failure instead of a skipped test.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (clang default, gcc)
+            os: ubuntu-latest
+            toolchains: gcc,clang
+            default: clang
+          - name: Linux (gcc default, clang)
+            os: ubuntu-latest
+            toolchains: gcc,clang
+            default: gcc
+          - name: Windows (MSVC, gcc)
+            os: windows-latest
+            toolchains: msvc,gcc
+            default: msvc
+          - name: macOS (Apple clang)
+            os: macos-latest
+            toolchains: clang
+            default: clang
+    env:
+      ANVIL_IT_TOOLCHAINS: ${{ matrix.toolchains }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The tools the tests drive: compilers, LLVM's runtimes and lint tools, ninja; vcpkg is the runner's
+      - name: Install tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc g++ clang lld llvm libomp-dev libclang-rt-dev \
+            clang-format clang-tidy ninja-build pkg-config
+          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_ENV"
+
+      - name: Install tools (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install ninja --no-progress
+          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_ENV"
+
+      # Apple clang's OpenMP needs Homebrew's libomp, which it finds through CPATH and LIBRARY_PATH
+      - name: Install tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libomp ninja
+          echo "CPATH=$(brew --prefix libomp)/include" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$(brew --prefix libomp)/lib" >> "$GITHUB_ENV"
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build
+
+      - name: Unit tests
+        run: cargo test --bins
+
+      - name: Default toolchain
+        shell: bash
+        run: |
+          target/debug/anvil toolchains --set-default ${{ matrix.default }}
+          target/debug/anvil toolchains
+
+      - name: Integration tests
+        run: cargo test --test cli

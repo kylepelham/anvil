@@ -233,6 +233,7 @@ impl Interpreter {
             if dir_id != existing.dir_id && !existing.other_dir_ids.contains(&dir_id) {
                 existing.other_dir_ids.push(dir_id);
             }
+            let earlier_condition = existing.condition.clone();
             existing.condition = match (existing.condition.take(), condition) {
                 (Some(first), Some(second)) => match Truth::Depends(first).or(Truth::Depends(second)) {
                     Truth::Depends(either) => Some(either),
@@ -261,7 +262,18 @@ impl Interpreter {
             let only_second = self.conditions[common.len()..]
                 .iter()
                 .fold(None, |combined, condition| model::and_optional(&combined, &Some(condition.clone())));
-            self.merge_kind(name, kind, only_first, only_second);
+
+            // Two earlier definitions in branches sharing no prefix left none to tell them by: their own conditions do
+            let common_condition = common
+                .iter()
+                .fold(None, |combined, condition| model::and_optional(&combined, &Some(condition.clone())));
+            let first_kind_condition = match (&only_first, &earlier_condition) {
+                (None, Some(earlier)) if !common_condition.as_deref().is_some_and(|common| model::equivalent(common, earlier)) => {
+                    earlier_condition.clone()
+                }
+                _ => only_first,
+            };
+            self.merge_kind(name, kind, first_kind_condition, only_second);
 
             self.target_prefixes.insert(name.to_string(), common);
             self.add_sources(name, sources);
@@ -2536,17 +2548,18 @@ fn define_export_symbol(target: &mut Target) {
     });
 }
 
-/// Where a target builds as a shared library: its kind, BUILD_SHARED_LIBS, and kinds set under conditions.
+/// Where a target builds as a shared library: its kind, kinds set under conditions, and BUILD_SHARED_LIBS (written
+/// after them, so it wins where it holds).
 fn shared_truth(target: &Target) -> Truth {
     let mut truth = Truth::Known(target.kind == TargetKind::Shared);
-    if let Some(condition) = &target.shared_condition {
-        truth = truth.or(Truth::Depends(condition.clone()));
-    }
-
     for item in target.settings.iter().filter(|item| item.value.0 == "kind") {
         let here = Truth::Known(item.value.1 == TargetKind::Shared.text());
         let condition = item.condition.clone().map_or(Truth::Known(true), Truth::Depends);
         truth = condition.clone().and(here).or(condition.not().and(truth));
+    }
+
+    if let Some(condition) = &target.shared_condition {
+        truth = truth.or(Truth::Depends(condition.clone()));
     }
 
     truth

@@ -739,6 +739,14 @@ fn detect_gcc(platform: &Platform, named: Option<&NamedCompiler>) -> Result<Tool
         },
     };
 
+    // macOS's g++ is Apple's clang under another name
+    if named.is_none() && reports_clang(&gxx) {
+        bail!(
+            "{} is clang (macOS's g++ is Apple clang): use the clang toolchain, or install GCC (Homebrew's g++-15) and name it in CXX",
+            slash(&gxx)
+        );
+    }
+
     // It builds for its own machine; a 64-bit gcc builds 32-bit programs of its system with -m32, when it can
     let machine = gcc_output(&gxx, "-dumpmachine").with_context(|| format!("running {}", slash(&gxx)))?;
     let builds_for = Platform::parse(&machine).ok();
