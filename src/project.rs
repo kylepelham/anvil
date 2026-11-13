@@ -446,7 +446,7 @@ impl Model {
             out_dir: &self.out_dir,
             out_root: &self.out_root,
             std: project.std.as_deref().unwrap_or("c++20"),
-            c_std: project.c_std.as_deref().unwrap_or("c17"),
+            c_std: project.c_std.as_deref().unwrap_or("gnu17"),
             version: package.version(),
             vcpkg_dir: &self.vcpkg_dir,
             cxx: &self.toolchain.cxx,
@@ -729,7 +729,7 @@ impl Model {
         for (name, public) in dep_names {
             self.note_dev_dep_use(index, &name);
             let resolved = self
-                .resolve_dep(package, &name)
+                .resolve_dep_of(package, &name, Some(index))
                 .with_context(|| format!("in target `{}`", self.qualified_name(index)))?;
             if let Some(dependency) = resolved {
                 if dependency == index {
@@ -744,7 +744,7 @@ impl Model {
         for name in self.targets[index].header_dep_names.clone() {
             self.note_dev_dep_use(index, &name);
             let resolved = self
-                .resolve_dep(package, &name)
+                .resolve_dep_of(package, &name, Some(index))
                 .with_context(|| format!("in target `{}` (header-deps)", self.qualified_name(index)))?;
             if let Some(dependency) = resolved.filter(|dependency| *dependency != index) {
                 header_deps.push(dependency);
@@ -766,7 +766,7 @@ impl Model {
         let mut whole_archive = Vec::new();
         for name in self.targets[index].whole_archive_names.clone() {
             let resolved = self
-                .resolve_dep(package, &name)
+                .resolve_dep_of(package, &name, Some(index))
                 .with_context(|| format!("in target `{}` (whole-archive)", self.qualified_name(index)))?;
             if let Some(dependency) = resolved {
                 if !matches!(
@@ -866,6 +866,12 @@ impl Model {
     /// A dependency name to a target: a local target, a [deps] entry, a workspace member, or "package/target".
     /// None when the [deps] entry's `if` is false.
     fn resolve_dep(&mut self, package: usize, name: &str) -> Result<Option<usize>> {
+        self.resolve_dep_of(package, name, None)
+    }
+
+    /// `resolve_dep` for the lists of target `asking`: its own name there is the [deps] entry of that name when there
+    /// is one (a program `threads` with threads = "system" links the system's), not itself.
+    fn resolve_dep_of(&mut self, package: usize, name: &str, asking: Option<usize>) -> Result<Option<usize>> {
         // package/target: a target of a [deps] entry's package (loading it), else of a loaded package by its name
         if let Some((package_name, target_name)) = name.split_once('/') {
             return match self.find_dep_package(package, package_name)? {
@@ -876,11 +882,13 @@ impl Model {
         }
 
         // A target of the same package
+        let manifest = &self.packages[package].manifest;
+        let declared = manifest.deps.contains_key(name) || manifest.dev_deps.contains_key(name);
         let local = self
             .targets
             .iter()
             .position(|target| target.package == package && target.name == name && target.kind != Kind::External);
-        if let Some(local) = local {
+        if let Some(local) = local.filter(|local| !(declared && asking == Some(*local))) {
             return Ok(Some(local));
         }
 
@@ -1122,6 +1130,7 @@ impl Model {
             target.lib_dirs.push(cuda.lib_dir.clone());
             target.libs.extend(cuda.runtime_libs(&self.toolchain));
             target.libs.push("cuda".to_string());
+            target.cxx_libraries = true;
             if self.toolchain.is_msvc_abi() && !self.profile.static_runtime {
                 target.link_flags.push(self.toolchain.linker_option("/NODEFAULTLIB:LIBCMT"));
             }
@@ -1170,6 +1179,7 @@ impl Model {
             target.libs.extend(usage.libs.iter().map(|lib| slash(lib)));
             target.link_flags.extend(usage.link_flags);
             target.runtime_files.extend(usage.runtime);
+            target.cxx_libraries = usage.cxx_libraries;
             target.cmake_package = Some(found.package);
         }
 
@@ -1699,6 +1709,7 @@ impl Model {
             target.libs.extend(usage.libs.iter().map(|lib| slash(lib)));
             target.link_flags.extend(usage.link_flags);
             target.runtime_files.extend(usage.runtime);
+            target.cxx_libraries = usage.cxx_libraries;
         }
 
         self.vcpkg = Some(instance);

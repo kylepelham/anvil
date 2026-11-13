@@ -71,6 +71,8 @@ pub(crate) struct ImportedFiles {
     pub(crate) location: Option<PathBuf>,
     pub(crate) import_library: Option<PathBuf>,
     pub(crate) dependent_libraries: Vec<String>,
+    /// The languages of a static library's code (IMPORTED_LINK_INTERFACE_LANGUAGES: C, CXX), when the package says.
+    pub(crate) languages: Option<Vec<String>>,
 }
 
 /// Where the `${_IMPORT_PREFIX}` of a package's files is: one folder for all (a vcpkg triplet's), or what each file
@@ -231,6 +233,9 @@ pub struct Usage {
     pub libs: Vec<PathBuf>,
     pub link_flags: Vec<String>,
     pub runtime: Vec<PathBuf>,
+    /// A static library among the libraries may hold C++ code (its package says so, or says nothing), so programs
+    /// linking it link as C++.
+    pub cxx_libraries: bool,
 }
 
 /// How CMake users find and link an installed port: `find_package(<name> [CONFIG])`, then its targets.
@@ -425,6 +430,17 @@ impl InstalledTree {
                 if let Some(wanted) = only_libs {
                     libs.retain(|lib| wanted.iter().any(|wanted_name| lib_matches(lib, wanted_name)));
                 }
+            }
+
+            // Its static libraries are C++ unless its CMake files say they are only C
+            if libs.iter().any(|lib| is_static_library(lib)) {
+                let languages: Vec<&String> = imported
+                    .iter()
+                    .flat_map(|target| &target.files)
+                    .filter_map(|files| files.languages.as_ref())
+                    .flatten()
+                    .collect();
+                usage.cxx_libraries |= languages.is_empty() || languages.iter().any(|language| *language == "CXX");
             }
 
             usage.libs.extend(libs);
@@ -880,6 +896,19 @@ pub(crate) fn module_target(name: &str, build: &BuildContext) -> Option<Imported
             };
             target.compile_options.push(format!("$<$<COMPILE_LANGUAGE:{language}>:SHELL:{flag}>"));
             match library {
+                // Apple clang has no OpenMP runtime: Homebrew's libomp (keg-only, so in no search path) where it is
+                // installed (unverified: no Mac to test on)
+                Some("omp") => match ["/opt/homebrew/opt/libomp", "/usr/local/opt/libomp"]
+                    .iter()
+                    .map(Path::new)
+                    .find(|prefix| prefix.join("include/omp.h").is_file())
+                {
+                    Some(prefix) => {
+                        target.include_values.push(slash(&prefix.join("include")));
+                        target.link_items.push(slash(&prefix.join("lib/libomp.dylib")));
+                    }
+                    None => target.link_items.push("omp".to_string()),
+                },
                 Some(library) => target.link_items.push(library.to_string()),
                 None if !flag.contains(' ') && build.frontend == "GNU" => target.link_options.push(flag.to_string()),
                 None => {}
@@ -994,9 +1023,14 @@ pub(crate) fn read_imported_targets(files: &[PathBuf], prefix: &ImportPrefix, bu
                 if value.contains("${") || value.contains("$<") {
                     continue;
                 }
-                let found = ["IMPORTED_LOCATION", "IMPORTED_IMPLIB", "IMPORTED_LINK_DEPENDENT_LIBRARIES"]
-                    .into_iter()
-                    .find_map(|key| Some((key, configuration_suffix(&property, key)?)));
+                let found = [
+                    "IMPORTED_LOCATION",
+                    "IMPORTED_IMPLIB",
+                    "IMPORTED_LINK_DEPENDENT_LIBRARIES",
+                    "IMPORTED_LINK_INTERFACE_LANGUAGES",
+                ]
+                .into_iter()
+                .find_map(|key| Some((key, configuration_suffix(&property, key)?)));
                 let Some((key, configuration)) = found else { continue };
                 let files = match target.files.iter().position(|files| files.configuration == configuration) {
                     Some(index) => &mut target.files[index],
@@ -1011,6 +1045,9 @@ pub(crate) fn read_imported_targets(files: &[PathBuf], prefix: &ImportPrefix, bu
                 match key {
                     "IMPORTED_LOCATION" => files.location = Some(util::normalize(Path::new(&value))),
                     "IMPORTED_IMPLIB" => files.import_library = Some(util::normalize(Path::new(&value))),
+                    "IMPORTED_LINK_INTERFACE_LANGUAGES" => {
+                        files.languages = Some(value.split(';').filter(|item| !item.is_empty()).map(String::from).collect())
+                    }
                     _ => files.dependent_libraries = value.split(';').filter(|item| !item.is_empty()).map(String::from).collect(),
                 }
             }
@@ -1034,6 +1071,12 @@ fn target_named<'a>(targets: &'a mut Vec<ImportedTarget>, name: &str) -> &'a mut
     };
 
     &mut targets[index]
+}
+
+/// A static library file (libz.a, z.lib), not a shared one or a MinGW import library (libz.dll.a).
+pub(crate) fn is_static_library(file: &Path) -> bool {
+    let name = file.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+    (name.ends_with(".a") && !name.ends_with(".dll.a")) || name.ends_with(".lib")
 }
 
 /// `IMPORTED_LOCATION_RELEASE` for `IMPORTED_LOCATION`: "RELEASE"; the property itself: "".

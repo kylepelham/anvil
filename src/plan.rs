@@ -72,6 +72,8 @@ pub struct Action {
 
     /// Copy actions: the file to copy (no process).
     pub copy_from: Option<PathBuf>,
+    /// Copy actions: link to that file (by its name, in the same folder) instead of copying it.
+    pub symlink: bool,
 
     /// Files the action must create, with the error to show when it does not.
     pub must_create: Vec<(PathBuf, String)>,
@@ -185,6 +187,9 @@ impl Action {
         field(self.workdir.as_deref().unwrap_or(Path::new("")).as_os_str().as_encoded_bytes());
         field(self.copy_from.as_deref().unwrap_or(Path::new("")).as_os_str().as_encoded_bytes());
         field(&[self.raw_args as u8]);
+        if self.symlink {
+            field(b"symlink");
+        }
 
         // Declared inputs as a set: a file a pattern newly matches makes the action stale
         let mut inputs: Vec<&[u8]> = self.inputs.iter().map(|input| input.as_os_str().as_encoded_bytes()).collect();
@@ -214,6 +219,7 @@ impl Action {
             remove_outputs_first: false,
             echo_line: None,
             copy_from: None,
+            symlink: false,
             must_create: Vec::new(),
             stamp: false,
             incremental_state: None,
@@ -450,6 +456,15 @@ fn source_kind(source: &Path, family: crate::toolchain::Family) -> Result<Source
         ),
     };
     Ok(kind)
+}
+
+/// Whether a target compiles C++ (CUDA and Objective-C++ too), whose link needs the C++ runtime.
+fn has_cxx_sources(target: &Target, family: crate::toolchain::Family) -> bool {
+    target.sources.iter().any(|source| match source_kind(source, family) {
+        Ok(SourceKind::Cxx | SourceKind::Cuda) => true,
+        Ok(SourceKind::ObjC) => source.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("mm")),
+        _ => false,
+    })
 }
 
 /// Replaces `{target:NAME}` with each target's artifact path.
@@ -1185,6 +1200,19 @@ impl<'a> Planner<'a> {
         // Module-definition files and manifests listed with the sources
         let (source_args, source_files) = self.source_link_args(target)?;
         flags.extend(source_args);
+        let cxx = self.links_cxx(index);
+
+        // A versioned shared library is written under its full version, which links then name (libfoo.so.1.2.3)
+        let output_name = output.file_name().unwrap().to_string_lossy().into_owned();
+        let library_version = match shared {
+            true => self
+                .toolchain
+                .library_version(&output_name, target.version.as_deref(), target.soversion.as_deref()),
+            false => None,
+        };
+        let written = library_version
+            .as_ref()
+            .map_or(output.clone(), |version| output.with_file_name(&version.file));
 
         let spec = LinkSpec {
             profile: &self.model.profile,
@@ -1197,22 +1225,28 @@ impl<'a> Planner<'a> {
             whole: &link.whole,
             lib_dirs: &link.lib_dirs,
             flags: &flags,
-            output: &output,
+            output: &written,
             import_lib: import_lib.as_deref(),
+            cxx,
+            library_version: library_version.as_ref(),
         };
 
-        let description = format!("Linking {}", output.file_name().unwrap().to_string_lossy());
-        let mut action = Action::new(ActionKind::Link, description, self.toolchain.linker.clone(), self.env.clone());
+        // Binaries without C++ code link through the C compiler, as CMake links by the languages linked
+        let linker = if cxx { &self.toolchain.linker } else { self.toolchain.c_linker() };
+        let description = format!("Linking {}", written.file_name().unwrap().to_string_lossy());
+        let mut action = Action::new(ActionKind::Link, description, linker.to_path_buf(), self.env.clone());
         action.args = self.toolchain.link_args(&spec);
         action.inputs = objects.clone();
         action.inputs.extend(link.files.iter().cloned());
         action.inputs.extend(target.link_depends.iter().cloned());
         action.inputs.extend(referenced_files);
         action.inputs.extend(source_files);
-        action.outputs = vec![output.clone()];
+        action.outputs = vec![written.clone()];
         action.after = own_objects.iter().map(|(_, action)| *action).chain(link.after.iter().copied()).collect();
         action.after.extend(referenced_actions);
         action.response = self.response_style();
+        // A link where it writes (the library was versioned before) is not to be written through
+        action.remove_outputs_first = shared && !self.toolchain.targets_windows();
         if action.args.iter().any(|argument| argument == "/INCREMENTAL") {
             action.incremental_state = Some(output.with_extension("ilk"));
         }
@@ -1229,7 +1263,20 @@ impl<'a> Planner<'a> {
             action.must_create.push((import_lib.clone(), message));
         }
 
-        let action = self.push(action);
+        let mut action = self.push(action);
+
+        // A versioned library's links beside it: its SONAME (libfoo.so.1), which programs load, then the name their
+        // links give (libfoo.so)
+        if let Some(version) = &library_version {
+            for (link, points_to) in [
+                (version.soname.as_str(), version.file.as_str()),
+                (output_name.as_str(), version.soname.as_str()),
+            ] {
+                if link != points_to {
+                    action = self.plan_symlink(&output.with_file_name(link), points_to, action);
+                }
+            }
+        }
         self.link_artifact.insert(index, (import_lib.unwrap_or_else(|| output.clone()), action));
         self.artifacts.insert(index, output.clone());
 
@@ -1253,6 +1300,23 @@ impl<'a> Planner<'a> {
         }
 
         Ok(())
+    }
+
+    /// Whether a binary links C++ code, as CMake's LINKER_LANGUAGE decides: its own sources, those of the static and
+    /// object libraries it links, or a package's static library that may be C++. Shared libraries and programs carry
+    /// their own runtime.
+    fn links_cxx(&self, index: usize) -> bool {
+        let mut order = Vec::new();
+        self.visit_link(index, index, &mut HashSet::new(), &mut order);
+
+        order.iter().any(|dependency| {
+            let target = &self.model.targets[*dependency];
+            match target.kind {
+                Kind::External => target.cxx_libraries,
+                Kind::Static | Kind::Object => has_cxx_sources(target, self.toolchain.family),
+                _ => *dependency == index && has_cxx_sources(target, self.toolchain.family),
+            }
+        })
     }
 
     /// Link arguments for the module-definition files and manifests among a target's sources, and those files (their
@@ -1286,6 +1350,20 @@ impl<'a> Planner<'a> {
         }
 
         Ok((args, files))
+    }
+
+    /// A symbolic link to `points_to`, a file of the same folder, made after action `after`; returns its action.
+    fn plan_symlink(&mut self, link: &Path, points_to: &str, after: usize) -> usize {
+        let file = link.with_file_name(points_to);
+        let description = format!("Symlinking {} -> {points_to}", link.file_name().unwrap().to_string_lossy());
+        let mut action = Action::new(ActionKind::Copy, description, PathBuf::new(), self.env.clone());
+        action.copy_from = Some(file.clone());
+        action.symlink = true;
+        action.inputs = vec![file];
+        action.outputs = vec![link.to_path_buf()];
+        action.after = vec![after];
+
+        self.push(action)
     }
 
     /// Copies a runtime or data file into the output folder once; a data file and another file for one destination

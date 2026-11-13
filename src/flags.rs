@@ -101,6 +101,20 @@ pub struct LinkSpec<'a> {
     pub flags: &'a [String],
     pub output: &'a Path,
     pub import_lib: Option<&'a Path>,
+    /// It links C++ code (its own, or a static library's), so it takes the C++ runtime.
+    pub cxx: bool,
+    /// A shared library's versioned names (`version`, `soversion`).
+    pub library_version: Option<&'a LibraryVersion>,
+}
+
+/// A versioned shared library's names and numbers: libfoo.so.1.2.3 (`file`, what the link writes) known as
+/// libfoo.so.1 (`soname`) on Linux; libfoo.1.2.3.dylib known as libfoo.1.dylib on macOS.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibraryVersion {
+    pub file: String,
+    pub soname: String,
+    pub version: String,
+    pub soversion: String,
 }
 
 impl Warnings {
@@ -338,6 +352,41 @@ impl Toolchain {
             args.extend(self.gnu_link_args(spec));
         }
         args
+    }
+
+    /// A shared library's versioned names (CMake's VERSION and SOVERSION; a missing one is the other), from its file
+    /// name: libfoo.so.1.2.3 known as libfoo.so.1 on Linux, libfoo.1.2.3.dylib as libfoo.1.dylib on macOS. None on
+    /// Windows, where a DLL's name has no version, or without either number.
+    pub fn library_version(&self, file_name: &str, version: Option<&str>, soversion: Option<&str>) -> Option<LibraryVersion> {
+        let (version, soversion) = match (version, soversion) {
+            (Some(version), Some(soversion)) => (version, soversion),
+            (Some(version), None) => (version, version),
+            (None, Some(soversion)) => (soversion, soversion),
+            (None, None) => return None,
+        };
+        let named = |number: &str| match self.platform.os {
+            Os::Linux => Some(format!("{file_name}.{number}")),
+            Os::Macos => file_name.strip_suffix(".dylib").map(|stem| format!("{stem}.{number}.dylib")),
+            Os::Windows => None,
+        };
+
+        Some(LibraryVersion {
+            file: named(version)?,
+            soname: named(soversion)?,
+            version: version.to_string(),
+            soversion: soversion.to_string(),
+        })
+    }
+
+    /// The program linking a binary with no C++ code: the C compiler where the linker is the C++ one (gcc and clang
+    /// outside the MSVC ABI), so it does not depend on the C++ runtime; else the linker.
+    pub fn c_linker(&self) -> &Path {
+        let gnu = matches!(self.family, Family::Gcc | Family::Clang) && !self.is_msvc_abi();
+        if gnu && self.linker == self.cxx {
+            &self.cc
+        } else {
+            &self.linker
+        }
     }
 
     /// Arguments for creating a static library (program: `self.archiver`).
@@ -765,12 +814,18 @@ impl Toolchain {
             }
         }
 
-        // A shared library is known by its file name, not its build path, so its users find it beside them (rpath)
+        // A shared library is known by its file name (its ABI version's, when versioned), not its build path, so its
+        // users find it beside them (rpath)
+        let soname = spec.library_version.map_or(file_name.as_str(), |version| version.soname.as_str());
         if spec.shared && linux {
-            args.push(format!("-Wl,-soname,{file_name}"));
+            args.push(format!("-Wl,-soname,{soname}"));
         }
         if spec.shared && macos {
-            args.push(format!("-Wl,-install_name,@rpath/{file_name}"));
+            args.push(format!("-Wl,-install_name,@rpath/{soname}"));
+        }
+        if let Some(version) = spec.library_version.filter(|_| spec.shared && macos) {
+            args.push(format!("-Wl,-current_version,{}", version.version));
+            args.push(format!("-Wl,-compatibility_version,{}", version.soversion));
         }
 
         // ELF programs export their symbols to modules through the dynamic symbol table; a Mach-O module's calls
@@ -819,8 +874,11 @@ impl Toolchain {
             );
             args.push("-Wl,/INCREMENTAL:NO".into());
         }
-        if profile.static_runtime && !windows_clang {
-            args.push(if self.targets_windows() { "-static" } else { "-static-libstdc++" }.into());
+        // The static C++ runtime (not Apple clang's libc++, which has none to link)
+        if profile.static_runtime && !windows_clang && self.targets_windows() {
+            args.push("-static".into());
+        } else if profile.static_runtime && !windows_clang && spec.cxx && !macos {
+            args.push("-static-libstdc++".into());
         }
 
         // Shared libraries beside the binary are found at run time, and from bin/ in lib/ as `anvil install` lays
@@ -1230,6 +1288,8 @@ mod tests {
             flags: &["-Wl,--as-needed".to_string()],
             output: Path::new("/out/libplugin.so"),
             import_lib: None,
+            cxx: true,
+            library_version: None,
         };
         toolchain.link_args(&spec)
     }
@@ -1315,6 +1375,8 @@ mod tests {
             flags: &flags,
             output: &output,
             import_lib: None,
+            cxx: true,
+            library_version: None,
         };
 
         let linux = Toolchain::for_tests(Family::Gcc, platform(Cpu::X64, Os::Linux), false);
@@ -1387,6 +1449,8 @@ mod tests {
             flags: &["/out/libhelper.a".to_string()],
             output: Path::new("/out/app"),
             import_lib: None,
+            cxx: true,
+            library_version: None,
         };
         let args = linux.link_args(&spec);
         let position = |wanted: &str| args.iter().position(|arg| arg == wanted).unwrap();
