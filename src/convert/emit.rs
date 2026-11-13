@@ -123,11 +123,9 @@ const KNOWN_PORTS: &[(&str, &str)] = &[
     ("httplib::", "cpp-httplib"),
 ];
 
-// Condition words every manifest knows; any other word is an option or a profile
-const KNOWN_ATOMS: &[&str] = &[
-    "windows", "linux", "macos", "unix", "x64", "x86", "arm64", "arm", "msvc", "gnu", "cl", "clang-cl", "clang", "gcc", "mingw", "debug", "release",
-    "true", "false",
-];
+// Profiles every manifest knows; with the platform and compiler words (crate::cond::BUILTIN_WORDS), any other word
+// in a condition is an option or a profile
+const KNOWN_PROFILES: &[&str] = &["debug", "release"];
 
 // The order settings appear in within a table
 const KEY_ORDER: &[&str] = &[
@@ -193,6 +191,9 @@ const FACTORED_KEYS: &[&str] = &[
     "exports",
 ];
 
+// Words a build step's command hands to the shell (redirections, pipes, chaining)
+const SHELL_OPERATORS: &[&str] = &[">", ">>", "<", "|", "&&", "||", "2>", "2>&1", "1>"];
+
 // Folders never searched for sources
 const SKIPPED_FOLDERS: &[&str] = &["out", "build", "target", "node_modules", "_deps", "vcpkg_installed"];
 
@@ -203,6 +204,34 @@ const NEVER: &str = "false";
 const PRESET_NAME: &str = "common";
 const MIN_PRESET_MEMBERS: usize = 3;
 const MIN_PRESET_ENTRIES: usize = 3;
+
+// Presets of targets made alike: the settings they may hold (public ones too: a preset is the targets' own), and
+// how many two targets must share
+const SIBLING_KEYS: &[&str] = &[
+    "defines",
+    "flags",
+    "link-flags",
+    "std",
+    "warnings",
+    "werror",
+    "arch",
+    "include",
+    "system-include",
+    "deps",
+    "header-deps",
+    "needs",
+    "libs",
+    "lib-dirs",
+    "public.include",
+    "public.system-include",
+    "public.defines",
+    "public.flags",
+    "public.link-flags",
+    "public.deps",
+    "public.libs",
+    "interface.defines",
+];
+const MIN_SIBLING_LINES_SAVED: usize = 4;
 
 // A list longer than this goes on several lines
 const INLINE_LIST_WIDTH: usize = 100;
@@ -318,6 +347,8 @@ struct Emitter {
     // Every file under the project, and every target's sources, for turning file lists back into patterns
     all_files: Vec<(String, PathBuf)>,
     source_owners: Vec<(String, String)>,
+    /// Folders where several targets would take the convention's sources: those targets list theirs.
+    crowded_folders: HashSet<String>,
 
     // Dependencies: the project's vcpkg.json, a vcpkg checkout to check port names, and what was found
     manifest_ports: Vec<String>,
@@ -395,6 +426,25 @@ impl Blocks {
         }
     }
 
+    /// Every condition at its shortest given `assumption` (the target's own condition), merging blocks that turn out
+    /// the same and dropping those that never hold.
+    fn simplify_conditions(&mut self, assumption: Option<&str>) {
+        let blocks = std::mem::take(&mut self.blocks);
+        for (condition, block) in blocks {
+            let simplified = condition.and_then(|condition| condition_text(&Some(condition), assumption));
+            for (key, value) in block {
+                match value {
+                    // (an empty list says something too: no sources, no include folders)
+                    Value::List(items) if items.is_empty() && simplified.as_deref() != Some(NEVER) => {
+                        let block = self.blocks.entry(simplified.clone()).or_default();
+                        block.entry(key).or_insert(Value::List(items));
+                    }
+                    value => self.add((simplified.clone(), key, value)),
+                }
+            }
+        }
+    }
+
     /// Drops empty lists and empty blocks; merges a scalar set the same way under `c` and `!c` into one.
     fn tidy(&mut self) {
         // With arch = "avx2" everywhere, the GCC flags it implies are noise
@@ -435,6 +485,8 @@ impl Blocks {
                         let Some(block) = self.blocks.get_mut(&condition) else { continue };
                         if let Some(Value::List(items)) = block.get_mut(key) {
                             items.retain(|item| !both.contains(item));
+
+                            // (emptied here: the items still hold, so it is no `sources = []`)
                             if items.is_empty() && !both.is_empty() {
                                 block.shift_remove(key);
                             }
@@ -481,6 +533,7 @@ impl Emitter {
             cmake_scripts: 0,
             all_files: collect_files(&root),
             source_owners,
+            crowded_folders: HashSet::new(),
             vcpkg: crate::vcpkg::Instance::select(None).ok(),
             cmake,
             root,
@@ -502,6 +555,26 @@ impl Emitter {
 
     fn convert_targets(&mut self) {
         let targets: Vec<Target> = self.cmake.targets.values().cloned().collect();
+
+        // Anvil gives a folder's sources to one target only, so where several would take them all, they list them
+        let mut conventional_per_folder: HashMap<String, usize> = HashMap::new();
+        for target in &targets {
+            let compiles = !matches!(target.kind, TargetKind::Interface | TargetKind::Custom);
+            let files: Vec<PathBuf> = target
+                .sources
+                .iter()
+                .filter(|item| is_compiled(&item.value))
+                .map(|item| item.value.clone())
+                .collect();
+            if compiles && self.matches_convention(&target.dir, &files) {
+                *conventional_per_folder.entry(util::path_key(&target.dir)).or_default() += 1;
+            }
+        }
+        self.crowded_folders = conventional_per_folder
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(folder, _)| folder)
+            .collect();
 
         for target in &targets {
             let converted = self.convert_target(target);
@@ -613,7 +686,6 @@ impl Emitter {
                 .blocks
                 .push(relative_condition(&item.condition), key, self.path_text(path, &dir));
         }
-        self.omit_conventional_includes(&dir, &mut converted.blocks);
 
         // Definitions and flags
         for item in &target.defines {
@@ -724,6 +796,16 @@ impl Emitter {
         if target.gui && converted.blocks.get(&None, "gui").is_none() {
             converted.blocks.set(None, "gui", Value::Bool(true));
         }
+
+        // A windows-subsystem program entered through main() (/ENTRY:mainCRTStartup), not WinMain
+        let options = target.link_options.iter().chain(&target.links);
+        if options.map(|item| item.value.to_lowercase()).any(|option| is_main_entry(&option)) {
+            for block in converted.blocks.blocks.values_mut() {
+                if let Some(gui @ Value::Bool(true)) = block.get_mut("gui") {
+                    *gui = Value::Text("main".into());
+                }
+            }
+        }
         if target.imported {
             converted.notes.push("an IMPORTED target in CMake: check its include and libs".into());
         }
@@ -790,8 +872,26 @@ impl Emitter {
                 .for_each(|block| block.retain(|key, _| matches!(*key, "deps" | "public.deps" | "needs")));
         }
 
+        // A program's settings are its own when nothing links it; then the include folders the convention gives anyway
+        let exports = target.settings.iter().any(|item| item.value.0 == "exports");
+        let is_program = converted.kind == "exe" && !exports && !self.is_linked(&target.name);
+        if is_program {
+            make_private(&mut converted.blocks);
+        }
+        self.omit_conventional_includes(&dir, converted.kind, &mut converted.blocks);
+
+        // Conditions combined above (`(unix & !macos) & unix`) at their shortest
+        converted.blocks.simplify_conditions(converted.condition.as_deref());
         converted.blocks.tidy();
         converted
+    }
+
+    /// Does a target of the project link this one?
+    fn is_linked(&self, name: &str) -> bool {
+        self.cmake
+            .targets
+            .values()
+            .any(|target| target.links.iter().any(|item| self.cmake.resolve_alias(&item.value) == name))
     }
 
     /// The target's standard, raised by the public standards of the project targets it links, as CMake does.
@@ -854,7 +954,8 @@ impl Emitter {
         // convention on the platforms where it does not hold, so they need only their when blocks
         let compiles = !matches!(target.kind, TargetKind::Interface | TargetKind::Custom);
         let every_file: Vec<PathBuf> = always.iter().chain(sometimes.values().flatten()).cloned().collect();
-        let conventional = compiles && self.matches_convention(dir, &every_file);
+        let crowded = self.crowded_folders.contains(&util::path_key(dir));
+        let conventional = compiles && !crowded && self.matches_convention(dir, &every_file);
 
         // Otherwise the files themselves, conditional ones excluded from the patterns and added under their condition
         if !conventional {
@@ -989,25 +1090,47 @@ impl Emitter {
         patterns
     }
 
-    /// Leaves include folders out when they are what Anvil assumes anyway (include/ public, src/ the target's own).
-    fn omit_conventional_includes(&self, dir: &Path, blocks: &mut Blocks) {
-        for (key, folder) in [("public.include", "include"), ("include", "src")] {
-            let conventional = if dir.join(folder).is_dir() {
+    /// Leaves include folders out when they are what Anvil assumes anyway (include/ public, src/ the target's own),
+    /// or when the folder the convention would add is one the target has anyway.
+    fn omit_conventional_includes(&self, dir: &Path, kind: &str, blocks: &mut Blocks) {
+        let conventional = |folder: &str| {
+            if dir.join(folder).is_dir() {
                 vec![folder.to_string()]
             } else {
                 Vec::new()
-            };
-            let given = match blocks.get(&None, key) {
-                Some(Value::List(list)) => list.clone(),
-                _ => Vec::new(),
-            };
-
-            // The convention gives the same: leave it out; it would add a folder CMake does not use: say none
-            if given == conventional {
-                blocks.remove(&None, key);
-            } else if given.is_empty() {
-                blocks.set(None, key, Value::List(Vec::new()));
             }
+        };
+        let given = |blocks: &Blocks, key: &str| match blocks.get(&None, key) {
+            Some(Value::List(list)) => list.clone(),
+            _ => Vec::new(),
+        };
+        if kind == "custom" {
+            return;
+        }
+
+        // Public: what dependents see. A program's include/ (public by convention) may also be one of its own folders
+        let public_convention = conventional("include");
+        let mut public = given(blocks, "public.include");
+        let mut private = given(blocks, "include");
+        let program = kind == "exe" && public.is_empty();
+        if program && !public_convention.is_empty() && public_convention.iter().all(|folder| private.contains(folder)) {
+            private.retain(|folder| !public_convention.contains(folder));
+            public = public_convention.clone();
+            blocks.set(None, "include", Value::List(private.clone()));
+        }
+        if public == public_convention {
+            blocks.remove(&None, "public.include");
+        } else if public.is_empty() {
+            blocks.set(None, "public.include", Value::List(Vec::new()));
+        }
+
+        // Private: the target's own; a headers target compiles nothing, and a folder it sees publicly needs no saying
+        let private_convention = conventional("src");
+        let seen_anyway = private_convention.iter().all(|folder| public.contains(folder));
+        if private == private_convention || (private.is_empty() && (kind == "headers" || seen_anyway)) {
+            blocks.remove(&None, "include");
+        } else if private.is_empty() {
+            blocks.set(None, "include", Value::List(Vec::new()));
         }
     }
 
@@ -1071,13 +1194,11 @@ impl Emitter {
     fn convert_link_flag(&self, flag: &str, condition: Option<String>, blocks: &mut Blocks) {
         let upper = flag.to_uppercase();
 
-        // A GUI program entered through main() (WIN32 with /ENTRY:mainCRTStartup) is gui = "main", else gui = true
+        // A GUI program (an entry through main() makes it gui = "main" once the target is converted)
         if upper == "/SUBSYSTEM:WINDOWS" || flag == "-mwindows" || flag == "-Wl,--subsystem,windows" {
             if blocks.get(&condition, "gui").is_none() {
                 blocks.set(condition, "gui", Value::Bool(true));
             }
-        } else if upper == "/ENTRY:MAINCRTSTARTUP" {
-            blocks.set(condition, "gui", Value::Text("main".into()));
         } else if upper.starts_with("/ENTRY:") || DROPPED_LINK_FLAGS.iter().any(|dropped| dropped.eq_ignore_ascii_case(flag)) {
         } else if let Some(library) = flag.strip_prefix("-l") {
             blocks.push(condition, "libs", library.to_string());
@@ -1430,6 +1551,17 @@ impl Emitter {
                 continue;
             };
 
+            // `cmake -E echo text > file`: a file whose text is known now
+            if let Some(text) = echoed_text(command) {
+                self.cmake.configure_writes.push(super::model::ConfigureWrite {
+                    location: String::new(),
+                    path: command.outputs[0].clone(),
+                    text: Some(text),
+                    condition: condition_text(&command.condition, None),
+                });
+                continue;
+            }
+
             // A step without outputs cannot be a [[run]] step
             if command.outputs.is_empty() {
                 let note = format!("command not converted (a run step needs outputs): {}", command_line(&command.commands));
@@ -1532,8 +1664,9 @@ impl Emitter {
             }
         }
 
-        // Several lines run through the shell, joined with &&
-        if lines.len() == 1 {
+        // Several lines run through the shell, joined with &&, and so does a line using the shell's operators
+        let uses_shell = lines.iter().flatten().any(|word| SHELL_OPERATORS.contains(&word.as_str()));
+        if lines.len() == 1 && !uses_shell {
             run.command = lines.remove(0);
         } else {
             run.shell = true;
@@ -1715,11 +1848,14 @@ impl Emitter {
                 .map(|dir| self.test_workdir(&dir.replace("$<CONFIG>", "{config}")))
                 .filter(|dir| dir != ".");
 
-            // Run after DEPENDS and after the setup of every fixture it requires; the environment as commands see it
+            // Run after DEPENDS and after the setup of every fixture it requires; the environment as commands see it,
+            // a variable set twice taking its last value as in CTest
             let mut properties = test.properties.clone();
             for (_, value) in &mut properties.env {
                 *value = self.command_word(&value.replace("$<CONFIG>", "{config}"));
             }
+            let environment: IndexMap<String, String> = properties.env.drain(..).collect();
+            properties.env = environment.into_iter().collect();
             for pattern in properties.expect.iter_mut().chain(&mut properties.reject) {
                 *pattern = self.command_word(&pattern.replace("$<CONFIG>", "{config}"));
             }
@@ -1851,10 +1987,15 @@ impl Emitter {
             self.defaults.add(entry);
         }
 
-        // The shared standard goes to [project]
+        // The shared standard goes to [project], where targets with that standard need not say it again
         if let Some(Value::Text(standard)) = self.defaults.get(&None, "std").cloned() {
-            self.project_std = Some(standard);
             self.defaults.remove(&None, "std");
+            for target in self.targets.values_mut() {
+                if target.blocks.get(&None, "std") == Some(&Value::Text(standard.clone())) {
+                    target.blocks.remove(&None, "std");
+                }
+            }
+            self.project_std = Some(standard);
         }
 
         self.defaults.tidy();
@@ -1881,6 +2022,91 @@ impl Emitter {
                 self.add_preset(&preset, &members);
             }
         }
+
+        // Shared by targets made alike (a library built shared and static): what is left of them, public settings
+        // and when blocks included
+        self.add_sibling_presets();
+    }
+
+    /// Presets for targets that still repeat enough of each other's settings: each target with the one sharing most
+    /// with it, and every other target having all of that.
+    fn add_sibling_presets(&mut self) {
+        let names: Vec<String> = self
+            .targets
+            .iter()
+            .filter(|(_, target)| target.kind != "custom")
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut taken: HashSet<String> = HashSet::new();
+
+        for (index, name) in names.iter().enumerate() {
+            if taken.contains(name) {
+                continue;
+            }
+
+            // The target sharing most with this one
+            let mut best: Vec<Entry> = Vec::new();
+            for other in names[index + 1..].iter().filter(|other| !taken.contains(*other)) {
+                let shared = self.shared_entries_with_keys(&[name.clone(), other.clone()], SIBLING_KEYS);
+                if shared.len() > best.len() {
+                    best = shared;
+                }
+            }
+            if best.is_empty() {
+                continue;
+            }
+
+            // Every target left having all of that, if a preset of it is shorter than saying it in each
+            let members: Vec<String> = names[index..]
+                .iter()
+                .filter(|member| !taken.contains(*member))
+                .filter(|member| {
+                    best.iter()
+                        .all(|(condition, key, value)| has_value(&self.targets[*member].blocks, condition, key, value))
+                })
+                .cloned()
+                .collect();
+            let entries = self.shared_entries_with_keys(&members, SIBLING_KEYS);
+            let preset_lines = written_lines(&entries) + 2 + members.len();
+            if members.len() * written_lines(&entries) < preset_lines + MIN_SIBLING_LINES_SAVED {
+                continue;
+            }
+
+            let mut blocks = Blocks::default();
+            for entry in self.move_entries(&members, entries) {
+                blocks.add(entry);
+            }
+            blocks.tidy();
+
+            let preset = self.sibling_preset_name(&members);
+            self.presets.insert(preset.clone(), blocks);
+            for member in &members {
+                self.targets[member].presets.push(preset.clone());
+                taken.insert(member.clone());
+            }
+        }
+    }
+
+    /// A preset named after the start its members' names share, in whole words (`pugixml-shared`, `pugixml-static`:
+    /// pugixml), not taken by another preset.
+    fn sibling_preset_name(&self, members: &[String]) -> String {
+        let mut start = members[0].clone();
+        for member in &members[1..] {
+            let length = start.chars().zip(member.chars()).take_while(|(left, right)| left == right).count();
+            start = start.chars().take(length).collect();
+        }
+        if !members.contains(&start) {
+            let word_end = start.rfind(|character: char| !character.is_ascii_alphanumeric()).unwrap_or(0);
+            start.truncate(word_end);
+        }
+        let start = preset_name(start.trim_end_matches(|character: char| !character.is_ascii_alphanumeric()));
+        let base = if start.len() >= 3 { start } else { "alike".to_string() };
+
+        let numbered = (2..).map(|number| format!("{base}-{number}"));
+        std::iter::once(base.clone())
+            .chain(numbered)
+            .find(|name| !self.presets.contains_key(name))
+            .unwrap()
     }
 
     /// A preset of the settings all of `members` share, when there are enough of both.
@@ -1903,10 +2129,15 @@ impl Emitter {
 
     /// The factorable settings of a target, one list item or scalar each.
     fn entries_of(&self, name: &str) -> Vec<Entry> {
+        self.entries_with_keys(name, FACTORED_KEYS)
+    }
+
+    /// The settings of a target under these keys, one list item or scalar each.
+    fn entries_with_keys(&self, name: &str, keys: &[&str]) -> Vec<Entry> {
         let mut entries = Vec::new();
 
         for (condition, block) in &self.targets[name].blocks.blocks {
-            for (key, value) in block.iter().filter(|(key, _)| FACTORED_KEYS.contains(key)) {
+            for (key, value) in block.iter().filter(|(key, _)| keys.contains(key)) {
                 match value {
                     Value::List(items) => entries.extend(items.iter().map(|item| (condition.clone(), *key, Value::List(vec![item.clone()])))),
                     scalar => entries.push((condition.clone(), *key, scalar.clone())),
@@ -1919,9 +2150,14 @@ impl Emitter {
 
     /// The settings all of `names` have.
     fn shared_entries(&self, names: &[String]) -> Vec<Entry> {
+        self.shared_entries_with_keys(names, FACTORED_KEYS)
+    }
+
+    /// The settings under these keys all of `names` have.
+    fn shared_entries_with_keys(&self, names: &[String], keys: &[&str]) -> Vec<Entry> {
         let Some(first) = names.first() else { return Vec::new() };
 
-        self.entries_of(first)
+        self.entries_with_keys(first, keys)
             .into_iter()
             .filter(|(condition, key, value)| names.iter().all(|name| has_value(&self.targets[name].blocks, condition, key, value)))
             .collect()
@@ -1941,23 +2177,34 @@ impl Emitter {
         let mut core: Vec<(Entry, usize)> = counts.into_values().filter(|(_, count)| *count >= threshold).collect();
         core.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
 
-        // Drop the rarest settings until enough targets have all the rest
-        while !core.is_empty() {
-            let members: Vec<String> = compiled
+        // Candidate groups: the targets having each common setting, and those having all of the most common ones
+        // (dropping the rarest one by one)
+        let holders = |entries: &[(Entry, usize)]| -> Vec<String> {
+            compiled
                 .iter()
                 .filter(|name| {
-                    core.iter()
+                    entries
+                        .iter()
                         .all(|((condition, key, value), _)| has_value(&self.targets[*name].blocks, condition, key, value))
                 })
                 .cloned()
-                .collect();
-            if members.len() >= threshold {
-                return members;
-            }
-            core.pop();
+                .collect()
+        };
+        let mut candidates: IndexSet<Vec<String>> = core.iter().map(|entry| holders(std::slice::from_ref(entry))).collect();
+        for length in (1..=core.len()).rev() {
+            candidates.insert(holders(&core[..length]));
         }
 
-        Vec::new()
+        // The group of enough targets whose preset takes the most settings out of them
+        let mut best: (usize, Vec<String>) = (0, Vec::new());
+        for members in candidates.into_iter().filter(|members| members.len() >= threshold) {
+            let moved = (members.len() - 1) * self.shared_entries(&members).len();
+            if moved > best.0 {
+                best = (moved, members);
+            }
+        }
+
+        best.1
     }
 
     /// Removes the entries from the targets, returning them.
@@ -1999,15 +2246,19 @@ impl Emitter {
             let _ = writeln!(output, "std = {}", quote(standard));
         }
 
-        // [options]: those a condition uses (the rest controlled what Anvil does not do: installing, fetching)
+        // [options]: those a condition uses (the rest controlled what Anvil does not do: installing, fetching). An
+        // option the project set() later is still one where conditions written before that use it
         let used_words = self.condition_words();
         let (options, unused): (Vec<(String, bool, String)>, Vec<_>) = self
             .cmake
             .options
             .iter()
-            .filter(|(name, _)| !self.cmake.overridden_options.contains(*name))
             .map(|(name, (default, description))| (name.clone(), *default, description.clone()))
             .partition(|(name, _, _)| used_words.contains(name));
+        let unused: Vec<_> = unused
+            .into_iter()
+            .filter(|(name, _, _)| !self.cmake.overridden_options.contains(name))
+            .collect();
         if !unused.is_empty() {
             let names: Vec<&str> = unused.iter().map(|(name, _, _)| name.as_str()).collect();
             self.warnings
@@ -2041,10 +2292,17 @@ impl Emitter {
                     }
                     DependencyEntry::PkgConfig(module) => (format!("{{ pkg-config = {} }}", quote(module)), None),
                 };
+
+                // Needed only where the targets using it are: installed only there
+                let value = match (self.dependency_condition(name), value.strip_suffix(" }")) {
+                    (None, _) => value,
+                    (Some(condition), Some(table)) => format!("{table}, if = {} }}", quote(&condition)),
+                    (Some(condition), None) => format!("{{ vcpkg = {}, if = {} }}", quote(name), quote(&condition)),
+                };
                 if note.as_deref().is_some_and(|note| note.starts_with("TODO")) {
                     todo_count += 1;
                 }
-                let comment = note.map(|note| format!("  # {note}")).unwrap_or_default();
+                let comment = note.map(|note| format!("  # {}", comment_text(&note))).unwrap_or_default();
                 let _ = writeln!(output, "{} = {value}{comment}", key(name));
 
                 if !self.manifest_ports.is_empty() && matches!(entry, DependencyEntry::Vcpkg { .. }) && !self.manifest_ports.contains(name) {
@@ -2058,15 +2316,17 @@ impl Emitter {
         // [vcpkg]
         self.render_vcpkg(&mut output);
 
-        // [defaults]
-        if !self.defaults.blocks.is_empty() {
+        // [defaults], then [preset.x] (a table with only sub-tables needs no header of its own)
+        let has_own_keys = |blocks: &Blocks| blocks.blocks.get(&None).is_some_and(|block| block.keys().any(|name| !name.contains('.')));
+        if has_own_keys(&self.defaults) {
             let _ = writeln!(output, "\n[defaults]");
-            render_blocks(&mut output, "defaults", &self.defaults);
         }
+        render_blocks(&mut output, "defaults", &self.defaults);
 
-        // [preset.x]
         for (name, preset) in &self.presets {
-            let _ = writeln!(output, "\n[preset.{}]", key(name));
+            if has_own_keys(preset) || preset.blocks.is_empty() {
+                let _ = writeln!(output, "\n[preset.{}]", key(name));
+            }
             render_blocks(&mut output, &format!("preset.{}", key(name)), preset);
         }
 
@@ -2149,12 +2409,13 @@ impl Emitter {
         // The same warning from a function called many times is shown once, with a count
         let mut counted: IndexMap<String, usize> = IndexMap::new();
         for warning in warnings {
-            *counted.entry(warning).or_default() += 1;
+            *counted.entry(comment_text(&warning)).or_default() += 1;
         }
         let warnings = counted
             .into_iter()
             .map(|(warning, count)| if count > 1 { format!("{warning} (x{count})") } else { warning })
             .collect();
+        let warnings = aggregate_warnings(warnings);
 
         Conversion {
             toml: output,
@@ -2169,26 +2430,52 @@ impl Emitter {
 
     /// [[test]] tables: alone, or tests of one kind as one with a matrix where that is clearly shorter.
     fn render_tests(&self, output: &mut String, tests: &[TestOut]) -> usize {
-        let mut todo_count = 0;
         let convert_word = |word: &str| self.command_word(word);
-        for entry in test_groups::group_tests(tests, &test_fields, &convert_word) {
+        let entries = test_groups::group_tests(tests, &test_fields, &convert_word);
+
+        self.render_test_entries(output, entries, true)
+    }
+
+    /// Tests alone and in groups; a group that does not read well is written split by its tests' shapes when
+    /// `split` (and that is shorter), else test by test. Returns the number of TODOs.
+    fn render_test_entries(&self, output: &mut String, entries: Vec<test_groups::Entry>, split: bool) -> usize {
+        let convert_word = |word: &str| self.command_word(word);
+        let mut todo_count = 0;
+
+        for entry in entries {
             match entry {
                 test_groups::Entry::Alone(test) => todo_count += render_test(output, test),
                 test_groups::Entry::Group(group, members) => {
                     let mut grouped = String::new();
                     render_test_group(&mut grouped, &group);
                     let mut alone = String::new();
-                    for test in &members {
-                        todo_count += render_test(&mut alone, test);
-                    }
+                    let alone_todo_count: usize = members.iter().map(|test| render_test(&mut alone, test)).sum();
 
                     // Only when it reads well: shorter, and every entry on a line of its own
                     let shorter = grouped.len() * GROUP_SIZE_PERCENT < alone.len() * 100;
                     let readable = grouped.lines().all(|line| line.len() <= GROUP_LINE_WIDTH);
-                    output.push_str(if shorter && readable { &grouped } else { &alone });
+                    if shorter && readable {
+                        output.push_str(&grouped);
+                        continue;
+                    }
+
+                    // Else its alike tests as groups of their own, if any
+                    let mut parts = String::new();
+                    let parts_todo_count = match split {
+                        true => self.render_test_entries(&mut parts, test_groups::split_group(&members, &test_fields, &convert_word), false),
+                        false => 0,
+                    };
+                    if split && parts.len() < alone.len() {
+                        output.push_str(&parts);
+                        todo_count += parts_todo_count;
+                    } else {
+                        output.push_str(&alone);
+                        todo_count += alone_todo_count;
+                    }
                 }
             }
         }
+
         todo_count
     }
 
@@ -2223,6 +2510,42 @@ impl Emitter {
         }
     }
 
+    /// Where a dependency is needed: the conditions of the settings naming it, joined; None when something needs it
+    /// always (or nothing names it).
+    fn dependency_condition(&self, name: &str) -> Option<String> {
+        const DEPENDENCY_KEYS: &[&str] = &["deps", "public.deps", "header-deps", "whole-archive"];
+
+        let mut sets: Vec<(Option<&String>, &Blocks)> = vec![(None, &self.defaults)];
+        sets.extend(self.presets.values().map(|preset| (None, preset)));
+        sets.extend(self.targets.values().map(|target| (target.condition.as_ref(), &target.blocks)));
+
+        let mut conditions: Vec<String> = Vec::new();
+        for (target_condition, blocks) in sets {
+            for (condition, block) in &blocks.blocks {
+                let names_it = DEPENDENCY_KEYS
+                    .iter()
+                    .any(|key| matches!(block.get(*key), Some(Value::List(items)) if items.contains(&name.to_string())));
+                if !names_it {
+                    continue;
+                }
+                match super::model::and_optional(&target_condition.cloned(), condition) {
+                    Some(condition) => conditions.push(condition),
+                    None => return None,
+                }
+            }
+        }
+        if conditions.is_empty() {
+            return None;
+        }
+
+        let any = conditions
+            .iter()
+            .map(|condition| format!("({condition})"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        condition_text(&Some(any), None)
+    }
+
     /// Profile names used in conditions or listed in CMAKE_CONFIGURATION_TYPES, other than debug and release.
     fn profiles(&self) -> Vec<String> {
         let option_names: HashSet<&str> = self.cmake.options.keys().map(String::as_str).collect();
@@ -2240,7 +2563,8 @@ impl Emitter {
 
         // A word that is not a known atom or an option names a profile
         for word in self.condition_words() {
-            if !KNOWN_ATOMS.contains(&word.as_str()) && !option_names.contains(word.as_str()) {
+            let known = crate::cond::BUILTIN_WORDS.contains(&word.as_str()) || KNOWN_PROFILES.contains(&word.as_str());
+            if !known && !option_names.contains(word.as_str()) {
                 profiles.insert(word);
             }
         }
@@ -2258,9 +2582,12 @@ impl Emitter {
             conditions.extend(target.condition.iter());
             conditions.extend(target.blocks.blocks.keys().flatten());
             conditions.extend(target.files.iter().filter_map(|rule| rule.condition.as_ref()));
-            conditions.extend(target.runs.iter().filter_map(|run| run.condition.as_ref()));
+            let steps = target.runs.iter().chain(&target.pre_build).chain(&target.post_build);
+            conditions.extend(steps.filter_map(|run| run.condition.as_ref()));
         }
         conditions.extend(self.tests.iter().filter_map(|test| test.condition.as_ref()));
+        let writes = self.cmake.configure_writes.iter().filter(|write| write.text.is_some());
+        conditions.extend(writes.filter_map(|write| write.condition.as_ref()));
 
         let mut words = IndexSet::new();
         for condition in conditions {
@@ -2283,7 +2610,6 @@ impl Emitter {
         relative_path(path, dir)
     }
 
-    /// A command word with the project folder written as {root}.
     /// Text with the headers find_file() looked for as files in vcpkg's include folder; None without vcpkg.
     fn found_header_text(&self, text: &str) -> Option<String> {
         let mut result = text.to_string();
@@ -2300,6 +2626,7 @@ impl Emitter {
         !self.manifest_ports.is_empty() || self.dependencies.values().any(|entry| matches!(entry, DependencyEntry::Vcpkg { .. }))
     }
 
+    /// A command word with the project folder written as {root}.
     fn command_word(&self, word: &str) -> String {
         // A whole path loses its `..` parts first, so equal paths read the same
         let word = match Path::new(word).is_absolute() {
@@ -2394,7 +2721,7 @@ fn render_target(output: &mut String, name: &str, target: &TargetOut) -> usize {
     }
     let todo_count = render_test_properties(output, &target.test);
     for note in &target.notes {
-        let _ = writeln!(output, "# TODO: {note}");
+        let _ = writeln!(output, "# TODO: {}", comment_text(note));
     }
 
     render_blocks(output, &table, &target.blocks);
@@ -2491,7 +2818,129 @@ fn render_target(output: &mut String, name: &str, target: &TargetOut) -> usize {
     todo_count + target.notes.len()
 }
 
-/// A test's judging and scheduling keys, then its notes as TODOs. Returns the number of TODOs.
+/// Warnings of one kind (one command at several places, custom targets dropped for one reason) as the first in full
+/// and where the others are, when there are enough of them.
+fn aggregate_warnings(warnings: Vec<String>) -> Vec<String> {
+    const MIN_AGGREGATED: usize = 3;
+    const LISTED_PLACES: usize = 10;
+    let located = regex::Regex::new(r"^(\S+?:\d+): (.*)$").unwrap();
+    let named = regex::Regex::new(r"`([^`]*)`").unwrap();
+
+    // Each warning's kind and what tells it from the others of its kind: its place, or the name it is about
+    let mut kinds: IndexMap<String, Vec<(String, String)>> = IndexMap::new();
+    for warning in warnings {
+        let (kind, place) = match (located.captures(&warning), named.captures(&warning)) {
+            (Some(captures), _) => {
+                let command = captures[2].split(['(', ' ']).next().unwrap_or_default().to_string();
+                (format!("at {command}"), captures[1].to_string())
+            }
+            (None, Some(captures)) => {
+                let without_name = warning.replacen(&captures[0], "``", 1);
+                let reason = without_name
+                    .rsplit_once(": ")
+                    .map_or(without_name.as_str(), |(reason, _)| reason)
+                    .to_string();
+                (reason, captures[1].to_string())
+            }
+            (None, None) => match warning.split_once(": ") {
+                Some((kind, detail)) => (kind.to_string(), detail.to_string()),
+                None => (warning.clone(), String::new()),
+            },
+        };
+        kinds.entry(kind).or_default().push((warning, place));
+    }
+
+    let mut aggregated = Vec::new();
+    for mut members in kinds.into_values() {
+        if members.len() < MIN_AGGREGATED {
+            aggregated.extend(members.into_iter().map(|(warning, _)| warning));
+            continue;
+        }
+
+        // The others' places once each, a file named once for its lines in a row (`a.cmake:4, :9`)
+        let (first, _) = members.remove(0);
+        let distinct: IndexSet<&String> = members.iter().map(|(_, place)| place).collect();
+        let mut places: Vec<String> = Vec::new();
+        let mut previous_file = "";
+        for place in distinct.iter().take(LISTED_PLACES) {
+            match place.rsplit_once(':') {
+                Some((file, line)) if file == previous_file => places.push(format!(":{line}")),
+                Some((file, _)) => {
+                    previous_file = file;
+                    places.push(place.to_string());
+                }
+                None => places.push(place.to_string()),
+            }
+        }
+        if distinct.len() > LISTED_PLACES {
+            places.push(format!("and {} more", distinct.len() - LISTED_PLACES));
+        }
+        aggregated.push(format!("{first}\n  {} more like it: {}", members.len(), places.join(", ")));
+    }
+
+    aggregated
+}
+
+/// `/ENTRY:mainCRTStartup` (or wmain, or through the GNU linker): main() as the entry of a windows program.
+fn is_main_entry(lowercase_option: &str) -> bool {
+    let option = lowercase_option.strip_prefix("-wl,").unwrap_or(lowercase_option);
+    let entry = option.strip_prefix("/entry:").or_else(|| option.strip_prefix("-entry:"));
+
+    matches!(entry, Some("maincrtstartup" | "wmaincrtstartup"))
+}
+
+/// About how many lines settings take written in a table: a line per key, and a header (with the blank line before
+/// it) per when block or sub-table.
+fn written_lines(entries: &[Entry]) -> usize {
+    let keys: HashSet<(&Option<String>, &str)> = entries.iter().map(|(condition, key, _)| (condition, *key)).collect();
+    let tables: HashSet<(&Option<String>, &str)> = entries
+        .iter()
+        .map(|(condition, key, _)| (condition, key.split_once('.').map_or("", |(table, _)| table)))
+        .filter(|(condition, table)| condition.is_some() || !table.is_empty())
+        .collect();
+
+    keys.len() + 2 * tables.len()
+}
+
+/// A program's public settings as its own: with nothing linking it, they mean the same.
+fn make_private(blocks: &mut Blocks) {
+    for block in blocks.blocks.values_mut() {
+        let public_keys: Vec<&'static str> = block.keys().copied().filter(|key| key.starts_with("public.")).collect();
+        for public_key in public_keys {
+            let private_key = &public_key["public.".len()..];
+            let Some(value) = block.shift_remove(public_key) else { continue };
+            match (block.get_mut(private_key), value) {
+                (Some(Value::List(items)), Value::List(public_items)) => {
+                    items.extend(public_items.into_iter().filter(|item| !items.contains(item)).collect::<Vec<_>>());
+                }
+                (None, value) => {
+                    block.insert(private_key, value);
+                }
+                (Some(_), value) => {
+                    block.insert(public_key, value);
+                }
+            }
+        }
+    }
+}
+
+/// A note as one comment line: option markers as the option's name, line breaks as spaces, other control
+/// characters (which TOML comments may not hold) dropped.
+fn comment_text(note: &str) -> String {
+    let marker = regex::Regex::new("\u{1}option-([^\u{2}]*)\u{2}").unwrap();
+    let unmarked = marker.replace_all(note, "$1");
+    let spaced: String = unmarked
+        .chars()
+        .filter_map(|character| match character {
+            '\n' | '\r' | '\t' => Some(' '),
+            _ if character.is_control() => None,
+            _ => Some(character),
+        })
+        .collect();
+
+    spaced.split(' ').filter(|word| !word.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
 /// One [[test]] table; returns the number of TODOs.
 fn render_test(output: &mut String, test: &TestOut) -> usize {
     let _ = writeln!(
@@ -2617,6 +3066,7 @@ fn field_value(field: &test_groups::Field, inline: bool) -> String {
     }
 }
 
+/// A test's judging and scheduling keys, then its notes as TODOs. Returns the number of TODOs.
 fn render_test_properties(output: &mut String, properties: &TestProperties) -> usize {
     if properties.will_fail {
         output.push_str("will-fail = true\n");
@@ -2663,7 +3113,7 @@ fn render_test_properties(output: &mut String, properties: &TestProperties) -> u
     }
 
     for note in &properties.notes {
-        let _ = writeln!(output, "# TODO: {note}");
+        let _ = writeln!(output, "# TODO: {}", comment_text(note));
     }
 
     properties.notes.len()
@@ -2721,7 +3171,6 @@ fn render_settings(output: &mut String, table: &str, block: &IndexMap<&'static s
     }
 }
 
-/// A TOML array: on one line when short, else one item per line.
 /// A preset named after the CMake function that made its targets: `add_plugin` -> add-plugin.
 fn preset_name(helper: &str) -> String {
     helper.to_lowercase().replace('_', "-")
@@ -2739,6 +3188,7 @@ fn command_text(words: &[String]) -> String {
     }
 }
 
+/// A TOML array: on one line when short, else as many items to a line as fit.
 fn list(items: &[String], indent: &str) -> String {
     pack(items.iter().map(|item| quote(item)).collect(), indent)
 }
@@ -2771,9 +3221,17 @@ fn quote(text: &str) -> String {
     toml::Value::String(text.to_string()).to_string()
 }
 
-/// Text over several lines as a literal '''...''' string when it can be, quoted otherwise.
+/// Text as a literal '''...''' string when it can be, quoted otherwise; one plain line ending in a line break stays
+/// on one line, the break escaped.
 fn multiline_quote(text: &str) -> String {
-    if text.contains('\n') && !text.contains("'''") && !text.contains('\r') {
+    let literal = !text.contains("'''")
+        && !text
+            .chars()
+            .any(|character| character.is_control() && character != '\n' && character != '\t');
+    let one_plain_line = !text.trim_end_matches('\n').contains(['\n', '"', '\\']);
+    if text.contains('\n') && one_plain_line && literal {
+        serde_json::to_string(text).unwrap()
+    } else if text.contains('\n') && literal {
         format!("'''\n{text}'''")
     } else {
         quote(text)
@@ -2831,8 +3289,6 @@ fn condition_text(condition: &Option<String>, assumption: Option<&str>) -> Optio
     }
 }
 
-/// The header generate_export_header would write: empty macros for a static library, dllexport/dllimport (or
-/// default visibility) when `<BASE>_SHARED` is defined.
 /// File rules merged: a file with the same settings under several conditions gets one rule under either of them
 /// (under `msvc` and `!msvc` is always), then files with the same settings and condition share one rule.
 fn merge_file_rules(rules: Vec<FileRuleOut>) -> Vec<FileRuleOut> {
@@ -3041,6 +3497,24 @@ fn shell_quote(word: &str) -> String {
     }
 }
 
+/// The text `cmake -E echo <text> > <output>` writes, when that is all a step does (and the text holds no `{`, which
+/// [[write]] would read as a placeholder).
+fn echoed_text(command: &CustomCommand) -> Option<String> {
+    let ([words], [output]) = (command.commands.as_slice(), command.outputs.as_slice()) else {
+        return None;
+    };
+    let [program, mode, operation, rest @ ..] = words.as_slice() else {
+        return None;
+    };
+    let [text @ .., redirect, file] = rest else { return None };
+
+    let is_cmake = program == "cmake" || program.to_lowercase().ends_with("cmake.exe");
+    let to_output = util::path_key(Path::new(file)) == util::path_key(output);
+    let text = text.join(" ");
+    let plain = !text.contains(['{', '}']);
+    (is_cmake && mode == "-E" && operation == "echo" && redirect == ">" && to_output && plain).then(|| format!("{text}\n"))
+}
+
 fn command_line(commands: &[Vec<String>]) -> String {
     commands.iter().map(|words| words.join(" ")).collect::<Vec<_>>().join(" && ")
 }
@@ -3074,5 +3548,48 @@ mod tests {
 
         assert_eq!(blocks.get(&None, "warnings"), Some(&Value::Text("high".into())));
         assert!(blocks.blocks.get(&Some("msvc".into())).is_none());
+    }
+
+    #[test]
+    fn notes_are_one_comment_line() {
+        assert_eq!(comment_text("a $<BOOL:\u{1}option-OPT\u{2}>\r\n  b\u{7}"), "a $<BOOL:OPT> b");
+    }
+
+    #[test]
+    fn conditions_simplify() {
+        let simplified = condition_text(&Some("(unix & !macos) & unix".into()), None);
+        assert_eq!(simplified.as_deref(), Some("unix & !macos"));
+        assert_eq!(condition_text(&Some("!!OPT & OPT".into()), None).as_deref(), Some("OPT"));
+    }
+
+    #[test]
+    fn main_entries() {
+        assert!(is_main_entry("/entry:maincrtstartup"));
+        assert!(is_main_entry("-wl,/entry:maincrtstartup"));
+        assert!(!is_main_entry("/entry:winmaincrtstartup"));
+    }
+
+    #[test]
+    fn warnings_of_one_kind_are_aggregated() {
+        let warnings: Vec<String> = (1..=4)
+            .map(|line| format!("a.cmake:{line}: configure_file(x{line}) is not converted"))
+            .collect();
+        let aggregated = aggregate_warnings(warnings);
+
+        assert_eq!(
+            aggregated,
+            ["a.cmake:1: configure_file(x1) is not converted\n  3 more like it: a.cmake:2, :3, :4"]
+        );
+    }
+
+    #[test]
+    fn programs_settings_are_their_own() {
+        let mut blocks = Blocks::default();
+        blocks.set(None, "public.include", Value::List(vec!["inc".into()]));
+        blocks.set(None, "include", Value::List(vec!["src".into()]));
+        make_private(&mut blocks);
+
+        assert_eq!(blocks.get(&None, "include"), Some(&Value::List(vec!["src".into(), "inc".into()])));
+        assert!(blocks.get(&None, "public.include").is_none());
     }
 }

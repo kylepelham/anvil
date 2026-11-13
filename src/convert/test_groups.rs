@@ -91,6 +91,33 @@ pub(super) fn group_tests<'a>(
     entries
 }
 
+/// A group too irregular to write as one, split by condition and command shape (a helper's fast, slow and valgrind
+/// variants): groups where enough tests are alike, the rest alone.
+pub(super) fn split_group<'a>(
+    members: &[&'a TestOut],
+    fields: &dyn Fn(&TestOut) -> Vec<(&'static str, Field)>,
+    convert_word: &dyn Fn(&str) -> String,
+) -> Vec<Entry<'a>> {
+    let mut shapes: IndexMap<String, Vec<&TestOut>> = IndexMap::new();
+    for test in members {
+        let shape = format!("{:?} {}", test.condition, command_options(&test.command).join(" "));
+        shapes.entry(shape).or_default().push(test);
+    }
+
+    let mut entries = Vec::new();
+    for alike in shapes.into_values() {
+        if alike.len() < MIN_CASES {
+            entries.extend(alike.into_iter().map(Entry::Alone));
+            continue;
+        }
+
+        let group = build_group(&alike, fields, convert_word);
+        entries.push(Entry::Group(group, alike));
+    }
+
+    entries
+}
+
 /// Tests added directly as groups whose commands line up word by word: all of them when their options differ in one
 /// short run only (`... -- --no-hwrt`), else those with the same options, and the rest together.
 fn split_by_options(members: Vec<&TestOut>) -> Vec<Vec<&TestOut>> {
@@ -467,6 +494,15 @@ impl<'a> Builder<'a> {
     fn unify_text(&mut self, texts: &[String], hint: Option<&str>) -> String {
         if texts.iter().all(|text| *text == texts[0]) {
             return texts[0].clone();
+        }
+
+        // Programs of the project: the part of their names that differs (`{target:{name}}` for tests named so)
+        let programs: Option<Vec<String>> = texts
+            .iter()
+            .map(|text| text.strip_prefix("{target:")?.strip_suffix('}').map(str::to_string))
+            .collect();
+        if let Some(programs) = programs.filter(|programs| programs.iter().all(|program| !program.contains(['{', '}']))) {
+            return format!("{{target:{}}}", self.unify_text(&programs, hint));
         }
 
         // A list joined into the text: the parameter is the whole list, so the shared part stops before it

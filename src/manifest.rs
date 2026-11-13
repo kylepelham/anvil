@@ -560,7 +560,12 @@ struct TestsFile {
 
 pub fn load_tests(path: &Path) -> Result<Vec<TestSpec>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let file: TestsFile = toml::from_str(&text).map_err(|error| anyhow::anyhow!("{}: {error}", crate::util::slash(path)))?;
+    parse_tests(&text).map_err(|error| anyhow::anyhow!("{}: {error}", crate::util::slash(path)))
+}
+
+/// A tests.toml file's text.
+pub fn parse_tests(text: &str) -> Result<Vec<TestSpec>> {
+    let file: TestsFile = toml::from_str(text)?;
     Ok(file.test)
 }
 
