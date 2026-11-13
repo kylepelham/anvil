@@ -33,6 +33,11 @@ pub fn color() -> bool {
     COLOR.load(Ordering::Relaxed)
 }
 
+/// `-q`: print less.
+pub fn quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
+
 pub fn interactive() -> bool {
     INTERACTIVE.load(Ordering::Relaxed)
 }

@@ -136,7 +136,7 @@ pub fn clean(start_dir: &Path, release: bool, profile: Option<&str>, all: bool) 
 }
 
 pub fn list_targets(start_dir: &Path, build: &BuildArgs) -> Result<()> {
-    let mut model = load_model(start_dir, build)?;
+    let mut model = load_model_for_listing(start_dir, build)?;
     model.collect_tests()?;
 
     for target in &model.targets {
@@ -324,22 +324,59 @@ pub fn update(start_dir: &Path, build: &BuildArgs, names: &[String]) -> Result<(
         Refresh::Only(names.to_vec())
     };
 
-    // A name the lock does not have is a typo, not a request to do nothing
-    let (root, _) = project::locate(start_dir)?;
+    // What can be updated: the lock's pins, and the git and vcpkg dependencies anvil.toml declares
+    let (root, manifest) = project::locate(start_dir)?;
     let lock_file = root.join(crate::lockfile::LOCK_NAME);
-    if let Ok(text) = std::fs::read_to_string(&lock_file) {
-        let lock: crate::lockfile::Lock = toml::from_str(&text).with_context(|| format!("{} is not a valid lock file", slash(&lock_file)))?;
-        let known = lock.names();
-        if let Some(unknown) = names.iter().find(|name| !known.contains(name)) {
-            bail!("`{unknown}` is not a git dependency or vcpkg; anvil.lock has: {}", known.join(", "));
+    let before = std::fs::read_to_string(&lock_file).ok();
+    let mut known = match &before {
+        Some(text) => toml::from_str::<crate::lockfile::Lock>(text)
+            .with_context(|| format!("{} is not a valid lock file", slash(&lock_file)))?
+            .names(),
+        None => Vec::new(),
+    };
+    for (name, value) in manifest.deps.iter().chain(&manifest.dev_deps) {
+        let spec = crate::manifest::parse_dep(name, value)?;
+        let updatable = if spec.git.is_some() {
+            Some(name.as_str())
+        } else {
+            spec.vcpkg.as_ref().map(|_| "vcpkg")
+        };
+        if let Some(updatable) = updatable.filter(|updatable| !known.iter().any(|known| known == updatable)) {
+            known.push(updatable.to_string());
         }
     }
 
-    load_model_with(start_dir, build, refresh)?;
-    if lock_file.is_file() {
+    // A name that is not one of them is a typo, not a request to do nothing
+    if let Some(unknown) = names.iter().find(|name| !known.contains(name)) {
+        let hint = util::suggest(unknown, known.iter().map(|known| known.as_str()))
+            .map(|close| format!(" Did you mean `{close}`?"))
+            .unwrap_or_default();
+        if known.is_empty() {
+            bail!("`{unknown}` is not a git dependency or vcpkg: this project has neither, so there is nothing to update");
+        }
+        bail!(
+            "`{unknown}` is not a git dependency or vcpkg.{hint} `anvil update` takes: {}",
+            known.join(", ")
+        );
+    }
+
+    let model = load_model_with(start_dir, build, refresh, false)?;
+    let after = std::fs::read_to_string(&lock_file).ok();
+    if after.is_none() {
+        ui::status("Updated", "nothing to lock (no git or vcpkg dependencies)");
+    } else if after != before {
         ui::status("Updated", &slash(&lock_file));
     } else {
-        ui::status("Updated", "nothing to lock (no git or vcpkg dependencies)");
+        ui::status("Fresh", "anvil.lock already has the newest versions");
+
+        // A vcpkg checkout offers only the ports it has: the newest are a pull away
+        let updates_vcpkg = names.is_empty() || names.iter().any(|name| name == "vcpkg");
+        if let Some(instance) = model.vcpkg.as_ref().filter(|instance| updates_vcpkg && instance.has_ports) {
+            ui::note(&format!(
+                "vcpkg's newest ports are those its checkout has; `git -C {} pull` fetches newer ones",
+                slash(&instance.root)
+            ));
+        }
     }
 
     Ok(())
@@ -347,10 +384,15 @@ pub fn update(start_dir: &Path, build: &BuildArgs, names: &[String]) -> Result<(
 
 /// Loads the model for the command line's profile, toolchain and options.
 pub fn load_model(start_dir: &Path, build: &BuildArgs) -> Result<Model> {
-    load_model_with(start_dir, build, Refresh::Nothing)
+    load_model_with(start_dir, build, Refresh::Nothing, false)
 }
 
-fn load_model_with(start_dir: &Path, build: &BuildArgs, refresh: Refresh) -> Result<Model> {
+/// Loads the model to list what it holds: no vcpkg install, no git fetch, anvil.lock untouched.
+pub fn load_model_for_listing(start_dir: &Path, build: &BuildArgs) -> Result<Model> {
+    load_model_with(start_dir, build, Refresh::Nothing, true)
+}
+
+fn load_model_with(start_dir: &Path, build: &BuildArgs, refresh: Refresh, list_only: bool) -> Result<Model> {
     let profile = match (&build.profile, build.release) {
         (Some(profile), _) => profile.clone(),
         (None, true) => "release".to_string(),
@@ -366,6 +408,7 @@ fn load_model_with(start_dir: &Path, build: &BuildArgs, refresh: Refresh) -> Res
         locked: build.locked,
         refresh,
         host_tools_dir: None,
+        list_only,
     })
 }
 

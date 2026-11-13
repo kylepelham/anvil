@@ -15,6 +15,9 @@ pub struct Manifest {
     pub defaults: TargetSpec,
     #[serde(default)]
     pub deps: IndexMap<String, toml::Value>,
+    /// Dependencies of the tests only: never linked into the package's programs and libraries.
+    #[serde(default)]
+    pub dev_deps: IndexMap<String, toml::Value>,
     #[serde(default)]
     pub target: IndexMap<String, TargetSpec>,
     /// Named groups of settings that targets opt into with `preset = "name"`.
@@ -83,6 +86,8 @@ pub struct VcpkgSpec {
     /// A vcpkg checkout to use for this project (overrides the user's choice).
     pub root: Option<String>,
     pub triplet: Option<String>,
+    /// "static" or "dynamic" libraries: the triplet for each machine and compiler follows.
+    pub linkage: Option<String>,
     pub baseline: Option<String>,
     /// Path to a vcpkg.json to install from (default: the project's own vcpkg.json when there is one).
     pub manifest: Option<String>,
@@ -497,7 +502,15 @@ fn deserialize_tests<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::
 
 pub fn parse_str(text: &str) -> Result<Manifest> {
     let error = match toml::from_str::<Manifest>(text) {
-        Ok(manifest) => return Ok(manifest),
+        Ok(manifest) => {
+            // The name becomes target and folder names
+            if let Some(name) = manifest.project.as_ref().and_then(|project| project.name.as_deref()) {
+                if name.contains(['/', '\\']) || name.trim().is_empty() {
+                    bail!("[project] name = \"{name}\": a name cannot be empty or hold `/` or `\\` (it names the main target)");
+                }
+            }
+            return Ok(manifest);
+        }
         Err(error) => error,
     };
 
@@ -526,6 +539,18 @@ fn parse_dep_table(name: &str, value: &toml::Value) -> Result<DepSpec> {
             "dependency `{name}`: say where it comes from: vcpkg = \"{name}\", path = \"...\", git = \"...\", pkg-config = \"...\", \
              or include/libs for a prebuilt one"
         );
+    }
+
+    // Keys of one origin only
+    let git_references = [&spec.tag, &spec.branch, &spec.rev].iter().filter(|given| given.is_some()).count();
+    if git_references > 0 && spec.git.is_none() {
+        bail!("dependency `{name}`: tag, branch and rev belong to a git dependency");
+    }
+    if git_references > 1 {
+        bail!("dependency `{name}`: give only one of tag, branch, rev");
+    }
+    if (!spec.features.is_empty() || spec.default_features.is_some()) && spec.vcpkg.is_none() {
+        bail!("dependency `{name}`: features and default-features belong to a vcpkg port");
     }
 
     Ok(spec)

@@ -2,8 +2,8 @@
 //! every dependency (local targets, vcpkg, pkg-config, path and git packages, prebuilt libraries) and installs vcpkg
 //! packages, giving the planner a complete list of targets.
 
-use crate::cond::CondContext;
-use crate::lockfile::{LockFile, Refresh};
+use crate::cond::{Cond, CondContext};
+use crate::lockfile::{Declared, LockFile, Refresh};
 use crate::manifest::{self, DepSpec, Manifest, TestSpec};
 use crate::platform::Platform;
 use crate::profile::Profile;
@@ -37,6 +37,9 @@ pub struct LoadOptions {
 
     /// Build for this machine into this folder: the tools a cross build runs.
     pub host_tools_dir: Option<PathBuf>,
+
+    /// Only list the project: no vcpkg install, no git fetch, anvil.lock left as it is.
+    pub list_only: bool,
 }
 
 #[derive(Debug)]
@@ -142,11 +145,8 @@ impl Model {
         let out_dir = options.host_tools_dir.clone().unwrap_or_else(|| out_root.join(out_folder));
 
         // vcpkg's triplet is known before anything installs, for {vcpkg}
-        let vcpkg_triplet = manifest
-            .vcpkg
-            .as_ref()
-            .and_then(|spec| spec.triplet.clone())
-            .unwrap_or_else(|| vcpkg::default_triplet(&toolchain, profile.static_runtime));
+        let vcpkg_spec = manifest.vcpkg.clone().unwrap_or_default();
+        let vcpkg_triplet = vcpkg::choose_triplet(&vcpkg_spec, &toolchain, profile.static_runtime)?;
         let vcpkg_dir = out_root.join("vcpkg").join("installed").join(&vcpkg_triplet).join(&vcpkg_triplet);
 
         let profile_names: Vec<String> = manifest.profile.keys().cloned().collect();
@@ -204,9 +204,16 @@ impl Model {
         model.check_output_names()?;
         model.check_sources()?;
         model.find_cuda()?;
-        model.install_vcpkg()?;
+        let mut declared = model.request_declared_vcpkg()?;
+        if !options.list_only {
+            model.install_vcpkg()?;
+            declared.vcpkg |= model.vcpkg.is_some();
+        }
         crate::plan::expand_hashes(&mut model)?;
-        model.lock.take().unwrap().finish(!model.vcpkg_requests.is_empty())?;
+        let lock = model.lock.take().unwrap();
+        if !options.list_only {
+            lock.finish(&declared)?;
+        }
         model.write_files()?;
 
         Ok(model)
@@ -292,6 +299,10 @@ impl Model {
         let index = self.packages.len();
         self.package_dirs.insert(util::path_key(root), index);
 
+        if let Some(both) = manifest.dev_deps.keys().find(|dev_dep| manifest.deps.contains_key(*dev_dep)) {
+            bail!("`{both}` is under both [deps] and [dev-deps] of package `{name}`; keep it in one (tests see [deps] too)");
+        }
+
         // Options declared by members join the root's
         for (option, value) in manifest::parse_options(&manifest.options)? {
             self.condition.options.entry(option).or_insert(value);
@@ -331,8 +342,9 @@ impl Model {
         // Explicit targets, or the layout conventions
         let mut created = Vec::new();
         if manifest.target.is_empty() {
-            let enabled_deps = enabled_dep_names(manifest, &self.condition)?;
-            created = Target::conventional(&scope, &manifest.defaults, &enabled_deps)?;
+            let enabled_deps = enabled_dep_names(&manifest.deps, &self.condition)?;
+            let enabled_dev_deps = enabled_dep_names(&manifest.dev_deps, &self.condition)?;
+            created = Target::conventional(&scope, &manifest.defaults, &enabled_deps, &enabled_dev_deps)?;
         } else {
             for (name, spec) in &manifest.target {
                 if let Some(target) = Target::from_spec(name, spec, &manifest.defaults, &manifest.preset, &scope)? {
@@ -364,6 +376,7 @@ impl Model {
 
         let mut deps = Vec::new();
         for (name, public) in dep_names {
+            self.check_dev_dep_user(index, &name)?;
             let resolved = self
                 .resolve_dep(package, &name)
                 .with_context(|| format!("in target `{}`", self.targets[index].name))?;
@@ -421,6 +434,31 @@ impl Model {
         Ok(())
     }
 
+    /// [dev-deps] are for tests only: a program or library using one would link it into what the project ships.
+    fn check_dev_dep_user(&self, index: usize, name: &str) -> Result<()> {
+        let target = &self.targets[index];
+        let manifest = &self.packages[target.package].manifest;
+        if target.kind == Kind::Test || !manifest.dev_deps.contains_key(name) {
+            return Ok(());
+        }
+
+        // A target of the same name comes first
+        let local = self
+            .targets
+            .iter()
+            .any(|other| other.package == target.package && other.name == name && other.kind != Kind::External);
+        if local {
+            return Ok(());
+        }
+
+        bail!(
+            "target `{}` ({}) uses `{name}`, which is under [dev-deps]: only tests (kind = \"test\") use those. Move `{name}` to [deps] if `{}` needs it.",
+            target.name,
+            target.kind.name(),
+            target.name
+        )
+    }
+
     /// A dependency name to a target: a local target, a [deps] entry, a workspace member, or "package/target".
     /// None when the [deps] entry's `if` is false.
     fn resolve_dep(&mut self, package: usize, name: &str) -> Result<Option<usize>> {
@@ -444,8 +482,9 @@ impl Model {
             return Ok(Some(local));
         }
 
-        // A [deps] entry
-        if let Some(value) = self.packages[package].manifest.deps.get(name).cloned() {
+        // A [deps] entry, or a [dev-deps] one (link_target lets only tests name those)
+        let manifest = &self.packages[package].manifest;
+        if let Some(value) = manifest.deps.get(name).or_else(|| manifest.dev_deps.get(name)).cloned() {
             let spec = manifest::parse_dep(name, &value)?;
             if let Some(condition) = &spec.cond {
                 if !self.condition.test(condition)? {
@@ -468,6 +507,7 @@ impl Model {
             .map(|target| target.name.clone())
             .collect();
         known.extend(self.packages[package].manifest.deps.keys().cloned());
+        known.extend(self.packages[package].manifest.dev_deps.keys().cloned());
         let hint = util::suggest(name, known.iter().map(|known| known.as_str()))
             .map(|close| format!(" Did you mean `{close}`?"))
             .unwrap_or_default();
@@ -485,6 +525,14 @@ impl Model {
             let folder = util::absolute(&package_root, Path::new(&util::expand_env(path)?));
             self.load_source_package(name, &folder, spec)?
         } else if let Some(url) = &spec.git {
+            if self.options.list_only {
+                // Listing names it without fetching it
+                let mut placeholder = Target::new(name, package, Kind::External, &package_root);
+                placeholder.default = false;
+                self.targets.push(placeholder);
+                self.externals.insert(key, self.targets.len() - 1);
+                return Ok(self.targets.len() - 1);
+            }
             let folder = fetch_git(name, url, spec, self.lock.as_mut().unwrap())?;
             self.load_source_package(name, &folder, spec)?
         } else {
@@ -530,7 +578,7 @@ impl Model {
 
         // pkg-config: ask it now
         if let Some(module) = &spec.pkg_config {
-            apply_pkg_config(&mut target, module)?;
+            apply_pkg_config(&mut target, module, &self.toolchain.platform)?;
         }
 
         self.targets.push(target);
@@ -555,6 +603,74 @@ impl Model {
                 default_features,
             }),
         }
+    }
+
+    /// Requests every vcpkg port the loaded packages declare (and the members' [dev-deps]) whose `if` holds here for
+    /// some setting of the options, used or not, so that turning an option on or off, or building the tests, installs
+    /// the same ports instead of vcpkg adding and removing some each time. Also says what anvil.lock must keep.
+    fn request_declared_vcpkg(&mut self) -> Result<Declared> {
+        let mut declared = Declared {
+            all_resolved: true,
+            ..Default::default()
+        };
+
+        for package_index in 0..self.packages.len() {
+            let package = &self.packages[package_index];
+            let dev_deps = package.member.then_some(&package.manifest.dev_deps).into_iter().flatten();
+            let entries: Vec<(String, toml::Value)> = package
+                .manifest
+                .deps
+                .iter()
+                .chain(dev_deps)
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+
+            for (name, value) in entries {
+                let spec = manifest::parse_dep(&name, &value)?;
+                if spec.git.is_some() {
+                    declared.git.push(name.clone());
+                }
+                let is_package = spec.git.is_some() || spec.path.is_some();
+                if is_package && !self.externals.contains_key(&(package_index, name.clone())) {
+                    declared.all_resolved = false;
+                }
+
+                let Some(port) = &spec.vcpkg else { continue };
+                declared.vcpkg = true;
+                let wanted = match &spec.cond {
+                    Some(condition) => self.can_hold(condition).with_context(|| format!("dependency `{name}`"))?,
+                    None => true,
+                };
+                if wanted {
+                    self.request_vcpkg(port, &spec);
+                }
+            }
+        }
+
+        Ok(declared)
+    }
+
+    /// Whether a condition holds for some setting of the options it names, everything else as this build has it.
+    fn can_hold(&self, condition_text: &str) -> Result<bool> {
+        let condition = crate::cond::parse(condition_text)?;
+        let mut options = Vec::new();
+        collect_options(&condition, &self.condition, &mut options);
+
+        // Every combination of the options it names (a handful at most)
+        if options.len() > 10 {
+            return self.condition.test(condition_text);
+        }
+        for combination in 0..(1u32 << options.len()) {
+            let lookup = |name: &str| match options.iter().position(|option| option == name) {
+                Some(bit) => Some(combination & (1 << bit) != 0),
+                None => self.condition.lookup(name),
+            };
+            if condition.eval(&lookup)? {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// A source package from a path or git checkout: its anvil.toml, or a library made from its layout.
@@ -747,24 +863,44 @@ impl Model {
     }
 
     fn install_vcpkg(&mut self) -> Result<()> {
-        if self.vcpkg_requests.is_empty() {
-            return Ok(());
-        }
-
         let spec = self.packages[0].manifest.vcpkg.clone().unwrap_or_default();
         let root = self.root.clone();
         let resolve = |text: &String| -> Result<PathBuf> { Ok(util::absolute(&root, Path::new(&util::expand_env(text)?))) };
 
-        // The instance and the install settings
+        // The project's own vcpkg.json installs even when no [deps] entry is a vcpkg port
+        let configured_manifest = spec.manifest.as_ref().map(resolve).transpose()?;
+        let own_manifest = vcpkg::own_manifest(&self.root, configured_manifest.as_deref())?;
+        if self.vcpkg_requests.is_empty() && own_manifest.is_none() {
+            return Ok(());
+        }
+
+        // A generated manifest needs a baseline: under --locked, the lock's, before anything runs
+        let lock = self.lock.as_ref().unwrap();
+        let locked_baseline = lock.vcpkg_baseline();
+        if own_manifest.is_none() && spec.baseline.is_none() && locked_baseline.is_none() {
+            lock.check_can_pin("the vcpkg baseline")?;
+        }
+        let refresh_baseline = lock.refreshes("vcpkg");
+
+        // The same requests in the same order whatever resolved them first, so the install stamp holds
+        self.vcpkg_requests.sort_by(|left, right| left.name.cmp(&right.name));
+        for request in &mut self.vcpkg_requests {
+            request.features.sort();
+        }
+
+        // The instance (when nobody chose one, the one the last install used) and the install settings
         let root_override = spec.root.as_ref().map(resolve).transpose()?;
-        let mut instance = Instance::select(root_override.as_deref())?;
+        let remembered = vcpkg::remembered_root(&self.out_root, &self.vcpkg_triplet);
+        let mut instance = Instance::select_with(root_override.as_deref(), remembered.as_deref())?;
         let config = vcpkg::InstallConfig {
-            project_root: &self.root,
+            project_name: &self.packages[0].name,
+            project_version: self.packages[0].version(),
             out_root: &self.out_root,
             triplet: self.vcpkg_triplet.clone(),
-            manifest: spec.manifest.as_ref().map(resolve).transpose()?,
+            manifest: own_manifest,
             baseline: spec.baseline.clone(),
-            locked_baseline: self.lock.as_ref().unwrap().vcpkg_baseline(),
+            locked_baseline,
+            refresh_baseline,
             overlay_ports: spec.overlay_ports.iter().map(resolve).collect::<Result<_>>()?,
             overlay_triplets: spec.overlay_triplets.iter().map(resolve).collect::<Result<_>>()?,
         };
@@ -950,12 +1086,15 @@ pub fn locate(start: &Path) -> Result<(PathBuf, Manifest)> {
 
 fn zero_config(start: &Path) -> Result<(PathBuf, Manifest)> {
     let has_sources = start.join("src").is_dir()
-        || std::fs::read_dir(start)?.flatten().any(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|extension| util::is_source_ext(&extension.to_string_lossy()))
-        });
+        || std::fs::read_dir(start)
+            .with_context(|| format!("reading {}", slash(start)))?
+            .flatten()
+            .any(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| util::is_source_ext(&extension.to_string_lossy()))
+            });
     if has_sources {
         return Ok((start.to_path_buf(), Manifest::default()));
     }
@@ -1022,11 +1161,27 @@ fn resolve_options(manifest: &Manifest, overrides: &[(String, bool)]) -> Result<
     Ok(options)
 }
 
-/// The [deps] names whose `if` holds (conventional targets use all of them).
-fn enabled_dep_names(manifest: &Manifest, condition: &CondContext) -> Result<Vec<String>> {
+/// The [options] names a condition uses.
+fn collect_options(condition: &Cond, context: &CondContext, options: &mut Vec<String>) {
+    match condition {
+        Cond::Atom(name) => {
+            if context.options.contains_key(name) && !options.contains(name) {
+                options.push(name.clone());
+            }
+        }
+        Cond::Not(inner) => collect_options(inner, context, options),
+        Cond::And(left, right) | Cond::Or(left, right) => {
+            collect_options(left, context, options);
+            collect_options(right, context, options);
+        }
+    }
+}
+
+/// The names in a [deps] or [dev-deps] table whose `if` holds (conventional targets use all of them).
+fn enabled_dep_names(deps: &indexmap::IndexMap<String, toml::Value>, condition: &CondContext) -> Result<Vec<String>> {
     let mut names = Vec::new();
 
-    for (name, value) in &manifest.deps {
+    for (name, value) in deps {
         let spec = manifest::parse_dep(name, value)?;
         let enabled = match &spec.cond {
             Some(condition_text) => condition.test(condition_text)?,
@@ -1076,7 +1231,10 @@ fn fetch_git(name: &str, url: &str, spec: &DepSpec, lock: &mut LockFile) -> Resu
 
     let commit = match lock.git_commit(name, url, &reference) {
         Some(commit) => commit,
-        None => resolve_git_commit(name, url, &reference)?,
+        None => {
+            lock.check_can_pin(&format!("git dependency `{name}` ({url} @ {reference})"))?;
+            resolve_git_commit(name, url, &reference)?
+        }
     };
     lock.set_git(name, url, &reference, &commit);
 
@@ -1173,7 +1331,7 @@ fn checkout_commit(name: &str, url: &str, commit: &str, folder: &Path) -> Result
         && git(&["fetch", "--quiet", "--depth", "1", "origin", commit])
         && git(&["checkout", "--quiet", "FETCH_HEAD"]);
     if shallow {
-        return Ok(());
+        return update_submodules(name, url, folder);
     }
 
     // Servers that refuse fetching a commit by id: the whole history
@@ -1190,19 +1348,57 @@ fn checkout_commit(name: &str, url: &str, commit: &str, folder: &Path) -> Result
         bail!("dependency `{name}`: commit {commit} is not in {url} (was it force-pushed away? `anvil update {name}` picks a new one)");
     }
 
+    update_submodules(name, url, folder)
+}
+
+/// A checkout's submodules, recursively: shallow, else with their history (servers that refuse fetching a commit
+/// by id).
+fn update_submodules(name: &str, url: &str, folder: &Path) -> Result<()> {
+    if !folder.join(".gitmodules").is_file() {
+        return Ok(());
+    }
+
+    let update = |shallow: bool| -> Result<std::process::Output> {
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(folder)
+            .args(["submodule", "update", "--init", "--recursive", "--quiet"]);
+        if shallow {
+            command.args(["--depth", "1"]);
+        }
+        command.output().context("running git submodule update")
+    };
+
+    if update(true)?.status.success() {
+        return Ok(());
+    }
+    let output = update(false)?;
+    if !output.status.success() {
+        bail!(
+            "dependency `{name}`: fetching the submodules of {url} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
     Ok(())
 }
 
 /// Fills an external target from `pkg-config --cflags --libs`.
-fn apply_pkg_config(target: &mut Target, module: &str) -> Result<()> {
+fn apply_pkg_config(target: &mut Target, module: &str, platform: &Platform) -> Result<()> {
+    let program = pkg_config_program(platform)?;
     let query = |argument: &str| -> Result<Vec<String>> {
-        let output = Command::new("pkg-config")
+        let output = Command::new(&program)
             .arg(argument)
             .arg(module)
             .output()
-            .context("running pkg-config (is it installed?)")?;
+            .with_context(|| format!("running {}", slash(&program)))?;
         if !output.status.success() {
-            bail!("pkg-config does not know `{module}`: {}", String::from_utf8_lossy(&output.stderr).trim());
+            bail!(
+                "{} does not know `{module}`: {}",
+                slash(&program),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
         Ok(util::split_command(&String::from_utf8_lossy(&output.stdout)))
     };
@@ -1228,6 +1424,24 @@ fn apply_pkg_config(target: &mut Target, module: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The pkg-config to run: PKG_CONFIG, else `<triple>-pkg-config` in a cross build, else pkg-config (or pkgconf) on
+/// PATH, wrappers (.bat, .cmd) included.
+fn pkg_config_program(platform: &Platform) -> Result<PathBuf> {
+    if let Some(configured) = std::env::var_os("PKG_CONFIG").filter(|value| !value.is_empty()) {
+        let configured = configured.to_string_lossy().into_owned();
+        return util::which(&configured).with_context(|| format!("PKG_CONFIG names {configured}, which is not a program on PATH"));
+    }
+
+    let cross = platform
+        .is_cross()
+        .then(|| util::which(&format!("{}pkg-config", platform.gnu_prefix())))
+        .flatten();
+    cross
+        .or_else(|| util::which("pkg-config"))
+        .or_else(|| util::which("pkgconf"))
+        .context("pkg-config is not on PATH: install it, or set PKG_CONFIG to its path")
 }
 
 /// Two targets in one folder that both take the convention's sources would compile the same files twice.

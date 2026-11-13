@@ -393,8 +393,9 @@ impl Target {
     }
 
     /// Conventional targets for a package with no `[target]` tables: an executable when src/ has a main file,
-    /// otherwise a library; one test per file in tests/ (or one test from all of tests/ when it has a main).
-    pub fn conventional(scope: &PackageScope, defaults: &TargetSpec, all_deps: &[String]) -> Result<Vec<Target>> {
+    /// otherwise a library; one test per file in tests/ (or one test from all of tests/ when it has a main). Tests
+    /// also use the [dev-deps].
+    pub fn conventional(scope: &PackageScope, defaults: &TargetSpec, all_deps: &[String], dev_deps: &[String]) -> Result<Vec<Target>> {
         let root = scope.root;
         let source_dir = root.join("src");
         let include_dir = root.join("include");
@@ -433,7 +434,8 @@ impl Target {
             .first()
             .filter(|target| target.kind.is_library())
             .map(|target| target.name.clone());
-        targets.extend(Target::conventional_tests(scope, defaults, all_deps, library)?);
+        let test_deps: Vec<String> = all_deps.iter().chain(dev_deps).cloned().collect();
+        targets.extend(Target::conventional_tests(scope, defaults, &test_deps, library)?);
 
         Ok(targets)
     }

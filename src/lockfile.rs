@@ -60,6 +60,17 @@ pub enum Refresh {
     Only(Vec<String>),
 }
 
+/// What the loaded manifests declare, whether or not this build resolved it.
+#[derive(Debug, Default)]
+pub struct Declared {
+    /// Names of git dependencies.
+    pub git: Vec<String>,
+    /// Every git and path dependency was resolved (none is behind a false `if` or unused).
+    pub all_resolved: bool,
+    /// A vcpkg dependency, or the project's own vcpkg.json.
+    pub vcpkg: bool,
+}
+
 pub struct LockFile {
     path: PathBuf,
     lock: Lock,
@@ -126,6 +137,18 @@ impl LockFile {
         (entry.url == url && entry.reference == reference).then(|| entry.commit.clone())
     }
 
+    /// Under --locked, fails before any git or vcpkg work when the build would have to add or change a pin.
+    pub fn check_can_pin(&self, what: &str) -> Result<()> {
+        if !self.locked {
+            return Ok(());
+        }
+
+        bail!(
+            "{} has no pin for {what}, and --locked forbids adding one. Run a build without --locked (or `anvil update`) and commit the file.",
+            slash(&self.path)
+        )
+    }
+
     pub fn set_git(&mut self, name: &str, url: &str, reference: &str, commit: &str) {
         self.used_git.push(name.to_string());
         self.lock.git.insert(
@@ -146,6 +169,11 @@ impl LockFile {
         self.lock.vcpkg.as_ref()?.baseline.clone()
     }
 
+    /// Does `anvil update` re-resolve this name (a git dependency, or `vcpkg`)?
+    pub fn refreshes(&self, name: &str) -> bool {
+        self.refresh.covers(name)
+    }
+
     pub fn set_vcpkg(&mut self, baseline: Option<String>, triplet: &str, ports: BTreeMap<String, String>) {
         let vcpkg = self.lock.vcpkg.get_or_insert_with(VcpkgLock::default);
         vcpkg.baseline = baseline;
@@ -156,12 +184,16 @@ impl LockFile {
         }
     }
 
-    /// Writes the file when it changed (or says what would change, under --locked). Without `uses_vcpkg` the
-    /// vcpkg entry goes.
-    pub fn finish(mut self, uses_vcpkg: bool) -> Result<()> {
+    /// Writes the file when it changed (or says what would change, under --locked). Pins of declared git
+    /// dependencies stay even when this build did not use them (behind an `if`, or another platform's); other pins go
+    /// only when every git and path dependency was resolved, so none can be a dependency's own. The vcpkg entry stays
+    /// while any [deps] entry is a vcpkg port.
+    pub fn finish(mut self, declared: &Declared) -> Result<()> {
         let used = std::mem::take(&mut self.used_git);
-        self.lock.git.retain(|name, _| used.contains(name));
-        if !uses_vcpkg {
+        self.lock
+            .git
+            .retain(|name, _| used.contains(name) || declared.git.contains(name) || !declared.all_resolved);
+        if !declared.vcpkg {
             self.lock.vcpkg = None;
         }
 
@@ -290,5 +322,46 @@ mod tests {
 
         file.refresh = Refresh::Only(vec!["lib".into()]);
         assert_eq!(file.git_commit("lib", "https://x/lib", "main"), None);
+    }
+
+    #[test]
+    fn unused_declared_pins_stay() {
+        let root = std::env::temp_dir().join(format!("anvil-lock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(LOCK_NAME);
+        let pinned = |name: &str| GitLock {
+            url: format!("https://x/{name}"),
+            reference: "main".into(),
+            commit: "1234".into(),
+        };
+
+        // A lock with a pin for `extra` (behind an `if` this build) and one nothing declares any more
+        let mut lock = Lock {
+            version: LOCK_VERSION,
+            vcpkg: Some(VcpkgLock {
+                baseline: Some("abc".into()),
+                ports: BTreeMap::new(),
+            }),
+            ..Default::default()
+        };
+        lock.git.insert("extra".into(), pinned("extra"));
+        lock.git.insert("gone".into(), pinned("gone"));
+        std::fs::write(&path, format!("{HEADER}{}", toml::to_string(&lock).unwrap())).unwrap();
+
+        // Every package resolved: only the undeclared pin goes; the baseline stays for an unused vcpkg dependency
+        let declared = Declared {
+            git: vec!["extra".into()],
+            all_resolved: true,
+            vcpkg: true,
+        };
+        LockFile::load(&root, false, Refresh::Nothing).unwrap().finish(&declared).unwrap();
+        let read: Lock = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(read.git.keys().collect::<Vec<_>>(), ["extra"]);
+        assert_eq!(read.vcpkg.and_then(|vcpkg| vcpkg.baseline).as_deref(), Some("abc"));
+
+        // --locked accepts the same lock when this build uses none of it
+        LockFile::load(&root, true, Refresh::Nothing).unwrap().finish(&declared).unwrap();
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
