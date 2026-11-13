@@ -485,7 +485,8 @@ impl Export {
                 Kind::External => {
                     // A vcpkg port CMake can find: its package and targets
                     let port = dependency.vcpkg.as_ref().map(|(port, _)| port.as_str());
-                    let package = port.and_then(|port| vcpkg_tree.and_then(|tree| tree.cmake_package(port)));
+                    let build = crate::vcpkg_tree::BuildContext::new(&model.toolchain, &model.profile);
+                    let package = port.and_then(|port| vcpkg_tree.and_then(|tree| tree.cmake_package(port, &build)));
                     if let Some(package) = package {
                         push_once(&mut self.dependencies, find_dependency_line(&package));
                         links.extend(package.targets.iter().map(|target| item(target.clone())));

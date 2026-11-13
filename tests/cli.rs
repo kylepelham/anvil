@@ -1068,6 +1068,28 @@ fn vcpkg_triplet_must_use_the_profile_runtime() {
 }
 
 #[test]
+fn vcpkg_interface_options_reach_users() {
+    require!("msvc", "windows", "vcpkg");
+    let project = Project::empty("vcpkg_options");
+    project.write("src/main.cpp", "int main() { return 0; }\n");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"app\"\n\n[vcpkg]\ntriplet = \"x64-windows-static-md\"\n\n[deps]\nglaze = \"vcpkg\"\n\n\
+         [target.app]\nkind = \"exe\"\nsources = [\"src/main.cpp\"]\ndeps = [\"glaze\"]\n",
+    );
+
+    // glaze's INTERFACE_COMPILE_OPTIONS, and in release its $<$<CONFIG:Release>:...> compile and link options
+    project.anvil(&["build", "--toolchain", "msvc"]).success();
+    let commands = project.read("out/compile_commands.json");
+    assert!(commands.contains("\"/Zc:preprocessor\"") && !commands.contains("\"/GL\""), "{commands}");
+    project
+        .anvil(&["build", "--release", "--toolchain", "msvc", "-v"])
+        .success()
+        .contains("/LTCG");
+    assert!(project.read("out/compile_commands.json").contains("\"/GL\""));
+}
+
+#[test]
 fn completions_leave_out_hidden_commands() {
     let project = Project::empty("completions");
     let run = project.anvil(&["completions", "bash"]);

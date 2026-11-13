@@ -110,6 +110,8 @@ struct CompileInputs {
     system_includes: Vec<PathBuf>,
     defines: Vec<String>,
     flags: Vec<String>,
+    /// Flags for one language's files only.
+    language_flags: Vec<(Language, String)>,
 }
 
 /// What linking a binary needs from its dependencies.
@@ -791,6 +793,16 @@ impl<'a> Planner<'a> {
             system_includes: &inputs.system_includes,
             flags: Cow::Borrowed(&inputs.flags),
         };
+
+        // Flags for this language's files only
+        let mut language_flags = inputs
+            .language_flags
+            .iter()
+            .filter(|(flag_language, _)| *flag_language == language)
+            .peekable();
+        if language_flags.peek().is_some() {
+            settings.flags.to_mut().extend(language_flags.map(|(_, flag)| flag.clone()));
+        }
 
         // File rules
         if target.file_rules.is_empty() {
@@ -1575,6 +1587,7 @@ impl<'a> Planner<'a> {
         inputs.defines.extend(target.public_defines.iter().cloned());
         inputs.flags.extend(target.flags.iter().cloned());
         inputs.flags.extend(target.public_flags.iter().cloned());
+        inputs.language_flags.extend(target.public_language_flags.iter().cloned());
 
         // Every direct dependency's exports (and through its public dependencies, theirs), header-only uses too
         let mut visited = HashSet::new();
@@ -1619,6 +1632,7 @@ impl<'a> Planner<'a> {
         inputs.defines.extend(target.interface_defines.iter().cloned());
         inputs.flags.extend(target.public_flags.iter().cloned());
         inputs.flags.extend(target.interface_flags.iter().cloned());
+        inputs.language_flags.extend(target.public_language_flags.iter().cloned());
 
         for (dependency, public) in &target.deps {
             if *public {

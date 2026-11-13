@@ -64,6 +64,8 @@ pub struct Target {
     pub interface_flags: Vec<String>,
     pub flags: Vec<String>,
     pub public_flags: Vec<String>,
+    /// Flags dependents compile one language's files with (a vcpkg package's $<COMPILE_LANGUAGE:CXX> options).
+    pub public_language_flags: Vec<(Language, String)>,
 
     // Linking: these all pass on to whatever links this target
     pub link_flags: Vec<String>,
@@ -310,6 +312,7 @@ impl Target {
             interface_flags: Vec::new(),
             flags: Vec::new(),
             public_flags: Vec::new(),
+            public_language_flags: Vec::new(),
             link_flags: Vec::new(),
             libs: Vec::new(),
             lib_dirs: Vec::new(),
