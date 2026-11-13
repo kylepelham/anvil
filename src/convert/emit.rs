@@ -3269,10 +3269,11 @@ fn remove_value(blocks: &mut Blocks, condition: &Option<String>, key: &str, valu
     let Some(block) = blocks.blocks.get_mut(condition) else { return };
 
     match (block.get_mut(key), value) {
-        // (a list emptied this way goes: an empty one would say something else)
+        // (a list emptied this way goes: an empty one would say something else. The target's own include folders
+        // stay as an empty list: without one, Anvil's convention would add src/ and include/)
         (Some(Value::List(items)), Value::List(removed)) => {
             items.retain(|item| !removed.contains(item));
-            if items.is_empty() {
+            if items.is_empty() && !(condition.is_none() && CONVENTION_KEYS.contains(&key)) {
                 block.shift_remove(key);
             }
         }

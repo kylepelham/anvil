@@ -405,11 +405,9 @@ impl Interpreter {
                 let flags = util::split_command(&self.get_variable(&name).unwrap_or_default());
                 let flags = self.with_off_host_flag_words(&name, flags, &options);
                 items.extend(flags.into_iter().map(|flag| {
-                    // The branch the word was added in, or else the compilers that take it
-                    let word_condition = match self.flag_word_conditions.get(&(name.clone(), flag.clone())) {
-                        Some(branch) => Some(branch.clone()),
-                        None => compiler_family_of_flag(&flag).map(String::from),
-                    };
+                    // The branch the word was added in, and the compilers that take it
+                    let branch = self.flag_word_conditions.get(&(name.clone(), flag.clone())).cloned();
+                    let word_condition = model::and_optional(&branch, &compiler_family_of_flag(&flag).map(String::from));
                     Item {
                         condition: model::and_optional(&condition, &word_condition),
                         public: false,
@@ -695,8 +693,8 @@ impl Interpreter {
         }
     }
 
-    /// cxx_std_NN and c_std_NN: the target's standard (the highest asked for), for C++ its dependents' too when
-    /// public. One asked for under a condition holds there, when it is higher.
+    /// cxx_std_NN and c_std_NN: the target's standard (the highest asked for), its dependents' too when public. One
+    /// asked for under a condition holds there, when it is higher.
     fn apply_compile_feature(&mut self, target: &str, feature: &str, public: bool, condition: Option<String>) {
         let (key, number) = match (feature.strip_prefix("cxx_std_"), feature.strip_prefix("c_std_")) {
             (Some(number), _) => ("std", number),
@@ -734,6 +732,9 @@ impl Interpreter {
         }
         if public && key == "std" {
             converted.public_std = Some(converted.public_std.map_or(standard, |current| current.max(standard)));
+        }
+        if public && key == "c-std" {
+            converted.public_c_std = Some(converted.public_c_std.map_or(standard, |current| current.max(standard)));
         }
     }
 
@@ -1736,6 +1737,14 @@ impl Interpreter {
             model::LANGUAGE_CXX
         };
 
+        // C standards dependents need: CMake raises a target's to those of what it links (C++'s is done when written)
+        let names: Vec<String> = self.targets.keys().cloned().collect();
+        for name in &names {
+            let passed_on = self.public_c_standard(name, &mut Vec::new(), true);
+            let target = self.targets.get_mut(name).unwrap();
+            target.c_std = target.c_std.max(passed_on);
+        }
+
         for target in self.targets.values_mut() {
             resolve_languages(target, project_language);
             define_export_symbol(target);
@@ -1785,6 +1794,25 @@ impl Interpreter {
             self.warn(command, &format!("{}: unknown target `{name}`", command.name));
         }
         None
+    }
+
+    /// The C standard a target's dependents get from it: its own public one, and what it links passes on (all its
+    /// links count for the target itself, `own`; only public ones beyond).
+    fn public_c_standard(&self, name: &str, visiting: &mut Vec<String>, own: bool) -> Option<u32> {
+        let Some(target) = self.targets.get(name) else { return None };
+        if visiting.iter().any(|visited| visited == name) {
+            return None;
+        }
+        visiting.push(name.to_string());
+
+        let mut standard = if own { None } else { target.public_c_std };
+        for item in target.links.iter().filter(|item| own || item.public) {
+            let linked = self.resolve_alias(&item.value);
+            standard = standard.max(self.public_c_standard(&linked, visiting, false));
+        }
+
+        visiting.pop();
+        standard
     }
 
     pub(super) fn resolve_alias(&self, name: &str) -> String {
@@ -1996,7 +2024,8 @@ fn is_ignored_property(property: &str) -> bool {
 }
 
 /// The compilers a word of a flag variable is for when only one family takes it: `/W4` is cl's; `-Wshadow`,
-/// `-fno-rtti` and `-march=native` are GCC's and Clang's. cl also takes its options with `-` (`-W4`, `-GS`).
+/// `-fno-rtti` and `-march=native` are GCC's and Clang's. cl also takes its options with `-` (`-W4`, `-GS`,
+/// `-fsanitize=address`).
 fn compiler_family_of_flag(flag: &str) -> Option<&'static str> {
     if flag.len() > 1 && flag.starts_with('/') {
         return Some("msvc");
@@ -2005,7 +2034,9 @@ fn compiler_family_of_flag(flag: &str) -> Option<&'static str> {
     let gnu_warning = flag
         .strip_prefix("-W")
         .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_lowercase()) && rest != "all");
-    let gnu_feature = flag.strip_prefix("-f").is_some_and(|rest| !rest.is_empty() && !rest.contains(':'));
+    let gnu_feature = flag
+        .strip_prefix("-f")
+        .is_some_and(|rest| !rest.is_empty() && !rest.contains(':') && rest != "sanitize=address");
     let gnu_machine = flag.strip_prefix("-m").is_some_and(|rest| !rest.is_empty());
     let gnu_other = matches!(flag, "-pedantic" | "-pedantic-errors" | "-pthread" | "-ansi");
     (gnu_warning || gnu_feature || gnu_machine || gnu_other).then_some("!msvc")
@@ -2128,6 +2159,28 @@ fn resolve_languages(target: &mut Target, project_language: &'static str) {
     decide_all(&mut target.link_options, main);
     decide_all(&mut target.lib_dirs, main);
     decide_all(&mut target.settings, main);
+
+    // cl takes no /std:c11 or later with /Za, and CMake gives it no C standard unless asked: a C target with /Za
+    // (and no standard) gets C89, for which Anvil passes cl none either
+    let has_c_standard = target.c_std.is_some() || target.settings.iter().any(|item| item.value.0 == "c-std");
+    if main == model::LANGUAGE_C && !has_c_standard {
+        let strict: Vec<Option<String>> = target
+            .options
+            .iter()
+            .filter(|item| matches!(item.value.as_str(), "/Za" | "-Za"))
+            .map(|item| item.condition.clone())
+            .collect();
+        for condition in strict {
+            match condition {
+                None => target.c_std = Some(89),
+                Some(_) => target.settings.push(Item {
+                    condition,
+                    public: false,
+                    value: ("c-std", "c89".to_string()),
+                }),
+            }
+        }
+    }
 }
 
 /// Takes a target's private settings that differ between C and C++ files out of the list: each value once, with the
@@ -2403,6 +2456,9 @@ set(flags -Wstrict-prototypes /sdl)
 foreach(flag ${flags})
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${flag}")
 endforeach()
+if(ENABLE_SAN)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-unused-variable")
+endif()
 separate_arguments(CMAKE_C_FLAGS)
 string(REPLACE ";" " " CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
 set(CMAKE_RC_FLAGS "${CMAKE_RC_FLAGS} /I \"${CMAKE_CURRENT_SOURCE_DIR}/res\"")
@@ -2421,6 +2477,10 @@ add_executable(app main.c app.rc)
         );
         assert!(toml.contains("[target.app.when.msvc]\nflags = [\"/sdl\"]\nwarnings = \"high\""), "{toml}");
         assert!(toml.contains("[target.app.when.ENABLE_SAN]\nflags = [\"-fsanitize=address\"]"), "{toml}");
+        assert!(
+            toml.contains("[target.app.when.\"ENABLE_SAN & !msvc\"]\nflags = [\"-Wno-unused-variable\"]"),
+            "{toml}"
+        );
         assert!(!toml.contains("/TC") && !toml.contains("-xc"), "{toml}");
     }
 
@@ -2489,6 +2549,67 @@ endif()
         assert!(toml.contains("[target.api]\nkind = \"lib\""), "{toml}");
         assert!(toml.contains("[target.api.when.HEADER_ONLY]\nkind = \"headers\""), "{toml}");
         assert!(toml.contains("[target.api.when.\"!HEADER_ONLY\"]\nsources = [\"api.cpp\"]"), "{toml}");
+    }
+
+    #[test]
+    fn c_standards_reach_users_and_strict_cl() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(cstd C CXX)
+add_library(api api.cc)
+target_compile_features(api INTERFACE c_std_11)
+add_executable(user user.c)
+target_link_libraries(user PRIVATE api)
+add_executable(strict strict.c)
+if(MSVC)
+  target_compile_options(strict PRIVATE /Za)
+endif()
+"#;
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("api.cc", "\n"),
+            ("user.c", "int main(void) { return 0; }\n"),
+            ("strict.c", "int main(void) { return 0; }\n"),
+        ];
+        let toml = convert_files("cstd", &files);
+
+        // A C standard asked for a library's users; C89 where cl gets /Za (it takes no /std:c17 with it)
+        assert!(
+            toml.contains("[target.user]\nkind = \"exe\"\nsources = [\"user.c\"]\ndeps = [\"api\"]\nc-std = \"c11\""),
+            "{toml}"
+        );
+        assert!(toml.contains("[target.strict.when.msvc]\nflags = [\"/Za\"]\nc-std = \"c89\""), "{toml}");
+    }
+
+    #[test]
+    fn hoisted_include_folders_keep_the_target_off_the_convention() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(hoisted CXX)
+include_directories(shared)
+add_definitions(-DONE -DTWO -DTHREE)
+add_library(first src/first.cpp)
+add_library(second src/second.cpp)
+add_library(third src/third.cpp)
+"#;
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("src/first.cpp", "\n"),
+            ("src/second.cpp", "\n"),
+            ("src/third.cpp", "\n"),
+            ("shared/shared.h", "\n"),
+        ];
+        let toml = convert_files("hoisted", &files);
+
+        // The folders moved to [defaults] or a preset; the target keeps an empty list, or Anvil would add src/
+        assert!(
+            !toml.contains("[target.first]\nkind = \"lib\"\nsources = [\"src/first.cpp\"]\n\n"),
+            "{toml}"
+        );
+        assert!(
+            toml.contains("[target.first]\nkind = \"lib\"\nsources = [\"src/first.cpp\"]\ninclude = []"),
+            "{toml}"
+        );
     }
 
     #[test]
