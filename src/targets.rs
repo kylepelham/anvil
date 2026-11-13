@@ -194,7 +194,7 @@ struct Accumulated {
     cuda_flags: Vec<String>,
     std: Option<String>,
     c_std: Option<String>,
-    gui: Option<bool>,
+    gui: Option<toml::Value>,
     exports: Option<bool>,
     export_header: Option<ExportHeaderSpec>,
     output_prefix: Option<String>,
@@ -581,7 +581,7 @@ impl Target {
         self.arch = settings.arch.as_deref().map(Arch::parse).transpose()?;
 
         // Output
-        self.gui = settings.gui.unwrap_or(false);
+        self.gui = settings.gui.map(|gui| gui.as_bool() != Some(false)).unwrap_or(false);
         self.exports = settings.exports.unwrap_or(false);
         self.output_prefix = settings.output_prefix;
         self.output_name = settings.output_name.unwrap_or_else(|| self.name.clone());

@@ -38,7 +38,7 @@ struct Parser<'a> {
 }
 
 // The words conditions know without a profile or an option: no profile or option may take one of them
-const BUILTIN_WORDS: &[&str] = &[
+pub const BUILTIN_WORDS: &[&str] = &[
     "true", "false", "windows", "win32", "linux", "macos", "osx", "apple", "unix", "x64", "x86_64", "amd64", "x86", "i686", "arm64", "aarch64",
     "arm", "cross", "msvc", "gnu", "cl", "clang-cl", "clang", "gcc", "mingw",
 ];

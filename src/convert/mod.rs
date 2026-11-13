@@ -9,7 +9,8 @@ mod parse;
 mod target_commands;
 mod test_groups;
 
-use anyhow::{bail, Result};
+use crate::util::slash;
+use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
 
 pub struct Conversion {
@@ -26,13 +27,101 @@ pub struct Conversion {
 
 pub fn convert(folder: &Path) -> Result<Conversion> {
     if !folder.join("CMakeLists.txt").is_file() {
-        bail!("no CMakeLists.txt in {}", crate::util::slash(folder));
+        bail!("no CMakeLists.txt in {}", slash(folder));
     }
 
     let mut interpreter = interp::Interpreter::new(folder);
     interpreter.run_root()?;
 
-    emit::emit(interpreter)
+    let conversion = emit::emit(interpreter)?;
+    check_output(&conversion)?;
+
+    Ok(conversion)
+}
+
+/// The written files must load: valid TOML, keys Anvil knows, and conditions over words it knows. Anything else is a
+/// bug in the converter, stopped here rather than left for `anvil build` to find.
+fn check_output(conversion: &Conversion) -> Result<()> {
+    const BUG: &str = "a bug in `anvil convert`: please report it with the CMake project";
+
+    // anvil.toml: the words its conditions may use
+    let manifest =
+        crate::manifest::parse_str(&conversion.toml).map_err(|error| anyhow!("the converted anvil.toml does not load ({BUG}):\n{error}"))?;
+    let options: Vec<String> = manifest.options.keys().cloned().collect();
+    let profiles: Vec<String> = manifest.profile.keys().cloned().collect();
+    crate::cond::check_names(&profiles, &options).map_err(|error| anyhow!("the converted anvil.toml: {error} ({BUG})"))?;
+
+    let mut known: Vec<&str> = crate::cond::BUILTIN_WORDS.to_vec();
+    known.extend(["debug", "release"]);
+    known.extend(options.iter().chain(&profiles).map(String::as_str));
+
+    let mut files = vec![("anvil.toml".to_string(), conversion.toml.as_str())];
+    for (path, text) in &conversion.tests_files {
+        crate::manifest::parse_tests(text).map_err(|error| anyhow!("the converted {} does not load ({BUG}):\n{error}", slash(path)))?;
+        files.push((slash(path), text.as_str()));
+    }
+
+    // Every condition, in every file
+    for (file, text) in files {
+        let document: toml::Value = toml::from_str(text)?;
+        let mut conditions = Vec::new();
+        collect_conditions(&document, "", &mut conditions);
+
+        for (place, condition) in conditions.iter().filter(|(_, condition)| !condition.contains('{')) {
+            let parsed = crate::cond::parse(condition).map_err(|error| anyhow!("the converted {file}, [{place}]: {error} ({BUG})"))?;
+            let mut words = Vec::new();
+            condition_words(&parsed, &mut words);
+            if let Some(word) = words.iter().find(|word| !known.contains(&word.as_str())) {
+                bail!(
+                    "the converted {file}, [{place}]: condition \"{condition}\" uses `{word}`, which is no option, profile or condition word ({BUG})"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Every condition in a TOML document with the table it is in: `if` values, and the keys of `when` tables.
+fn collect_conditions(value: &toml::Value, place: &str, conditions: &mut Vec<(String, String)>) {
+    // (tables of names, where `when` and `if` would be a target or dependency called that)
+    const NAME_TABLES: &[&str] = &["target", "preset", "deps", "profile", "options"];
+
+    match value {
+        toml::Value::Table(table) => {
+            for (key, child) in table {
+                let child_place = if place.is_empty() { key.clone() } else { format!("{place}.{key}") };
+                let named = NAME_TABLES.contains(&place);
+                match (key.as_str(), child) {
+                    ("if", toml::Value::String(condition)) if !named => conditions.push((place.to_string(), condition.clone())),
+                    ("when", toml::Value::Table(blocks)) if !named => {
+                        conditions.extend(blocks.keys().map(|condition| (child_place.clone(), condition.clone())));
+                    }
+                    _ => {}
+                }
+                collect_conditions(child, &child_place, conditions);
+            }
+        }
+        toml::Value::Array(items) => {
+            for item in items {
+                collect_conditions(item, place, conditions);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn condition_words(condition: &crate::cond::Cond, words: &mut Vec<String>) {
+    use crate::cond::Cond;
+
+    match condition {
+        Cond::Atom(word) => words.push(word.clone()),
+        Cond::Not(inner) => condition_words(inner, words),
+        Cond::And(left, right) | Cond::Or(left, right) => {
+            condition_words(left, words);
+            condition_words(right, words);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -260,5 +349,70 @@ endforeach()
         assert!(tests.contains(r#"matrix.view = ["street", "arch", "hall"]"#), "{tests}");
         assert!(tests.contains(r#"{ path = "cpu", args = ["--cpu"] }"#), "{tests}");
         assert!(!tests.contains("--stale"), "{tests}");
+    }
+
+    #[test]
+    fn what_is_written_loads() {
+        let cmake = r#"cmake_minimum_required(VERSION 3.20)
+project(loads CXX)
+option(OPT_A "a" OFF)
+option(WITH_FMT "fmt" OFF)
+option(INSTALL_IT "install" ON)
+add_executable(app app/main.cpp)
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+  target_compile_definitions(app PRIVATE BITS32)
+endif()
+if(OPT_A)
+  target_compile_definitions(app PRIVATE HAS_A)
+endif()
+set(OPT_A ON)
+if(WITH_FMT)
+  find_package(fmt REQUIRED)
+  target_link_libraries(app PRIVATE fmt::fmt)
+endif()
+set_target_properties(app PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<BOOL:${OPT_A}>:DLL>
+")
+target_link_options(app PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
+if(INSTALL_IT)
+  file(WRITE ${CMAKE_BINARY_DIR}/config.cmake "include(x)\n")
+endif()
+add_library(one STATIC lib/a.cpp lib/b.cpp)
+add_library(two SHARED lib/a.cpp lib/b.cpp)
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/gen.cpp COMMAND cmake -E echo "int x = 1" > ${CMAKE_BINARY_DIR}/gen.cpp)
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/list.txt COMMAND tool --list | sort > ${CMAKE_BINARY_DIR}/list.txt)
+add_custom_target(lists ALL DEPENDS ${CMAKE_BINARY_DIR}/list.txt)
+enable_testing()
+add_test(NAME t COMMAND app)
+set_tests_properties(t PROPERTIES ENVIRONMENT "A=1;B=3;A=2")
+"#;
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("app/main.cpp", "int main() {}\n"),
+            ("lib/a.cpp", "\n"),
+            ("lib/b.cpp", "\n"),
+        ];
+        let conversion = convert_files("loads", &files);
+        let toml = &conversion.toml;
+
+        // Conditions over known words only; an option set() later still declared where a condition uses it
+        assert!(toml.contains(r#"[target.app.when."x86 | arm"]"#), "{toml}");
+        assert!(toml.contains("OPT_A = {"), "{toml}");
+        assert!(toml.contains("INSTALL_IT = {"), "{toml}");
+        assert!(!toml.contains('\u{1}'), "{toml}");
+
+        // The dependency only where it is used; main() as a windows program's entry
+        assert!(toml.contains(r#"fmt = { vcpkg = "fmt", if = "WITH_FMT" }"#), "{toml}");
+        assert!(toml.contains(r#"gui = "main""#), "{toml}");
+
+        // Two targets in one folder list their sources; echo > file is a [[write]], a pipe runs through the shell
+        assert_eq!(toml.matches(r#"sources = ["lib/a.cpp", "lib/b.cpp"]"#).count(), 2, "{toml}");
+        assert!(toml.contains(r#"text = "int x = 1\n""#), "{toml}");
+        assert!(toml.contains("shell = true"), "{toml}");
+
+        // The last value of a variable set twice
+        assert!(
+            toml.contains(r#"env = { A = "2", B = "3" }"#) || toml.contains(r#"env = { B = "3", A = "2" }"#),
+            "{toml}"
+        );
     }
 }

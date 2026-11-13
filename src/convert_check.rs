@@ -1,6 +1,6 @@
 //! `anvil convert --check`: configures the CMake project with Ninja and the same compiler and vcpkg tree, plans the
 //! Anvil build, and compares the two compile_commands.json file by file: which files each side compiles, and each
-//! common file's definitions and include folders.
+//! common file's definitions, include folders, standard and other options.
 
 use crate::project::Model;
 use crate::util::{self, slash};
@@ -12,6 +12,71 @@ use std::process::Command;
 // Definitions CMake adds on its own (CMAKE_<LANG>_FLAGS defaults, Ninja Multi-Config, shared library exports)
 const CMAKE_IMPLICIT_DEFINES: &[&str] = &["WIN32", "_WINDOWS", "_MBCS", "UNICODE", "_UNICODE"];
 
+// Options each side adds by itself (output and dependency files, precompiled headers, optimization, debug info,
+// runtime, warning level, conformance, diagnostics), left out of the comparison; a trailing `*` matches any rest.
+// MSVC options are compared with `-`, however written; `@file` (response files, module maps) is CMake's own too
+const OWN_OPTIONS: &[&str] = &[
+    "-nologo",
+    "-utf-8",
+    "-bigobj",
+    "-EHsc",
+    "-EHs",
+    "-GR",
+    "-permissive-",
+    "-Zc:__cplusplus",
+    "-FS",
+    "-MP*",
+    "-c",
+    "-Fo*",
+    "-Fd*",
+    "-Fp*",
+    "-Yu*",
+    "-Yc*",
+    "-FI*",
+    "-Tc*",
+    "-Tp*",
+    "-TC",
+    "-TP",
+    "-showIncludes",
+    "-O*",
+    "-Z7",
+    "-Zi",
+    "-ZI",
+    "-RTC*",
+    "-MD",
+    "-MDd",
+    "-MT",
+    "-MTd",
+    "-W0",
+    "-W1",
+    "-W2",
+    "-W3",
+    "-W4",
+    "-Wall",
+    "-external:W*",
+    "-Gy",
+    "-Gw",
+    "-GL",
+    "-JMC",
+    "-diagnostics:*",
+    "-g*",
+    "-MMD",
+    "-MP",
+    "-fdiagnostics-color*",
+    "-fcolor-diagnostics",
+    "-fPIC",
+    "-fpic",
+    "-w",
+    "-Wextra",
+    "-Winvalid-pch",
+    "-flto*",
+    "-fms-runtime-lib=*",
+    "@*",
+];
+
+// Options whose value is the next word (files, a language), left out with it
+const OPTIONS_WITH_VALUE: &[&str] = &["-o", "-MF", "-MT", "-MQ", "-x", "-include", "-include-pch", "-sourceDependencies"];
+
 // Files and differences listed per group before "and N more"
 const LISTED_FILES: usize = 5;
 
@@ -19,11 +84,13 @@ const LISTED_FILES: usize = 5;
 const CMAKE_LOG_LINES: usize = 30;
 
 /// One compiled file's settings that matter for a correct build.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct FileFlags {
     shown_path: String,
     defines: IndexSet<String>,
     includes: IndexSet<String>,
+    standard: Option<String>,
+    options: IndexSet<String>,
 }
 
 /// Configures CMake, plans Anvil, and prints the differences. Returns the exit code: 0 when both compile the same.
@@ -35,7 +102,23 @@ pub fn check(model: &Model) -> Result<i32> {
     let cmake_entries = read_database(&cmake_folder.join("compile_commands.json"), &cmake_folder, model)?;
     let roots: Vec<usize> = model.default_targets(true);
     crate::plan::plan(model, None, &roots, false)?;
-    let anvil_entries = read_database(&model.out_dir.join("compile_commands.json"), &model.out_dir, model)?;
+    let mut anvil_entries = read_database(&model.out_dir.join("compile_commands.json"), &model.out_dir, model)?;
+
+    // Resource files a target lists but compile_commands.json leaves out: compiled the same as CMake's
+    let prefixes = Prefixes {
+        build: util::path_key(&model.out_dir),
+        root: util::path_key(&model.root),
+    };
+    let listed: IndexSet<String> = roots
+        .iter()
+        .flat_map(|index| &model.targets[*index].sources)
+        .map(|source| comparable_path(source, &prefixes))
+        .collect();
+    for (key, entries) in &cmake_entries {
+        if key.ends_with(".rc") && listed.contains(key) && !anvil_entries.contains_key(key) {
+            anvil_entries.insert(key.clone(), entries.clone());
+        }
+    }
 
     Ok(report(&cmake_entries, &anvil_entries))
 }
@@ -55,6 +138,8 @@ fn configure_cmake(model: &Model, folder: &Path) -> Result<()> {
         "-G".into(),
         "Ninja".into(),
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON".into(),
+        // (projects asking for CMake older than 3.5 configure only with this)
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5".into(),
         format!("-DCMAKE_BUILD_TYPE={}", cmake_build_type(model)),
         format!("-DCMAKE_C_COMPILER={}", slash(&model.toolchain.cc)),
         format!("-DCMAKE_CXX_COMPILER={}", slash(&model.toolchain.cxx)),
@@ -150,14 +235,24 @@ fn read_database(file: &Path, build_folder: &Path, model: &Model) -> Result<Data
             shown_path: util::rel(&source, &model.root),
             ..Default::default()
         };
+        let source_key = util::path_key(&source);
+        let is_resource = source.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("rc"));
         read_flags(&words, &mut |kind, value| match kind {
             FlagKind::Define => {
                 flags.defines.insert(value.to_string());
             }
             FlagKind::Include => {
-                flags
-                    .includes
-                    .insert(comparable_path(&util::absolute(&directory, Path::new(value)), &prefixes));
+                let folder = util::absolute(&directory, Path::new(value));
+                if !is_empty_gen_folder(&folder, model) {
+                    flags.includes.insert(comparable_path(&folder, &prefixes));
+                }
+            }
+            FlagKind::Standard => flags.standard = Some(value.to_string()),
+
+            // The source itself aside; a resource compiler's options are its own
+            FlagKind::Option if is_resource || util::path_key(&util::absolute(&directory, Path::new(value))) == source_key => {}
+            FlagKind::Option => {
+                flags.options.insert(value.to_string());
             }
         });
 
@@ -165,6 +260,18 @@ fn read_database(file: &Path, build_folder: &Path, model: &Model) -> Result<Data
     }
 
     Ok(files)
+}
+
+/// Anvil's folder for a target's generated headers ({gen}) while nothing is in it: CMake has none to match.
+fn is_empty_gen_folder(folder: &Path, model: &Model) -> bool {
+    let gen_root = format!("{}/", util::path_key(&model.out_dir.join("gen")));
+    let is_gen = util::path_key(folder).starts_with(&gen_root);
+    let has_files = walkdir::WalkDir::new(folder)
+        .into_iter()
+        .flatten()
+        .any(|entry| entry.file_type().is_file());
+
+    is_gen && !has_files
 }
 
 /// A path as both databases can compare it: case-folded, with the build folder as <build> and the project as <root>.
@@ -183,24 +290,50 @@ fn comparable_path(path: &Path, prefixes: &Prefixes) -> String {
 enum FlagKind {
     Define,
     Include,
+    Standard,
+    /// Any other option the compiler is given, but those each side adds by itself (OWN_OPTIONS).
+    Option,
 }
 
-/// Calls `found` for each definition and include folder in a compile command (attached or separate values).
+/// Calls `found` for each definition, include folder, standard and other option in a compile command (attached or
+/// separate values).
 fn read_flags(words: &[String], found: &mut dyn FnMut(FlagKind, &str)) {
     const DEFINE_FLAGS: &[&str] = &["-D", "/D"];
     const INCLUDE_FLAGS: &[&str] = &["-I", "/I", "-external:I", "/external:I", "-isystem", "-imsvc", "-iquote"];
+    const STANDARD_FLAGS: &[&str] = &["-std=", "/std:", "-std:"];
 
     // The longest flag first: /external:I before /I
     let mut flags: Vec<(&str, bool)> = DEFINE_FLAGS.iter().map(|flag| (*flag, true)).collect();
     flags.extend(INCLUDE_FLAGS.iter().map(|flag| (*flag, false)));
     flags.sort_by_key(|(flag, _)| std::cmp::Reverse(flag.len()));
 
+    // MSVC takes `/` and `-` alike: compared as `-`
+    let program = words
+        .first()
+        .map(|word| Path::new(word).file_stem().unwrap_or_default().to_string_lossy().to_lowercase());
+    let msvc = matches!(program.as_deref(), Some("cl" | "clang-cl"));
+
     let mut index = 1;
     while index < words.len() {
         let word = &words[index];
         index += 1;
 
+        if let Some(standard) = STANDARD_FLAGS.iter().find_map(|flag| word.strip_prefix(flag)) {
+            found(FlagKind::Standard, standard);
+            continue;
+        }
+
         let Some((flag, is_define)) = flags.iter().find(|(flag, _)| word.starts_with(*flag)) else {
+            // Another option, unless the side adds it by itself
+            let option = match word.strip_prefix('/') {
+                Some(rest) if msvc => format!("-{rest}"),
+                _ => word.clone(),
+            };
+            if OPTIONS_WITH_VALUE.contains(&option.as_str()) {
+                index += 1;
+            } else if !OWN_OPTIONS.iter().any(|own| matches_pattern(own, &option)) {
+                found(FlagKind::Option, &option);
+            }
             continue;
         };
         let attached = &word[flag.len()..];
@@ -213,6 +346,14 @@ fn read_flags(words: &[String], found: &mut dyn FnMut(FlagKind, &str)) {
 
         let kind = if *is_define { FlagKind::Define } else { FlagKind::Include };
         found(kind, value);
+    }
+}
+
+/// `pattern` with a trailing `*` matching any rest.
+fn matches_pattern(pattern: &str, text: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(start) => text.starts_with(start),
+        None => text == pattern,
     }
 }
 
@@ -330,7 +471,7 @@ fn pair_entries<'a>(cmake: &'a [FileFlags], anvil: &'a [FileFlags]) -> Vec<(&'a 
     pairs
 }
 
-/// How many definitions and include folders one side has and the other lacks.
+/// How many definitions, include folders and options one side has and the other lacks.
 fn difference_size(cmake: &FileFlags, anvil: &FileFlags) -> usize {
     let defines = cmake
         .defines
@@ -339,8 +480,14 @@ fn difference_size(cmake: &FileFlags, anvil: &FileFlags) -> usize {
         .count()
         + anvil.defines.iter().filter(|define| !cmake.defines.contains(*define)).count();
     let includes = cmake.includes.symmetric_difference(&anvil.includes).count();
+    let options = cmake.options.symmetric_difference(&anvil.options).count();
 
-    defines + includes
+    defines + includes + options + different_standards(cmake, anvil) as usize
+}
+
+/// Both say which standard, and not the same one (a side without one compiles with the compiler's default).
+fn different_standards(cmake: &FileFlags, anvil: &FileFlags) -> bool {
+    matches!((&cmake.standard, &anvil.standard), (Some(cmake), Some(anvil)) if cmake != anvil)
 }
 
 /// Definitions and include folders one side has and the other lacks, one line each; empty when they match.
@@ -352,12 +499,21 @@ fn describe_difference(cmake: &FileFlags, anvil: &FileFlags) -> String {
     let only_anvil_defines = anvil.defines.iter().filter(|define| !cmake.defines.contains(*define));
     let only_cmake_includes = cmake.includes.iter().filter(|folder| !anvil.includes.contains(*folder));
     let only_anvil_includes = anvil.includes.iter().filter(|folder| !cmake.includes.contains(*folder));
+    let only_cmake_options = cmake.options.iter().filter(|option| !anvil.options.contains(*option));
+    let only_anvil_options = anvil.options.iter().filter(|option| !cmake.options.contains(*option));
+    let standards = match (&cmake.standard, &anvil.standard) {
+        (Some(cmake), Some(anvil)) if cmake != anvil => Some(format!("  standard: CMake {cmake}, Anvil {anvil}")),
+        _ => None,
+    };
 
     let lines = [
         difference_line("definitions only CMake has", only_cmake_defines),
         difference_line("definitions only Anvil has", only_anvil_defines),
         difference_line("include folders only CMake has", only_cmake_includes),
         difference_line("include folders only Anvil has", only_anvil_includes),
+        difference_line("options only CMake has", only_cmake_options),
+        difference_line("options only Anvil has", only_anvil_options),
+        standards,
     ];
 
     lines.into_iter().flatten().collect::<Vec<_>>().join("\n")
@@ -410,8 +566,32 @@ mod tests {
         read_flags(&words, &mut |kind, value| match kind {
             FlagKind::Define => defines.push(value.to_string()),
             FlagKind::Include => includes.push(value.to_string()),
+            _ => {}
         });
         assert_eq!(defines, vec![r#"NAME="x y""#]);
         assert_eq!(includes, vec!["C:/a b/include", "C:/v/include"]);
+    }
+
+    #[test]
+    fn options_each_side_adds_are_left_out() {
+        let options = |command: &str| {
+            let mut found = Vec::new();
+            read_flags(&split_command(command), &mut |kind, value| match kind {
+                FlagKind::Option => found.push(value.to_string()),
+                FlagKind::Standard => found.push(format!("std {value}")),
+                _ => {}
+            });
+            found
+        };
+
+        // MSVC options read the same with `-` or `/`; output, debug, runtime and warning level are each side's own
+        // (the source file is left out by the caller)
+        let cmake = options(r"C:\VS\cl.exe /nologo -wd4251 /W3 /MDd /Zi /Ob0 /Od /RTC1 -std:c++17 /Foa.obj /Fdx\ /FS @a.modmap -c a.cpp");
+        assert_eq!(cmake, ["-wd4251", "std c++17", "a.cpp"]);
+        let anvil = options(r"C:\VS\cl.exe /nologo /utf-8 /std:c++17 /Od /Z7 /W4 /wd4251 /sourceDependencies a.json /c /Foa.obj /Tpa.cpp");
+        assert_eq!(anvil, ["std c++17", "-wd4251"]);
+
+        let gnu = options("g++ -std=c++17 -O0 -g -Wshadow -MD -MF a.d -c a.cpp -o a.o");
+        assert_eq!(gnu, ["std c++17", "-Wshadow", "a.cpp"]);
     }
 }
