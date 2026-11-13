@@ -31,6 +31,7 @@ pub fn convert(folder: &Path) -> Result<Conversion> {
 
     let mut interpreter = interp::Interpreter::new(folder);
     interpreter.run_root()?;
+    interpreter.finish_targets();
 
     emit::emit(interpreter)
 }

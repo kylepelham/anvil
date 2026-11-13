@@ -38,19 +38,33 @@ pub struct ConfigureWrite {
     pub condition: Option<String>,
 }
 
+/// Settings for a target's files of one language: those under `folder` matching `pattern` (`*.c`).
+#[derive(Debug, Clone)]
+pub struct LanguageRule {
+    pub folder: PathBuf,
+    pub pattern: String,
+    pub condition: Option<String>,
+    pub options: Vec<String>,
+    pub defines: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Target {
     pub name: String,
     pub kind: TargetKind,
     pub dir: PathBuf,
     pub dir_id: usize,
+    /// Folders of later definitions (one per if/else branch), whose settings it takes too.
+    pub other_dir_ids: Vec<usize>,
     pub condition: Option<String>,
 
     pub sources: Vec<Item<PathBuf>>,
     pub includes: Vec<Item<(PathBuf, bool)>>,
     pub defines: Vec<Item<String>>,
-    /// INTERFACE definitions of a target that compiles: its users' only.
+    /// INTERFACE settings of a target that compiles: its users' only.
     pub interface_defines: Vec<Item<String>>,
+    pub interface_includes: Vec<Item<(PathBuf, bool)>>,
+    pub interface_options: Vec<Item<String>>,
     pub options: Vec<Item<String>>,
     pub links: Vec<Item<String>>,
     pub link_options: Vec<Item<String>>,
@@ -59,6 +73,8 @@ pub struct Target {
     pub std: Option<u32>,
     /// The standard its dependents need too (a PUBLIC cxx_std_NN).
     pub public_std: Option<u32>,
+    /// The C standard of its C files (C_STANDARD, c_std_NN).
+    pub c_std: Option<u32>,
     pub pch: Option<PathBuf>,
     pub gui: bool,
     pub output_name: Option<String>,
@@ -66,10 +82,15 @@ pub struct Target {
     pub notes: Vec<String>,
     pub imported: bool,
 
-    /// Anvil keys properties set, each under its condition: output-prefix, output-suffix, exports, link-depends.
+    /// Anvil keys properties set, each under its condition: output-prefix, output-suffix, exports, link-depends;
+    /// and single values set only under a condition (pch, std, kind, ...), which override the target's own there.
     pub settings: Vec<Item<(&'static str, String)>>,
     /// add_library without a type under an unset BUILD_SHARED_LIBS: shared when this holds.
     pub shared_condition: Option<String>,
+    /// DEFINE_SYMBOL: what a shared build defines instead of `<target>_EXPORTS` (empty: nothing).
+    pub define_symbol: Option<String>,
+    /// Flags and definitions for its files of one language only (C flags in a target that also compiles C++).
+    pub language_rules: Vec<LanguageRule>,
     /// generate_export_header as Anvil's key: the header's path under its include folder, and the macro.
     pub export_header: Option<(String, String)>,
     /// The project's function that created it, if one did: its targets share a preset.
@@ -163,6 +184,8 @@ impl Target {
         qualify(&mut self.includes, condition);
         qualify(&mut self.defines, condition);
         qualify(&mut self.interface_defines, condition);
+        qualify(&mut self.interface_includes, condition);
+        qualify(&mut self.interface_options, condition);
         qualify(&mut self.options, condition);
         qualify(&mut self.links, condition);
         qualify(&mut self.link_options, condition);
@@ -176,17 +199,21 @@ impl Target {
             kind,
             dir,
             dir_id,
+            other_dir_ids: Vec::new(),
             condition,
             sources: Vec::new(),
             includes: Vec::new(),
             defines: Vec::new(),
             interface_defines: Vec::new(),
+            interface_includes: Vec::new(),
+            interface_options: Vec::new(),
             options: Vec::new(),
             links: Vec::new(),
             link_options: Vec::new(),
             lib_dirs: Vec::new(),
             std: None,
             public_std: None,
+            c_std: None,
             pch: None,
             gui: false,
             output_name: None,
@@ -195,8 +222,24 @@ impl Target {
             imported: false,
             settings: Vec::new(),
             shared_condition: None,
+            define_symbol: None,
+            language_rules: Vec::new(),
             export_header: None,
             helper: None,
+        }
+    }
+}
+
+impl TargetKind {
+    /// The kind as anvil.toml writes it.
+    pub fn text(self) -> &'static str {
+        match self {
+            TargetKind::Exe => "exe",
+            TargetKind::Static => "lib",
+            TargetKind::Shared => "shared",
+            TargetKind::Object => "object",
+            TargetKind::Interface => "headers",
+            TargetKind::Custom => "custom",
         }
     }
 }
@@ -563,8 +606,8 @@ pub fn split_list(value: &str) -> Vec<String> {
 }
 
 /// Evaluates generator expressions in one list item: each result is (condition, value). Unknown expressions are
-/// kept and reported.
-pub fn expand_genex(item: &str, unknown: &mut Vec<String>) -> Vec<(Truth, String)> {
+/// kept and reported. `target_exists` answers $<TARGET_EXISTS:...> (without it, that expression is unknown).
+pub fn expand_genex(item: &str, unknown: &mut Vec<String>, target_exists: Option<&dyn Fn(&str) -> bool>) -> Vec<(Truth, String)> {
     if !item.contains("$<") {
         return vec![(Truth::Known(true), item.to_string())];
     }
@@ -573,16 +616,27 @@ pub fn expand_genex(item: &str, unknown: &mut Vec<String>) -> Vec<(Truth, String
         characters: item.chars().collect(),
         position: 0,
         unknown,
+        target_exists,
     };
     let parts = parser.sequence(&[]);
 
-    join_alternatives(parts).into_iter().filter(|(_, value)| !value.is_empty()).collect()
+    // A compiler version outside a version comparison is a value Anvil cannot know
+    let mut results: Vec<(Truth, String)> = join_alternatives(parts).into_iter().filter(|(_, value)| !value.is_empty()).collect();
+    for (_, value) in &mut results {
+        if value.contains(COMPILER_VERSION_MARKER) {
+            *value = value.replace(COMPILER_VERSION_MARKER, "$<CXX_COMPILER_VERSION>");
+            unknown.push("$<CXX_COMPILER_VERSION>".into());
+        }
+    }
+
+    results
 }
 
 struct GenexParser<'a> {
     characters: Vec<char>,
     position: usize,
     unknown: &'a mut Vec<String>,
+    target_exists: Option<&'a dyn Fn(&str) -> bool>,
 }
 
 type Alternatives = Vec<(Truth, String)>;
@@ -605,6 +659,14 @@ const CONDITION_EXPRESSIONS: &[&str] = &[
     "C_COMPILER_FRONTEND_VARIANT",
     "COMPILE_LANGUAGE",
     "LINK_LANGUAGE",
+    "COMPILE_LANG_AND_ID",
+    "CXX_COMPILER_VERSION",
+    "C_COMPILER_VERSION",
+    "VERSION_LESS",
+    "VERSION_GREATER",
+    "VERSION_EQUAL",
+    "VERSION_LESS_EQUAL",
+    "VERSION_GREATER_EQUAL",
     "BOOL",
     "NOT",
     "AND",
@@ -613,6 +675,20 @@ const CONDITION_EXPRESSIONS: &[&str] = &[
     "EQUAL",
     "TARGET_EXISTS",
 ];
+
+// The condition words a COMPILE_LANGUAGE test becomes; decided per target (and per file) once its sources are known
+pub const LANGUAGE_C: &str = "language.c";
+pub const LANGUAGE_CXX: &str = "language.cxx";
+const LANGUAGE_PREFIX: &str = "language.";
+
+// $<CXX_COMPILER_VERSION> as a value, for a version comparison to recognise
+const COMPILER_VERSION_MARKER: &str = "\u{1}compiler-version\u{2}";
+
+// $<TARGET_OBJECTS:x> as a value: `{objects:x}`, a dependency on the object library x
+pub const OBJECTS_PREFIX: &str = "{objects:";
+
+// The version each compiler family is assumed to have (a current one), for version tests
+const CURRENT_COMPILER_VERSIONS: &[(&str, &str)] = &[("cl", "19.44"), ("gcc", "14.2"), ("clang", "19.1")];
 
 impl GenexParser<'_> {
     /// Text and expressions up to the end, or up to one of `stops` (not consumed).
@@ -648,11 +724,13 @@ impl GenexParser<'_> {
     fn expression(&mut self) -> Alternatives {
         let start = self.position;
 
-        // $<$<cond>:value>: the head is a nested condition
+        // $<$<cond>:value>: the head is a nested condition; one Anvil cannot read leaves the whole expression unknown
         if self.at_expression() {
             self.position += 2;
+            let unknown_count = self.unknown.len();
             let condition = truth_of(&self.expression());
-            if self.peek() != Some(':') {
+            if self.unknown.len() > unknown_count || self.peek() != Some(':') {
+                self.unknown.truncate(unknown_count);
                 return self.unknown_expression(start);
             }
             self.position += 1;
@@ -672,6 +750,7 @@ impl GenexParser<'_> {
             self.position += 1;
             return match head.as_str() {
                 "CONFIG" | "CONFIGURATION" => vec![(Truth::Known(true), "{config}".into())],
+                "CXX_COMPILER_VERSION" | "C_COMPILER_VERSION" => vec![(Truth::Known(true), COMPILER_VERSION_MARKER.into())],
                 "SEMICOLON" => vec![(Truth::Known(true), ";".into())],
                 "COMMA" => vec![(Truth::Known(true), ",".into())],
                 "ANGLE-R" => vec![(Truth::Known(true), ">".into())],
@@ -682,7 +761,7 @@ impl GenexParser<'_> {
 
         match head.as_str() {
             // $<1:value>, $<0:value>, interface wrappers: the value runs to the closing '>'
-            "1" | "0" | "BUILD_INTERFACE" | "BUILD_LOCAL_INTERFACE" | "INSTALL_INTERFACE" => {
+            "1" | "0" | "BUILD_INTERFACE" | "BUILD_LOCAL_INTERFACE" | "INSTALL_INTERFACE" | "LINK_ONLY" => {
                 let value = join_alternatives(self.sequence(&['>']));
                 self.expect_close();
                 if head == "0" || head == "INSTALL_INTERFACE" {
@@ -702,6 +781,22 @@ impl GenexParser<'_> {
                 vec![(Truth::Known(true), "{out}".into())]
             }
 
+            // An object library's objects: a dependency on it
+            "TARGET_OBJECTS" => {
+                let name = self.text_until(&['>']);
+                self.expect_close();
+                vec![(Truth::Known(true), format!("{OBJECTS_PREFIX}{name}}}"))]
+            }
+            "TARGET_NAME_IF_EXISTS" => {
+                let name = self.text_until(&['>']);
+                self.expect_close();
+                match self.target_exists {
+                    Some(target_exists) if target_exists(&name) => vec![(Truth::Known(true), name)],
+                    Some(_) => Vec::new(),
+                    None => self.unknown_expression(start),
+                }
+            }
+
             // A target's headers without linking it: Anvil's header-deps
             "COMPILE_ONLY" => {
                 let name = self.text_until(&['>']);
@@ -719,14 +814,27 @@ impl GenexParser<'_> {
                 }
             }
             name if CONDITION_EXPRESSIONS.contains(&name) => {
+                let unknown_count = self.unknown.len();
                 let arguments = self.arguments();
-                truth_only(condition_expression(name, &arguments))
+                let truth = match self.unknown.len() > unknown_count {
+                    true => None,
+                    false => condition_expression(name, &arguments, self.target_exists),
+                };
+                match truth {
+                    Some(truth) => truth_only(truth),
+                    None => {
+                        self.unknown.truncate(unknown_count);
+                        self.unknown_expression(start)
+                    }
+                }
             }
 
             // $<IF:cond,then,else>
             "IF" => {
+                let unknown_count = self.unknown.len();
                 let arguments = self.arguments();
-                let [condition, then, otherwise] = arguments.as_slice() else {
+                let ([condition, then, otherwise], false) = (arguments.as_slice(), self.unknown.len() > unknown_count) else {
+                    self.unknown.truncate(unknown_count);
                     return self.unknown_expression(start);
                 };
                 let truth = truth_of(condition);
@@ -784,6 +892,7 @@ impl GenexParser<'_> {
         }
 
         let raw = format!("$<{}", self.characters[start..self.position].iter().collect::<String>());
+        let raw = without_option_markers(&raw);
         self.unknown.push(raw.clone());
         vec![(Truth::Known(true), raw)]
     }
@@ -815,8 +924,8 @@ impl GenexParser<'_> {
     }
 }
 
-/// The truth of a condition expression from its (already expanded) arguments.
-fn condition_expression(name: &str, arguments: &[Alternatives]) -> Truth {
+/// The truth of a condition expression from its (already expanded) arguments; None when Anvil cannot decide it.
+fn condition_expression(name: &str, arguments: &[Alternatives], target_exists: Option<&dyn Fn(&str) -> bool>) -> Option<Truth> {
     let flat = |index: usize| -> String {
         arguments
             .get(index)
@@ -824,27 +933,129 @@ fn condition_expression(name: &str, arguments: &[Alternatives]) -> Truth {
             .map(|(_, text)| text.clone())
             .unwrap_or_default()
     };
+    let any_of =
+        |from: usize, test: &dyn Fn(&str) -> Truth| (from..arguments.len()).fold(Truth::Known(false), |result, index| result.or(test(&flat(index))));
 
-    match name {
-        "CONFIG" => (0..arguments.len()).fold(Truth::Known(false), |result, index| result.or(Truth::Depends(profile_name(&flat(index))))),
-        "PLATFORM_ID" => (0..arguments.len()).fold(Truth::Known(false), |result, index| result.or(platform_truth(&flat(index)))),
-        "CXX_COMPILER_ID" | "C_COMPILER_ID" => {
-            (0..arguments.len()).fold(Truth::Known(false), |result, index| result.or(compiler_truth(&flat(index))))
-        }
+    Some(match name {
+        "CONFIG" => any_of(0, &|config| Truth::Depends(profile_name(config))),
+        "PLATFORM_ID" => any_of(0, &platform_truth),
+        "CXX_COMPILER_ID" | "C_COMPILER_ID" => any_of(0, &compiler_truth),
         "CXX_COMPILER_FRONTEND_VARIANT" | "C_COMPILER_FRONTEND_VARIANT" => Truth::Depends(if flat(0) == "MSVC" { "msvc" } else { "gnu" }.into()),
-        "COMPILE_LANGUAGE" | "LINK_LANGUAGE" => Truth::Known((0..arguments.len()).any(|index| flat(index) == "CXX")),
+        "COMPILE_LANGUAGE" | "LINK_LANGUAGE" => any_of(0, &language_truth),
+        "COMPILE_LANG_AND_ID" => language_truth(&flat(0)).and(any_of(1, &compiler_truth)),
+        "CXX_COMPILER_VERSION" | "C_COMPILER_VERSION" => version_comparison("VERSION_EQUAL", COMPILER_VERSION_MARKER, &flat(0)),
+        "VERSION_LESS" | "VERSION_GREATER" | "VERSION_EQUAL" | "VERSION_LESS_EQUAL" | "VERSION_GREATER_EQUAL" => {
+            version_comparison(name, &flat(0), &flat(1))
+        }
         "BOOL" => truth_of(&arguments[0]),
         "NOT" => truth_of(&arguments[0]).not(),
         "AND" => arguments.iter().map(truth_of).fold(Truth::Known(true), Truth::and),
         "OR" => arguments.iter().map(truth_of).fold(Truth::Known(false), Truth::or),
         "STREQUAL" | "EQUAL" => Truth::Known(flat(0) == flat(1)),
-        _ => Truth::Known(true),
+        "TARGET_EXISTS" => Truth::Known(target_exists?(&flat(0))),
+        _ => return None,
+    })
+}
+
+/// $<COMPILE_LANGUAGE:...> of one language: the language's condition word; languages Anvil passes no flags to are
+/// never true.
+fn language_truth(language: &str) -> Truth {
+    match language {
+        "C" => Truth::Depends(LANGUAGE_C.into()),
+        "CXX" => Truth::Depends(LANGUAGE_CXX.into()),
+        _ => Truth::Known(false),
     }
+}
+
+/// A $<VERSION_...> comparison; against the compiler's version, true for the compiler families whose current version
+/// passes.
+fn version_comparison(operator: &str, left: &str, right: &str) -> Truth {
+    let compare = |left: &str, right: &str| {
+        let ordering = super::interp::compare_versions(left, right);
+        match operator {
+            "VERSION_LESS" => ordering.is_lt(),
+            "VERSION_GREATER" => ordering.is_gt(),
+            "VERSION_LESS_EQUAL" => ordering.is_le(),
+            "VERSION_GREATER_EQUAL" => ordering.is_ge(),
+            _ => ordering.is_eq(),
+        }
+    };
+    if left != COMPILER_VERSION_MARKER && right != COMPILER_VERSION_MARKER {
+        return Truth::Known(compare(left, right));
+    }
+
+    let passing: Vec<&str> = CURRENT_COMPILER_VERSIONS
+        .iter()
+        .filter(|(_, version)| {
+            let side = |text: &str| {
+                if text == COMPILER_VERSION_MARKER {
+                    version.to_string()
+                } else {
+                    text.to_string()
+                }
+            };
+            compare(&side(left), &side(right))
+        })
+        .map(|(family, _)| *family)
+        .collect();
+    match passing.len() {
+        0 => Truth::Known(false),
+        count if count == CURRENT_COMPILER_VERSIONS.len() => Truth::Known(true),
+        _ => passing
+            .iter()
+            .fold(Truth::Known(false), |result, family| result.or(Truth::Depends(family.to_string()))),
+    }
+}
+
+/// A condition with the language words decided for files of `language` (LANGUAGE_C or LANGUAGE_CXX).
+pub fn for_language(condition: &str, language: &str) -> Truth {
+    use crate::cond::Cond;
+
+    fn decide(condition: &Cond, language: &str) -> Truth {
+        match condition {
+            Cond::Atom(name) if name.starts_with(LANGUAGE_PREFIX) => Truth::Known(name == language),
+            Cond::Atom(name) => match name.as_str() {
+                "true" => Truth::Known(true),
+                "false" => Truth::Known(false),
+                _ => Truth::Depends(name.clone()),
+            },
+            Cond::Not(inner) => decide(inner, language).not(),
+            Cond::And(left, right) => decide(left, language).and(decide(right, language)),
+            Cond::Or(left, right) => decide(left, language).or(decide(right, language)),
+        }
+    }
+
+    match crate::cond::parse(condition) {
+        Ok(parsed) => decide(&parsed, language),
+        Err(_) => Truth::Depends(condition.to_string()),
+    }
+}
+
+/// Does a condition test the language of the file compiled?
+pub fn mentions_language(condition: &Option<String>) -> bool {
+    condition.as_ref().is_some_and(|condition| condition.contains(LANGUAGE_PREFIX))
 }
 
 /// An option's value in a generator expression's condition: the option itself, not its default.
 pub fn option_marker(name: &str) -> String {
     format!("{OPTION_MARKER}{name}{OPTION_MARKER_END}")
+}
+
+/// Text with option markers written back as the `${NAME}` they came from, for messages.
+pub fn without_option_markers(text: &str) -> String {
+    let mut result = String::new();
+    let mut rest = text;
+
+    while let Some(start) = rest.find(OPTION_MARKER) {
+        let after = &rest[start + OPTION_MARKER.len()..];
+        let Some(end) = after.find(OPTION_MARKER_END) else { break };
+        result.push_str(&rest[..start]);
+        result.push_str(&format!("${{{}}}", &after[..end]));
+        rest = &after[end + OPTION_MARKER_END.len()..];
+    }
+    result.push_str(rest);
+
+    result
 }
 
 /// A value read as a condition: true where its text is a true constant, or the option it names.
@@ -919,22 +1130,22 @@ mod tests {
     fn genex_conditions() {
         let mut unknown = Vec::new();
         assert_eq!(
-            expand_genex("$<$<CONFIG:Debug>:FOO>", &mut unknown),
+            expand_genex("$<$<CONFIG:Debug>:FOO>", &mut unknown, None),
             vec![(Truth::Depends("debug".into()), "FOO".into())]
         );
         assert_eq!(
-            expand_genex("$<BUILD_INTERFACE:inc>", &mut unknown),
+            expand_genex("$<BUILD_INTERFACE:inc>", &mut unknown, None),
             vec![(Truth::Known(true), "inc".into())]
         );
-        assert!(expand_genex("$<INSTALL_INTERFACE:inc>", &mut unknown).is_empty());
+        assert!(expand_genex("$<INSTALL_INTERFACE:inc>", &mut unknown, None).is_empty());
 
-        let negated = expand_genex("$<$<NOT:$<CONFIG:Shipping>>:Tracy::TracyClient>", &mut unknown);
+        let negated = expand_genex("$<$<NOT:$<CONFIG:Shipping>>:Tracy::TracyClient>", &mut unknown, None);
         assert_eq!(negated, vec![(Truth::Depends("!shipping".into()), "Tracy::TracyClient".into())]);
 
-        let platform = expand_genex("$<$<PLATFORM_ID:Windows>:NOMINMAX>", &mut unknown);
+        let platform = expand_genex("$<$<PLATFORM_ID:Windows>:NOMINMAX>", &mut unknown, None);
         assert_eq!(platform, vec![(Truth::Depends("windows".into()), "NOMINMAX".into())]);
 
-        let choice = expand_genex("lib/$<IF:$<CONFIG:Debug>,d,r>/x", &mut unknown);
+        let choice = expand_genex("lib/$<IF:$<CONFIG:Debug>,d,r>/x", &mut unknown, None);
         assert_eq!(
             choice,
             vec![
@@ -943,6 +1154,56 @@ mod tests {
             ]
         );
         assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn genex_compilers_languages_and_targets() {
+        let mut unknown = Vec::new();
+        let depends = |condition: &str, value: &str| vec![(Truth::Depends(condition.into()), value.to_string())];
+
+        // A compiler of a language, and the compiler's version (each family at a current one)
+        let msvc_cxx = expand_genex("$<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/wd4251>", &mut unknown, None);
+        assert_eq!(msvc_cxx, depends("language.cxx & cl", "/wd4251"));
+        let new_enough = expand_genex("$<$<VERSION_GREATER_EQUAL:$<CXX_COMPILER_VERSION>,10>:-Wfoo>", &mut unknown, None);
+        assert_eq!(new_enough, vec![(Truth::Known(true), "-Wfoo".to_string())]);
+        let old_compilers = expand_genex("$<$<VERSION_LESS:$<CXX_COMPILER_VERSION>,15>:-Wbar>", &mut unknown, None);
+        assert_eq!(old_compilers, depends("gcc", "-Wbar"));
+        assert_eq!(
+            expand_genex("$<$<COMPILE_LANGUAGE:C>:-Wstrict-prototypes>", &mut unknown, None),
+            depends("language.c", "-Wstrict-prototypes")
+        );
+        assert!(unknown.is_empty(), "{unknown:?}");
+
+        // TARGET_EXISTS asks the interpreter; without one it is unknown
+        let exists = |name: &str| name == "real";
+        assert_eq!(
+            expand_genex("$<$<TARGET_EXISTS:real>:real>", &mut unknown, Some(&exists)),
+            vec![(Truth::Known(true), "real".to_string())]
+        );
+        assert!(expand_genex("$<$<TARGET_EXISTS:nosuch>:nosuch>", &mut unknown, Some(&exists)).is_empty());
+        assert!(unknown.is_empty(), "{unknown:?}");
+        expand_genex("$<$<TARGET_EXISTS:real>:real>", &mut unknown, None);
+        assert_eq!(unknown, vec!["$<$<TARGET_EXISTS:real>:real>"]);
+    }
+
+    #[test]
+    fn unknown_conditions_keep_the_whole_expression() {
+        let mut unknown = Vec::new();
+        let kept = expand_genex("$<$<FOO_ID:x>:-Wflag>", &mut unknown, None);
+
+        assert_eq!(kept, vec![(Truth::Known(true), "$<$<FOO_ID:x>:-Wflag>".to_string())]);
+        assert_eq!(unknown, vec!["$<$<FOO_ID:x>:-Wflag>"]);
+    }
+
+    #[test]
+    fn language_conditions_decide_per_language() {
+        assert_eq!(for_language("language.c & gcc", LANGUAGE_C), Truth::Depends("gcc".into()));
+        assert_eq!(for_language("language.c & gcc", LANGUAGE_CXX), Truth::Known(false));
+        assert_eq!(
+            for_language("(language.c | language.cxx) & debug", LANGUAGE_CXX),
+            Truth::Depends("debug".into())
+        );
+        assert_eq!(for_language("!language.cxx", LANGUAGE_C), Truth::Known(true));
     }
 
     #[test]
