@@ -146,8 +146,9 @@ pub struct Interpreter {
     pub tests: Vec<Test>,
     pub custom_commands: Vec<CustomCommand>,
     pub source_properties: Vec<SourceProperties>,
-    /// Files set_source_files_properties(HEADER_FILE_ONLY) keeps out of every target (path keys).
-    pub(super) header_only_sources: HashSet<String>,
+    /// Files set_source_files_properties(HEADER_FILE_ONLY) keeps out of every target (path keys), with the condition
+    /// it holds under (None: always).
+    pub(super) header_only_sources: HashMap<String, Option<String>>,
     /// Words added to a CMAKE_<LANG>_FLAGS variable under a condition: (variable, word) -> condition.
     pub(super) flag_word_conditions: HashMap<(String, String), String>,
     /// Words added to a flag variable in a branch this machine does not take, which puts the variable back
@@ -201,7 +202,7 @@ impl Interpreter {
             tests: Vec::new(),
             custom_commands: Vec::new(),
             source_properties: Vec::new(),
-            header_only_sources: HashSet::new(),
+            header_only_sources: HashMap::new(),
             flag_word_conditions: HashMap::new(),
             off_host_flag_words: Vec::new(),
             export_headers: Vec::new(),

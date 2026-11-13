@@ -430,6 +430,39 @@ fn convert_cmake_project_builds_and_tests() {
     assert_eq!(fast.compiled(), 1);
 }
 
+// 14b. Platform files kept out by HEADER_FILE_ONLY under a condition, a library's per-language definitions and
+// CMAKE_MSVC_RUNTIME_LIBRARY convert to a project that builds with each compiler and compiles as CMake does
+
+#[test]
+fn convert_platform_files_languages_and_runtime() {
+    require!("msvc", "gcc");
+    let project = Project::fixture("convert_platform", "convert_platform");
+    project.anvil(&["convert"]).success();
+    let converted = project.read("anvil.toml");
+    assert!(converted.contains("[profile.debug]\nstatic-runtime = true"), "{converted}");
+
+    for toolchain in ["msvc", "gcc"] {
+        let run = project.anvil(&["run", "app", "--toolchain", toolchain]);
+        run.success().contains("windows 42");
+    }
+
+    // CMake's compile commands, configured again for the other compiler
+    let runs = |program: &str| {
+        Command::new(program)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    if !runs("cmake") || !runs("ninja") {
+        eprintln!("skipped --check: cmake or ninja is not on PATH");
+        return;
+    }
+    for toolchain in ["msvc", "gcc"] {
+        let check = project.anvil(&["convert", "--check", "--toolchain", toolchain]);
+        check.success().contains("3 files compiled by both: 3 the same");
+    }
+}
+
 // 15. A git dependency is pinned in anvil.lock; under --locked a changed tag is an error
 
 fn git(folder: &Path, args: &[&str]) -> String {

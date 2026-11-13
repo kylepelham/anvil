@@ -13,7 +13,7 @@ use std::process::Command;
 const CMAKE_IMPLICIT_DEFINES: &[&str] = &["WIN32", "_WINDOWS", "_MBCS", "UNICODE", "_UNICODE"];
 
 // Options each side adds by itself (output and dependency files, precompiled headers, optimization, debug info,
-// runtime, warning level, conformance, diagnostics), left out of the comparison; a trailing `*` matches any rest.
+// warning level, conformance, diagnostics), left out of the comparison; a trailing `*` matches any rest.
 // MSVC options are compared with `-`, however written; `@file` (response files, module maps) is CMake's own too
 const OWN_OPTIONS: &[&str] = &[
     "-nologo",
@@ -44,9 +44,6 @@ const OWN_OPTIONS: &[&str] = &[
     "-ZI",
     "-RTC*",
     "-MD",
-    "-MDd",
-    "-MT",
-    "-MTd",
     "-W0",
     "-W1",
     "-W2",
@@ -74,8 +71,16 @@ const OWN_OPTIONS: &[&str] = &[
     "@*",
 ];
 
-// Options whose value is the next word (files, a language), left out with it
-const OPTIONS_WITH_VALUE: &[&str] = &["-o", "-MF", "-MT", "-MQ", "-x", "-include", "-include-pch", "-sourceDependencies"];
+// Options whose value is the next word (files, a language), left out with it: GCC's and Clang's, and cl's (whose `-MT`
+// is the static runtime)
+const GNU_OPTIONS_WITH_VALUE: &[&str] = &["-o", "-MF", "-MT", "-MQ", "-x", "-include", "-include-pch"];
+const MSVC_OPTIONS_WITH_VALUE: &[&str] = &["-sourceDependencies"];
+
+// cl's C runtime: compared, since the profile's `static-runtime` and `debug-runtime` must match CMake's
+const MSVC_RUNTIME_OPTIONS: &[&str] = &["-MD", "-MDd", "-MT", "-MTd"];
+
+// CMake's own source of a precompiled header (`target_precompile_headers`); Anvil compiles the header itself
+const CMAKE_PCH_SOURCES: &[&str] = &["cmake_pch.c", "cmake_pch.cxx"];
 
 // Files and differences listed per group before "and N more"
 const LISTED_FILES: usize = 5;
@@ -99,7 +104,8 @@ pub fn check(model: &Model) -> Result<i32> {
     configure_cmake(model, &cmake_folder)?;
 
     // Both databases, by file
-    let cmake_entries = read_database(&cmake_folder.join("compile_commands.json"), &cmake_folder, model)?;
+    let mut cmake_entries = read_database(&cmake_folder.join("compile_commands.json"), &cmake_folder, model)?;
+    cmake_entries.retain(|_, entries| !CMAKE_PCH_SOURCES.iter().any(|name| entries[0].shown_path.ends_with(&format!("/{name}"))));
     let roots: Vec<usize> = model.default_targets(true);
     crate::plan::plan(model, None, &roots, false)?;
     let mut anvil_entries = read_database(&model.out_dir.join("compile_commands.json"), &model.out_dir, model)?;
@@ -130,6 +136,12 @@ fn configure_cmake(model: &Model, folder: &Path) -> Result<()> {
         bail!("--check needs ninja on PATH");
     }
 
+    // Configured for another compiler (--toolchain changed): CMake keeps its old compile commands, so start over
+    let cache = std::fs::read_to_string(folder.join("CMakeCache.txt")).unwrap_or_default();
+    if cached_compiler(&cache).is_some_and(|compiler| util::path_key(Path::new(compiler)) != util::path_key(&model.toolchain.cc)) {
+        std::fs::remove_dir_all(folder).with_context(|| format!("removing {}", slash(folder)))?;
+    }
+
     let mut args: Vec<String> = vec![
         "-S".into(),
         slash(&model.root),
@@ -145,9 +157,13 @@ fn configure_cmake(model: &Model, folder: &Path) -> Result<()> {
         format!("-DCMAKE_CXX_COMPILER={}", slash(&model.toolchain.cxx)),
     ];
 
-    // The options as Anvil resolved them
-    for (name, value) in &model.condition.options {
-        args.push(format!("-D{name}={}", if *value { "ON" } else { "OFF" }));
+    // The options given with -o; the others keep CMake's own defaults (also after an earlier --check set them), so
+    // the converted defaults are checked too
+    for name in model.condition.options.keys() {
+        match model.options.options.iter().find(|(given, _)| given == name) {
+            Some((_, value)) => args.push(format!("-D{name}={}", if *value { "ON" } else { "OFF" })),
+            None => args.push(format!("-U{name}")),
+        }
     }
 
     // vcpkg: the packages Anvil installed, without installing again
@@ -176,6 +192,15 @@ fn configure_cmake(model: &Model, folder: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The C compiler a CMakeCache.txt was configured with.
+fn cached_compiler(cache: &str) -> Option<&str> {
+    cache
+        .lines()
+        .find_map(|line| line.strip_prefix("CMAKE_C_COMPILER:"))
+        .and_then(|rest| rest.split_once('=').map(|(_, value)| value.trim()))
+        .filter(|value| !value.is_empty())
 }
 
 /// The CMake configuration for Anvil's profile.
@@ -329,8 +354,11 @@ fn read_flags(words: &[String], found: &mut dyn FnMut(FlagKind, &str)) {
                 Some(rest) if msvc => format!("-{rest}"),
                 _ => word.clone(),
             };
-            if OPTIONS_WITH_VALUE.contains(&option.as_str()) {
+            let with_value = if msvc { MSVC_OPTIONS_WITH_VALUE } else { GNU_OPTIONS_WITH_VALUE };
+            if with_value.contains(&option.as_str()) {
                 index += 1;
+            } else if msvc && MSVC_RUNTIME_OPTIONS.contains(&option.as_str()) {
+                found(FlagKind::Option, &option);
             } else if !OWN_OPTIONS.iter().any(|own| matches_pattern(own, &option)) {
                 found(FlagKind::Option, &option);
             }
@@ -584,14 +612,39 @@ mod tests {
             found
         };
 
-        // MSVC options read the same with `-` or `/`; output, debug, runtime and warning level are each side's own
-        // (the source file is left out by the caller)
+        // MSVC options read the same with `-` or `/`; output, debug and warning level are each side's own, the runtime
+        // is compared (the source file is left out by the caller)
         let cmake = options(r"C:\VS\cl.exe /nologo -wd4251 /W3 /MDd /Zi /Ob0 /Od /RTC1 -std:c++17 /Foa.obj /Fdx\ /FS @a.modmap -c a.cpp");
-        assert_eq!(cmake, ["-wd4251", "std c++17", "a.cpp"]);
-        let anvil = options(r"C:\VS\cl.exe /nologo /utf-8 /std:c++17 /Od /Z7 /W4 /wd4251 /sourceDependencies a.json /c /Foa.obj /Tpa.cpp");
-        assert_eq!(anvil, ["std c++17", "-wd4251"]);
+        assert_eq!(cmake, ["-wd4251", "-MDd", "std c++17", "a.cpp"]);
+        let anvil = options(r"C:\VS\cl.exe /nologo /utf-8 /std:c++17 /Od /Z7 /W4 /wd4251 /MDd /sourceDependencies a.json /c /Foa.obj /Tpa.cpp");
+        assert_eq!(anvil, ["std c++17", "-wd4251", "-MDd"]);
 
-        let gnu = options("g++ -std=c++17 -O0 -g -Wshadow -MD -MF a.d -c a.cpp -o a.o");
+        let gnu = options("g++ -std=c++17 -O0 -g -Wshadow -MD -MF a.d -MT a.o -c a.cpp -o a.o");
         assert_eq!(gnu, ["std c++17", "-Wshadow", "a.cpp"]);
+    }
+
+    #[test]
+    fn cl_runtime_options_take_no_value() {
+        let options = |command: &str| {
+            let mut found = Vec::new();
+            read_flags(&split_command(command), &mut |kind, value| {
+                if let FlagKind::Option = kind {
+                    found.push(value.to_string());
+                }
+            });
+            found
+        };
+
+        // cl's -MT is the static runtime, compared; the next word is an option of its own
+        assert_eq!(options(r"C:\VS\cl.exe -MT -wd4100 -c a.cpp"), ["-MT", "-wd4100", "a.cpp"]);
+        assert_eq!(options(r"C:\VS\cl.exe /MTd /wd4100 -c a.cpp"), ["-MTd", "-wd4100", "a.cpp"]);
+    }
+
+    #[test]
+    fn reads_the_cached_compiler() {
+        let cache = "# comment\nCMAKE_BUILD_TYPE:STRING=Debug\nCMAKE_C_COMPILER:STRING=C:/gcc/bin/gcc.exe\n";
+        assert_eq!(cached_compiler(cache), Some("C:/gcc/bin/gcc.exe"));
+        assert_eq!(cached_compiler("CMAKE_C_COMPILER:FILEPATH=\n"), None);
+        assert_eq!(cached_compiler(""), None);
     }
 }
