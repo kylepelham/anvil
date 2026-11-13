@@ -2374,12 +2374,22 @@ fn output_folder_holding_the_project_is_refused() {
     let project = Project::empty("harden_out");
     project.write("src/main.cpp", "int main() { return 0; }\n");
 
-    for out in [".", "", "..", "src"] {
+    for out in [".", "", ".."] {
         project.write("anvil.toml", &format!("[project]\nname = \"keep\"\nout = \"{out}\"\n"));
         project.anvil(&["build"]).code(1).contains(&format!("[project] out = \"{out}\""));
         project.anvil(&["clean", "--all"]).code(1).contains("anvil clean --all");
         assert!(project.path("src/main.cpp").is_file(), "out = \"{out}\" lost the sources");
     }
+
+    // A folder of sources as the output folder: `clean --all` refuses what Anvil did not write
+    project.write("anvil.toml", "[project]\nname = \"keep\"\nout = \"src\"\n");
+    project.anvil(&["build"]).success();
+    project
+        .anvil(&["clean", "--all"])
+        .code(1)
+        .contains("holds what Anvil did not write (main.cpp)");
+    assert!(project.path("src/main.cpp").is_file());
+    let _ = std::fs::remove_dir_all(project.path("src/debug"));
 
     // An output folder holding something else is not deleted whole
     project.write("anvil.toml", "[project]\nname = \"keep\"\nout = \"build\"\n");
@@ -3705,4 +3715,172 @@ fn cmake_project_uses_an_installed_openmp_library_gcc() {
         );
     }
     assert_eq!(run_installed(&prefix, &build.join(format!("app{}", std::env::consts::EXE_SUFFIX))), "1");
+}
+
+// 56. The installed package follows what the prefix holds: a profile with the same C runtime replaces another's
+//     package files; a partial install keeps the other libraries in it; no exported library leaves no package; a
+//     library's private include folder stays out; `clean --all` deletes what Anvil wrote into the output folder (a
+//     JUnit report, a prefix) and refuses what it did not; a package reached through a link is the same package;
+//     `--target` and the unused-dependency warning name only what they should
+
+#[test]
+fn install_profiles_of_one_runtime_replace_each_others_package() {
+    require!("default");
+    let project = two_libraries("install_same_runtime");
+    project.write(
+        "anvil.toml",
+        &format!("{TWO_LIBRARIES}\n[profile.check]\ninherits = \"debug\"\n\n[target.core.when.check]\npublic.defines = [\"CORE_CHECK\"]\n"),
+    );
+
+    // Both use the debug runtime, so the same debug/ files: the second's package replaces the first's
+    project.anvil(&["install", "-p", "check"]).success();
+    assert!(project.path("out/install/lib/cmake/pair/pairTargets-check.cmake").is_file());
+    project.anvil(&["install", "-p", "debug"]).success();
+    assert!(!project.path("out/install/lib/cmake/pair/pairTargets-check.cmake").exists());
+    assert!(project.path("out/install/lib/cmake/pair/pairTargets-debug.cmake").is_file());
+    let config = project.read("out/install/lib/cmake/pair/pairConfig.cmake");
+    assert!(!config.contains("CORE_CHECK") && !config.contains("CONFIG:CHECK"), "{config}");
+    let manifest = project.read("out/install/debug/share/pair/install_manifest.txt");
+    assert!(!manifest.contains("(package check)"), "{manifest}");
+
+    // A release install beside it reads only the debug configuration's usage
+    project.anvil(&["install"]).success();
+    let config = project.read("out/install/lib/cmake/pair/pairConfig.cmake");
+    assert!(!config.contains("CORE_CHECK"), "{config}");
+}
+
+#[test]
+fn install_of_one_library_keeps_the_others_in_the_package() {
+    require!("default");
+    let project = two_libraries("install_partial_package");
+
+    // `extra`'s files stay installed, so the package keeps describing it
+    project.anvil(&["install"]).success();
+    project.anvil(&["install", "core"]).success();
+    let config = project.read("out/install/lib/cmake/pair/pairConfig.cmake");
+    assert!(config.contains("add_library(pair::extra STATIC IMPORTED)"), "{config}");
+    assert!(config.contains("add_library(pair::core STATIC IMPORTED)"), "{config}");
+    assert!(project.path("out/install/lib/pkgconfig/pair-extra.pc").is_file());
+    assert!(project.read("out/install/lib/pkgconfig/pair.pc").contains("pair-extra"));
+
+    // Installing only the program keeps the package too
+    project.anvil(&["install", "app"]).success();
+    assert!(project.read("out/install/lib/cmake/pair/pairConfig.cmake").contains("pair::extra"));
+}
+
+#[test]
+fn install_without_an_export_removes_the_package() {
+    require!("default");
+    let project = two_libraries("install_export_off");
+
+    project.anvil(&["install"]).success();
+    assert!(project.path("out/install/lib/cmake/pair/pairConfig.cmake").is_file());
+    project.edit("anvil.toml", "name = \"pair\"\n", "name = \"pair\"\nexport = false\n");
+    project.anvil(&["install"]).success().contains("removed");
+    assert!(!project.path("out/install/lib/cmake").exists());
+    assert!(!project.path("out/install/lib/pkgconfig").exists());
+    assert!(project.path("out/install/include/core/core.h").is_file());
+    let manifest = project.read("out/install/share/pair/install_manifest.txt");
+    assert!(!manifest.contains("(package"), "{manifest}");
+}
+
+#[test]
+fn install_leaves_out_a_private_include_folder_of_sources() {
+    require!("default");
+    let project = Project::empty("install_private_sources");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"hdr\"\n\n[target.mylib]\nkind = \"static\"\nsources = [\"src/*.cpp\"]\ninclude = [\"src\"]\npublic.include = [\".\"]\n",
+    );
+    project.write("mylib/mylib.h", "#pragma once\nint mylib();\n");
+    project.write("src/internal.h", "#pragma once\n");
+    project.write(
+        "src/mylib.cpp",
+        "#include \"internal.h\"\n#include \"mylib/mylib.h\"\nint mylib() { return 0; }\n",
+    );
+
+    project.anvil(&["install"]).success();
+    assert_eq!(files_under(&project.path("out/install/include")), ["mylib/mylib.h"]);
+}
+
+#[test]
+fn clean_all_deletes_what_anvil_wrote_into_the_output_folder() {
+    require!("default");
+    let project = Project::empty("clean_written_entries");
+    project.write("anvil.toml", "[project]\nname = \"c\"\n");
+    project.write("src/main.cpp", "int main() { return 0; }\n");
+    project.write("tests/t.cpp", "int main() { return 0; }\n");
+
+    // compdb before any build creates the output folder, marked
+    project.anvil(&["compdb"]).success();
+    project.anvil(&["clean", "--all"]).success();
+    assert!(!project.path("out").exists());
+
+    // A JUnit report and a prefix inside it are Anvil's
+    project.anvil(&["test", "--junit", "out/junit.xml"]).success();
+    project.anvil(&["install", "--prefix", "out/stage"]).success();
+    assert!(project.read("out/.anvil-out").contains("wrote stage\n"));
+    project.anvil(&["clean", "--all"]).success();
+    assert!(!project.path("out").exists());
+
+    // What Anvil did not write still stops it, and an output folder holding headers is no error
+    project.write("anvil.toml", "[project]\nname = \"c\"\nout = \"build\"\n");
+    project.write("build/config.h", "#define OLD 1\n");
+    project.anvil(&["build"]).success();
+    project
+        .anvil(&["clean", "--all"])
+        .code(1)
+        .contains("holds what Anvil did not write (config.h)");
+    assert!(project.path("build/config.h").is_file());
+}
+
+#[test]
+#[cfg(windows)]
+fn a_package_reached_through_a_link_is_the_same_package() {
+    require!("default");
+    let project = Project::empty("package_through_link");
+    project.write("lib/anvil.toml", "[project]\nname = \"lib\"\n\n[target.lib]\nkind = \"static\"\n");
+    project.write("lib/src/l.cpp", "int l() { return 0; }\n");
+    project.write(
+        "app/anvil.toml",
+        "[project]\nname = \"app\"\n\n[deps]\nlib = { path = \"../lib\" }\nlinked = { path = \"../link\" }\n\n\
+         [target.app]\nkind = \"exe\"\ndeps = [\"lib\", \"linked\"]\n",
+    );
+    project.write("app/src/main.cpp", "int l();\nint main() { return l(); }\n");
+    let junction = Command::new("cmd")
+        .args(["/c", "mklink", "/J", "link", "lib"])
+        .current_dir(project.path(""))
+        .output()
+        .expect("running mklink");
+    assert!(junction.status.success());
+
+    project.anvil_in("app", &["build"]).success().lacks("two packages");
+}
+
+#[test]
+fn target_flag_and_unused_dependencies_name_only_what_they_should() {
+    require!("default");
+    let project = Project::empty("names_only_what_they_should");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"n\"\n\n[deps]\nlibx = { path = \"libx\" }\n\n\
+         [target.app]\nkind = \"exe\"\ndir = \"libx\"\ninclude = [\"libx/include\"]\nsources = [\"../src/main.cpp\"]\n",
+    );
+    project.write("libx/src/x.cpp", "int x() { return 0; }\n");
+    project.write("src/main.cpp", "int main() { return 0; }\n");
+
+    // Strings that merely start with a dependency's name are not uses of it
+    project.anvil(&["build"]).success().contains("`[deps] libx`: no target uses it");
+
+    // A mistyped machine is no target name; a target's name is
+    project
+        .anvil(&["build", "--target", "x68"])
+        .code(1)
+        .contains("did you mean `x")
+        .lacks("anvil build x68");
+    project.anvil(&["build", "--target", "app"]).code(1).contains("write `anvil build app`");
+
+    // A version filling file names and quoted definitions holds no separators
+    project.edit("anvil.toml", "name = \"n\"\n", "name = \"n\"\nversion = \"1.0/beta\"\n");
+    project.anvil(&["build"]).code(1).contains("write a version without spaces, `/`");
 }

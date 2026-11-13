@@ -142,16 +142,24 @@ pub fn install(start_dir: &Path, build: &BuildArgs, names: &[String], prefix: Op
         None => model.out_root.join("install"),
     };
     check_prefix(&model, &prefix)?;
-    check_package_version(&model, &installed)?;
+    let root = if model.profile.debug_runtime { "debug/" } else { "" };
 
-    let (model, plan) = commands::build_roots(model, &build, &installed)?;
+    // The libraries an earlier install of this configuration left in the prefix, which the package keeps describing;
+    // built too, for their files' names
+    let kept = kept_libraries(&model, &prefix, root, &installed);
+    let mut exported: Vec<usize> = installed.iter().chain(&kept).copied().collect();
+    exported.sort_unstable();
+    check_package_version(&model, &exported)?;
+    commands::mark_output(&model.out_root, Some(&prefix))?;
+
+    let (model, plan) = commands::build_roots(model, &build, &exported)?;
 
     // The targets' files, then the package files describing the libraries
     let mut installer = Installer {
         model: &model,
         plan: &plan,
         prefix,
-        root: if model.profile.debug_runtime { "debug/" } else { "" },
+        root,
         files: Vec::new(),
         destinations: HashMap::new(),
     };
@@ -162,17 +170,49 @@ pub fn install(start_dir: &Path, build: &BuildArgs, names: &[String], prefix: Op
             libraries.insert(*index, library);
         }
     }
+    let mut kept_files = Installer {
+        model: &model,
+        plan: &plan,
+        prefix: installer.prefix.clone(),
+        root,
+        files: Vec::new(),
+        destinations: HashMap::new(),
+    };
+    for index in &kept {
+        libraries.insert(*index, kept_files.add_target(*index)?);
+    }
 
-    // What this install answers for in the manifest: its targets, and the package files when it writes them
-    let mut scope: HashSet<String> = installed.iter().map(|index| model.targets[*index].name.clone()).collect();
+    // What this install answers for in the manifest: its targets (the package files always)
+    let scope: HashSet<String> = installed.iter().map(|index| model.targets[*index].name.clone()).collect();
     let project = model.packages[0].manifest.project.clone().unwrap_or_default();
     if project.export.unwrap_or(true) && !libraries.is_empty() {
-        installer.add_package_files(&installed, &libraries)?;
-        scope.insert(PACKAGE_OWNER.to_string());
-        scope.insert(package_owner(&model.profile.name));
+        installer.add_package_files(&exported, &libraries)?;
     }
 
     installer.write(&scope)
+}
+
+/// The libraries of the project, other than `installed`, whose files this configuration's manifest in the prefix still
+/// lists and holds (an earlier install of more targets).
+fn kept_libraries(model: &Model, prefix: &Path, root: &str, installed: &[usize]) -> Vec<usize> {
+    let mut kept = Vec::new();
+    for entry in read_manifest(&manifest_path(model, prefix, root)) {
+        let Some(index) = model.targets.iter().position(|target| target.name == entry.owner) else {
+            continue;
+        };
+        let library = matches!(model.targets[index].kind, Kind::Static | Kind::Shared | Kind::Headers);
+        if library && !installed.contains(&index) && !kept.contains(&index) && prefix.join(&entry.path).is_file() {
+            kept.push(index);
+        }
+    }
+
+    kept
+}
+
+/// This project's install manifest for the configurations under `root` ("" or "debug/").
+fn manifest_path(model: &Model, prefix: &Path, root: &str) -> PathBuf {
+    let project = targets::sanitize_name(&model.packages[0].name);
+    prefix.join(format!("{root}share/{project}/install_manifest.txt"))
 }
 
 /// The manifest's owner of a configuration's own package file, `<project>Targets-<profile>.cmake`.
@@ -541,7 +581,8 @@ impl Installer<'_> {
         let owner = "the CMake package";
         let folder = format!("lib/cmake/{project}");
         let targets_file = format!("{folder}/{project}Targets-{}.cmake", targets::sanitize_name(&model.profile.name));
-        let other_usage = read_other_usage(&self.prefix.join(&folder), &project, &targets_file);
+        let other_root = if self.root.is_empty() { "debug/" } else { "" };
+        let other_usage = read_other_usage(&self.prefix, &read_manifest(&manifest_path(model, &self.prefix, other_root)));
         self.add(
             &format!("{folder}/{project}Config.cmake"),
             Content::Text(export.cmake_config(model, &project, &other_usage)),
@@ -595,6 +636,7 @@ impl Installer<'_> {
 
     /// Adds a file to the install; two different files for one destination are an error naming both.
     fn add(&mut self, destination: &str, content: Content, owner: &str, manifest_owner: &str) -> Result<()> {
+        check_destination(destination, owner)?;
         let key = util::path_key(Path::new(destination));
         let Some(existing) = self.destinations.get(&key).map(|index| &self.files[*index]) else {
             self.destinations.insert(key, self.files.len());
@@ -630,10 +672,9 @@ impl Installer<'_> {
         // The manifests: this configuration's, the other configuration's (a debug install shares headers and the
         // CMake package with a release one), and other projects' in the same prefix
         let project = targets::sanitize_name(&model.packages[0].name);
-        let manifest_path = |root: &str| prefix.join(format!("{root}share/{project}/install_manifest.txt"));
         let other_root = if self.root.is_empty() { "debug/" } else { "" };
-        let previous = read_manifest(&manifest_path(self.root));
-        let other_configuration = read_manifest(&manifest_path(other_root));
+        let previous = read_manifest(&manifest_path(model, prefix, self.root));
+        let other_configuration = read_manifest(&manifest_path(model, prefix, other_root));
         let other_projects = other_projects_files(prefix, &project);
         let owned: HashSet<String> = previous
             .iter()
@@ -680,7 +721,9 @@ impl Installer<'_> {
 
         // What the last install of this configuration wrote for the same owners and this one does not is removed,
         // unless the other configuration or another project lists it; the other owners' files stay listed. An owner
-        // no target of the project has any more (a removed target) is this install's to clean up.
+        // no target of the project has any more (a removed target) is this install's to clean up, and so are the
+        // package files, every profile's of this C runtime: its files replace theirs, and the package was rewritten
+        // for the libraries installed now (or left out).
         let installed: HashSet<String> = entries.iter().map(|entry| util::path_key(Path::new(&entry.path))).collect();
         let listed_elsewhere: HashSet<String> = other_configuration
             .iter()
@@ -689,7 +732,8 @@ impl Installer<'_> {
             .collect();
         let in_scope = |owner: &str| {
             let removed_target = !owner.is_empty() && !owner.starts_with('(') && !model.targets.iter().any(|target| target.name == owner);
-            scope.contains(owner) || removed_target
+            let package = owner == PACKAGE_OWNER || owner.starts_with("(package ");
+            scope.contains(owner) || removed_target || package
         };
         let sources: HashSet<String> = self
             .files
@@ -714,7 +758,7 @@ impl Installer<'_> {
                 removed += remove_installed(prefix, &entry.path)? as usize;
             }
         }
-        util::write_if_changed(&manifest_path(self.root), manifest_text(&entries).as_bytes())?;
+        util::write_if_changed(&manifest_path(model, prefix, self.root), manifest_text(&entries).as_bytes())?;
 
         let shown = util::rel(prefix, &std::env::current_dir()?);
         let unchanged = self.files.len() - copied;
@@ -723,6 +767,15 @@ impl Installer<'_> {
 
         Ok(())
     }
+}
+
+/// The install manifest holds one file per line, its fields separated by tabs: a name with either cannot be listed.
+fn check_destination(destination: &str, owner: &str) -> Result<()> {
+    if destination.contains(['\t', '\n', '\r']) {
+        bail!("{owner} would install {destination:?}, whose name holds a tab or line break that the install manifest cannot list; rename the file");
+    }
+
+    Ok(())
 }
 
 /// The files an install manifest lists, relative to the prefix, with their owners (`<path>\t<owner>[\tfound]`); only
@@ -1296,21 +1349,13 @@ fn target_properties(name: &str, properties: &[(String, String)], indent: &str) 
     text
 }
 
-/// The usage the other configurations' `<project>Targets-<profile>.cmake` files in `folder` record, all but `own`'s.
-fn read_other_usage(folder: &Path, project: &str, own: &str) -> OtherUsage {
-    let own = Path::new(own)
-        .file_name()
-        .map(|name| name.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    let mut files: Vec<PathBuf> = std::fs::read_dir(folder)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            let name = file_name(path);
-            name.starts_with(&format!("{project}Targets-")) && name.ends_with(".cmake") && name.to_lowercase() != own
-        })
+/// The usage the other configuration's `<project>Targets-<profile>.cmake` files record: those its manifest lists (the
+/// profiles sharing this install's C runtime replace each other's).
+fn read_other_usage(prefix: &Path, other_manifest: &[ManifestEntry]) -> OtherUsage {
+    let mut files: Vec<PathBuf> = other_manifest
+        .iter()
+        .filter(|entry| entry.owner.starts_with("(package "))
+        .map(|entry| prefix.join(&entry.path))
         .collect();
     files.sort();
 
@@ -1427,10 +1472,23 @@ fn build_folders(model: &Model, package: usize) -> HashSet<String> {
 
 /// The folders a walk of a library's public include folder that holds the rest of the package (its root, the target's
 /// folder) leaves out: those holding other targets' sources, private include folders and the package's tests/, but not
-/// the library's own source folders, whose headers are its own (mylib/mylib.h beside mylib/mylib.cpp).
+/// the library's own source folders, whose headers are its own (mylib/mylib.h beside mylib/mylib.cpp), unless it
+/// declares them private (`include = ["src"]`).
 fn skipped_folders(model: &Model, index: usize) -> HashSet<String> {
     let library = &model.targets[index];
-    let own: HashSet<String> = library.sources.iter().filter_map(|source| source.parent()).map(util::path_key).collect();
+    let private: HashSet<String> = library
+        .private_include
+        .iter()
+        .chain(&library.system_include)
+        .map(|folder| util::path_key(folder))
+        .collect();
+    let own: HashSet<String> = library
+        .sources
+        .iter()
+        .filter_map(|source| source.parent())
+        .map(util::path_key)
+        .filter(|folder| !private.contains(folder))
+        .collect();
 
     let mut folders = HashSet::new();
     for target in model.targets.iter().filter(|target| target.package == library.package) {
@@ -1607,6 +1665,16 @@ mod tests {
         );
         assert!(read_manifest(&folder.join("missing.txt")).is_empty());
         std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn a_name_the_manifest_cannot_list_is_refused() {
+        assert!(check_destination("bin/assets/song one.ogg", "target `app`").is_ok());
+        for name in ["bin/a\tb.txt", "bin/a\nb.txt"] {
+            let error = check_destination(name, "target `app`").unwrap_err().to_string();
+            assert!(error.starts_with("target `app` would install \"bin/a\\"), "{error}");
+            assert!(error.contains("rename the file"), "{error}");
+        }
     }
 
     #[test]

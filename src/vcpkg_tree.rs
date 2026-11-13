@@ -3,7 +3,7 @@
 //! CMake.
 
 use crate::flags::Language;
-use crate::platform::Os;
+use crate::platform::{Cpu, Os};
 use crate::profile::Profile;
 use crate::toolchain::{Family, Toolchain};
 use crate::util::{self, slash};
@@ -61,27 +61,46 @@ struct ImportedTarget {
 
 /// The OpenMP runtime programs need beside them: LLVM's libomp.dll beside a clang or clang-cl that builds for the MSVC
 /// ABI (Visual Studio's `VC/Tools/Llvm/x64/bin`, or LLVM's install), or MinGW gcc's libgomp-1.dll with the DLLs of
-/// its bin folder it loads (libwinpthread-1.dll, libgcc_s_seh-1.dll).
-fn openmp_runtime(toolchain: &Toolchain) -> Vec<PathBuf> {
-    let Some(bin) = toolchain.cxx.parent() else { return Vec::new() };
+/// its bin folder it loads (libwinpthread-1.dll, libgcc_s_seh-1.dll). Built for the target's processor: Visual Studio's
+/// LLVM has a folder per processor (`Llvm/bin` is 32-bit); with none for it, a message saying so.
+fn openmp_runtime(toolchain: &Toolchain) -> Result<Vec<PathBuf>, String> {
+    let Some(bin) = toolchain.cxx.parent() else { return Ok(Vec::new()) };
     let llvm = matches!(toolchain.family, Family::Clang | Family::ClangCl) && toolchain.is_msvc_abi();
     let mingw = toolchain.family == Family::Gcc && toolchain.platform.os == Os::Windows;
 
-    let runtime = match (llvm, mingw) {
-        (true, _) => bin.join("libomp.dll"),
-        (_, true) => bin.join("libgomp-1.dll"),
-        _ => return Vec::new(),
+    let name = match (llvm, mingw) {
+        (true, _) => "libomp.dll",
+        (_, true) => "libgomp-1.dll",
+        _ => return Ok(Vec::new()),
     };
-    if !runtime.is_file() {
-        return Vec::new();
+    if !bin.join(name).is_file() {
+        return Ok(Vec::new());
     }
 
+    // The folder with the one for the target's processor: the compiler's, or Visual Studio's for another processor
+    let mut folders = vec![bin.to_path_buf()];
+    let llvm_root = bin
+        .ancestors()
+        .take(3)
+        .find(|folder| folder.file_name().is_some_and(|name| name.eq_ignore_ascii_case("llvm")));
+    if let Some(llvm_root) = llvm_root.filter(|_| llvm) {
+        folders.extend(["bin", "x64/bin", "ARM64/bin"].iter().map(|folder| llvm_root.join(folder)));
+    }
+    let machine = pe_machine_of(toolchain.platform.cpu);
+    let Some(folder) = folders.into_iter().find(|folder| file_machine(&folder.join(name)) == Some(machine)) else {
+        return Err(format!(
+            "{} is for another processor than {}, and no {name} for it was found: programs using OpenMP need one beside them; copy it there yourself",
+            slash(&bin.join(name)),
+            toolchain.platform.name()
+        ));
+    };
+
     // The DLLs it loads from the same folder, and theirs (the system's are never there)
-    let mut files = vec![runtime];
+    let mut files = vec![folder.join(name)];
     let mut next = 0;
     while next < files.len() {
         for name in imported_dlls(&files[next]) {
-            let file = bin.join(&name);
+            let file = folder.join(&name);
             if file.is_file() && !files.iter().any(|known| util::path_key(known) == util::path_key(&file)) {
                 files.push(file);
             }
@@ -89,7 +108,35 @@ fn openmp_runtime(toolchain: &Toolchain) -> Vec<PathBuf> {
         next += 1;
     }
 
-    files
+    Ok(files)
+}
+
+/// The machine field of a PE file's header for a processor.
+fn pe_machine_of(cpu: Cpu) -> u16 {
+    match cpu {
+        Cpu::X64 => 0x8664,
+        Cpu::X86 => 0x14c,
+        Cpu::Arm64 => 0xaa64,
+        Cpu::Arm => 0x1c4,
+    }
+}
+
+/// The processor a Windows program or DLL is for, from the start of the file.
+fn file_machine(file: &Path) -> Option<u16> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(file).ok()?.take(4096).read_to_end(&mut bytes).ok()?;
+    pe_machine(&bytes)
+}
+
+/// The processor a Windows program or DLL is for, as its PE header's machine field says.
+fn pe_machine(bytes: &[u8]) -> Option<u16> {
+    let header = u32::from_le_bytes(bytes.get(0x3c..0x40)?.try_into().ok()?) as usize;
+    if bytes.get(header..header + 4)? != b"PE\0\0" {
+        return None;
+    }
+
+    Some(u16::from_le_bytes(bytes.get(header + 4..header + 6)?.try_into().ok()?))
 }
 
 /// The DLLs a Windows program or DLL imports, as its PE import table names them; none when it cannot be read.
@@ -188,8 +235,8 @@ pub struct BuildContext {
     link: bool,
 
     /// The OpenMP runtime DLLs beside the compiler (clang and clang-cl with the MSVC ABI, MinGW gcc), copied beside
-    /// programs.
-    openmp_runtime: Vec<PathBuf>,
+    /// programs; or why there are none for the target's processor.
+    openmp_runtime: Result<Vec<PathBuf>, String>,
 }
 
 impl BuildContext {
@@ -832,7 +879,10 @@ fn module_target(name: &str, build: &BuildContext) -> Option<ImportedTarget> {
                 None if !flag.contains(' ') && build.frontend == "GNU" => target.link_options.push(flag.to_string()),
                 None => {}
             }
-            target.runtime.extend(build.openmp_runtime.clone());
+            match &build.openmp_runtime {
+                Ok(files) => target.runtime.extend(files.iter().cloned()),
+                Err(message) => warn_once(message),
+            }
         }
         "Threads::Threads" if build.os != Os::Windows => {
             target.compile_options.push("-pthread".into());
@@ -852,6 +902,14 @@ fn module_target(name: &str, build: &BuildContext) -> Option<ImportedTarget> {
     }
 
     Some(target)
+}
+
+/// A warning about the OpenMP runtime, once per run however many packages and targets use OpenMP.
+fn warn_once(message: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::ui::warn(message);
+    }
 }
 
 /// An imported target's path with the variables package files write for the install prefix and their own folder.
@@ -1122,7 +1180,7 @@ mod tests {
             frontend: if family.is_msvc_style() { "MSVC" } else { "GNU" },
             language: None,
             link: false,
-            openmp_runtime: Vec::new(),
+            openmp_runtime: Ok(Vec::new()),
         }
     }
 
@@ -1261,6 +1319,16 @@ mod tests {
         assert!(imports.iter().any(|name| name.eq_ignore_ascii_case("kernel32.dll")), "{imports:?}");
         assert!(imported_dlls(Path::new(file!())).is_empty());
         assert_eq!(pe_imports(b"MZ"), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn reads_the_processor_a_dll_is_for() {
+        // This test program is built for the processor it runs on; a file that is not a program is for none
+        let host = crate::platform::Platform::host().cpu;
+        assert_eq!(file_machine(&std::env::current_exe().unwrap()), Some(pe_machine_of(host)));
+        assert_eq!(file_machine(Path::new(file!())), None);
+        assert_eq!(pe_machine(b"MZ"), None);
     }
 
     #[test]

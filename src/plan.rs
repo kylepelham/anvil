@@ -224,6 +224,7 @@ impl Action {
 /// Plans every action `roots` need (their dependencies, and programs their build steps run). In a cross build,
 /// `host` is the project loaded for this machine: the programs build steps run come from it.
 pub fn plan(model: &Model, host: Option<&Model>, roots: &[usize], color: bool) -> Result<Plan> {
+    crate::commands::mark_output(&model.out_root, None)?;
     let mut planner = Planner::new(model, color);
 
     // Programs build steps run, built for this machine first

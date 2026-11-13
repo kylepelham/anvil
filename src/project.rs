@@ -22,10 +22,11 @@ pub const MANIFEST_NAME: &str = "anvil.toml";
 // Files of [[test]] tables, beside what they test
 pub const TESTS_FILE_NAME: &str = "tests.toml";
 
-// What a C or C++ project's own folders hold and its build output folder never does at its top
-const OUT_REFUSED_EXTENSIONS: &[&str] = &[
-    "c", "cc", "cpp", "cxx", "c++", "cppm", "ixx", "cu", "cuh", "h", "hh", "hpp", "hxx", "h++", "inl", "ipp", "tpp",
-];
+// What a version cannot hold besides spaces: it fills file names and quoted definitions
+const VERSION_REFUSED: &[char] = &['/', '\\', '"', ';'];
+
+// The keys whose items name dependencies, for the unused-dependency warning
+const DEP_LIST_KEYS: &[&str] = &["deps", "whole-archive", "header-deps", "needs"];
 
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
@@ -385,7 +386,7 @@ impl Model {
             );
         }
         let index = self.packages.len();
-        self.package_dirs.insert(util::path_key(root), index);
+        self.package_dirs.insert(package_key(root), index);
 
         if let Some(both) = manifest.dev_deps.keys().find(|dev_dep| manifest.deps.contains_key(*dev_dep)) {
             bail!("`{both}` is under both [deps] and [dev-deps] of package `{name}`; keep it in one (tests see [deps] too)");
@@ -691,7 +692,7 @@ impl Model {
                     },
                     (None, None) => continue,
                 };
-                if !seen.insert(util::path_key(&folder)) {
+                if !seen.insert(package_key(&folder)) {
                     continue;
                 }
 
@@ -1167,7 +1168,7 @@ impl Model {
         }
 
         // Already loaded (shared by several packages, or a workspace member)
-        if let Some(existing) = self.package_dirs.get(&util::path_key(folder)).copied() {
+        if let Some(existing) = self.package_dirs.get(&package_key(folder)).copied() {
             return Ok(existing);
         }
 
@@ -1193,9 +1194,14 @@ impl Model {
         // No anvil.toml: a library from the given include/sources, or include/ and src/
         let has_overrides = spec.include.is_some() || spec.sources.is_some();
         if !has_overrides && folder.join("CMakeLists.txt").is_file() && self.options.host_tools_dir.is_none() {
+            // A git checkout is shared by every project using it: converting it in place would write into the cache
             let shown = util::rel(folder, &std::env::current_dir().unwrap_or_default());
+            let advice = match spec.git.is_some() {
+                true => "give its [deps] entry `include` and `sources` keys, or `anvil convert` a fork of it and depend on that".to_string(),
+                false => format!("`anvil convert {shown}` writes an {MANIFEST_NAME} that follows them"),
+            };
             crate::ui::warn(&format!(
-                "dependency `{name}`: {shown} has a CMakeLists.txt but no {MANIFEST_NAME}, so it builds by Anvil's layout (include/, src/), not by its CMake rules; `anvil convert {shown}` writes an {MANIFEST_NAME} that follows them"
+                "dependency `{name}`: {shown} has a CMakeLists.txt but no {MANIFEST_NAME}, so it builds by Anvil's layout (include/, src/), not by its CMake rules; {advice}"
             ));
         }
         let synthetic = Manifest {
@@ -1395,13 +1401,12 @@ impl Model {
             let manifest = &package.manifest;
             let manifest_file = package.root.join(MANIFEST_NAME);
 
-            // Every word of the manifest outside the entries themselves, then of its tests.toml files if needed
+            // The words naming dependencies in the manifest, then in its tests.toml files if needed
             let mut words = Vec::new();
             collect_dep_words(&manifest_file, &mut words);
             let used = |words: &[String], name: &str| {
                 let prefix = format!("{name}/");
-                let names = |word: &String| word == name || word.starts_with(&prefix);
-                words.iter().any(names) || crate::plan::target_references(words).iter().any(names)
+                words.iter().any(|word| word == name || word.starts_with(&prefix))
             };
             let entries = || manifest.deps.keys().chain(manifest.dev_deps.keys());
             if entries().all(|name| used(&words, name)) {
@@ -1584,6 +1589,7 @@ impl Model {
             overlay_triplets,
         };
 
+        crate::commands::mark_output(&self.out_root, None)?;
         let vcpkg::Installed {
             tree,
             own_manifest,
@@ -1808,7 +1814,7 @@ impl Model {
 /// Finds the project root: the nearest anvil.toml (or the workspace that lists it). With none, a folder that
 /// looks like a C++ project builds with no manifest at all.
 /// The build output folder `[project] out` names (default `out`), refused where building and `anvil clean --all`
-/// would write over or delete the project: its own folder or one above it, a package's folder, a folder of sources.
+/// would write over or delete the project: its own folder or one above it, a package's folder.
 pub fn output_root(root: &Path, manifest: &Manifest) -> Result<PathBuf> {
     let out = manifest.project.as_ref().and_then(|project| project.out.as_deref()).unwrap_or("out");
     let out_root = util::absolute(root, Path::new(out));
@@ -1825,25 +1831,9 @@ pub fn output_root(root: &Path, manifest: &Manifest) -> Result<PathBuf> {
         bail!("{key} is {which}, which `anvil clean --all` would delete; {instead}");
     }
 
-    // A package's folder, or one with the project's sources and headers
+    // A package's folder (a folder holding anything else, `anvil clean --all` refuses to delete)
     if out_root.join(MANIFEST_NAME).is_file() {
         bail!("{key} holds a package ({}); {instead}", slash(&out_root.join(MANIFEST_NAME)));
-    }
-    let mut sources: Vec<String> = std::fs::read_dir(&out_root)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .filter(|path| {
-            let extension = path.extension().map(|extension| extension.to_string_lossy().to_ascii_lowercase());
-            extension.is_some_and(|extension| OUT_REFUSED_EXTENSIONS.contains(&extension.as_str()))
-        })
-        .map(|path| util::rel(&path, root))
-        .collect();
-    sources.sort();
-    if let Some(first) = sources.first() {
-        bail!("{key} holds C and C++ files ({first}), which `anvil clean --all` would delete; {instead}");
     }
 
     Ok(out_root)
@@ -1931,7 +1921,12 @@ fn zero_config(start: &Path) -> Result<(PathBuf, Manifest)> {
     )
 }
 
-fn package_name(root: &Path, manifest: &Manifest) -> String {
+/// A package folder's key: one for the folder however it is reached (a junction or link to it, another spelling).
+fn package_key(folder: &Path) -> String {
+    util::path_key(&std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf()))
+}
+
+pub fn package_name(root: &Path, manifest: &Manifest) -> String {
     let declared = manifest.project.as_ref().and_then(|project| project.name.clone());
     declared.unwrap_or_else(|| {
         root.file_name()
@@ -1955,14 +1950,14 @@ pub fn is_version(text: &str) -> bool {
             .all(|part| !part.is_empty() && part.chars().all(|character| character.is_ascii_digit()))
 }
 
-/// `[project] version` is free-form ("1.4.0-beta.2"), but one word: it fills {version} in commands and file names.
-/// Only `anvil install`'s CMake package needs numbers (`is_version`).
+/// `[project] version` is free-form ("1.4.0-beta.2"), but one word: it fills {version} in commands, file names
+/// (`output-name`) and quoted definitions. Only `anvil install`'s CMake package needs numbers (`is_version`).
 pub fn check_version(version: &str) -> Result<()> {
-    if !version.is_empty() && !version.contains(char::is_whitespace) {
+    if !version.is_empty() && !version.contains(|character: char| character.is_whitespace() || VERSION_REFUSED.contains(&character)) {
         return Ok(());
     }
 
-    bail!("[project] version = \"{version}\": write a version without spaces (\"2.1.0\", \"1.4.0-beta.2\")");
+    bail!("[project] version = \"{version}\": write a version without spaces, `/`, `\\`, `\"` or `;` (\"2.1.0\", \"1.4.0-beta.2\")");
 }
 
 /// Where a package's errors come from: its anvil.toml, and its name outside the root package.
@@ -2429,12 +2424,23 @@ fn qualify_references(text: &str, package: &str, own: &[String]) -> String {
 
 /// The tests.toml files of the package at `root`, not those of packages inside it, in a stable order.
 /// The strings of a manifest or tests.toml, past its [deps] and [dev-deps] tables: where dependencies are named.
+/// The words of a manifest or tests.toml that name dependencies: the items of the keys that list them (in targets,
+/// `public`, `when`, `[defaults]` and presets), and the targets `{target:...}` names in any text (a step's command).
 fn collect_dep_words(file: &Path, words: &mut Vec<String>) {
-    fn collect(value: &toml::Value, words: &mut Vec<String>) {
+    fn collect(value: &toml::Value, naming: bool, words: &mut Vec<String>) {
         match value {
-            toml::Value::String(text) => words.push(text.clone()),
-            toml::Value::Array(items) => items.iter().for_each(|item| collect(item, words)),
-            toml::Value::Table(table) => table.values().for_each(|item| collect(item, words)),
+            toml::Value::String(text) => {
+                if naming {
+                    words.push(text.clone());
+                }
+                words.extend(crate::plan::target_references(std::slice::from_ref(text)));
+            }
+            toml::Value::Array(items) => items.iter().for_each(|item| collect(item, naming, words)),
+            toml::Value::Table(table) => {
+                for (key, item) in table {
+                    collect(item, DEP_LIST_KEYS.contains(&key.as_str()), words);
+                }
+            }
             _ => {}
         }
     }
@@ -2443,7 +2449,7 @@ fn collect_dep_words(file: &Path, words: &mut Vec<String>) {
     let Ok(table) = text.parse::<toml::Table>() else { return };
     for (key, value) in &table {
         if key != "deps" && key != "dev-deps" {
-            collect(value, words);
+            collect(value, false, words);
         }
     }
 }
@@ -2669,7 +2675,7 @@ mod tests {
         assert!(out_root(".").unwrap_err().contains("is the project's own folder"));
         assert!(out_root("").unwrap_err().contains("is the project's own folder"));
         assert!(out_root("..").unwrap_err().contains("is a folder holding the project"));
-        assert!(out_root("src").unwrap_err().contains("holds C and C++ files (src/main.cpp)"));
+        assert_eq!(out_root("src").unwrap(), root.join("src"));
         assert!(out_root("lib/inner").unwrap_err().contains("holds a package"));
         assert!(output_root(&root, &Manifest::default()).is_ok());
 

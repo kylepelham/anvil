@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 
 // Marks a folder as Anvil's output, so `clean --all` never deletes anything else
 const OUT_MARKER: &str = ".anvil-out";
+const OUT_MARKER_TEXT: &str = "Anvil build output. `anvil clean --all` deletes this folder.\n";
+
+// A line of the marker naming what else Anvil wrote at the top of the output folder (a JUnit report, a prefix)
+const WRITTEN_PREFIX: &str = "wrote ";
 
 // In a profile's output folder (`<out>/<folder>/.anvil/`): the profile it is built with, for `anvil clean -p`
 const PROFILE_MARKER: &str = "profile";
@@ -24,6 +28,9 @@ const PROFILE_MARKER: &str = "profile";
 // What else Anvil writes at the top of the output folder, beside the profiles' folders
 const OUT_FILES: &[&str] = &[OUT_MARKER, "compile_commands.json"];
 const OUT_FOLDERS: &[&str] = &["vcpkg", "install", "convert-check"];
+
+// The machines `--target` takes by name, for a mistyped one
+const MACHINES: &[&str] = &["x64", "x86", "arm64", "arm"];
 
 pub fn build(start_dir: &Path, build: &BuildArgs, names: &[String], include_tests: bool) -> Result<(Model, Plan)> {
     let model = load_model_naming(start_dir, build, names)?;
@@ -152,6 +159,13 @@ pub fn test(start_dir: &Path, build: &BuildArgs, options: &TestArgs) -> Result<i
     } else {
         build_roots(model, build, &roots)?
     };
+
+    // The results go into the output folder, and so may the report, which is then Anvil's to delete
+    let junit = options
+        .junit
+        .as_ref()
+        .map(|junit| util::absolute(&std::env::current_dir().unwrap_or_default(), junit));
+    mark_output(&model.out_root, junit.as_deref())?;
     let options = crate::testrun::TestOptions {
         jobs: jobs(build),
         show_output: options.show_output,
@@ -165,11 +179,12 @@ pub fn clean(start_dir: &Path, release: bool, profile: Option<&str>, all: bool) 
     let out_root = project::output_root(&root, &manifest)?;
 
     if all {
-        if !out_root.join(OUT_MARKER).is_file() {
+        let Ok(marker) = std::fs::read_to_string(out_root.join(OUT_MARKER)) else {
             bail!("{} does not look like Anvil's output folder; not deleting it", slash(&out_root));
-        }
+        };
 
-        // Only what Anvil wrote: profiles' folders and its own files and folders
+        // Only what Anvil wrote: profiles' folders, its own files and folders, and what the marker names
+        let written = written_entries(&marker);
         let profiles: Vec<&str> = ["debug", "release"]
             .into_iter()
             .chain(manifest.profile.keys().map(|name| name.as_str()))
@@ -187,7 +202,7 @@ pub fn clean(start_dir: &Path, release: bool, profile: Option<&str>, all: bool) 
                 } else {
                     OUT_FILES.contains(&name.as_str())
                 };
-                !known
+                !known && !written.iter().any(|written| same_name(written, &name))
             })
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
@@ -514,14 +529,20 @@ fn load_model_with(start_dir: &Path, build: &BuildArgs, refresh: Refresh, list_o
         (None, false) => "debug".to_string(),
     };
 
-    // `--target game`: a target's name where the machine goes
+    // `--target game`: a target's name where the machine goes; else a machine's name mistyped
     if let Some(platform) = &build.platform {
         if let Err(error) = Platform::parse(platform) {
-            let declared = project::locate(start_dir).is_ok_and(|(_, manifest)| manifest.target.contains_key(platform));
-            if declared || is_target_like(platform) {
+            let declared = project::locate(start_dir).is_ok_and(|(root, manifest)| {
+                manifest.target.contains_key(platform) || (manifest.target.is_empty() && project::package_name(&root, &manifest) == *platform)
+            });
+            if declared {
                 bail!("`--target {platform}`: `--target` picks the machine to build for (x64, x86, arm64, arm, or a triple such as aarch64-linux-gnu); to build target `{platform}`, write `anvil build {platform}`");
             }
-            return Err(error);
+            let hint = match platform.contains('-') {
+                true => String::new(),
+                false => util::did_you_mean(&platform.to_ascii_lowercase(), MACHINES.iter().copied()),
+            };
+            bail!("{error}{hint}");
         }
     }
 
@@ -539,11 +560,6 @@ fn load_model_with(start_dir: &Path, build: &BuildArgs, refresh: Refresh, list_o
     })
 }
 
-/// A word that names a target rather than a machine: no triple's dashes, a target name's characters.
-fn is_target_like(text: &str) -> bool {
-    !text.contains('-') && !text.is_empty() && text.chars().all(|character| character.is_alphanumeric() || "_.+".contains(character))
-}
-
 /// Programs built for another machine cannot start here.
 fn check_runs_here(model: &Model, command: &str) -> Result<()> {
     let platform = &model.toolchain.platform;
@@ -558,6 +574,34 @@ fn check_runs_here(model: &Model, command: &str) -> Result<()> {
     )
 }
 
+/// Creates the output folder marked as Anvil's, so that `clean --all` deletes it. `written` is a path Anvil writes
+/// besides its own folders (a JUnit report, an install prefix): when it is inside, the marker names its top entry, which
+/// `clean --all` then deletes too.
+pub fn mark_output(out_root: &Path, written: Option<&Path>) -> Result<()> {
+    std::fs::create_dir_all(out_root).with_context(|| format!("creating {}", slash(out_root)))?;
+    let marker = out_root.join(OUT_MARKER);
+    let mut text = std::fs::read_to_string(&marker).unwrap_or_else(|_| OUT_MARKER_TEXT.to_string());
+
+    let entry = written
+        .and_then(|path| util::strip_prefix_ci(path, out_root))
+        .and_then(|inside| inside.components().next().map(|first| first.as_os_str().to_string_lossy().into_owned()));
+    if let Some(entry) = entry.filter(|entry| !written_entries(&text).iter().any(|known| same_name(known, entry))) {
+        text.push_str(&format!("{WRITTEN_PREFIX}{entry}\n"));
+    }
+
+    util::write_if_changed(&marker, text.as_bytes())?;
+    Ok(())
+}
+
+/// The entries the output folder's marker says Anvil wrote at its top.
+fn written_entries(marker: &str) -> Vec<&str> {
+    marker.lines().filter_map(|line| line.strip_prefix(WRITTEN_PREFIX)).collect()
+}
+
+fn same_name(left: &str, right: &str) -> bool {
+    util::path_key(Path::new(left)) == util::path_key(Path::new(right))
+}
+
 /// Plans and runs the actions `roots` need, then prints the summary line.
 pub fn build_roots(mut model: Model, build: &BuildArgs, roots: &[usize]) -> Result<(Model, Plan)> {
     // The compiler cache, needed now that compiles run
@@ -566,11 +610,7 @@ pub fn build_roots(mut model: Model, build: &BuildArgs, roots: &[usize]) -> Resu
         toolchain::check_launcher(launcher, model.toolchain.family);
     }
 
-    std::fs::create_dir_all(&model.out_root)?;
-    std::fs::write(
-        model.out_root.join(OUT_MARKER),
-        "Anvil build output. `anvil clean --all` deletes this folder.\n",
-    )?;
+    mark_output(&model.out_root, None)?;
     let state_dir = model.out_dir.join(".anvil");
     std::fs::create_dir_all(&state_dir)?;
     std::fs::write(state_dir.join(PROFILE_MARKER), format!("{}\n", model.profile.name))?;
@@ -812,10 +852,9 @@ mod tests {
     }
 
     #[test]
-    fn target_names_where_the_machine_goes() {
-        assert!(is_target_like("game"));
-        assert!(is_target_like("game_tests"));
-        assert!(!is_target_like("aarch64-linux-gnu"));
-        assert!(!is_target_like(""));
+    fn a_mistyped_machine_gets_a_suggestion() {
+        assert!(util::did_you_mean("x68", MACHINES.iter().copied()).starts_with(" (did you mean `x"));
+        assert_eq!(util::did_you_mean("arm64ec", MACHINES.iter().copied()), " (did you mean `arm64`?)");
+        assert_eq!(util::did_you_mean("game", MACHINES.iter().copied()), "");
     }
 }

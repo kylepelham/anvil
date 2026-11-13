@@ -38,7 +38,7 @@ const CXX_STANDARDS: &[&str] = &[
 const C_STANDARDS: &[&str] = &["c17", "c11", "c23", "c99", "c89", "c90", "c18"];
 
 // What crate::project::check_version takes
-const VERSION_PATTERN: &str = r"^\S+$";
+const VERSION_PATTERN: &str = r#"^[^\s/\\";]+$"#;
 
 // Every spelling crate::flags::normalize_standard takes ("20", "cxx20", "GNU++20")
 const CXX_STANDARD_PATTERN: &str = r"^([cC]\+\+)*([cC][xX][xX])*([cC][pP][pP])*([gG][nN][uU]\+\+)*[cC]*(11|14|17|20|23|26)$";
@@ -208,7 +208,7 @@ fn project_table() -> Value {
                 "type": "string",
                 "pattern": VERSION_PATTERN,
                 "examples": ["0.1.0"],
-                "description": "The package's version, without spaces (\"2.1.0\", \"1.4.0-beta.2\"): the {version} placeholder, and the installed package's (whose CMake package file needs one to four numbers).",
+                "description": "The package's version, without spaces, `/`, `\\`, `\"` or `;` (\"2.1.0\", \"1.4.0-beta.2\"): the {version} placeholder, and the installed package's (whose CMake package file needs one to four numbers).",
             }),
         ),
         ("description", text(metadata)),
@@ -1142,6 +1142,10 @@ mod tests {
             "[[test]]\nname = \"a_{v}\"\nmatrix.v = [\"x\"]\n",
             "[project]\nversion = \"2.1 beta\"\n",
             "[project]\nversion = \"\"\n",
+            "[project]\nversion = \"1.0/2\"\n",
+            "[project]\nversion = '1\\2'\n",
+            "[project]\nversion = '1\"2'\n",
+            "[project]\nversion = \"1;2\"\n",
         ];
         let accepted = [
             "[target.t]\nkind = \"test\"\ntimeout = 5000000000\n",
