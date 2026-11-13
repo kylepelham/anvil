@@ -385,6 +385,16 @@ fn workspace_root_without_sources_does_not_warn() {
     project.anvil(&["build"]).success().lacks("warning:");
 }
 
+#[test]
+fn workspace_member_cannot_set_root_only_keys() {
+    let project = Project::fixture("workspace", "workspace_root_keys");
+    project.edit("core/anvil.toml", "name = \"core\"", "name = \"core\"\nlauncher = \"sccache\"");
+    project
+        .anvil(&["targets"])
+        .code(1)
+        .contains("core/anvil.toml: [project] launcher is read only from the workspace root");
+}
+
 // 14. A CMake project converts to the expected anvil.toml, which builds and tests
 
 #[test]
@@ -695,6 +705,18 @@ fn missing_compiler_cache_is_an_error() {
         "{text}"
     );
 
+    // Commands that compile nothing do not need it
+    for args in [["targets"], ["compdb"]] {
+        let listing = Command::new(common::ANVIL)
+            .arg("-C")
+            .arg(&project.root)
+            .args(args)
+            .env_remove("ANVIL_LAUNCHER")
+            .output()
+            .expect("starting anvil");
+        assert!(listing.status.success(), "anvil {args:?}: {}", String::from_utf8_lossy(&listing.stderr));
+    }
+
     // ANVIL_LAUNCHER set empty turns it off
     command.env("ANVIL_LAUNCHER", "");
     let output = command.output().expect("starting anvil");
@@ -751,7 +773,7 @@ fn build_trace(toolchain: Option<&str>, test: &str) {
         assert!(event["ts"].is_u64() && event["dur"].is_u64(), "{event}");
     }
 
-    // A build with nothing to do leaves the trace alone and reports nothing
+    // A build with nothing to do leaves the trace alone and says where it is
     let trace_file = first
         .output()
         .lines()
@@ -764,6 +786,7 @@ fn build_trace(toolchain: Option<&str>, test: &str) {
         .anvil(&with_toolchain(toolchain, &["build", "--timings"]))
         .success()
         .up_to_date()
+        .contains(&format!("Timings: nothing ran; the last trace: {trace_file}"))
         .lacks("Slowest actions");
     assert_eq!(project.read(&trace_file), trace);
 
@@ -831,6 +854,29 @@ fn fmt_checks_then_formats_the_package() {
     assert!(project.read("src/pick.cpp").contains("      return 0;"));
 }
 
+#[test]
+fn fmt_keeps_ignored_files_and_bytes() {
+    let project = Project::fixture("lint", "fmt_bytes");
+    project.write("gen/.clang-format-ignore", "!keep.cpp\n");
+    project.write("gen/keep.cpp", "int  keep( ){return 1;}\n");
+    project.write("gen/other.cpp", "int  other( ){return 2;}\n");
+    std::fs::write(project.path("src/latin1.cpp"), b"// caf\xe9\r\nint  latin( ){return 3;}\r\n").unwrap();
+
+    let run = project.anvil(&["fmt"]);
+    if lint_tool_missing(&run, "clang-format") {
+        return;
+    }
+    run.success().contains("Formatted gen/keep.cpp").contains("Formatted src/latin1.cpp");
+
+    // A file clang-format leaves out (all but keep.cpp up to clang-format 22) is never emptied
+    let other = project.read("gen/other.cpp");
+    assert!(other.contains("other("), "{other:?}");
+
+    // A CP1252 file keeps its bytes and line endings
+    let latin = std::fs::read(project.path("src/latin1.cpp")).unwrap();
+    assert_eq!(latin, b"// caf\xe9\r\nint latin() { return 3; }\r\n");
+}
+
 fn tidy_reports_and_fixes(toolchain: Option<&str>, test: &str) {
     let project = Project::fixture("lint", test);
 
@@ -866,6 +912,25 @@ fn tidy_reports_and_fixes_findings() {
 fn tidy_reports_and_fixes_findings_gcc() {
     require!("gcc");
     tidy_reports_and_fixes(Some("gcc"), "tidy_gcc");
+}
+
+#[test]
+fn tidy_runs_the_build_steps_sources_need() {
+    require!("default");
+    let project = Project::empty("tidy_generated");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"gen\"\n\n[[target.gen.run]]\ninputs = [\"gen.h.in\"]\noutput = \"{gen}/gen.h\"\ncommand = \"cmake -E copy {root}/gen.h.in {output}\"\n",
+    );
+    project.write("gen.h.in", "#define GEN 1\n");
+    project.write("src/main.cpp", "#include \"gen.h\"\nint main() { return GEN; }\n");
+    project.write(".clang-tidy", "Checks: '-*,bugprone-*'\n");
+
+    let run = project.anvil(&["tidy"]);
+    if lint_tool_missing(&run, "clang-tidy") {
+        return;
+    }
+    run.success().contains("1 files, nothing found");
 }
 
 // 21. Dependencies: anvil.lock keeps only the pins something declares; dev-deps; anvil remove, init, completions
@@ -1514,4 +1579,84 @@ command = ["cmake", "-E", "copy", "{root}/in.txt", "{output}"]
         .anvil_in("a&b dir", &["build"])
         .code(1)
         .contains("the step succeeded but did not write out/debug/gen/app/d.txt");
+}
+
+// OpenMP and threads as built-in system dependencies: the program runs its parallel region on every toolchain
+
+fn openmp_program(toolchain: Option<&str>, test: &str) {
+    let project = Project::empty(test);
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"omp\"\n\n[deps]\nopenmp = \"system\"\nthreads = \"system\"\n",
+    );
+    project.write(
+        "src/main.cpp",
+        "#include <omp.h>\n#include <cstdio>\n#include <thread>\nint main() {\n    int count = 0;\n#pragma omp parallel\n    {\n#pragma omp atomic\n        count++;\n    }\n    std::thread([] {}).join();\n    std::printf(\"%d\\n\", count == omp_get_max_threads());\n}\n",
+    );
+
+    let run = project.anvil(&with_toolchain(toolchain, &["run"]));
+    run.success();
+    assert_eq!(program_output(&run), "1");
+}
+
+#[test]
+fn openmp_system_dependency_runs() {
+    require!("default");
+    openmp_program(None, "openmp");
+}
+
+#[test]
+fn openmp_system_dependency_runs_gcc() {
+    require!("gcc");
+    openmp_program(Some("gcc"), "openmp_gcc");
+}
+
+#[test]
+fn openmp_system_dependency_runs_clang() {
+    require!("clang");
+    openmp_program(Some("clang"), "openmp_clang");
+}
+
+#[test]
+fn openmp_system_dependency_runs_clang_cl() {
+    require!("clang-cl");
+    openmp_program(Some("clang-cl"), "openmp_clang_cl");
+}
+
+// A port's language-specific definitions reach only that language's files; $<CONFIG:Debug> holds exactly when its
+// debug libraries are linked; its OpenMP::OpenMP_CXX gives C++ files OpenMP
+
+fn vcpkg_port_usage(toolchain: Option<&str>, test: &str, debug_libraries: bool) {
+    let project = Project::fixture("vcpkg_overlay", test);
+    let debug = if debug_libraries { " OPT_DEBUG" } else { "" };
+
+    // The program's line comes last (vcpkg's install prints on stdout too)
+    let run = project.anvil(&with_toolchain(toolchain, &["run"]));
+    run.success();
+    assert_eq!(
+        program_output(&run).lines().last(),
+        Some(format!("c=1 OPT_CXX_DEF{debug} openmp").as_str())
+    );
+
+    let run = project.anvil(&with_toolchain(toolchain, &["run", "--release"]));
+    run.success();
+    assert_eq!(program_output(&run).lines().last(), Some("c=1 OPT_CXX_DEF openmp"));
+}
+
+#[test]
+fn vcpkg_port_usage_follows_language_and_libraries() {
+    require!("msvc", "vcpkg");
+    vcpkg_port_usage(Some("msvc"), "vcpkg_usage", true);
+}
+
+#[test]
+fn vcpkg_port_usage_follows_language_and_libraries_clang() {
+    require!("clang", "windows", "vcpkg");
+    vcpkg_port_usage(Some("clang"), "vcpkg_usage_clang", true);
+}
+
+#[test]
+fn vcpkg_port_usage_follows_language_and_libraries_gcc() {
+    require!("gcc", "vcpkg");
+    vcpkg_port_usage(Some("gcc"), "vcpkg_usage_gcc", false);
 }

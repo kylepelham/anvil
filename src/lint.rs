@@ -2,7 +2,9 @@
 //! with the profile's compile_commands.json. Both run one process per file, in parallel.
 
 use crate::commands;
+use crate::exec::{self, ExecOptions};
 use crate::manifest::{self, Manifest};
+use crate::plan::{ActionKind, Plan};
 use crate::project::{self, Model, MANIFEST_NAME};
 use crate::targets::{self, Kind};
 use crate::toolchain::{self, Family};
@@ -12,8 +14,9 @@ use crate::BuildArgs;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -33,9 +36,25 @@ const FORMAT_IGNORE_FILE: &str = ".clang-format-ignore";
 /// `anvil fmt [--check] [paths]`: formats the files in place, or with `check` lists those that are not formatted and
 /// returns 1 when there are any.
 pub fn format(start_dir: &Path, check: bool, paths: &[PathBuf]) -> Result<i32> {
-    let (root, files) = format_files(start_dir, paths)?;
+    let (root, mut files) = format_files(start_dir, paths)?;
     if files.is_empty() {
         ui::status("Formatted", "nothing: no C or C++ files");
+        return Ok(0);
+    }
+
+    let clang_format = toolchain::find_llvm_program("clang-format")?;
+
+    // .clang-format-ignore files, read as this clang-format reads them
+    let mut ignores = IgnoreLookup::new(last_ignore_match_wins(&clang_format));
+    let mut kept = Vec::new();
+    for file in files {
+        if !ignores.ignores(&file)? {
+            kept.push(file);
+        }
+    }
+    files = kept;
+    if files.is_empty() {
+        ui::status("Formatted", "nothing: .clang-format-ignore leaves out every file");
         return Ok(0);
     }
 
@@ -53,10 +72,8 @@ pub fn format(start_dir: &Path, check: bool, paths: &[PathBuf]) -> Result<i32> {
         );
     }
 
-    let clang_format = toolchain::find_llvm_program("clang-format")?;
-
     // Each file through clang-format, its output compared with the file
-    let results: Vec<(&PathBuf, Result<Option<String>>)> = files.par_iter().map(|file| (file, reformat(&clang_format, file))).collect();
+    let results: Vec<(&PathBuf, Result<Option<Vec<u8>>>)> = files.par_iter().map(|file| (file, reformat(&clang_format, file))).collect();
 
     let mut changed = Vec::new();
     let mut failures = Vec::new();
@@ -120,8 +137,10 @@ pub fn tidy(start_dir: &Path, build: &BuildArgs, fix: bool, names: &[String]) ->
         names.iter().map(|name| model.find_target(name)).collect::<Result<Vec<_>>>()?
     };
 
-    // compile_commands.json, current, made readable for clang-tidy
-    crate::plan::plan(&model, None, &roots, false)?;
+    // compile_commands.json, current, made readable for clang-tidy; the build steps compiles wait for run first, so
+    // generated headers exist
+    let plan = crate::plan::plan(&model, None, &roots, false)?;
+    run_generation(&model, build, &plan)?;
     let database = model.out_dir.join("compile_commands.json");
     let tidy_dir = model.out_dir.join(".anvil").join("tidy");
     let compiled = write_tidy_database(&model, &database, &tidy_dir)?;
@@ -347,6 +366,66 @@ fn parse_diagnostics(output: &str) -> (Vec<Diagnostic>, Vec<String>) {
     (diagnostics, other)
 }
 
+/// Runs the actions the plan's compiles wait for (build steps, copies, and whatever those need built), not the
+/// compiles themselves.
+fn run_generation(model: &Model, build: &BuildArgs, plan: &Plan) -> Result<()> {
+    let is_compile = |kind: ActionKind| matches!(kind, ActionKind::Compile | ActionKind::Precompile);
+
+    // What the compiles wait for, and everything that needs
+    let mut needed = vec![false; plan.actions.len()];
+    let mut pending: Vec<usize> = plan
+        .actions
+        .iter()
+        .filter(|action| is_compile(action.kind))
+        .flat_map(|action| action.after.iter().copied())
+        .filter(|index| !is_compile(plan.actions[*index].kind))
+        .collect();
+    while let Some(index) = pending.pop() {
+        if !std::mem::replace(&mut needed[index], true) {
+            pending.extend(&plan.actions[index].after);
+        }
+    }
+    if !needed.contains(&true) {
+        return Ok(());
+    }
+
+    // Those actions alone, their `after` renumbered
+    let mut numbers = vec![usize::MAX; plan.actions.len()];
+    let mut actions = Vec::new();
+    for (index, action) in plan.actions.iter().enumerate().filter(|(index, _)| needed[*index]) {
+        numbers[index] = actions.len();
+        actions.push(action.clone());
+    }
+    for action in &mut actions {
+        action.after = action.after.iter().map(|index| numbers[*index]).collect();
+    }
+    let generation = Plan {
+        actions,
+        artifacts: HashMap::new(),
+        import_libs: HashMap::new(),
+        runtime_files: HashMap::new(),
+    };
+
+    let options = ExecOptions {
+        jobs: commands::jobs(build),
+        keep_going: build.keep_going,
+        verbose: build.verbose,
+        explain: build.explain,
+        low_priority: build.low_priority,
+        root: model.root.clone(),
+    };
+    let summary = exec::execute(&generation, &model.toolchain, &model.out_dir.join(".anvil"), &options)?;
+    if summary.failed > 0 {
+        bail!(
+            "the build steps the sources need failed ({} of {}); clang-tidy needs the files they generate",
+            summary.failed,
+            summary.failed + summary.ran
+        );
+    }
+
+    Ok(())
+}
+
 /// clang-tidy's options for every file: the compile database, and what clang needs to read a GNU toolchain's
 /// command lines as that compiler would (cl's are recognized by the compiler's name).
 fn tidy_arguments(toolchain: &toolchain::Toolchain, database_dir: &Path) -> Vec<String> {
@@ -476,7 +555,7 @@ fn without_pch(arguments: &[String], header: Option<&Path>) -> Vec<String> {
 }
 
 /// The files `anvil fmt` formats: those under `paths`, else every package's (the root's and its workspace members'),
-/// minus what .clang-format-ignore files leave out; sorted. Also the project root, which messages name files from.
+/// sorted. Also the project root, which messages name files from.
 fn format_files(start_dir: &Path, paths: &[PathBuf]) -> Result<(PathBuf, Vec<PathBuf>)> {
     let (root, manifest) = project::locate(start_dir)?;
     let members = project::workspace_members(&root, &manifest)?;
@@ -510,15 +589,8 @@ fn format_files(start_dir: &Path, paths: &[PathBuf]) -> Result<(PathBuf, Vec<Pat
 
     files.sort();
     files.dedup();
-    let mut ignores = IgnoreLookup::default();
-    let mut kept = Vec::new();
-    for file in files {
-        if !ignores.ignores(&file)? {
-            kept.push(file);
-        }
-    }
 
-    Ok((root, kept))
+    Ok((root, files))
 }
 
 /// A package's output folder (`[project] out`, default `out`).
@@ -551,25 +623,44 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
         .is_some_and(|extension| extensions.contains(&extension.to_string_lossy().to_ascii_lowercase().as_str()))
 }
 
-/// The file as clang-format would write it, or None when it already is.
-fn reformat(clang_format: &Path, file: &Path) -> Result<Option<String>> {
-    let output = Command::new(clang_format)
+/// The file as clang-format would write it, or None when it already is. The file goes in on stdin, bytes as they are,
+/// named by `--assume-filename` for its style and language.
+fn reformat(clang_format: &Path, file: &Path) -> Result<Option<Vec<u8>>> {
+    let original = std::fs::read(file).with_context(|| format!("reading {}", slash(file)))?;
+
+    let mut child = Command::new(clang_format)
         .args(["--style=file", "--fallback-style=none"])
-        .arg(file)
-        .output()
+        .arg(format!("--assume-filename={}", file.display()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("running {}", slash(clang_format)))?;
+
+    // Feed stdin from another thread, so a full stdout pipe cannot stall both sides
+    let mut stdin = child.stdin.take().unwrap();
+    let output = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _ = stdin.write_all(&original);
+            drop(stdin);
+        });
+        child.wait_with_output()
+    })
+    .with_context(|| format!("running {}", slash(clang_format)))?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
 
-    let original = std::fs::read(file).with_context(|| format!("reading {}", slash(file)))?;
+    // clang-format up to 22 prints nothing for a file its .clang-format-ignore leaves out: never write that
+    if output.stdout.is_empty() && !original.is_empty() {
+        bail!("clang-format printed nothing for it (a .clang-format-ignore it reads may leave it out); the file is left as it is");
+    }
+
     if output.stdout == original {
         return Ok(None);
     }
 
-    Ok(Some(
-        String::from_utf8(output.stdout).context("clang-format wrote text that is not UTF-8")?,
-    ))
+    Ok(Some(output.stdout))
 }
 
 fn plural(count: usize, noun: &str) -> String {
@@ -611,28 +702,36 @@ impl ConfigLookup {
     }
 }
 
-/// .clang-format-ignore files, read as clang-format reads them: the nearest one above a file decides, its last
-/// matching pattern wins, `!` negates, and patterns are relative to its folder (`*` stays within a folder, `**` not).
-#[derive(Default)]
+/// .clang-format-ignore files, read as clang-format reads them: the nearest one above a file decides, `!` negates,
+/// and patterns are relative to its folder (`*` stays within a folder, `**` not). From clang-format 23 the last
+/// matching pattern wins; up to 22 the first pattern that decides does (one that matches, or a `!` one that does not).
 struct IgnoreLookup {
-    files: Vec<Vec<(globset::GlobMatcher, bool)>>,
+    last_match_wins: bool,
+    files: Vec<Vec<IgnorePattern>>,
     folders: HashMap<PathBuf, Option<usize>>,
 }
 
+/// A .clang-format-ignore pattern, made absolute (slashes, no `.` or `..` steps).
+#[derive(Debug)]
+struct IgnorePattern {
+    pattern: String,
+    negated: bool,
+}
+
 impl IgnoreLookup {
+    fn new(last_match_wins: bool) -> IgnoreLookup {
+        IgnoreLookup {
+            last_match_wins,
+            files: Vec::new(),
+            folders: HashMap::new(),
+        }
+    }
+
     fn ignores(&mut self, file: &Path) -> Result<bool> {
         let Some(folder) = file.parent() else { return Ok(false) };
         let Some(index) = self.nearest(folder)? else { return Ok(false) };
 
-        let text = slash(file);
-        let mut ignored = false;
-        for (matcher, negated) in &self.files[index] {
-            if matcher.is_match(&text) {
-                ignored = !negated;
-            }
-        }
-
-        Ok(ignored)
+        Ok(is_ignored(&self.files[index], &remove_dots(&slash(file)), self.last_match_wins))
     }
 
     fn nearest(&mut self, folder: &Path) -> Result<Option<usize>> {
@@ -642,8 +741,8 @@ impl IgnoreLookup {
 
         let ignore_file = folder.join(FORMAT_IGNORE_FILE);
         let found = if ignore_file.is_file() {
-            let text = std::fs::read_to_string(&ignore_file).with_context(|| format!("reading {}", slash(&ignore_file)))?;
-            self.files.push(ignore_patterns(folder, &text).with_context(|| slash(&ignore_file))?);
+            let bytes = std::fs::read(&ignore_file).with_context(|| format!("reading {}", slash(&ignore_file)))?;
+            self.files.push(ignore_patterns(folder, &String::from_utf8_lossy(&bytes)));
             Some(self.files.len() - 1)
         } else {
             match folder.parent() {
@@ -657,8 +756,44 @@ impl IgnoreLookup {
     }
 }
 
+/// Whether the clang-format found reads .clang-format-ignore with the last matching pattern winning (23 and later),
+/// from its `--version` line; a version it does not print counts as a new one.
+fn last_ignore_match_wins(clang_format: &Path) -> bool {
+    let output = Command::new(clang_format).arg("--version").output();
+    let text = output
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+
+    clang_format_major(&text).is_none_or(|major| major >= 23)
+}
+
+/// The major version in clang-format's `--version` line (`Ubuntu clang-format version 18.1.3 (1ubuntu1)`).
+fn clang_format_major(text: &str) -> Option<u32> {
+    let version = regex::Regex::new(r"clang-format version (\d+)").unwrap();
+
+    version.captures(text).and_then(|captures| captures[1].parse().ok())
+}
+
+/// Whether a file (absolute, slashes, no dot steps) is ignored by these patterns.
+fn is_ignored(patterns: &[IgnorePattern], file: &str, last_match_wins: bool) -> bool {
+    let mut ignored = false;
+
+    for pattern in patterns {
+        let matched = match_file_path(pattern.pattern.as_bytes(), file.as_bytes());
+        if last_match_wins {
+            if matched {
+                ignored = !pattern.negated;
+            }
+        } else if matched != pattern.negated {
+            return true;
+        }
+    }
+
+    ignored
+}
+
 /// A .clang-format-ignore file's patterns, made absolute, each with whether it is negated.
-fn ignore_patterns(folder: &Path, text: &str) -> Result<Vec<(globset::GlobMatcher, bool)>> {
+fn ignore_patterns(folder: &Path, text: &str) -> Vec<IgnorePattern> {
     let mut patterns = Vec::new();
 
     for line in text.lines() {
@@ -678,18 +813,162 @@ fn ignore_patterns(folder: &Path, text: &str) -> Result<Vec<(globset::GlobMatche
         let absolute = if pattern.starts_with('/') {
             pattern.to_string()
         } else {
-            format!("{}/{pattern}", slash(folder).trim_end_matches('/'))
+            remove_dots(&format!("{}/{pattern}", slash(folder).trim_end_matches('/')))
         };
-        let matcher = globset::GlobBuilder::new(&remove_dots(&absolute))
-            .literal_separator(true)
-            .backslash_escape(true)
-            .build()
-            .with_context(|| format!("bad pattern `{pattern}`"))?
-            .compile_matcher();
-        patterns.push((matcher, negated));
+        patterns.push(IgnorePattern { pattern: absolute, negated });
     }
 
-    Ok(patterns)
+    patterns
+}
+
+/// clang-format's `matchFilePath` (clang/lib/Format/MatchFilePath.cpp), byte for byte: POSIX fnmatch with `*`, `?`,
+/// `[...]` and `\` escapes that never match a `/`, and `**` between slashes (or at either end) matching across them.
+fn match_file_path(pattern: &[u8], path: &[u8]) -> bool {
+    const SEPARATOR: u8 = b'/';
+    let (Some(&pattern_back), Some(&path_back)) = (pattern.last(), path.last()) else {
+        return false;
+    };
+
+    // No match when the pattern ends with a plain character the path does not end with
+    if !b"?*]".contains(&pattern_back) && pattern_back != path_back {
+        return false;
+    }
+
+    let end_of_pattern = pattern.len();
+    let end = path.len();
+    let mut i = 0;
+    let mut j = 0;
+    while j < end {
+        if i == end_of_pattern {
+            return false;
+        }
+
+        let character = path[j];
+        match pattern[i] {
+            b'\\' => {
+                i += 1;
+                if i == end_of_pattern || character != pattern[i] {
+                    return false;
+                }
+            }
+            b'?' => {
+                if character == SEPARATOR {
+                    return false;
+                }
+            }
+            b'*' => {
+                // A run of stars: `**` alone between separators is a globstar
+                let mut globstar = i == 0 || pattern[i - 1] == SEPARATOR;
+                let mut star_count = 1;
+                i += 1;
+                while i < end_of_pattern && pattern[i] == b'*' {
+                    i += 1;
+                    star_count += 1;
+                }
+                if star_count != 2 {
+                    globstar = false;
+                }
+
+                let next_separator = path[j..].iter().position(|&byte| byte == SEPARATOR).map(|offset| j + offset);
+                if i == end_of_pattern {
+                    return globstar || next_separator.is_none();
+                }
+                if pattern[i] != SEPARATOR {
+                    if pattern[i] == b'\\' {
+                        i += 1;
+                        if i == end_of_pattern {
+                            return false;
+                        }
+                    }
+                    globstar = false;
+                }
+
+                // The star is followed by a (possibly escaped) separator
+                if pattern[i] == SEPARATOR {
+                    if !globstar {
+                        let Some(separator) = next_separator else { return false };
+                        j = separator + 1;
+                        i += 1;
+                        continue;
+                    }
+                    i += 1;
+                    if i == end_of_pattern {
+                        return path_back == SEPARATOR;
+                    }
+                }
+
+                // The rest of the pattern against each place the stars may stop
+                let rest = &pattern[i..];
+                while j < end && (globstar || path[j] != SEPARATOR) {
+                    if match_file_path(rest, &path[j..]) {
+                        return true;
+                    }
+                    j += 1;
+                }
+                return false;
+            }
+            b'[' if bracket_end(pattern, i).is_some() => {
+                let close = bracket_end(pattern, i).unwrap();
+                if character == SEPARATOR {
+                    return false;
+                }
+
+                i += 1;
+                let negated = pattern[i] == b'!';
+                if negated {
+                    i += 1;
+                }
+                let mut matched;
+                loop {
+                    if i + 2 < close && pattern[i + 1] == b'-' {
+                        matched = pattern[i] <= character && character <= pattern[i + 2];
+                        i += 3;
+                    } else {
+                        matched = character == pattern[i];
+                        i += 1;
+                    }
+                    if matched || i >= close {
+                        break;
+                    }
+                }
+                if matched == negated {
+                    return false;
+                }
+
+                i = close + 1;
+                j += 1;
+                continue;
+            }
+            literal => {
+                if character != literal {
+                    return false;
+                }
+            }
+        }
+
+        i += 1;
+        j += 1;
+    }
+
+    // Trailing stars match nothing
+    while i < end_of_pattern && pattern[i] == b'*' {
+        i += 1;
+    }
+
+    i == end_of_pattern
+}
+
+/// The `]` closing the bracket expression at `start`, when clang-format reads one there (not `[]`, `[!]`, an unpaired
+/// `[` or one holding a slash, which match a `[` literally).
+fn bracket_end(pattern: &[u8], start: usize) -> Option<usize> {
+    let end_of_pattern = pattern.len();
+    if !(start + 3 < end_of_pattern || (start + 3 == end_of_pattern && pattern[start + 1] != b'!')) {
+        return None;
+    }
+
+    let close = start + 1 + pattern[start + 1..].iter().position(|&byte| byte == b']' || byte == b'/')?;
+
+    (pattern[close] == b']' && close > start + 1).then_some(close)
 }
 
 /// A slash path without its `.` steps and with each `..` step taking the folder before it.
@@ -714,29 +993,182 @@ fn remove_dots(path: &str) -> String {
 mod tests {
     use super::*;
 
-    fn ignored(patterns: &str, file: &str) -> bool {
-        let matchers = ignore_patterns(Path::new("/project"), patterns).unwrap();
-        let mut ignored = false;
-        for (matcher, negated) in &matchers {
-            if matcher.is_match(file) {
-                ignored = !negated;
-            }
-        }
-        ignored
+    fn ignored(patterns: &str, file: &str, last_match_wins: bool) -> bool {
+        is_ignored(&ignore_patterns(Path::new("/project"), patterns), file, last_match_wins)
     }
 
     #[test]
     fn ignore_patterns_follow_clang_format() {
-        assert!(ignored("third_party/*", "/project/third_party/a.cpp"));
-        assert!(!ignored("third_party/*", "/project/third_party/sub/a.cpp"));
-        assert!(ignored("third_party/**", "/project/third_party/sub/a.cpp"));
-        assert!(ignored("# comment\n\n  *.h  ", "/project/a.h"));
-        assert!(!ignored("*.h", "/project/src/a.h"));
-        assert!(ignored("**/gen_*.cpp", "/project/src/x/gen_a.cpp"));
-        assert!(!ignored("src/*\n!src/keep.cpp", "/project/src/keep.cpp"));
-        assert!(ignored("src/*\n!src/keep.cpp", "/project/src/other.cpp"));
-        assert!(ignored("src/../lib/*", "/project/lib/a.c"));
-        assert!(ignored("/project/abs/*", "/project/abs/a.c"));
+        for last_match_wins in [false, true] {
+            let ignored = |patterns: &str, file: &str| ignored(patterns, file, last_match_wins);
+            assert!(ignored("third_party/*", "/project/third_party/a.cpp"));
+            assert!(!ignored("third_party/*", "/project/third_party/sub/a.cpp"));
+            assert!(ignored("third_party/**", "/project/third_party/sub/a.cpp"));
+            assert!(ignored("# comment\n\n  *.h  ", "/project/a.h"));
+            assert!(!ignored("*.h", "/project/src/a.h"));
+            assert!(ignored("**/gen_*.cpp", "/project/src/x/gen_a.cpp"));
+            assert!(ignored("src/*\n!src/keep.cpp", "/project/src/other.cpp"));
+            assert!(ignored("src/../lib/*", "/project/lib/a.c"));
+            assert!(ignored("/project/abs/*", "/project/abs/a.c"));
+            assert!(!ignored("! ", "/project/a.c"));
+        }
+
+        // Up to clang-format 22 the first pattern that decides wins: a `!` pattern ignores every file it does not match
+        assert!(ignored("src/*\n!src/keep.cpp", "/project/src/keep.cpp", false));
+        assert!(ignored("!src/keep.cpp", "/project/root.cpp", false));
+        assert!(!ignored("!src/keep.cpp", "/project/src/keep.cpp", false));
+
+        // From 23 the last matching pattern wins, as in .gitignore
+        assert!(!ignored("src/*\n!src/keep.cpp", "/project/src/keep.cpp", true));
+        assert!(!ignored("!src/keep.cpp", "/project/root.cpp", true));
+        assert!(ignored("!src/*.h\nsrc/*", "/project/src/a.h", true));
+    }
+
+    #[test]
+    fn reads_clang_format_versions() {
+        assert_eq!(
+            clang_format_major("clang-format version 22.1.7 (https://github.com/llvm/llvm-project a255c1e)"),
+            Some(22)
+        );
+        assert_eq!(clang_format_major("Ubuntu clang-format version 18.1.3 (1ubuntu1)"), Some(18));
+        assert_eq!(clang_format_major("something else"), None);
+    }
+
+    #[test]
+    fn matches_file_paths_as_clang_format() {
+        // clang/unittests/Format/MatchFilePathTest.cpp: (matches, path, pattern)
+        let cases: &[(bool, &[u8], &[u8])] = &[
+            (true, b"abc", b"?*?"),
+            (true, b"abc", b"???*"),
+            (true, b"abc", b"*???"),
+            (true, b"abc", b"???"),
+            (true, b"abc", b"*"),
+            (true, b"abc", b"ab[cd]"),
+            (true, b"abc", b"ab[!de]"),
+            (false, b"abc", b"ab[de]"),
+            (false, b"a", b"??"),
+            (false, b"a", b"b"),
+            (true, b"a?", b"a\\?"),
+            (false, b"a\\", b"a\\"),
+            (true, b"\\", b"[\\]"),
+            (true, b"a", b"[!\\]"),
+            (false, b"\\", b"[!\\]"),
+            (true, b"foo\x0abar", b"foo*"),
+            (true, b"foo\x0abar\x0a", b"foo*"),
+            (false, b"\x0afoo", b"foo*"),
+            (true, b"\x0a", b"*"),
+            (true, b"abc", b"abc"),
+            (false, b"AbC", b"abc"),
+            (false, b"abc", b"AbC"),
+            (true, b"AbC", b"AbC"),
+            (true, b"usr/bin", b"usr/bin"),
+            (true, b"usr\\bin", b"usr\\\\bin"),
+            (true, b"test", b"te*"),
+            (true, b"test\xff", b"te*\xff"),
+            (true, b"foo\x0abar", b"foo*"),
+            (true, b"z", b"[az]"),
+            (false, b"z", b"[!az]"),
+            (true, b"a", b"[aa]"),
+            (true, b"^", b"[^az]"),
+            (true, b"[", b"[[az]"),
+            (false, b"]", b"[!]]"),
+            (true, b"[", b"["),
+            (true, b"[]", b"[]"),
+            (true, b"[!", b"[!"),
+            (true, b"[!]", b"[!]"),
+            (true, b"c", b"[b-d]"),
+            (false, b"c", b"[!b-d]"),
+            (true, b"y", b"[b-dx-z]"),
+            (false, b"y", b"[!b-dx-z]"),
+            (false, b"#", b"[!-#]"),
+            (false, b"-", b"[!--.]"),
+            (true, b"_", b"[^-`]"),
+            (true, b"]", b"[[-^]"),
+            (true, b"]", b"[\\-^]"),
+            (true, b"-", b"[b-]"),
+            (false, b"-", b"[!b-]"),
+            (true, b"-", b"[-b]"),
+            (false, b"-", b"[!-b]"),
+            (true, b"-", b"[-]"),
+            (false, b"-", b"[!-]"),
+            (false, b"c", b"[d-b]"),
+            (true, b"c", b"[!d-b]"),
+            (true, b"y", b"[d-bx-z]"),
+            (false, b"y", b"[!d-bx-z]"),
+            (true, b"_", b"[d-b^-`]"),
+            (true, b"]", b"[d-b[-^]"),
+            (true, b"b", b"[b-b]"),
+            (false, b"/", b"[/]"),
+            (true, b"\\", b"[\\]"),
+            (true, b"[/]", b"[/]"),
+            (true, b"\\", b"[\\t]"),
+            (true, b"t", b"[\\t]"),
+            (false, b"\x09", b"[\\t]"),
+            (false, b"a/b", b"a[.-0]b"),
+            (true, b"a\\b", b"a[Z-^]b"),
+            (false, b"a/b", b"a[/-0]b"),
+            (true, b"a[/-0]b", b"a[/-0]b"),
+            (false, b"a/b", b"a[.-/]b"),
+            (true, b"a[.-/]b", b"a[.-/]b"),
+            (true, b"a\\b", b"a[\\-^]b"),
+            (true, b"a\\b", b"a[Z-\\]b"),
+            (true, b"[", b"[[]"),
+            (true, b"&", b"[a&&b]"),
+            (true, b"|", b"[a||b]"),
+            (true, b"~", b"[a~~b]"),
+            (true, b",", b"[a-z+--A-Z]"),
+            (false, b".", b"[a-z--/A-Z]"),
+            (true, b".clang-format", b"*"),
+            (true, b".git", b"*git*"),
+            (true, b".gitignore", b"*git*"),
+            (true, b"foo/bar", b"foo*/*bar"),
+            (true, b"foo/bar", b"*/*"),
+            (true, b"foo/bar", b"*foo*\\/*bar*"),
+            (false, b"foo/bar", b"foo*"),
+            (false, b"foo/bar", b"foo?bar"),
+            (false, b"foo/bar", b"foo*bar"),
+            (false, b"foobar", b"foo*/*"),
+            (false, b"foo\\", b"foo*\\"),
+            (true, b"/", b"**"),
+            (true, b"foo", b"**"),
+            (true, b"/foo", b"**"),
+            (true, b"foo/", b"**"),
+            (true, b"foo/bar", b"**"),
+            (true, b"/", b"**/"),
+            (true, b"foo/", b"**/"),
+            (true, b"/foo/", b"**/"),
+            (true, b"foo/bar/", b"**/"),
+            (true, b"/", b"/**"),
+            (true, b"/foo", b"/**"),
+            (true, b"/foo/", b"/**"),
+            (true, b"/foo/bar", b"/**"),
+            (true, b"foo", b"**/foo"),
+            (true, b"/foo", b"**/foo"),
+            (true, b"foo/bar", b"**/bar"),
+            (true, b"/foo/bar", b"**/foo/bar"),
+            (true, b"foo/bar/baz", b"**/bar/baz"),
+            (true, b"abc/foo", b"abc/**"),
+            (true, b"abc/foo/", b"abc/**"),
+            (true, b"abc/foo/bar", b"abc/**"),
+            (true, b"a/b", b"a/**/b"),
+            (true, b"a/x/b", b"a/**/b"),
+            (true, b"a/x/y/b", b"a/**/b"),
+            (false, b"a/x/b", b"a**/b"),
+            (false, b"a/x/b", b"a/**b"),
+        ];
+        for (expected, path, pattern) in cases {
+            assert_eq!(
+                match_file_path(pattern, path),
+                *expected,
+                "{} against {}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(pattern)
+            );
+        }
+
+        let many = "a".repeat(50);
+        assert!(match_file_path(b"*a*a*a*a*a*a*a*a*a*a", many.as_bytes()));
+        assert!(!match_file_path(b"*a*a*a*a*a*a*a*a*a*a", (many + "b").as_bytes()));
     }
 
     #[test]

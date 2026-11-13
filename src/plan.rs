@@ -887,7 +887,8 @@ impl<'a> Planner<'a> {
         // Precompiled header (C++ only)
         let mut after = barrier.to_vec();
         let mut inputs_read = vec![source.to_path_buf()];
-        if let Some(pch) = pch.filter(|_| settings.language == Language::Cxx) {
+        let pch = pch.filter(|_| settings.language == Language::Cxx);
+        if let Some(pch) = pch {
             insert_before_source(&mut args, &pch.use_args, self.toolchain.family.is_msvc_style());
             after.push(pch.action);
             inputs_read.push(pch.file.clone());
@@ -904,13 +905,25 @@ impl<'a> Planner<'a> {
         action.response = self.response_style();
         action.echo_line = self.compiler_echo(source);
         action.color_diagnostics = self.color_diagnostics();
-        action.launcher = self.model.launcher.clone();
+        action.launcher = self.launcher(pch.is_some());
 
         self.compile_commands.push(CompileEntry {
             source: source.to_path_buf(),
             command: CompileCommand::Planned(self.actions.len()),
         });
         Ok(self.push(action))
+    }
+
+    /// The compiler cache a compile runs through: none for sccache with cl's precompiled headers (/Yc, /Yu), which
+    /// it never caches.
+    fn launcher(&self, uses_pch: bool) -> Option<PathBuf> {
+        let launcher = self.model.launcher.as_ref()?;
+        let sccache = launcher.file_stem().is_some_and(|stem| stem.eq_ignore_ascii_case("sccache"));
+        if uses_pch && sccache && self.toolchain.family.is_msvc_style() {
+            return None;
+        }
+
+        Some(launcher.clone())
     }
 
     /// A compile_commands.json entry for a file compiled inside a unity batch, as if compiled alone.
@@ -955,7 +968,7 @@ impl<'a> Planner<'a> {
         action.after = barrier.to_vec();
         action.response = self.response_style();
         action.color_diagnostics = self.color_diagnostics();
-        action.launcher = self.model.launcher.clone();
+        action.launcher = self.launcher(true);
 
         let (file, use_args) = match self.toolchain.family {
             // cl: compile a stub source with /Yc; its object links into the target
@@ -2241,6 +2254,17 @@ mod tests {
         action.launcher = Some(PathBuf::from("sccache"));
         assert_eq!(action.compute_command_hash(), without);
         assert_eq!(crate::exec::command_line(&action), "sccache cl /c a.cpp");
+    }
+
+    #[test]
+    fn long_compiles_run_without_their_launcher() {
+        let mut action = Action::new(ActionKind::Compile, String::new(), PathBuf::from("cl"), Arc::new(Vec::new()));
+        action.launcher = Some(PathBuf::from("sccache"));
+        action.args = (0..500)
+            .map(|number| format!("/DLONG_DEFINE_{number}_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX={number}"))
+            .collect();
+
+        assert_eq!(crate::exec::command_line(&action).starts_with("sccache "), !cfg!(windows));
     }
 
     fn values() -> Vec<ShellValue> {

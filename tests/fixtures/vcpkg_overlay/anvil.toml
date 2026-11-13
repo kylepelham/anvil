@@ -1,0 +1,8 @@
+[project]
+name = "vopt"
+
+[deps]
+optport = "vcpkg"
+
+[vcpkg]
+overlay-ports = ["ports"]

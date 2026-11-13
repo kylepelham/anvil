@@ -195,6 +195,24 @@ target_include_directories(app PRIVATE ${CGLTF_INCLUDE_DIRS})
     }
 
     #[test]
+    fn find_modules_become_system_dependencies() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(omp CXX)
+find_package(OpenMP REQUIRED)
+find_package(Threads REQUIRED)
+find_package(OpenGL)
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE OpenMP::OpenMP_CXX Threads::Threads ${OPENGL_LIBRARIES})
+"#;
+        let toml = convert_files("findmodules", &[("CMakeLists.txt", cmake), ("main.cpp", "int main() {}\n")]).toml;
+
+        assert!(toml.contains("openmp = \"system\"\nthreads = \"system\"\nopengl = \"system\""), "{toml}");
+        assert!(toml.contains(r#"deps = ["openmp", "threads", "opengl"]"#), "{toml}");
+        assert!(!toml.contains("TODO:") && !toml.contains("pthread"), "{toml}");
+    }
+
+    #[test]
     fn configure_time_values_are_not_frozen() {
         let cmake = r#"
 cmake_minimum_required(VERSION 3.20)

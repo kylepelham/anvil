@@ -95,7 +95,9 @@ pub struct Model {
 
     pub profile: Profile,
     pub toolchain: Toolchain,
-    /// The compiler cache C and C++ compiles run through (crate::toolchain::find_launcher).
+    /// The compiler cache C and C++ compiles run through: `[project] launcher` as written, and the program, found
+    /// only by builds that run compiles (crate::toolchain::find_launcher), so other commands work without it.
+    pub launcher_setting: Option<String>,
     pub launcher: Option<PathBuf>,
     pub condition: CondContext,
     pub default_run: Option<String>,
@@ -144,7 +146,6 @@ impl Model {
             .or_else(|| Settings::load().toolchain);
         let toolchain = Toolchain::find(requested.as_deref(), &platform)?;
         toolchain.adapt_profile(&mut profile)?;
-        let launcher = crate::toolchain::find_launcher(project.launcher.as_deref(), &root)?;
 
         // Output folders: a toolchain or a target machine picked on the command line gets its own
         let out_root = util::absolute(&root, Path::new(project.out.as_deref().unwrap_or("out")));
@@ -169,6 +170,9 @@ impl Model {
             .into_iter()
             .map(|member| Ok((member.clone(), manifest::load(&member.join(MANIFEST_NAME))?)))
             .collect::<Result<_>>()?;
+        for (member, member_manifest) in &member_manifests {
+            check_member_project(&root, member, member_manifest)?;
+        }
         let package_options = std::iter::once((root.as_path(), &manifest.options)).chain(
             member_manifests
                 .iter()
@@ -194,7 +198,8 @@ impl Model {
             tests: Vec::new(),
             profile,
             toolchain,
-            launcher,
+            launcher_setting: project.launcher.clone(),
+            launcher: None,
             condition,
             default_run: project.default_run.clone(),
             vcpkg: None,
@@ -820,7 +825,19 @@ impl Model {
         target.public_flags = spec.flags.clone().unwrap_or_default();
         target.link_flags = spec.link_flags.clone().unwrap_or_default();
 
-        if spec.vcpkg.is_none() {
+        // `openmp`, `threads` and `opengl` = "system": what CMake's find modules give their users
+        let build = crate::vcpkg_tree::BuildContext::new(&self.toolchain, &self.profile);
+        let system = Some(vec![name.to_string()])
+            .filter(|libs| spec.libs.as_ref() == Some(libs) && spec.vcpkg.is_none() && spec.pkg_config.is_none())
+            .and_then(|_| crate::vcpkg_tree::system_dependency(name, &build));
+        if let Some(usage) = system {
+            target.public_defines.extend(usage.defines);
+            target.public_flags.extend(usage.flags);
+            target.public_language_flags.extend(usage.language_flags);
+            target.libs.extend(usage.libs.iter().map(|lib| slash(lib)));
+            target.link_flags.extend(usage.link_flags);
+            target.runtime_files.extend(usage.runtime);
+        } else if spec.vcpkg.is_none() {
             for lib in spec.libs.iter().flatten() {
                 let expanded = util::expand_env(lib)?;
                 let is_path = expanded.contains('/') || expanded.contains('\\') || Path::new(&expanded).extension().is_some();
@@ -1236,7 +1253,7 @@ impl Model {
             baseline,
         } = instance.install(&self.vcpkg_requests, &config)?;
         self.lock.as_mut().unwrap().set_vcpkg(baseline, &config.triplet, tree.versions());
-        let debug_libs = self.profile.debug_runtime && self.toolchain.is_msvc_abi();
+        let debug_libs = crate::vcpkg_tree::uses_debug_libraries(&self.toolchain, &self.profile);
         let build = crate::vcpkg_tree::BuildContext::new(&self.toolchain, &self.profile);
 
         // A package nothing links here (one used only on other platforms) may be missing
@@ -1494,6 +1511,28 @@ fn package_context(index: usize, name: &str, root: &Path) -> String {
     match index {
         0 => file,
         _ => format!("package `{name}` ({file})"),
+    }
+}
+
+/// A workspace member's `[project]` keys that only the root's manifest sets (the toolchain, compiler cache, output
+/// folder, `anvil run`'s program and install's exports): an error, not silently ignored.
+fn check_member_project(root: &Path, member: &Path, manifest: &Manifest) -> Result<()> {
+    let Some(project) = &manifest.project else { return Ok(()) };
+    let root_only = [
+        ("toolchain", project.toolchain.is_some()),
+        ("launcher", project.launcher.is_some()),
+        ("out", project.out.is_some()),
+        ("default-run", project.default_run.is_some()),
+        ("export", project.export.is_some()),
+    ];
+
+    match root_only.iter().find(|(_, set)| *set) {
+        Some((key, _)) => bail!(
+            "{}: [project] {key} is read only from the workspace root, for every member: set it in {} instead",
+            slash(&member.join(MANIFEST_NAME)),
+            slash(&root.join(MANIFEST_NAME))
+        ),
+        None => Ok(()),
     }
 }
 
