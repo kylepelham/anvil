@@ -81,7 +81,7 @@ const STANDARD_TRIPLETS: &[&str] = &[
 ];
 
 // Imported targets whose vcpkg port is not their namespace ("ns::" matches the whole namespace)
-const KNOWN_PORTS: &[(&str, &str)] = &[
+pub(super) const KNOWN_PORTS: &[(&str, &str)] = &[
     ("gpuopen::vulkanmemoryallocator", "vulkan-memory-allocator"),
     ("curl::", "curl"),
     ("jolt::", "joltphysics"),
@@ -683,6 +683,21 @@ impl Emitter {
                     Link::Library(library) => converted.blocks.push(condition, "libs", library),
                     Link::Flag(flag) => self.convert_link_flag(&flag, condition, &mut converted.blocks),
                 }
+            }
+        }
+
+        // A dependency it links needs no header-only entry as well (a find module's include folder and libraries)
+        for block in converted.blocks.blocks.values_mut() {
+            let linked: Vec<String> = ["deps", "public.deps"]
+                .iter()
+                .filter_map(|key| match block.get(*key) {
+                    Some(Value::List(items)) => Some(items.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            if let Some(Value::List(headers)) = block.get_mut("header-deps") {
+                headers.retain(|name| !linked.contains(name));
             }
         }
 
@@ -1357,6 +1372,29 @@ impl Emitter {
         let mut runs: IndexMap<String, Vec<(RunOut, Option<PathBuf>)>> = IndexMap::new();
 
         for command in &commands {
+            // A step whose program was not found (find_program, a package's tool) cannot run
+            let missing = command
+                .commands
+                .iter()
+                .find(|words| words.first().map_or(true, |program| program.is_empty() || program.ends_with("-NOTFOUND")));
+            if let Some(words) = missing {
+                let program = words
+                    .first()
+                    .map(String::as_str)
+                    .filter(|program| !program.is_empty())
+                    .unwrap_or("an empty command");
+                let made = command
+                    .outputs
+                    .first()
+                    .map(|output| slash(output))
+                    .or(command.target.clone())
+                    .unwrap_or_default();
+                self.warnings.push(format!(
+                    "the build step making {made} runs {program}, which was not found when converting; dropped (install it and convert again, or add the step by hand)"
+                ));
+                continue;
+            }
+
             // Pre-build and post-build commands (PRE_LINK runs before compiling in Anvil, which a check does not mind)
             if let (Some(target), Some(stage)) = (&command.target, &command.stage) {
                 if !self.targets.contains_key(target) {
@@ -2210,6 +2248,7 @@ impl Emitter {
             conditions.extend(target.runs.iter().filter_map(|run| run.condition.as_ref()));
         }
         conditions.extend(self.tests.iter().filter_map(|test| test.condition.as_ref()));
+        conditions.extend(self.cmake.configure_writes.iter().filter_map(|write| write.condition.as_ref()));
 
         let mut words = IndexSet::new();
         for condition in conditions {
@@ -2303,6 +2342,18 @@ fn found_header(text: &str) -> Option<String> {
 }
 
 /// Renders one target: its table, when blocks, file rules and run steps. Returns the number of TODOs.
+/// A note as one line of comment text: line breaks written as `\n`, other control characters (which TOML comments
+/// cannot hold, such as a marker's delimiters) dropped.
+fn comment_text(note: &str) -> String {
+    note.chars()
+        .flat_map(|character| match character {
+            '\n' => vec!['\\', 'n'],
+            _ if character.is_control() && character != '\t' => Vec::new(),
+            _ => vec![character],
+        })
+        .collect()
+}
+
 fn render_target(output: &mut String, name: &str, target: &TargetOut) -> usize {
     let table = format!("target.{}", key(name));
     let _ = writeln!(output, "\n[{table}]\nkind = {}", quote(target.kind));
@@ -2343,7 +2394,7 @@ fn render_target(output: &mut String, name: &str, target: &TargetOut) -> usize {
     }
     let todo_count = render_test_properties(output, &target.test);
     for note in &target.notes {
-        let _ = writeln!(output, "# TODO: {note}");
+        let _ = writeln!(output, "# TODO: {}", comment_text(note));
     }
 
     render_blocks(output, &table, &target.blocks);
@@ -2612,7 +2663,7 @@ fn render_test_properties(output: &mut String, properties: &TestProperties) -> u
     }
 
     for note in &properties.notes {
-        let _ = writeln!(output, "# TODO: {note}");
+        let _ = writeln!(output, "# TODO: {}", comment_text(note));
     }
 
     properties.notes.len()

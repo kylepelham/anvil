@@ -15,11 +15,13 @@ pub(super) struct ScriptTest {
     pub expect: Vec<String>,
     pub reject: Vec<String>,
     pub exit_code: i32,
+    /// Environment variables the script set (`set(ENV{X} value)`) before running the command.
+    pub env: Vec<(String, String)>,
 }
 
 /// The test `words` as the command its script runs, when the script is a check script (`read` gives a file's text).
 pub(super) fn convert(words: &[String], read: &dyn Fn(&str) -> Option<String>) -> Option<ScriptTest> {
-    // cmake -DNAME=value ... -P script
+    // cmake -DNAME[:TYPE]=value ... -P script
     let (program, rest) = words.split_first()?;
     let is_cmake = Path::new(program).file_stem().is_some_and(|stem| stem.eq_ignore_ascii_case("cmake"));
     let [defines @ .., mode, script] = rest else { return None };
@@ -29,6 +31,7 @@ pub(super) fn convert(words: &[String], read: &dyn Fn(&str) -> Option<String>) -
     let mut values = HashMap::new();
     for define in defines {
         let (name, value) = define.strip_prefix("-D")?.split_once('=')?;
+        let name = name.split(':').next().unwrap_or(name);
         values.insert(name.to_string(), value.to_string());
     }
 
@@ -42,6 +45,9 @@ pub(super) fn convert(words: &[String], read: &dyn Fn(&str) -> Option<String>) -
         let Some(value) = name.and_then(|name| values.get(name)) else {
             return Vec::new();
         };
+        if shape.whole.contains(name.unwrap()) {
+            return [value.clone()].into_iter().filter(|value| !value.is_empty()).collect();
+        }
         let separator = shape.separators.get(name.unwrap()).map(String::as_str).unwrap_or(";");
         value
             .replace(separator, ";")
@@ -55,9 +61,16 @@ pub(super) fn convert(words: &[String], read: &dyn Fn(&str) -> Option<String>) -
         return None;
     }
 
-    // Regexes Anvil cannot read as CMake meant them keep the script
-    let regexes = |items: Vec<String>| -> Option<Vec<String>> {
-        let converted: Vec<String> = items.iter().map(|item| anvil_regex(item)).collect();
+    // Regexes Anvil cannot read as CMake meant them keep the script; ones the script escaped are plain text
+    let regexes = |name: Option<&String>| -> Option<Vec<String>> {
+        let escaped = name.and_then(|name| shape.escaped.get(name));
+        let mut converted = Vec::new();
+        for item in list(name) {
+            match escaped {
+                Some(characters) => converted.push(literal_regex(&item, characters)?),
+                None => converted.push(anvil_regex(&item)),
+            }
+        }
         converted.iter().all(|pattern| Regex::new(pattern).is_ok()).then_some(converted)
     };
     let exit_code = match shape.exit.as_ref().and_then(|name| values.get(name)) {
@@ -67,9 +80,10 @@ pub(super) fn convert(words: &[String], read: &dyn Fn(&str) -> Option<String>) -
 
     Some(ScriptTest {
         command,
-        expect: regexes(list(shape.expect.as_ref()))?,
-        reject: regexes(list(shape.reject.as_ref()))?,
+        expect: regexes(shape.expect.as_ref())?,
+        reject: regexes(shape.reject.as_ref())?,
         exit_code,
+        env: shape.env.clone(),
     })
 }
 
@@ -83,6 +97,12 @@ struct Shape {
     exit_default: i32,
     /// Variables split at something other than `;` (`string(REPLACE "@@" ";" COMMAND "${COMMAND}")`).
     separators: HashMap<String, String>,
+    /// Variables read as one regex, not a list of them (`if(EXPECTED AND NOT OUTPUT MATCHES "${EXPECTED}")`).
+    whole: HashSet<String>,
+    /// Variables a macro escaped before matching, so their text matches literally: the characters it escaped.
+    escaped: HashMap<String, String>,
+    /// `set(ENV{X} value)` before the command runs.
+    env: Vec<(String, String)>,
 }
 
 impl Shape {
@@ -90,19 +110,32 @@ impl Shape {
         let text = strip_comments(text);
         let pattern = |source: &str| Regex::new(source).unwrap();
 
+        // A macro that only escapes a variable's regex characters (`string(REGEX REPLACE "([.+*?^$()])" "\\\\\\1" ...)`)
+        let escaping_macro = pattern(
+            r#"(?i)macro\s*\(\s*(\w+)\s+(\w+)\s*\)\s*string\s*\(\s*REGEX\s+REPLACE\s+"\(\[([^\]"]+)\]\)"\s+"(?:\\\\)+1"\s+\$\{(\w+)\}\s+"\$\{\$\{(\w+)\}\}"\s*\)\s*endmacro\s*\(\s*\w*\s*\)"#,
+        )
+        .captures(&text)
+        .filter(|captures| captures[2] == captures[4] && captures[2] == captures[5])
+        .map(|captures| (captures[1].to_lowercase(), captures[3].to_string()));
+
         // Only commands that compute and report: nothing that writes files or runs more
         let commands: Vec<String> = pattern(r"(?m)^\s*([A-Za-z_]\w*)\s*\(")
             .captures_iter(&text)
             .map(|captures| captures[1].to_lowercase())
             .collect();
-        let allowed = |command: &String| ALLOWED_COMMANDS.contains(&command.as_str());
+        let allowed = |command: &String| {
+            let escaping = escaping_macro
+                .as_ref()
+                .is_some_and(|(name, _)| command == name || command == "macro" || command == "endmacro");
+            ALLOWED_COMMANDS.contains(&command.as_str()) || escaping
+        };
         let runs = commands.iter().filter(|command| *command == "execute_process").count();
         if !commands.iter().all(allowed) || runs != 1 {
             return None;
         }
 
         // execute_process(COMMAND ${COMMAND} RESULT_VARIABLE r OUTPUT_VARIABLE o ERROR_VARIABLE e)
-        let run = pattern(r"execute_process\(\s*COMMAND\s+\$\{(\w+)\}((?:\s+(?:RESULT_VARIABLE|OUTPUT_VARIABLE|ERROR_VARIABLE)\s+\w+)+)\s*\)")
+        let run = pattern(r"execute_process\s*\(\s*COMMAND\s+\$\{(\w+)\}((?:\s+(?:RESULT_VARIABLE|OUTPUT_VARIABLE|ERROR_VARIABLE)\s+\w+)+)\s*\)")
             .captures(&text)?;
         let command = run[1].to_string();
         let outputs: HashMap<String, String> = pattern(r"(\w+)\s+(\w+)")
@@ -119,20 +152,20 @@ impl Shape {
         let all = if out == err {
             out.clone()
         } else {
-            let joined = pattern(r#"set\(\s*(\w+)\s+"\$\{(\w+)\}\$\{(\w+)\}"\s*\)"#)
+            let joined = pattern(r#"set\s*\(\s*(\w+)\s+"\$\{(\w+)\}\$\{(\w+)\}"\s*\)"#)
                 .captures_iter(&text)
                 .find(|captures| (&captures[2] == out && &captures[3] == err) || (&captures[2] == err && &captures[3] == out))?;
             joined[1].to_string()
         };
 
-        // The exit code compared: a variable with a default, or a number
-        let exit_check = pattern(r#"if\(\s*NOT\s+"?\$\{(\w+)\}"?\s+(?:STREQUAL|EQUAL)\s+"?(?:\$\{(\w+)\}|(-?\d+))"?\s*\)"#)
+        // The exit code compared (`${result}` or `result`): a variable with a default, or a number
+        let exit_check = pattern(r#"if\s*\(\s*NOT\s+"?(?:\$\{(\w+)\}|(\w+))"?\s+(?:STREQUAL|EQUAL)\s+"?(?:\$\{(\w+)\}|(-?\d+)|(\w+))"?\s*\)"#)
             .captures_iter(&text)
-            .find(|captures| &captures[1] == result)?;
-        let (exit, exit_default) = match (exit_check.get(2), exit_check.get(3)) {
+            .find(|captures| captures.get(1).or(captures.get(2)).is_some_and(|name| name.as_str() == result))?;
+        let (exit, exit_default) = match (exit_check.get(3).or(exit_check.get(5)), exit_check.get(4)) {
             (Some(name), _) => {
                 let name = name.as_str().to_string();
-                let default = pattern(r#"if\(\s*NOT\s+DEFINED\s+(\w+)\s*\)\s*set\(\s*(\w+)\s+"?(-?\d+)"?\s*\)"#)
+                let default = pattern(r#"if\s*\(\s*NOT\s+DEFINED\s+(\w+)\s*\)\s*set\s*\(\s*(\w+)\s+"?(-?\d+)"?\s*\)"#)
                     .captures_iter(&text)
                     .find(|captures| captures[1] == name && captures[2] == name)?;
                 (Some(name), default[3].parse().ok()?)
@@ -144,7 +177,8 @@ impl Shape {
         // foreach(re IN LISTS EXPECT) if(NOT all MATCHES "${re}"): must match; without NOT: must not
         let mut expect = None;
         let mut reject = None;
-        let checks = pattern(r#"foreach\(\s*(\w+)\s+IN\s+LISTS\s+(\w+)\s*\)\s*if\(\s*(NOT\s+)?("?\$\{\w+\}"?|\w+)\s+MATCHES\s+"\$\{(\w+)\}"\s*\)"#);
+        let checks =
+            pattern(r#"foreach\s*\(\s*(\w+)\s+IN\s+LISTS\s+(\w+)\s*\)\s*if\s*\(\s*(NOT\s+)?("?\$\{\w+\}"?|\w+)\s+MATCHES\s+"\$\{(\w+)\}"\s*\)"#);
         for captures in checks.captures_iter(&text) {
             let subject = captures[4].trim_matches('"').trim_start_matches("${").trim_end_matches('}');
             if subject != all || captures[1] != captures[5] {
@@ -156,11 +190,48 @@ impl Shape {
             }
         }
 
-        let separators: HashMap<String, String> = pattern(r#"string\(\s*REPLACE\s+"([^"]+)"\s+";"\s+(\w+)\s+"\$\{(\w+)\}"\s*\)"#)
+        // if(EXPECTED AND NOT all MATCHES "${EXPECTED}"): one regex that must match (when given); without NOT: must not
+        let mut whole = HashSet::new();
+        let single_checks = pattern(r#"if\s*\(\s*(\w+)\s+AND\s+(NOT\s+)?("?\$\{\w+\}"?|\w+)\s+MATCHES\s+"\$\{(\w+)\}"\s*\)"#);
+        for captures in single_checks.captures_iter(&text) {
+            let subject = captures[3].trim_matches('"').trim_start_matches("${").trim_end_matches('}');
+            if subject != all || captures[1] != captures[4] {
+                return None;
+            }
+            let slot = if captures.get(2).is_some() { &mut expect } else { &mut reject };
+            if slot.replace(captures[1].to_string()).is_some() {
+                return None;
+            }
+            whole.insert(captures[1].to_string());
+        }
+
+        let separators: HashMap<String, String> = pattern(r#"string\s*\(\s*REPLACE\s+"([^"]+)"\s+";"\s+(\w+)\s+"\$\{(\w+)\}"\s*\)"#)
             .captures_iter(&text)
             .filter(|captures| captures[2] == captures[3])
             .map(|captures| (captures[2].to_string(), captures[1].to_string()))
             .collect();
+
+        // The variables the escaping macro is called on
+        let mut escaped = HashMap::new();
+        if let Some((name, characters)) = &escaping_macro {
+            let calls = pattern(&format!(r"(?im)^\s*{}\s*\(\s*(\w+)\s*\)", regex::escape(name)));
+            for captures in calls.captures_iter(&text) {
+                escaped.insert(captures[1].to_string(), characters.clone());
+            }
+        }
+
+        // set(ENV{X} "value"): the test's environment
+        let env: Vec<(String, String)> = pattern(r#"(?m)^\s*set\s*\(\s*ENV\{(\w+)\}\s+(?:"([^"$\\]*)"|([^\s")$\\]+))\s*\)"#)
+            .captures_iter(&text)
+            .map(|captures| {
+                let value = captures.get(2).or(captures.get(3)).map(|value| value.as_str()).unwrap_or_default();
+                (captures[1].to_string(), value.to_string())
+            })
+            .collect();
+        let env_sets = pattern(r"(?i)set\s*\(\s*ENV\{").find_iter(&text).count();
+        if env_sets != env.len() {
+            return None;
+        }
 
         // It reads nothing else from outside: every variable it uses is one of these, or set in the script
         let inputs: HashSet<&str> = [Some(&command), expect.as_ref(), reject.as_ref(), exit.as_ref()]
@@ -184,6 +255,9 @@ impl Shape {
             exit,
             exit_default,
             separators,
+            whole,
+            escaped,
+            env,
         })
     }
 }
@@ -206,6 +280,32 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "cmake_minimum_required",
     "cmake_policy",
 ];
+
+/// A value a script escaped (`characters` made literal) as an Anvil regex matching it literally; None when it keeps
+/// other regex characters, which CMake still reads as a regex.
+fn literal_regex(value: &str, characters: &str) -> Option<String> {
+    // The regex the script matches: the value with a backslash before each escaped character
+    let escaped: String = value
+        .chars()
+        .flat_map(|character| characters.contains(character).then_some('\\').into_iter().chain([character]))
+        .collect();
+
+    // As CMake reads it: `\c` is the character c; any other special character means a real regex
+    let mut text = String::new();
+    let mut rest = escaped.chars();
+    while let Some(character) = rest.next() {
+        match character {
+            '\\' => text.push(rest.next()?),
+            _ if CMAKE_REGEX_CHARACTERS.contains(character) => return None,
+            _ => text.push(character),
+        }
+    }
+
+    Some(regex::escape(&text))
+}
+
+// Characters CMake's regexes give a meaning (braces are literal there)
+const CMAKE_REGEX_CHARACTERS: &str = ".+*?^$()[]|\\";
 
 /// A CMake regex in Anvil's (Rust's) syntax: braces are literal in CMake, and `.` matches line ends too.
 fn anvil_regex(cmake: &str) -> String {
@@ -317,6 +417,7 @@ endif()
                 expect: words(&[r#"\{"id": 1\}"#, "(?s)ran .* frames"]),
                 reject: words(&["ERROR"]),
                 exit_code: 2,
+                env: Vec::new(),
             })
         );
 
@@ -338,5 +439,77 @@ endif()
         assert!(convert(&words(&["cmake", "-DCOMMAND=app", "-P", "run.cmake"]), &writes).is_none());
         let reads_more = |_: &str| Some(RUN_AND_EXPECT.replace("message(SEND_ERROR \"exit code", "message(SEND_ERROR \"${MODE} exit code"));
         assert!(convert(&words(&["cmake", "-DCOMMAND=app", "-P", "run.cmake"]), &reads_more).is_none());
+    }
+
+    // gflags' cmake/execute_test.cmake, trimmed
+    const EXECUTE_TEST: &str = r#"macro (sanitize_for_regex STRVAR)
+  string (REGEX REPLACE "([.+*?^$()])" "\\\\\\1" ${STRVAR} "${${STRVAR}}")
+endmacro ()
+if (NOT COMMAND)
+  message (FATAL_ERROR "Test command not specified!")
+endif ()
+if (NOT DEFINED EXPECTED_RC)
+  set (EXPECTED_RC 0)
+endif ()
+if (EXPECTED_OUTPUT)
+  sanitize_for_regex(EXPECTED_OUTPUT)
+endif ()
+if (UNEXPECTED_OUTPUT)
+  sanitize_for_regex(UNEXPECTED_OUTPUT)
+endif ()
+set (ENV{FLAGS_undefok} "foo,bar")
+set (ENV{FLAGS_weirdo}  "")
+execute_process(
+  COMMAND ${COMMAND}
+  RESULT_VARIABLE RC
+  OUTPUT_VARIABLE OUTPUT
+  ERROR_VARIABLE  OUTPUT
+)
+if (NOT RC EQUAL EXPECTED_RC)
+  message (FATAL_ERROR "Exit status is ${RC}, expected ${EXPECTED_RC}")
+endif ()
+if (EXPECTED_OUTPUT AND NOT OUTPUT MATCHES "${EXPECTED_OUTPUT}")
+  message (FATAL_ERROR "Test output does not match expected output: ${EXPECTED_OUTPUT}")
+endif ()
+if (UNEXPECTED_OUTPUT AND OUTPUT MATCHES "${UNEXPECTED_OUTPUT}")
+  message (FATAL_ERROR "Test output matches unexpected output: ${UNEXPECTED_OUTPUT}")
+endif ()
+"#;
+
+    #[test]
+    fn typed_defines_escaped_text_and_environment() {
+        let read = |_: &str| Some(EXECUTE_TEST.to_string());
+        let test = words(&[
+            "cmake",
+            "-DCOMMAND:STRING=app;--x",
+            "-DEXPECTED_RC:STRING=1",
+            "-DEXPECTED_OUTPUT:STRING=a.b (c)",
+            "-DUNEXPECTED_OUTPUT:STRING=",
+            "-P",
+            "execute_test.cmake",
+        ]);
+
+        // The escaped value matches literally, whole; the environment the script set comes along
+        assert_eq!(
+            convert(&test, &read),
+            Some(ScriptTest {
+                command: words(&["app", "--x"]),
+                expect: words(&[r"a\.b \(c\)"]),
+                reject: Vec::new(),
+                exit_code: 1,
+                env: vec![
+                    ("FLAGS_undefok".to_string(), "foo,bar".to_string()),
+                    ("FLAGS_weirdo".to_string(), String::new())
+                ],
+            })
+        );
+
+        // A character the macro leaves special keeps the script
+        let test = words(&["cmake", "-DCOMMAND=app", "-DEXPECTED_OUTPUT=[ab]", "-P", "execute_test.cmake"]);
+        assert!(convert(&test, &read).is_none());
+
+        // A backslash escapes the next character, as in CMake's regexes (gflags' `\\gflags.cc:` on Windows)
+        let test = words(&["cmake", "-DCOMMAND=app", r"-DEXPECTED_OUTPUT=\\gflags.cc:", "-P", "execute_test.cmake"]);
+        assert_eq!(convert(&test, &read).unwrap().expect, words(&[r"\\gflags\.cc:"]));
     }
 }

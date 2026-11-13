@@ -103,6 +103,8 @@ pub struct Interpreter {
     pub(super) glob_results: Vec<(String, Vec<String>)>,
     pub unknown_genex: Vec<String>,
     pub(super) unknown_commands: IndexSet<String>,
+    /// What the built-in commands keep besides variables (builtins.rs).
+    pub(super) builtin: super::builtins::BuiltinState,
 }
 
 impl Interpreter {
@@ -143,6 +145,7 @@ impl Interpreter {
             glob_results: Vec::new(),
             unknown_genex: Vec::new(),
             unknown_commands: IndexSet::new(),
+            builtin: Default::default(),
         };
         interpreter.define_builtin_variables();
         interpreter
@@ -156,6 +159,7 @@ impl Interpreter {
         let nodes = parse::parse_file(&file)?;
         self.run_block(&nodes)?;
         self.finish_directory(0);
+        self.finish_builtins();
 
         Ok(())
     }
@@ -308,10 +312,22 @@ impl Interpreter {
                         let option_condition = kind == "var" && in_genex_condition(&output) && self.option_truth(&name).is_some();
                         let value = match kind {
                             // An option read as a generator expression's condition stays the option
-                            _ if option_condition => model::option_marker(&name),
+                            _ if option_condition => match self.option_truth(&name) {
+                                Some(Truth::Depends(condition)) => model::option_marker(&condition),
+                                _ => model::option_marker(&name),
+                            },
                             "env" => std::env::var(&name).unwrap_or_default(),
                             "cache" => self.cache.get(&name).cloned().unwrap_or_default(),
-                            _ => self.get_variable(&name).unwrap_or_default(),
+                            _ => {
+                                // A check's result stays a condition alone or in a generator expression's condition;
+                                // inside longer text it reads as this machine's
+                                let value = self.get_variable(&name).unwrap_or_default();
+                                let whole = output.is_empty() && end + 1 == characters.len();
+                                match model::marked_condition(&value) {
+                                    Some(_) if !whole && !in_genex_condition(&output) => self.host_text(&value),
+                                    _ => value,
+                                }
+                            }
                         };
                         output.push_str(&value);
                         position = end + 1;
@@ -334,6 +350,20 @@ impl Interpreter {
         }
 
         output
+    }
+
+    /// A value as text on this machine: platform symbols and check results become what they are here.
+    pub(super) fn host_text(&self, value: &str) -> String {
+        if let Some(condition) = model::marked_condition(value) {
+            let options = self.option_defaults();
+            let holds = model::holds_on_host(condition, &|name| options.get(name).copied());
+            return if holds { "1" } else { "" }.to_string();
+        }
+
+        let pattern = regex::Regex::new(&format!("{}([A-Za-z0-9_]+)", regex::escape(SYMBOL_PREFIX))).unwrap();
+        pattern
+            .replace_all(value, |captures: &regex::Captures| symbol_host_text(&captures[1]))
+            .into_owned()
     }
 
     // Execution
@@ -893,6 +923,9 @@ impl Interpreter {
         if let Some(symbol) = text.strip_prefix(SYMBOL_PREFIX) {
             return symbol_truth(symbol);
         }
+        if let Some(condition) = model::marked_condition(text) {
+            return Truth::Depends(condition.to_string());
+        }
         if let Some(constant) = model::constant_truth(text) {
             return Truth::Known(constant);
         }
@@ -906,15 +939,20 @@ impl Interpreter {
         }
         match self.get_variable(text) {
             Some(value) if value.starts_with(SYMBOL_PREFIX) => symbol_truth(&value[SYMBOL_PREFIX.len()..]),
+            Some(value) if model::marked_condition(&value).is_some() => self.truthiness(&value, false),
             Some(value) => Truth::Known(model::constant_truth(&value).unwrap_or(true)),
             None => Truth::Known(false),
         }
     }
 
-    /// An option() that nothing set since is a condition of its own.
+    /// An option() that nothing set since is a condition of its own (and of its cmake_dependent_option() dependencies).
     pub(super) fn option_truth(&self, name: &str) -> Option<Truth> {
         if self.options.contains_key(name) && !self.overridden_options.contains(name) {
-            return Some(Truth::Depends(name.to_string()));
+            let condition = match self.builtin.option_conditions.get(name) {
+                Some(depends) => model::and(name, depends),
+                None => name.to_string(),
+            };
+            return Some(Truth::Depends(condition));
         }
         None
     }
@@ -933,6 +971,12 @@ impl Interpreter {
                 let symbol = symbol.to_string();
                 let other = other.clone();
                 return self.compare_symbol(&symbol, operator, &other, std::ptr::eq(symbol_side, &left_value));
+            }
+
+            // A check's result against a truth value: `HAVE_X EQUAL 1`
+            let marked = model::marked_condition(symbol_side).map(|condition| Truth::Depends(condition.to_string()));
+            if let (Some(truth), "EQUAL" | "STREQUAL", Some(constant)) = (marked, operator, model::constant_truth(other)) {
+                return if constant { truth } else { truth.not() };
             }
         }
 
@@ -1256,7 +1300,9 @@ pub fn unescape(text: &str) -> String {
             Some('n') => output.push('\n'),
             Some('t') => output.push('\t'),
             Some('r') => output.push('\r'),
-            Some(other) if "\\\"$;() #^@[]{}<>".contains(other) => output.push(other),
+            // `\;` stays escaped until a list is split (`split_list` reads it), as in CMake
+            Some(';') => output.push_str("\\;"),
+            Some(other) if "\\\"$()#^@[]{}<> ".contains(other) => output.push(other),
             Some(other) => {
                 output.push('\\');
                 output.push(other);

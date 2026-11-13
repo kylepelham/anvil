@@ -261,4 +261,163 @@ endforeach()
         assert!(tests.contains(r#"{ path = "cpu", args = ["--cpu"] }"#), "{tests}");
         assert!(!tests.contains("--stale"), "{tests}");
     }
+
+    #[test]
+    fn checks_and_dependent_options_become_conditions() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(checks C)
+include(CheckCCompilerFlag)
+include(CheckIncludeFile)
+include(CMakeDependentOption)
+check_c_compiler_flag(-Wstrict-prototypes HAVE_STRICT)
+check_include_file(unistd.h HAVE_UNISTD_H)
+check_include_file(stdio.h HAVE_STDIO_H)
+cmake_dependent_option(USE_WAYLAND "Wayland" ON "UNIX;NOT APPLE" OFF)
+cmake_dependent_option(USE_NEVER "Never" ON "ANDROID" OFF)
+add_executable(app main.c)
+if(HAVE_STRICT)
+  target_compile_options(app PRIVATE -Wstrict-prototypes)
+endif()
+target_compile_definitions(app PRIVATE $<$<BOOL:${HAVE_UNISTD_H}>:HAS_UNISTD> $<$<BOOL:${HAVE_STDIO_H}>:HAS_STDIO>)
+if(USE_WAYLAND)
+  target_compile_definitions(app PRIVATE WAYLAND)
+endif()
+if(USE_NEVER)
+  target_compile_definitions(app PRIVATE NEVER)
+endif()
+"#;
+        let toml = convert_files("checks", &[("CMakeLists.txt", cmake), ("main.c", "int main(void) { return 0; }\n")]).toml;
+
+        // unistd.h: MinGW has it too, so not under MSVC only
+        let not_msvc = "[target.app.when.\"!msvc\"]\ndefines = [\"HAS_UNISTD\"]\nflags = [\"-Wstrict-prototypes\"]";
+        assert!(toml.contains(not_msvc), "{toml}");
+        assert!(toml.contains(r#"defines = ["HAS_STDIO"]"#), "{toml}");
+        assert!(toml.contains(r#"[target.app.when."USE_WAYLAND & unix & !macos"]"#), "{toml}");
+        assert!(!toml.contains("NEVER"), "{toml}");
+    }
+
+    #[test]
+    fn configure_file_becomes_a_write() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(conf VERSION 1.2 LANGUAGES C)
+include(CheckIncludeFile)
+option(WITH_FOO "Foo" OFF)
+set(NAME conf)
+check_include_file(unistd.h HAVE_UNISTD_H)
+configure_file(config.h.in ${CMAKE_BINARY_DIR}/gen/config.h)
+configure_file(conf.pc.in conf.pc @ONLY)
+add_executable(app main.c)
+target_include_directories(app PRIVATE ${CMAKE_BINARY_DIR}/gen)
+"#;
+        let template = "#define NAME \"@NAME@ ${PROJECT_VERSION}\"\n#cmakedefine HAVE_UNISTD_H 1\n#cmakedefine01 WITH_FOO\n";
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("config.h.in", template),
+            ("conf.pc.in", "prefix=@CMAKE_INSTALL_PREFIX@\n"),
+            ("main.c", "int main(void) { return 0; }\n"),
+        ];
+        let conversion = convert_files("configure", &files);
+        let toml = &conversion.toml;
+
+        // Platform results as #if, options as one write each way; the install-only .pc says nothing
+        assert!(toml.contains(r#"path = "{out}/gen/config.h""#), "{toml}");
+        assert!(toml.contains("#define NAME \"conf 1.2\""), "{toml}");
+        assert!(
+            toml.contains("#if (defined(_MSC_VER) || (defined(RC_INVOKED) && !defined(__GNUC__)))\n/* #undef HAVE_UNISTD_H */\n#else\n#define HAVE_UNISTD_H 1\n#endif"),
+            "{toml}"
+        );
+        assert!(toml.contains("if = \"WITH_FOO\"") && toml.contains("#define WITH_FOO 1"), "{toml}");
+        assert!(toml.contains("if = \"!WITH_FOO\"") && toml.contains("#define WITH_FOO 0"), "{toml}");
+        assert!(toml.contains("WITH_FOO = { default = false"), "{toml}");
+        assert!(!toml.contains("conf.pc"), "{toml}");
+        assert!(
+            !conversion.warnings.iter().any(|warning| warning.contains("configure_file")),
+            "{:?}",
+            conversion.warnings
+        );
+    }
+
+    #[test]
+    fn packages_and_programs_that_are_not_there() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(pkgs C)
+find_package(ZLIB)
+find_package(HarfBuzz)
+find_program(NOPE_EXE nope-not-here-xyz)
+add_executable(app main.c)
+if(ZLIB_FOUND)
+  target_link_libraries(app PRIVATE ${ZLIB_LIBRARIES})
+  target_include_directories(app PRIVATE ${ZLIB_INCLUDE_DIRS})
+endif()
+if(HarfBuzz_FOUND)
+  target_compile_definitions(app PRIVATE HAS_HARFBUZZ)
+endif()
+if(NOPE_EXE)
+  target_compile_definitions(app PRIVATE HAS_NOPE)
+endif()
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/doc.txt COMMAND ${NOPE_EXE} -o doc.txt)
+add_custom_target(docs ALL DEPENDS ${CMAKE_BINARY_DIR}/doc.txt)
+"#;
+        let manifest = r#"{ "name": "pkgs", "dependencies": ["zlib"] }"#;
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("main.c", "int main(void) { return 0; }\n"),
+            ("vcpkg.json", manifest),
+        ];
+        let conversion = convert_files("packages", &files);
+        let toml = &conversion.toml;
+
+        assert!(toml.contains(r#"deps = ["zlib"]"#), "{toml}");
+        assert!(!toml.contains("header-deps"), "{toml}");
+        assert!(
+            !toml.contains("HARFBUZZ") && !toml.contains("HAS_NOPE") && !toml.contains("NOTFOUND"),
+            "{toml}"
+        );
+        assert!(
+            conversion
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("which was not found when converting")),
+            "{:?}",
+            conversion.warnings
+        );
+    }
+
+    #[test]
+    fn arguments_cache_and_global_state() {
+        let root = r#"
+cmake_minimum_required(VERSION 3.25)
+project(state C)
+function(helper)
+  cmake_parse_arguments(P "" "NAME" "SOURCES" "${ARGN}")
+  add_executable(${P_NAME} ${P_SOURCES})
+endfunction()
+helper(NAME app SOURCES main.c)
+set(PLUGINS "" CACHE INTERNAL "")
+add_subdirectory(plugins)
+set_property(GLOBAL APPEND PROPERTY KINDS a)
+set_property(GLOBAL APPEND PROPERTY KINDS b)
+get_property(kinds GLOBAL PROPERTY KINDS)
+block(PROPAGATE FROM_BLOCK)
+  set(FROM_BLOCK yes)
+  set(INSIDE_ONLY yes)
+endblock()
+target_compile_definitions(app PRIVATE "PLUGINS=${PLUGINS}" "KINDS=${kinds}" "FROM_BLOCK=${FROM_BLOCK}" "INSIDE=${INSIDE_ONLY}")
+"#;
+        let plugins = "set(PLUGINS ${PLUGINS} pa CACHE INTERNAL \"\")\nset(PLUGINS ${PLUGINS} pb CACHE INTERNAL \"\")\n";
+        let files = [
+            ("CMakeLists.txt", root),
+            ("plugins/CMakeLists.txt", plugins),
+            ("main.c", "int main(void) { return 0; }\n"),
+        ];
+        let toml = convert_files("state", &files).toml;
+
+        assert!(toml.contains("[target.app]"), "{toml}");
+        assert!(toml.contains(r#""PLUGINS=pa", "pb""#), "{toml}");
+        assert!(toml.contains(r#""KINDS=a", "b""#), "{toml}");
+        assert!(toml.contains(r#""FROM_BLOCK=yes", "INSIDE=""#), "{toml}");
+    }
 }
