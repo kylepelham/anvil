@@ -463,6 +463,62 @@ fn convert_platform_files_languages_and_runtime() {
     }
 }
 
+// 14c. Each branch of a converted CMake project keeps what it adds under its condition, this machine's too
+
+#[test]
+fn convert_keeps_every_branch_under_its_condition() {
+    require!("msvc", "gcc");
+    let project = Project::empty("convert_branches");
+    let cmake = r#"cmake_minimum_required(VERSION 3.20)
+project(branches C)
+function(add_compiler_source)
+  if(NOT MSVC)
+    set(SRCS ${SRCS} gnu.c PARENT_SCOPE)
+  endif()
+endfunction()
+set(SRCS main.c)
+if(MSVC)
+  list(APPEND SRCS cl.c)
+  set(COMPILER_DEF USING_CL)
+else()
+  set(COMPILER_DEF USING_GNU)
+endif()
+add_compiler_source()
+add_executable(app ${SRCS})
+target_compile_definitions(app PRIVATE ${COMPILER_DEF} $<$<TARGET_EXISTS:extra>:HAVE_EXTRA>)
+add_library(extra STATIC lib/extra.c)
+target_link_libraries(app PRIVATE extra)
+"#;
+    let main = r#"#include <stdio.h>
+int which(void);
+int extra(void);
+int main(void) {
+#if defined(USING_CL)
+    const char *name = "cl";
+#elif defined(USING_GNU)
+    const char *name = "gnu";
+#endif
+#ifdef HAVE_EXTRA
+    printf("%s %d %d\n", name, which(), extra());
+#endif
+    return 0;
+}
+"#;
+    project.write("CMakeLists.txt", cmake);
+    project.write("main.c", main);
+    project.write("cl.c", "int which(void) { return 1; }\n");
+    project.write("gnu.c", "int which(void) { return 2; }\n");
+    project.write("lib/extra.c", "int extra(void) { return 7; }\n");
+    project.anvil(&["convert"]).success();
+
+    // The compiler's own source and definition, a PARENT_SCOPE set in a branch, and a target made later
+    for (toolchain, expected) in [("msvc", "cl 1 7"), ("gcc", "gnu 2 7")] {
+        let run = project.anvil(&["run", "--toolchain", toolchain]);
+        run.success();
+        assert_eq!(program_output(&run), expected, "{toolchain}");
+    }
+}
+
 // 15. A git dependency is pinned in anvil.lock; under --locked a changed tag is an error
 
 fn git(folder: &Path, args: &[&str]) -> String {

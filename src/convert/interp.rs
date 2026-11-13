@@ -7,9 +7,11 @@ use super::parse::{self, Arg, ArgKind, Command, Node};
 use crate::util::{self, slash};
 use anyhow::Result;
 use indexmap::{IndexMap, IndexSet};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::LazyLock;
 
 // Function calls and includes nested deeper than this are runaway recursion
 const MAX_DEPTH: usize = 64;
@@ -50,11 +52,40 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "general",
 ];
 
+// Commands that read names, paths and text at configure time, not build settings: an item a branch added under a
+// condition (which the target commands keep as a generator expression) reads as this machine's there
+const HOST_CHOICE_COMMANDS: &[&str] = &[
+    "message",
+    "include",
+    "add_subdirectory",
+    "project",
+    "find_package",
+    "find_program",
+    "find_library",
+    "find_path",
+    "find_file",
+    "pkg_check_modules",
+    "configure_file",
+    "execute_process",
+    "file",
+    "get_filename_component",
+    "cmake_path",
+    "math",
+    "set_tests_properties",
+    "add_dependencies",
+    "get_target_property",
+    "enable_language",
+];
+
 // A scope's value for a variable it unset
 const UNSET: &str = "\u{1}unset";
 
 // Values of variables that depend on the platform or compiler; tests against them become conditions
 const SYMBOL_PREFIX: &str = "\u{1}sym:";
+
+// A platform value inside longer text, and its name
+static SYMBOL_PATTERN: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(&format!("{}([A-Za-z0-9_]+)", regex::escape(SYMBOL_PREFIX))).unwrap());
 
 pub struct Function {
     pub name: String,
@@ -91,32 +122,151 @@ pub enum Flow {
     Continue,
 }
 
-/// Variables and functions as they were before a branch this machine does not take.
-struct VariableState {
-    scopes: Vec<HashMap<String, String>>,
-    cache: HashMap<String, String>,
-    functions: HashMap<String, Rc<Function>>,
+/// The variable scopes (directory, function and block() ones), innermost last. While a branch runs under a mark,
+/// each write is journaled with the value it replaced, so the branch can be read back and undone at a cost in what
+/// it changed.
+pub struct Scopes {
+    maps: Vec<HashMap<String, String>>,
+    // Each scope's id, which journal entries name (an index is reused once its scope ends)
+    ids: Vec<usize>,
+    next_id: usize,
+    journal: Vec<(usize, String, Option<String>)>,
+    marks: usize,
+}
+
+/// The cache variables, journaled as Scopes are.
+pub struct Cache {
+    map: HashMap<String, String>,
+    journal: Vec<(String, Option<String>)>,
+    marks: usize,
+}
+
+/// Where the journals stood when a branch started.
+struct Mark {
+    scopes: usize,
+    cache: usize,
+    functions: usize,
     overridden_options: HashSet<String>,
 }
 
-/// Items a branch this machine does not take appended to a list, kept under the branch's condition.
-struct AppendedItems {
-    variable: String,
-    condition: String,
-    before: Vec<String>,
-    items: Vec<String>,
+/// A variable a branch wrote: in a scope (by id) or the cache.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum VariableKey {
+    Scope(usize, String),
+    Cache(String),
 }
 
-impl VariableState {
-    fn get_variable(&self, name: &str) -> Option<String> {
-        for scope in self.scopes.iter().rev() {
-            match scope.get(name) {
-                Some(value) if value == UNSET => break,
-                Some(value) => return Some(value.clone()),
-                None => {}
-            }
+/// The values variables had at a mark, from the journals: by scope id and name, and in the cache.
+#[derive(Default)]
+struct Before<'a> {
+    scopes: IndexMap<(usize, &'a str), &'a Option<String>>,
+    cache: IndexMap<&'a str, &'a Option<String>>,
+}
+
+/// What one branch under a condition changed: each variable's value before it and after it.
+struct BranchChanges {
+    condition: Truth,
+    changes: IndexMap<VariableKey, (Option<String>, Option<String>)>,
+}
+
+impl Scopes {
+    fn new() -> Scopes {
+        Scopes {
+            maps: vec![HashMap::new()],
+            ids: vec![0],
+            next_id: 1,
+            journal: Vec::new(),
+            marks: 0,
         }
-        self.cache.get(name).cloned()
+    }
+
+    pub fn push(&mut self, scope: HashMap<String, String>) {
+        self.maps.push(scope);
+        self.ids.push(self.next_id);
+        self.next_id += 1;
+    }
+
+    pub fn pop(&mut self) -> Option<HashMap<String, String>> {
+        self.ids.pop();
+        self.maps.pop()
+    }
+
+    /// Sets (Some) or removes (None) a variable in the scope at `index`.
+    fn set(&mut self, index: usize, name: &str, value: Option<String>) {
+        let old = match value {
+            Some(value) => self.maps[index].insert(name.to_string(), value),
+            None => self.maps[index].remove(name),
+        };
+        if self.marks > 0 {
+            self.journal.push((self.ids[index], name.to_string(), old));
+        }
+    }
+
+    fn index_of(&self, id: usize) -> Option<usize> {
+        self.ids.iter().rposition(|scope_id| *scope_id == id)
+    }
+
+    fn undo(&mut self, mark: usize) {
+        while self.journal.len() > mark {
+            let (id, name, old) = self.journal.pop().unwrap();
+            let Some(index) = self.index_of(id) else { continue };
+            match old {
+                Some(old) => self.maps[index].insert(name, old),
+                None => self.maps[index].remove(&name),
+            };
+        }
+    }
+}
+
+impl std::ops::Deref for Scopes {
+    type Target = [HashMap<String, String>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.maps
+    }
+}
+
+impl Cache {
+    fn new() -> Cache {
+        Cache {
+            map: HashMap::new(),
+            journal: Vec::new(),
+            marks: 0,
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&String> {
+        self.map.get(name)
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.map.contains_key(name)
+    }
+
+    pub fn insert(&mut self, name: String, value: String) -> Option<String> {
+        let old = self.map.insert(name.clone(), value);
+        if self.marks > 0 {
+            self.journal.push((name, old.clone()));
+        }
+        old
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<String> {
+        let old = self.map.remove(name);
+        if self.marks > 0 {
+            self.journal.push((name.to_string(), old.clone()));
+        }
+        old
+    }
+
+    fn undo(&mut self, mark: usize) {
+        while self.journal.len() > mark {
+            let (name, old) = self.journal.pop().unwrap();
+            match old {
+                Some(old) => self.map.insert(name, old),
+                None => self.map.remove(&name),
+            };
+        }
     }
 }
 
@@ -124,9 +274,11 @@ pub struct Interpreter {
     pub root: PathBuf,
 
     // Variables: function and directory scopes over the cache
-    pub(super) scopes: Vec<HashMap<String, String>>,
-    pub(super) cache: HashMap<String, String>,
+    pub(super) scopes: Scopes,
+    pub(super) cache: Cache,
     pub(super) functions: HashMap<String, Rc<Function>>,
+    /// Functions a branch under a mark redefined, with their earlier definition.
+    function_journal: Vec<(String, Rc<Function>)>,
 
     // Where we are: directories and the list file being read
     pub dirs: Vec<DirState>,
@@ -181,9 +333,10 @@ impl Interpreter {
     pub fn new(root: &Path) -> Interpreter {
         let mut interpreter = Interpreter {
             root: root.to_path_buf(),
-            scopes: vec![HashMap::new()],
-            cache: HashMap::new(),
+            scopes: Scopes::new(),
+            cache: Cache::new(),
             functions: HashMap::new(),
+            function_journal: Vec::new(),
             dirs: vec![DirState {
                 dir: root.to_path_buf(),
                 ..Default::default()
@@ -233,8 +386,58 @@ impl Interpreter {
         self.run_block(&nodes)?;
         self.finish_directory(0);
         self.finish_builtins();
+        self.decide_target_exists();
 
         Ok(())
+    }
+
+    /// Decides the `$<TARGET_EXISTS:...>` tests in conditions now that every target is known (a target made later in
+    /// the project counts too), dropping what they rule out.
+    fn decide_target_exists(&mut self) {
+        // The names asked about, and the answers
+        let mut conditions: Vec<&String> = Vec::new();
+        for target in self.targets.values() {
+            conditions.extend(target.condition.iter().chain(&target.shared_condition));
+            conditions.extend(target.language_rules.iter().filter_map(|rule| rule.condition.as_ref()));
+            target.each_condition(&mut |condition| conditions.push(condition));
+        }
+        conditions.extend(self.tests.iter().filter_map(|test| test.condition.as_ref()));
+        conditions.extend(self.custom_commands.iter().filter_map(|command| command.condition.as_ref()));
+        conditions.extend(self.configure_writes.iter().filter_map(|write| write.condition.as_ref()));
+        let names: HashSet<String> = conditions
+            .into_iter()
+            .flat_map(|condition| model::target_exists_names(condition))
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        let existing: HashSet<String> = names.into_iter().filter(|name| self.target_exists(name)).collect();
+
+        // Each condition decided; what can no longer hold goes
+        let decide = |condition: &mut Option<String>| -> bool {
+            let Some(text) = condition.as_deref() else { return true };
+            match model::decide_target_exists(text, &|name| existing.contains(name)) {
+                Truth::Known(holds) => {
+                    *condition = None;
+                    holds
+                }
+                Truth::Depends(decided) => {
+                    *condition = Some(decided);
+                    true
+                }
+            }
+        };
+        for target in self.targets.values_mut() {
+            if !decide(&mut target.condition) {
+                target.condition = Some("false".into());
+            }
+            decide(&mut target.shared_condition);
+            target.language_rules.retain_mut(|rule| decide(&mut rule.condition));
+            target.retain_items(&mut |condition| decide(condition));
+        }
+        self.tests.retain_mut(|test| decide(&mut test.condition));
+        self.custom_commands.retain_mut(|command| decide(&mut command.condition));
+        self.configure_writes.retain_mut(|write| decide(&mut write.condition));
     }
 
     // Variables
@@ -252,7 +455,8 @@ impl Interpreter {
 
     pub fn set_variable(&mut self, name: &str, value: &str) {
         self.note_flag_words(name, value);
-        self.scopes.last_mut().unwrap().insert(name.to_string(), value.to_string());
+        let innermost = self.scopes.len() - 1;
+        self.scopes.set(innermost, name, Some(value.to_string()));
         if self.options.contains_key(name) {
             self.overridden_options.insert(name.to_string());
         }
@@ -265,7 +469,7 @@ impl Interpreter {
         if count < 2 {
             return;
         }
-        self.scopes[count - 2].insert(name.to_string(), value.to_string());
+        self.scopes.set(count - 2, name, Some(value.to_string()));
     }
 
     /// Unsets a variable in the current scope: the scopes below no longer show through, as in CMake, where a
@@ -277,9 +481,9 @@ impl Interpreter {
 
     pub fn unset_in(&mut self, index: usize, name: &str) {
         if index == 0 {
-            self.scopes[0].remove(name);
+            self.scopes.set(0, name, None);
         } else {
-            self.scopes[index].insert(name.to_string(), UNSET.to_string());
+            self.scopes.set(index, name, Some(UNSET.to_string()));
         }
     }
 
@@ -291,8 +495,12 @@ impl Interpreter {
         *self.dir_stack.last().unwrap()
     }
 
-    /// A path from CMake text: relative to the current source folder; {out} paths stay as they are.
+    /// A path from CMake text: relative to the current source folder; {out} paths stay as they are. A part that
+    /// branches set differently is this machine's.
     pub fn resolve_path(&self, text: &str) -> PathBuf {
+        let text: &str = &model::choose_list_items(text, &|condition| {
+            model::holds_on_host(condition, &|name| self.options.get(name).map(|(default, _)| *default))
+        });
         if text.starts_with("{out}") {
             return PathBuf::from(text);
         }
@@ -345,6 +553,26 @@ impl Interpreter {
         }
 
         values
+    }
+
+    /// A built-in command's arguments, evaluated; for commands that read names and text at configure time, with
+    /// this machine's choice of the items branches added under a condition.
+    pub(super) fn command_args(&mut self, command: &Command) -> Vec<String> {
+        let args = self.evaluate_args(&command.args);
+        if !HOST_CHOICE_COMMANDS.contains(&command.name.as_str()) {
+            return args;
+        }
+
+        let holds = |condition: &str| model::holds_on_host(condition, &|name| self.options.get(name).map(|(default, _)| *default));
+        let mut chosen = Vec::new();
+        for arg in args {
+            match model::choose_list_items(&arg, &holds) {
+                Cow::Borrowed(_) => chosen.push(arg),
+                Cow::Owned(text) if model::split_conditional_item(&arg).is_some() && text.is_empty() => {}
+                Cow::Owned(text) => chosen.push(text),
+            }
+        }
+        chosen
     }
 
     /// Replaces ${VAR}, $ENV{VAR} and $CACHE{VAR} references (nested ones too); escapes stay as written.
@@ -408,6 +636,7 @@ impl Interpreter {
                     if let Some(end) = find_closing_brace(&characters, position + skip) {
                         let inner: String = characters[position + skip..end].iter().collect();
                         let name = self.expand(&inner);
+                        let whole = output.is_empty() && end + 1 == characters.len();
                         let option_condition = kind == "var" && in_genex_condition(&output) && self.option_truth(&name).is_some();
                         let mut value = match kind {
                             // An option read as a generator expression's condition stays the option
@@ -421,7 +650,6 @@ impl Interpreter {
                                 // A check's result stays a condition alone or in a generator expression's condition;
                                 // inside longer text it reads as this machine's
                                 let value = self.get_variable(&name).unwrap_or_default();
-                                let whole = output.is_empty() && end + 1 == characters.len();
                                 match model::marked_condition(&value) {
                                     Some(_) if !whole && !in_genex_condition(&output) => self.host_text(&value),
                                     _ => value,
@@ -435,7 +663,13 @@ impl Interpreter {
                                 value = model::symbol_marker(symbol);
                             }
                         }
-                        output.push_str(&self.resolve_conditional_items(value));
+
+                        // One value per condition, inside longer text: the text under each (`-D$<c:a>$<!c:b>`)
+                        let value = self.resolve_conditional_items(value);
+                        match per_condition_value(&value) {
+                            Some(_) if !whole => output.push_str(&model::list_elements(&value).concat()),
+                            _ => output.push_str(&value),
+                        }
                         position = end + 1;
                         continue;
                     }
@@ -449,8 +683,7 @@ impl Interpreter {
         // A platform value inside longer text cannot stay symbolic: it reads as this machine's
         let is_single_symbol = output.starts_with(SYMBOL_PREFIX) && output.rfind(SYMBOL_PREFIX) == Some(0) && !output.contains(' ');
         if output.contains(SYMBOL_PREFIX) && !is_single_symbol {
-            let pattern = regex::Regex::new(&format!("{}([A-Za-z0-9_]+)", regex::escape(SYMBOL_PREFIX))).unwrap();
-            return pattern
+            return SYMBOL_PATTERN
                 .replace_all(&output, |captures: &regex::Captures| symbol_host_text(&captures[1]))
                 .into_owned();
         }
@@ -458,18 +691,36 @@ impl Interpreter {
         output
     }
 
-    /// A value as text on this machine: platform symbols and check results become what they are here.
+    /// A value as text on this machine: platform symbols, check results and conditional items become what they are
+    /// here.
     pub(super) fn host_text(&self, value: &str) -> String {
+        let holds = |condition: &str| model::holds_on_host(condition, &|name| self.options.get(name).map(|(default, _)| *default));
         if let Some(condition) = model::marked_condition(value) {
-            let options = self.option_defaults();
-            let holds = model::holds_on_host(condition, &|name| options.get(name).copied());
-            return if holds { "1" } else { "" }.to_string();
+            return if holds(condition) { "1" } else { "" }.to_string();
         }
 
-        let pattern = regex::Regex::new(&format!("{}([A-Za-z0-9_]+)", regex::escape(SYMBOL_PREFIX))).unwrap();
-        pattern
-            .replace_all(value, |captures: &regex::Captures| symbol_host_text(&captures[1]))
+        let value = model::choose_list_items(value, &holds);
+        if !value.contains(SYMBOL_PREFIX) {
+            return value.into_owned();
+        }
+        SYMBOL_PATTERN
+            .replace_all(&value, |captures: &regex::Captures| symbol_host_text(&captures[1]))
             .into_owned()
+    }
+
+    /// A variable's text in a configured file where its truth depends on a condition: for a value branches set
+    /// under conditions, its items under those `choice` takes; otherwise `text` (1 for a check's result).
+    pub(super) fn chosen_text(&self, value: Option<&str>, text: &str, choice: &dyn Fn(&str) -> bool) -> String {
+        let Some(value) = value.filter(|value| conditional_value_truth(value).is_some()) else {
+            return text.to_string();
+        };
+
+        let items = model::split_list(value);
+        let chosen = items
+            .iter()
+            .filter_map(|item| model::split_conditional_item(item))
+            .filter(|(condition, _)| choice(condition));
+        chosen.map(|(_, item)| item).collect::<Vec<_>>().join(";")
     }
 
     // Execution
@@ -631,7 +882,14 @@ impl Interpreter {
         for arg in args {
             match arg.kind {
                 ArgKind::Unquoted => {
-                    let items = model::split_list(&self.expand_argument(&arg.text));
+                    // One value per condition stays one operand
+                    let value = self.expand_argument(&arg.text);
+                    if per_condition_value(&value).is_some() {
+                        tokens.push((value, false));
+                        continue;
+                    }
+
+                    let items = model::split_list(&value);
                     if items.is_empty() {
                         tokens.push((String::new(), false));
                     }
@@ -802,7 +1060,10 @@ impl Interpreter {
                     body: body.clone(),
                     is_macro: *is_macro,
                 };
-                self.functions.insert(name.clone(), Rc::new(function));
+                let earlier = self.functions.insert(name.clone(), Rc::new(function));
+                if let (Some(earlier), true) = (earlier, self.scopes.marks > 0) {
+                    self.function_journal.push((name.clone(), earlier));
+                }
                 Ok(Flow::Normal)
             }
         }
@@ -824,38 +1085,49 @@ impl Interpreter {
                 break;
             }
         }
+        // Where no branch runs (no else())
+        let uncovered = match otherwise {
+            Some(_) => Truth::Known(false),
+            None => taken.clone().not(),
+        };
         if let (Some(body), false) = (otherwise, taken == Truth::Known(true)) {
             chosen.push((taken.not(), body));
         }
 
-        // Only this machine's branch sets variables: the others run from the state before the if() (their targets and
-        // settings are recorded under their conditions), then their variables are put back. Items they appended to a
-        // list stay in it, under their condition.
-        let options = self.option_defaults();
-        let on_host = |truth: &Truth| match truth {
-            Truth::Depends(condition) => model::holds_on_host(condition, &|name| options.get(name).copied()),
-            Truth::Known(_) => true,
-        };
-        chosen.sort_by_key(|(truth, _)| on_host(truth));
-        let before = chosen.iter().any(|(truth, _)| !on_host(truth)).then(|| self.variable_state());
-        let mut appended: Vec<AppendedItems> = Vec::new();
+        // Only this machine's branch keeps the variables it sets: the others run from the state before the if() (their
+        // targets and settings are recorded under their conditions), then their variables are put back. Then what the
+        // branches did to each variable is merged in, under their conditions.
+        let on_host: Vec<bool> = chosen
+            .iter()
+            .map(|(truth, _)| match truth {
+                Truth::Depends(condition) => model::holds_on_host(condition, &|name| self.options.get(name).map(|(default, _)| *default)),
+                Truth::Known(_) => true,
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..chosen.len()).collect();
+        order.sort_by_key(|index| on_host[*index]);
+        let mut changes: Vec<(usize, BranchChanges)> = Vec::new();
 
         let mut flow = Flow::Normal;
-        for (truth, body) in chosen {
+        for index in order {
+            let (truth, body) = chosen[index].clone();
             let branch_flow = match &truth {
                 Truth::Known(_) => self.run_block(body)?,
                 Truth::Depends(condition) => {
+                    let mark = self.mark();
                     self.conditions.push(condition.clone());
                     let result = self.run_block(body);
                     self.conditions.pop();
+
+                    changes.push((index, self.changes_since(&mark, truth.clone())));
+                    if on_host[index] {
+                        self.release_mark();
+                    } else {
+                        self.undo(mark);
+                    }
                     result?
                 }
             };
-
-            if let (Some(before), Truth::Depends(condition), false) = (&before, &truth, on_host(&truth)) {
-                appended.extend(self.appended_items(before, condition));
-                self.restore_variable_state(before);
-            }
 
             flow = match (flow, branch_flow, truth) {
                 (Flow::Return(previous), Flow::Return(inner), truth) => Flow::Return(previous.or(truth.and(inner))),
@@ -867,9 +1139,9 @@ impl Interpreter {
             };
         }
 
-        for appended in appended {
-            self.keep_appended_items(appended);
-        }
+        changes.sort_by_key(|(index, _)| *index);
+        let changes: Vec<BranchChanges> = changes.into_iter().map(|(_, branch)| branch).collect();
+        self.merge_branches(&changes, &uncovered);
         Ok(flow)
     }
 
@@ -892,83 +1164,142 @@ impl Interpreter {
         items.join(";")
     }
 
-    /// The variables and functions, to run a branch this machine does not take and undo what it set.
-    fn variable_state(&self) -> VariableState {
-        VariableState {
-            scopes: self.scopes.clone(),
-            cache: self.cache.clone(),
-            functions: self.functions.clone(),
+    /// Starts journaling variable writes, to read back or undo what a branch does.
+    fn mark(&mut self) -> Mark {
+        self.scopes.marks += 1;
+        self.cache.marks += 1;
+        Mark {
+            scopes: self.scopes.journal.len(),
+            cache: self.cache.journal.len(),
+            functions: self.function_journal.len(),
             overridden_options: self.overridden_options.clone(),
         }
     }
 
-    /// Puts variables back as they were; functions the branch defined stay (calls to them run under its condition).
-    fn restore_variable_state(&mut self, state: &VariableState) {
-        if self.scopes.len() == state.scopes.len() {
-            self.scopes.clone_from(&state.scopes);
-        } else {
-            // A block() left open in the branch: keep the scopes it pushed apart from the rest
-            let count = state.scopes.len().min(self.scopes.len());
-            self.scopes[..count].clone_from_slice(&state.scopes[..count]);
+    /// Keeps what was done since the latest mark (this machine's branch).
+    fn release_mark(&mut self) {
+        self.scopes.marks -= 1;
+        self.cache.marks -= 1;
+        if self.scopes.marks == 0 {
+            self.scopes.journal.clear();
+            self.cache.journal.clear();
+            self.function_journal.clear();
         }
-        self.cache.clone_from(&state.cache);
-        for (name, function) in &state.functions {
-            self.functions.insert(name.clone(), function.clone());
-        }
-        self.overridden_options.clone_from(&state.overridden_options);
     }
 
-    /// Lists in the current scope that a branch only appended to: what it appended, under the branch's condition.
-    fn appended_items(&self, before: &VariableState, condition: &str) -> Vec<AppendedItems> {
-        let scope = self.scopes.len() - 1;
-        let mut found = Vec::new();
-
-        for (name, value) in &self.scopes[scope] {
-            // CMake's own variables (flags, module paths) are read at configure time, as are strings built with spaces
-            if value == UNSET || name.starts_with("CMAKE_") {
-                continue;
-            }
-            let previous = before.get_variable(name).unwrap_or_default();
-            if *value == previous {
-                continue;
-            }
-
-            let (old_items, new_items) = (model::list_elements(&previous), model::list_elements(value));
-            let appended = new_items.len() > old_items.len() && new_items.starts_with(&old_items);
-            let is_value = |item: &String| !item.contains(char::is_whitespace) && !COMMAND_KEYWORDS.contains(&item.as_str());
-            if appended && new_items[old_items.len()..].iter().all(is_value) {
-                found.push(AppendedItems {
-                    variable: name.clone(),
-                    condition: condition.to_string(),
-                    before: old_items.clone(),
-                    items: new_items[old_items.len()..].to_vec(),
-                });
-            }
+    /// Puts variables back as they were at the mark; functions the branch defined stay (calls to them run under its
+    /// condition), those it redefined go back.
+    fn undo(&mut self, mark: Mark) {
+        self.scopes.undo(mark.scopes);
+        self.cache.undo(mark.cache);
+        while self.function_journal.len() > mark.functions {
+            let (name, function) = self.function_journal.pop().unwrap();
+            self.functions.insert(name, function);
         }
-
-        found.sort_by(|left, right| left.variable.cmp(&right.variable));
-        found
+        self.overridden_options = mark.overridden_options;
+        self.release_mark();
     }
 
-    /// Adds a branch's appended items back, each under the branch's condition, where the branch this machine takes
-    /// (if any) left the list as it was or only appended to it too. A list the host's branch set from nothing is
-    /// its own: `if(A) set(X a) else() set(X b) endif()`.
-    fn keep_appended_items(&mut self, appended: AppendedItems) {
-        let current = model::list_elements(&self.get_variable(&appended.variable).unwrap_or_default());
-        let host_appended = current.len() > appended.before.len();
-        if !current.starts_with(&appended.before) || (appended.before.is_empty() && host_appended) {
-            return;
+    /// The variables written since the mark whose value changed: in every scope (PARENT_SCOPE too) and the cache.
+    fn changes_since(&self, mark: &Mark, condition: Truth) -> BranchChanges {
+        // Each one's value before (its first journal entry)
+        let mut before = Before::default();
+        for (id, name, old) in &self.scopes.journal[mark.scopes..] {
+            before.scopes.entry((*id, name.as_str())).or_insert(old);
+        }
+        for (name, old) in &self.cache.journal[mark.cache..] {
+            before.cache.entry(name.as_str()).or_insert(old);
         }
 
-        let mut items = current;
-        items.extend(
-            appended
-                .items
+        let mut changes = IndexMap::new();
+        for (id, name) in before.scopes.keys() {
+            let Some(index) = self.scopes.index_of(*id) else { continue };
+            let (old, new) = (self.value_from(index, name, Some(&before)), self.value_from(index, name, None));
+            if old != new {
+                changes.insert(VariableKey::Scope(*id, name.to_string()), (old, new));
+            }
+        }
+        for (name, old) in &before.cache {
+            let new = self.cache.get(name).cloned();
+            if **old != new {
+                changes.insert(VariableKey::Cache(name.to_string()), ((*old).clone(), new));
+            }
+        }
+
+        BranchChanges { condition, changes }
+    }
+
+    /// A variable as the scope at `index` sees it, now or (with `before`) at the mark.
+    fn value_from(&self, index: usize, name: &str, before: Option<&Before>) -> Option<String> {
+        for scope in (0..=index).rev() {
+            let value = match before.and_then(|before| before.scopes.get(&(self.scopes.ids[scope], name))) {
+                Some(old) => old.as_ref(),
+                None => self.scopes[scope].get(name),
+            };
+            match value {
+                Some(value) if value == UNSET => break,
+                Some(value) => return Some(value.clone()),
+                None => {}
+            }
+        }
+
+        match before.and_then(|before| before.cache.get(name)) {
+            Some(old) => (*old).clone(),
+            None => self.cache.get(name).cloned(),
+        }
+    }
+
+    /// Sets each variable the branches changed to what they did, together: items they appended, each under its
+    /// branch's condition, or one value per condition where two branches or more set it differently. Otherwise it
+    /// keeps this machine's value. `uncovered` is where no branch runs.
+    fn merge_branches(&mut self, branches: &[BranchChanges], uncovered: &Truth) {
+        let mut variables: IndexMap<&VariableKey, &Option<String>> = IndexMap::new();
+        for branch in branches {
+            for (key, (before, _)) in &branch.changes {
+                variables.entry(key).or_insert(before);
+            }
+        }
+
+        let mut merged: Vec<(VariableKey, String)> = Vec::new();
+        for (key, before) in variables {
+            // CMake's own variables (flags, module paths) are read at configure time
+            let (VariableKey::Scope(_, name) | VariableKey::Cache(name)) = key;
+            if name.starts_with("CMAKE_") {
+                continue;
+            }
+
+            // What each branch left, and what is left where none runs
+            let mut outcomes: Vec<(Truth, Option<String>, bool)> = branches
                 .iter()
-                .filter(|item| !item.is_empty())
-                .map(|item| model::conditional_item(&appended.condition, item)),
-        );
-        self.set_variable(&appended.variable, &items.join(";"));
+                .map(|branch| match branch.changes.get(key) {
+                    Some((_, after)) => (branch.condition.clone(), after.clone(), true),
+                    None => (branch.condition.clone(), before.clone(), false),
+                })
+                .collect();
+            if *uncovered != Truth::Known(false) {
+                outcomes.push((uncovered.clone(), before.clone(), false));
+            }
+
+            if let Some(value) = merged_value(before, &outcomes) {
+                merged.push((key.clone(), value));
+            }
+        }
+
+        for (key, value) in merged {
+            match key {
+                VariableKey::Scope(id, name) => {
+                    let Some(index) = self.scopes.index_of(id) else { continue };
+                    if self.scopes[index].get(&name) != Some(&value) {
+                        self.scopes.set(index, &name, Some(value));
+                    }
+                }
+                VariableKey::Cache(name) => {
+                    if self.cache.get(&name) != Some(&value) {
+                        self.cache.insert(name, value);
+                    }
+                }
+            }
+        }
     }
 
     fn run_foreach(&mut self, args: &[Arg], body: &[Node]) -> Result<Flow> {
@@ -1011,26 +1342,30 @@ impl Interpreter {
         let options = self.option_defaults();
         let mut flow = Flow::Normal;
         for item in items {
-            // An item a branch this machine does not take appended: the body runs for it as in that branch
-            let conditional = model::split_conditional_item(&item)
-                .filter(|(condition, _)| !model::holds_on_host(condition, &|name| options.get(name).copied()))
-                .map(|(condition, value)| (condition, value.to_string()));
+            // An item a branch appended: the body runs for it as in that branch (keeping its variables only where
+            // this machine takes it)
+            let conditional = model::split_conditional_item(&item).map(|(condition, value)| (condition, value.to_string()));
             if let Some((condition, value)) = conditional {
-                let before = self.variable_state();
-                self.conditions.push(condition.clone());
+                let on_host = model::holds_on_host(&condition, &|name| options.get(name).copied());
                 self.set_variable(variable, &value);
                 self.loops.push((variable.clone(), value));
+                let mark = self.mark();
+                self.conditions.push(condition.clone());
                 let result = self.run_block(body);
-                self.loops.pop();
                 self.conditions.pop();
+                self.loops.pop();
 
-                let appended = self.appended_items(&before, &condition);
-                self.restore_variable_state(&before);
-                for appended in appended {
-                    self.keep_appended_items(appended);
+                let changes = self.changes_since(&mark, Truth::Depends(condition.clone()));
+                if on_host {
+                    self.release_mark();
+                } else {
+                    self.undo(mark);
                 }
-                if let Flow::Return(inner) = result? {
-                    flow = Flow::Return(Truth::Depends(condition).and(inner));
+                self.merge_branches(&[changes], &Truth::Depends(model::negate(&condition)));
+                match result? {
+                    Flow::Return(inner) => flow = Flow::Return(Truth::Depends(condition).and(inner)),
+                    Flow::Break if on_host => break,
+                    _ => {}
                 }
                 continue;
             }
@@ -1049,11 +1384,8 @@ impl Interpreter {
             }
         }
 
-        if let Some(scope) = self.scopes.get_mut(scope) {
-            match previous {
-                Some(previous) => scope.insert(variable.clone(), previous),
-                None => scope.remove(variable),
-            };
+        if scope < self.scopes.len() {
+            self.scopes.set(scope, variable, previous);
         }
         Ok(flow)
     }
@@ -1199,6 +1531,12 @@ impl Interpreter {
     }
 
     pub(super) fn truthiness(&self, text: &str, quoted: bool) -> Truth {
+        // One value per condition: true where its value there is
+        if let Some(alternatives) = per_condition_value(text) {
+            return alternatives.into_iter().fold(Truth::Known(false), |result, (condition, value)| {
+                result.or(Truth::Depends(condition).and(self.truthiness(&value, quoted)))
+            });
+        }
         if let Some(symbol) = text.strip_prefix(SYMBOL_PREFIX) {
             return model::symbol_truth(symbol);
         }
@@ -1243,6 +1581,42 @@ impl Interpreter {
             "IN_LIST" => right.0.clone(),
             _ => self.operand_value(right),
         };
+
+        // A list with items under conditions holds the value where an item that is it is there
+        if operator == "IN_LIST" {
+            let list = self.get_variable(&right_value).unwrap_or_default();
+            if list.contains("$<$<BOOL:") {
+                return model::split_list(&list)
+                    .iter()
+                    .fold(Truth::Known(false), |result, item| match model::split_conditional_item(item) {
+                        Some((condition, text)) if text == left_value => result.or(Truth::Depends(condition)),
+                        _ => result.or(Truth::Known(*item == left_value)),
+                    });
+            }
+        }
+
+        // One value per condition: compared under each condition (and as empty where none holds)
+        for (alternatives_on_left, value) in [(true, &left_value), (false, &right_value)] {
+            let Some(mut alternatives) = per_condition_value(value).filter(|_| alternatives_on_left || operator != "IN_LIST") else {
+                continue;
+            };
+            let covered = alternatives
+                .iter()
+                .fold(Truth::Known(false), |result, (condition, _)| result.or(Truth::Depends(condition.clone())));
+            if let Truth::Depends(covered) = covered {
+                if let Truth::Depends(uncovered) = model::simplify(&model::negate(&covered), None) {
+                    alternatives.push((uncovered, String::new()));
+                }
+            }
+
+            return alternatives.into_iter().fold(Truth::Known(false), |result, (condition, text)| {
+                let truth = match alternatives_on_left {
+                    true => self.compare(&(text, true), operator, right),
+                    false => self.compare(left, operator, &(text, true)),
+                };
+                result.or(Truth::Depends(condition).and(truth))
+            });
+        }
 
         // Against a platform or compiler symbol: test each value it can have
         for (symbol_side, other) in [(&left_value, &right_value), (&right_value, &left_value)] {
@@ -1400,10 +1774,191 @@ fn conditional_value_truth(value: &str) -> Option<Truth> {
     let items = model::split_list(value);
     let conditions: Vec<(String, &str)> = items.iter().map(|item| model::split_conditional_item(item)).collect::<Option<Vec<_>>>()?;
 
+    // Each item is true as a check's result or platform value is, else as a constant
+    let item_truth = |item: &str| match (model::marked_condition(item), item.strip_prefix(SYMBOL_PREFIX)) {
+        (Some(condition), _) => Truth::Depends(condition.to_string()),
+        (None, Some(symbol)) => model::symbol_truth(symbol),
+        (None, None) => Truth::Known(model::constant_truth(item).unwrap_or(true)),
+    };
     let truth = conditions.into_iter().fold(Truth::Known(false), |result, (condition, item)| {
-        result.or(Truth::Depends(condition).and(Truth::Known(model::constant_truth(item).unwrap_or(true))))
+        result.or(Truth::Depends(condition).and(item_truth(item)))
     });
-    Some(truth)
+
+    // One value per condition covers every case: `msvc | !msvc` is true
+    Some(match truth {
+        Truth::Depends(condition) if items.len() > 1 => model::simplify(&condition, None),
+        truth => truth,
+    })
+}
+
+/// A value with one item per condition (a variable branches set differently): its conditions and items, when the
+/// conditions exclude each other.
+fn per_condition_value(value: &str) -> Option<Vec<(String, String)>> {
+    if !value.starts_with("$<$<BOOL:") {
+        return None;
+    }
+
+    let items = model::list_elements(value);
+    let alternatives: Vec<(String, String)> = items
+        .iter()
+        .map(|item| model::split_conditional_item(item).map(|(condition, text)| (condition, text.to_string())))
+        .collect::<Option<Vec<_>>>()?;
+    for (index, (left, _)) in alternatives.iter().enumerate() {
+        for (right, _) in &alternatives[index + 1..] {
+            if model::simplify(&model::and(left, right), None) != Truth::Known(false) {
+                return None;
+            }
+        }
+    }
+
+    Some(alternatives)
+}
+
+/// A variable's value after branches changed it (`outcomes`: each branch's condition, what it left, and whether it
+/// changed it). Items branches removed stay under the conditions of those that kept them, and items they appended
+/// come after, under the conditions of those that appended them; a single value two branches or more set differently
+/// becomes one item per condition. None leaves this machine's value: a list a branch replaced, or a keyword that
+/// chooses how a command runs.
+fn merged_value(before: &Option<String>, outcomes: &[(Truth, Option<String>, bool)]) -> Option<String> {
+    let elements = |value: &Option<String>| model::list_elements(value.as_deref().unwrap_or_default());
+    let is_value = |item: &String| !item.contains(char::is_whitespace) && !COMMAND_KEYWORDS.contains(&item.as_str());
+    let before_items = elements(before);
+
+    // Each outcome as the earlier items it kept and the items it appended (not both removing and appending). A
+    // branch reads an earlier item under a condition as plain where its own condition implies it, and does not see
+    // one its condition rules out (which it therefore keeps)
+    let mut kept_and_appended: Vec<(Vec<bool>, Vec<String>)> = Vec::new();
+    for (condition, value, _) in outcomes {
+        let items = elements(value);
+        let mut kept = vec![false; before_items.len()];
+        let mut seen: Vec<Option<&str>> = before_items.iter().map(|item| Some(item.as_str())).collect();
+        if let (Truth::Depends(condition), false) = (condition, items.starts_with(&before_items)) {
+            for (index, item) in before_items.iter().enumerate() {
+                let Some((inner, text)) = model::split_conditional_item(item) else {
+                    continue;
+                };
+                match model::simplify(&inner, Some(condition)) {
+                    Truth::Known(true) => seen[index] = Some(text),
+                    Truth::Known(false) => (kept[index], seen[index]) = (true, None),
+                    Truth::Depends(_) => {}
+                }
+            }
+        }
+
+        let mut next = 0;
+        let mut appended_from = items.len();
+        for (index, item) in items.iter().enumerate() {
+            match seen[next..].iter().position(|earlier| *earlier == Some(item.as_str())) {
+                Some(offset) => {
+                    kept[next + offset] = true;
+                    next += offset + 1;
+                }
+                None => {
+                    appended_from = index;
+                    break;
+                }
+            }
+        }
+
+        let appended = items[appended_from..].to_vec();
+        let removed: Vec<&String> = before_items.iter().zip(&kept).filter(|(_, kept)| !**kept).map(|(item, _)| item).collect();
+        if !(removed.is_empty() || appended.is_empty()) || !removed.into_iter().chain(&appended).all(is_value) {
+            kept_and_appended.clear();
+            break;
+        }
+        kept_and_appended.push((kept, appended));
+    }
+
+    let either = |left: Truth, right: &Truth| match left.or(right.clone()) {
+        Truth::Depends(condition) => model::simplify(&condition, None),
+        known => known,
+    };
+    let tagged = |item: &str, condition: Truth| match condition {
+        Truth::Known(true) => item.to_string(),
+        Truth::Known(false) => String::new(),
+        Truth::Depends(condition) => conditional_item_under(&condition, item),
+    };
+
+    if kept_and_appended.len() == outcomes.len() {
+        // The earlier items, each where it was kept
+        let mut items: Vec<String> = Vec::new();
+        for (index, item) in before_items.iter().enumerate() {
+            if kept_and_appended.iter().all(|(kept, _)| kept[index]) {
+                items.push(item.clone());
+                continue;
+            }
+            let condition = outcomes
+                .iter()
+                .zip(&kept_and_appended)
+                .filter(|(_, (kept, _))| kept[index])
+                .fold(Truth::Known(false), |result, ((condition, _, _), _)| either(result, condition));
+            items.push(tagged(item, condition));
+        }
+
+        // Then the appended ones, the same item from different branches (or their inner ones) joined
+        let mut appended: Vec<(String, Truth, usize)> = Vec::new();
+        for (index, ((condition, _, _), (_, added))) in outcomes.iter().zip(&kept_and_appended).enumerate() {
+            for item in added.iter().filter(|item| !item.is_empty()) {
+                let (condition, item) = match model::split_conditional_item(item) {
+                    Some((inner, text)) => match condition.clone().and(Truth::Depends(inner)) {
+                        Truth::Depends(both) => (model::simplify(&both, None), text.to_string()),
+                        known => (known, text.to_string()),
+                    },
+                    None => (condition.clone(), item.clone()),
+                };
+                match appended.iter_mut().find(|(other, _, from)| *other == item && *from != index) {
+                    Some((_, joined, from)) => {
+                        *joined = either(joined.clone(), &condition);
+                        *from = index;
+                    }
+                    None => appended.push((item, condition, index)),
+                }
+            }
+        }
+        items.extend(appended.into_iter().map(|(item, condition, _)| tagged(&item, condition)));
+        items.retain(|item| !item.is_empty());
+        return Some(items.join(";"));
+    }
+
+    // A single value set differently: one item per value, under the conditions it has
+    let changed = outcomes.iter().filter(|(_, _, changed)| *changed).count();
+    let single = |value: &Option<String>| {
+        let items = elements(value);
+        items.len() <= 1 && items.iter().all(is_value)
+    };
+    if changed >= 2 && single(before) && outcomes.iter().all(|(_, value, _)| single(value)) {
+        let mut values: Vec<(String, Truth)> = Vec::new();
+        for (condition, value, _) in outcomes {
+            let Some(value) = value.as_ref().filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            match values.iter_mut().find(|(other, _)| other == value) {
+                Some((_, joined)) => *joined = either(joined.clone(), condition),
+                None => values.push((value.clone(), condition.clone())),
+            }
+        }
+        return Some(
+            values
+                .into_iter()
+                .map(|(value, condition)| tagged(&value, condition))
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
+    }
+
+    None
+}
+
+/// `item` under `condition`; an item already under a condition gets both.
+fn conditional_item_under(condition: &str, item: &str) -> String {
+    match model::split_conditional_item(item) {
+        Some((inner, text)) => match model::simplify(&model::and(condition, &inner), None) {
+            Truth::Depends(both) => model::conditional_item(&both, text),
+            Truth::Known(true) => text.to_string(),
+            Truth::Known(false) => String::new(),
+        },
+        None => model::conditional_item(condition, item),
+    }
 }
 
 fn compare_values(left: &str, operator: &str, right: &str, variable: &dyn Fn(&str) -> Option<String>) -> bool {
@@ -1589,10 +2144,17 @@ mod tests {
 
     /// Runs a CMakeLists.txt in a fresh temporary folder and returns the interpreter.
     fn run(name: &str, cmake: &str) -> Interpreter {
+        run_files(name, &[("CMakeLists.txt", cmake)])
+    }
+
+    /// Runs a project of these files (one is CMakeLists.txt) in a fresh temporary folder.
+    fn run_files(name: &str, files: &[(&str, &str)]) -> Interpreter {
         let folder = std::env::temp_dir().join(format!("anvil-interp-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&folder);
         std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(folder.join("CMakeLists.txt"), cmake).unwrap();
+        for (path, text) in files {
+            std::fs::write(folder.join(path), text).unwrap();
+        }
 
         let mut interpreter = Interpreter::new(&folder);
         interpreter.run_root().unwrap();
@@ -1602,6 +2164,195 @@ mod tests {
 
     fn variable(interpreter: &Interpreter, name: &str) -> String {
         interpreter.get_variable(name).unwrap_or_default()
+    }
+
+    /// A variable's items, each written `condition: item` when it is under one.
+    fn items(interpreter: &Interpreter, name: &str) -> Vec<String> {
+        model::list_elements(&variable(interpreter, name))
+            .into_iter()
+            .map(|item| match model::split_conditional_item(&item) {
+                Some((condition, text)) => format!("{condition}: {text}"),
+                None => item,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_branch_keeps_what_it_added_under_its_condition() {
+        let cmake = r#"
+set(SRCS main.c)
+if(MSVC)
+  list(APPEND SRCS cl.c)
+  set(D USING_CL)
+else()
+  list(APPEND SRCS gnu.c)
+  set(D USING_GNU)
+endif()
+set(L a b c)
+if(MSVC)
+  list(REMOVE_ITEM L b)
+endif()
+if(WIN32)
+  set(KIND SHARED)
+else()
+  set(KIND STATIC)
+endif()
+set(BOTH x)
+if(MSVC)
+  list(APPEND BOTH y)
+else()
+  list(APPEND BOTH y)
+endif()
+set(DEF "-D${D}")
+if(D STREQUAL "USING_GNU")
+  set(IS_GNU 1)
+endif()
+if(${D} STREQUAL "USING_CL")
+  set(IS_CL 1)
+endif()
+set(PICKED "")
+foreach(source ${SRCS})
+  list(APPEND PICKED "picked/${source}")
+endforeach()
+set(INNER "")
+if(WIN32)
+  if(MSVC)
+    list(APPEND INNER cl)
+  endif()
+endif()
+option(PUBLIC_SYMBOLS "p" ON)
+if(PUBLIC_SYMBOLS)
+  list(APPEND CHECKED -fvisibility=hidden)
+endif()
+foreach(flag ${CHECKED})
+  check_c_compiler_flag(${flag} SUPPORTED)
+endforeach()
+if(SUPPORTED)
+  set(USE_DEFAULT 1)
+endif()
+"#;
+        let interpreter = run("added", cmake);
+
+        // This machine's branch is no different from the others
+        assert_eq!(items(&interpreter, "SRCS"), ["main.c", "msvc: cl.c", "!msvc: gnu.c"]);
+        assert_eq!(items(&interpreter, "D"), ["msvc: USING_CL", "!msvc: USING_GNU"]);
+
+        // An item one branch removed is under the others; a keyword stays this machine's; one added everywhere is plain
+        assert_eq!(items(&interpreter, "L"), ["a", "!msvc: b", "c"]);
+        assert_eq!(variable(&interpreter, "KIND"), if cfg!(windows) { "SHARED" } else { "STATIC" });
+        assert_eq!(variable(&interpreter, "BOTH"), "x;y");
+
+        // Inside longer text, and tested: under each condition
+        let mut unknown = Vec::new();
+        let alternatives = model::expand_genex(&variable(&interpreter, "DEF"), &mut unknown, None);
+        assert!(
+            alternatives.contains(&(Truth::Depends("msvc".into()), "-DUSING_CL".into())),
+            "{alternatives:?}"
+        );
+        assert!(
+            alternatives.contains(&(Truth::Depends("!msvc".into()), "-DUSING_GNU".into())),
+            "{alternatives:?}"
+        );
+        assert_eq!(items(&interpreter, "IS_GNU"), ["!msvc: 1"]);
+        assert_eq!(items(&interpreter, "IS_CL"), ["msvc: 1"]);
+
+        // A loop over them runs under each item's condition; nested branches add both conditions
+        assert_eq!(
+            items(&interpreter, "PICKED"),
+            ["picked/main.c", "msvc: picked/cl.c", "!msvc: picked/gnu.c"]
+        );
+        assert_eq!(items(&interpreter, "INNER"), ["windows & msvc: cl"]);
+
+        // A check's result set under a condition is true where both hold
+        assert_eq!(items(&interpreter, "USE_DEFAULT"), ["PUBLIC_SYMBOLS & !msvc: 1"]);
+    }
+
+    #[test]
+    fn branches_not_taken_keep_parent_scope_and_cache_writes() {
+        let cmake = r#"
+function(add_platform_sources)
+  if(NOT MSVC)
+    set(SRCS ${SRCS} gnu.c PARENT_SCOPE)
+  endif()
+endfunction()
+set(SRCS main.c)
+add_platform_sources()
+if(UNIX)
+  set(THREADS_LIB pthread CACHE STRING "")
+endif()
+macro(define_helper)
+  function(helper)
+    set(HELPED 1 PARENT_SCOPE)
+  endfunction()
+endmacro()
+if(UNIX)
+  function(helper)
+  endfunction()
+endif()
+"#;
+        let interpreter = run("parent", cmake);
+
+        assert_eq!(items(&interpreter, "SRCS"), ["main.c", "!msvc: gnu.c"]);
+        assert_eq!(items(&interpreter, "THREADS_LIB"), ["unix: pthread"]);
+        assert!(interpreter.functions.contains_key("helper"));
+        assert!(interpreter.scopes.journal.is_empty() && interpreter.cache.journal.is_empty());
+    }
+
+    #[test]
+    fn configure_time_commands_read_this_machines_items() {
+        let cmake = r#"
+project(configured C)
+if(WIN32)
+  set(EXT dll)
+endif()
+if(UNIX)
+  set(PLATFORM posix)
+else()
+  set(PLATFORM windows)
+endif()
+set(NAMES first)
+if(WIN32)
+  list(APPEND NAMES second)
+endif()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/names.txt" "${NAMES}")
+configure_file(config.h.in config.h)
+"#;
+        let interpreter = run_files(
+            "configured",
+            &[
+                ("CMakeLists.txt", cmake),
+                ("config.h.in", "#define EXT \"@EXT@\"\n#define PLATFORM \"@PLATFORM@\"\n"),
+            ],
+        );
+        let text = |file: &str| {
+            let writes = interpreter.configure_writes.iter().filter(|write| write.path.ends_with(file));
+            writes.filter_map(|write| write.text.clone()).collect::<Vec<_>>().join("\n")
+        };
+
+        // Names and text as on this machine; a configured value under each condition, not its truth
+        assert_eq!(text("names.txt"), if cfg!(windows) { "first;second" } else { "first" });
+        let header = text("config.h");
+        assert!(header.contains("#define EXT \"dll\"") && header.contains("#define EXT \"\""), "{header}");
+        let platform = if cfg!(windows) { "windows" } else { "posix" };
+        assert!(header.contains(&format!("#define PLATFORM \"{platform}\"")), "{header}");
+    }
+
+    #[test]
+    fn target_exists_counts_targets_made_later() {
+        let cmake = r#"
+project(later C)
+add_library(early STATIC early.c)
+target_compile_definitions(early PRIVATE $<$<TARGET_EXISTS:late>:SAW_LATE> $<$<TARGET_EXISTS:never>:SAW_NEVER>)
+add_library(late STATIC late.c)
+"#;
+        let interpreter = run("exists", cmake);
+        let defines: Vec<(Option<String>, String)> = interpreter.targets["early"]
+            .defines
+            .iter()
+            .map(|item| (item.condition.clone(), item.value.clone()))
+            .collect();
+
+        assert_eq!(defines, [(None, "SAW_LATE".to_string())]);
     }
 
     #[test]
@@ -1635,11 +2386,11 @@ endif()
 set(OUTSIDE "${OPT_DIR}")
 "#;
         let interpreter = run("branches", cmake);
-        let host = if cfg!(windows) { "win" } else { "other" };
 
+        // A value one branch replaced stays this machine's; one the branches set differently is one per condition
         assert_eq!(variable(&interpreter, "X"), "a");
-        assert_eq!(variable(&interpreter, "Y"), host);
-        assert_eq!(variable(&interpreter, "Z"), host);
+        assert_eq!(items(&interpreter, "Y"), ["windows: win", "!windows: other"]);
+        assert_eq!(items(&interpreter, "Z"), ["!windows: other", "windows: win"]);
 
         // A value an option's branch set is plain inside the same option's branch
         assert_eq!(
