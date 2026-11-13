@@ -2523,3 +2523,836 @@ fn messages_say_what_to_write() {
     project.anvil(&["test", "--list"]).success().contains("no tests");
     project.anvil(&["-q", "new", "quiet"]).success().lacks("note:");
 }
+
+// 40. A precompiled header: every C++ file sees it without including it, and editing it rebuilds them all
+
+fn precompiled_header(toolchain: &str, test: &str) {
+    let project = Project::empty(test);
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"pch\"\n\n[target.app]\nkind = \"exe\"\npch = \"src/pch.h\"\n",
+    );
+    project.write("src/pch.h", "#pragma once\n#include <cstdio>\n#define PCH_VALUE 1\n");
+    project.write("src/value.cpp", "int value() { return PCH_VALUE * 10; }\n");
+    project.write(
+        "src/main.cpp",
+        "int value();\nint main() { std::printf(\"pch %d %d\\n\", PCH_VALUE, value()); }\n",
+    );
+
+    let first = project.anvil(&["run", "--toolchain", toolchain]);
+    first.success();
+    assert_eq!(program_output(&first), "pch 1 10");
+    assert!(first.actions().contains(&"Precompiling src/pch.h".to_string()), "{:?}", first.actions());
+    project.anvil(&["build", "--toolchain", toolchain]).success().up_to_date();
+
+    // An edited header is precompiled again, and every file using it compiles again
+    project.edit("src/pch.h", "PCH_VALUE 1", "PCH_VALUE 2");
+    let edited = project.anvil(&["run", "--toolchain", toolchain]);
+    edited.success();
+    assert_eq!(program_output(&edited), "pch 2 20");
+    let actions = edited.actions();
+    for expected in ["Precompiling src/pch.h", "Compiling src/main.cpp", "Compiling src/value.cpp"] {
+        assert!(actions.contains(&expected.to_string()), "no {expected} in {actions:?}");
+    }
+
+    // A source edit recompiles that file only, with the header as it was
+    project.edit("src/value.cpp", "* 10", "* 100");
+    let source = project.anvil(&["run", "--toolchain", toolchain]);
+    source.success();
+    assert_eq!(program_output(&source), "pch 2 200");
+    assert_eq!(source.compiled(), 1, "{:?}", source.actions());
+}
+
+#[test]
+fn precompiled_header_rebuilds_when_edited_msvc() {
+    require!("msvc");
+    precompiled_header("msvc", "pch_msvc");
+}
+
+#[test]
+fn precompiled_header_rebuilds_when_edited_gcc() {
+    require!("gcc");
+    precompiled_header("gcc", "pch_gcc");
+}
+
+// 41. Unity builds: N files per unity source, the program right, and an edit recompiles its batch only
+
+fn unity_build(toolchain: &str, test: &str) {
+    let project = Project::empty(test);
+    project.write("anvil.toml", "[project]\nname = \"uni\"\n\n[target.app]\nkind = \"exe\"\nunity = 2\n");
+
+    // Sorted into batches: [a, b], [c, d], [main]
+    for (name, value) in [("a", 1), ("b", 2), ("c", 3), ("d", 4)] {
+        project.write(&format!("src/{name}.cpp"), &format!("int {name}() {{ return {value}; }}\n"));
+    }
+    project.write(
+        "src/main.cpp",
+        "#include <cstdio>\nint a(); int b(); int c(); int d();\nint main() { std::printf(\"unity %d\\n\", a() * 1000 + b() * 100 + c() * 10 + d()); }\n",
+    );
+    let anvil = |args: &[&str]| project.anvil(&with_toolchain(Some(toolchain), args));
+
+    let first = anvil(&["run"]);
+    first.success();
+    assert_eq!(program_output(&first), "unity 1234");
+    assert_eq!(first.compiled(), 3, "{:?}", first.actions());
+    let mut batches: Vec<String> = first.actions().into_iter().filter(|action| action.starts_with("Compiling")).collect();
+    batches.sort();
+    assert_eq!(batches, ["Compiling unity_0.cpp", "Compiling unity_1.cpp", "Compiling unity_2.cpp"]);
+    anvil(&["build"]).success().up_to_date();
+
+    // d.cpp is in the second batch: only that batch compiles again
+    project.edit("src/d.cpp", "return 4;", "return 9;");
+    let edited = anvil(&["run"]);
+    edited.success();
+    assert_eq!(program_output(&edited), "unity 1239");
+    assert_eq!(edited.compiled(), 1, "{:?}", edited.actions());
+    assert!(edited.actions().contains(&"Compiling unity_1.cpp".to_string()), "{:?}", edited.actions());
+}
+
+#[test]
+fn unity_build_recompiles_one_batch_msvc() {
+    require!("msvc");
+    unity_build("msvc", "unity_msvc");
+}
+
+#[test]
+fn unity_build_recompiles_one_batch_gcc() {
+    require!("gcc");
+    unity_build("gcc", "unity_gcc");
+}
+
+// 42. lto = true in release: compiles and links with link-time optimization, a static library included
+
+fn link_time_optimization(toolchain: &str, test: &str) {
+    let project = Project::empty(test);
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"lto\"\n\n[profile.release]\nlto = true\n\n\
+         [target.twice]\nkind = \"lib\"\nsources = [\"lib/*.c\"]\n\n\
+         [target.app]\nkind = \"exe\"\nsources = [\"src/main.c\"]\ndeps = [\"twice\"]\n",
+    );
+    project.write("lib/twice.c", "int twice(int x) { return 2 * x; }\n");
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\nint twice(int x);\nint main(void) { printf(\"lto %d\\n\", twice(21)); return 0; }\n",
+    );
+
+    let run = project.anvil(&["run", "app", "--release", "-v", "--toolchain", toolchain]);
+    run.success();
+    assert_eq!(program_output(&run).lines().last(), Some("lto 42"));
+    if toolchain == "msvc" {
+        run.contains("/GL").contains("/LTCG");
+    } else {
+        run.contains("-flto").contains("gcc-ar");
+    }
+
+    // Debug has none of it
+    let debug = project.anvil(&["run", "app", "-v", "--toolchain", toolchain]);
+    debug.success().lacks("/LTCG").lacks("-flto");
+}
+
+#[test]
+fn lto_release_profile_runs_msvc() {
+    require!("msvc");
+    link_time_optimization("msvc", "lto_msvc");
+}
+
+#[test]
+fn lto_release_profile_runs_gcc() {
+    require!("gcc");
+    link_time_optimization("gcc", "lto_gcc");
+}
+
+// 43. sanitize = ["address"] with MSVC: a clean run passes, a heap overflow fails with AddressSanitizer's report
+
+#[test]
+fn address_sanitizer_reports_heap_overflow_msvc() {
+    require!("msvc", "windows");
+    let project = Project::empty("asan_msvc");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"asan\"\n\n[profile.asan]\ninherits = \"debug\"\nsanitize = [\"address\"]\n",
+    );
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\n#include <stdlib.h>\nint main(int argc, char **argv) {\n    int *values = malloc(4 * sizeof(int));\n    int index = argc > 1 ? 4 : 3;\n    values[index] = 1;\n    printf(\"wrote %d\\n\", index);\n    free(values);\n    return 0;\n}\n",
+    );
+
+    let clean = project.anvil(&["run", "-p", "asan", "--toolchain", "msvc"]);
+    clean.success();
+    assert_eq!(program_output(&clean), "wrote 3");
+    let folder = project.root.join(clean.program()).parent().unwrap().to_path_buf();
+    let runtime = std::fs::read_dir(folder)
+        .unwrap()
+        .any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with("clang_rt.asan"));
+    assert!(runtime, "no ASan runtime DLL beside the program");
+
+    let overflow = project.anvil(&["run", "-p", "asan", "--toolchain", "msvc", "--", "overflow"]);
+    assert_ne!(overflow.code, 0, "{}", overflow.output());
+    overflow
+        .contains("ERROR: AddressSanitizer: heap-buffer-overflow")
+        .contains("main.c:6")
+        .lacks("wrote 4");
+}
+
+// 44. --target x86 builds a 32-bit program, into its own folder, that sees when.x86; gcc needs multilib
+
+#[test]
+fn cross_build_x86_has_four_byte_pointers_msvc() {
+    require!("msvc", "windows");
+    let project = Project::empty("x86_msvc");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"ptr\"\n\n[target.ptr]\nkind = \"exe\"\nwhen.x86.defines = [\"IS_X86\"]\n",
+    );
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\nint main(void) {\n#ifdef IS_X86\n    printf(\"x86 \");\n#endif\n    printf(\"%d\\n\", (int)sizeof(void *));\n    return 0;\n}\n",
+    );
+
+    let native = project.anvil(&["run", "--toolchain", "msvc"]);
+    native.success();
+    assert_eq!(program_output(&native), "8");
+
+    let cross = project.anvil(&["run", "--toolchain", "msvc", "--target", "x86"]);
+    cross.success().contains("for x86");
+    assert_eq!(program_output(&cross), "x86 4");
+    assert_ne!(cross.program(), native.program(), "the x86 build overwrote the x64 one");
+    project.anvil(&["build", "--toolchain", "msvc"]).success().up_to_date();
+}
+
+#[test]
+fn cross_build_x86_has_four_byte_pointers_gcc() {
+    require!("gcc", "windows");
+    let project = Project::empty("x86_gcc");
+    project.write("anvil.toml", "[project]\nname = \"ptr\"\n");
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\nint main(void) { printf(\"%d\\n\", (int)sizeof(void *)); return 0; }\n",
+    );
+
+    let cross = project.anvil(&["run", "--toolchain", "gcc", "--target", "x86"]);
+    if cross.code != 0 && cross.output().contains("cannot build 32-bit programs") {
+        eprintln!("skipped: this gcc has no 32-bit multilib");
+        return;
+    }
+    cross.success();
+    assert_eq!(program_output(&cross), "4");
+}
+
+// 45. CUDA: a .cu kernel adding vectors on the GPU, called from C++
+
+/// Whether nvcc is installed (on PATH or under CUDA_PATH).
+fn has_nvcc() -> bool {
+    let under_cuda_path = std::env::var_os("CUDA_PATH").is_some_and(|folder| {
+        let name = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
+        Path::new(&folder).join("bin").join(name).is_file()
+    });
+    under_cuda_path || on_path("nvcc")
+}
+
+#[test]
+fn cuda_kernel_adds_vectors() {
+    require!("msvc", "windows");
+    if !has_nvcc() {
+        eprintln!("skipped: nvcc not found");
+        return;
+    }
+    let project = Project::empty("cuda");
+    project.write("anvil.toml", "[project]\nname = \"vadd\"\n\n[target.vadd]\nkind = \"exe\"\n");
+    project.write(
+        "src/add.cu",
+        r#"#include <cuda_runtime.h>
+
+__global__ void add(const int *a, const int *b, int *sum, int count) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) sum[index] = a[index] + b[index];
+}
+
+int add_vectors(const int *a, const int *b, int *sum, int count) {
+    int *device_a, *device_b, *device_sum;
+    size_t bytes = count * sizeof(int);
+    if (cudaMalloc(&device_a, bytes) != cudaSuccess) return -1;
+    cudaMalloc(&device_b, bytes);
+    cudaMalloc(&device_sum, bytes);
+    cudaMemcpy(device_a, a, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_b, b, bytes, cudaMemcpyHostToDevice);
+    add<<<(count + 255) / 256, 256>>>(device_a, device_b, device_sum, count);
+    cudaError_t status = cudaMemcpy(sum, device_sum, bytes, cudaMemcpyDeviceToHost);
+    cudaFree(device_a);
+    cudaFree(device_b);
+    cudaFree(device_sum);
+    return status == cudaSuccess ? 0 : -1;
+}
+"#,
+    );
+    project.write(
+        "src/main.cpp",
+        r#"#include <cstdio>
+int add_vectors(const int *a, const int *b, int *sum, int count);
+int main() {
+    static int a[1000], b[1000], sum[1000];
+    for (int i = 0; i < 1000; i++) { a[i] = i; b[i] = 2 * i; }
+    if (add_vectors(a, b, sum, 1000) != 0) { std::printf("no CUDA device\n"); return 0; }
+    long long total = 0;
+    for (int i = 0; i < 1000; i++) total += sum[i];
+    std::printf("sum %lld\n", total);
+}
+"#,
+    );
+
+    let run = project.anvil(&["run", "--toolchain", "msvc"]);
+    run.success().contains("Compiling src/add.cu");
+    let output = program_output(&run);
+    if output == "no CUDA device" {
+        eprintln!("skipped running the kernel: no CUDA device");
+        return;
+    }
+    assert_eq!(output, "sum 1498500");
+    project.anvil(&["build", "--toolchain", "msvc"]).success().up_to_date();
+}
+
+// 46. .asm sources assemble with ml64 and link into the program; an edit assembles again
+
+#[test]
+fn masm_source_links_into_program_msvc() {
+    require!("msvc", "windows");
+    let project = Project::empty("masm");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"asm\"\n\n[target.app]\nkind = \"exe\"\nsources = [\"src/*.c\", \"src/*.asm\"]\n",
+    );
+    project.write(
+        "src/add.asm",
+        ".code\nadd_numbers PROC\n    lea rax, [rcx + rdx]\n    ret\nadd_numbers ENDP\nEND\n",
+    );
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\nlong long add_numbers(long long a, long long b);\nint main(void) { printf(\"asm %lld\\n\", add_numbers(40, 2)); return 0; }\n",
+    );
+
+    // The program's line comes last (ml64 names the file it assembles on stdout)
+    let first = project.anvil(&["run", "--toolchain", "msvc"]);
+    first.success().contains("Assembling src/add.asm");
+    assert_eq!(program_output(&first).lines().last(), Some("asm 42"));
+
+    project.edit("src/add.asm", "[rcx + rdx]", "[rcx + rdx + 1]");
+    let edited = project.anvil(&["run", "--toolchain", "msvc"]);
+    edited.success();
+    assert_eq!(program_output(&edited).lines().last(), Some("asm 43"));
+    assert_eq!(edited.compiled(), 1, "{:?}", edited.actions());
+}
+
+// 47. An object library's files link into the program that uses it, its public defines with them; whole-archive
+//     links a static library's self-registering object that nothing calls
+
+const REGISTRY_PLUGIN: &str = r#"extern int registered;
+static void register_plugin(void) { registered += 40; }
+#ifdef _MSC_VER
+#pragma section(".CRT$XCU", read)
+__declspec(allocate(".CRT$XCU")) static void (*register_entry)(void) = register_plugin;
+#else
+__attribute__((constructor)) static void register_entry(void) { register_plugin(); }
+#endif
+"#;
+
+fn object_library_and_whole_archive(toolchain: &str, test: &str) {
+    let project = Project::empty(test);
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"objlib\"\n\n\
+         [target.parts]\nkind = \"object\"\nsources = [\"parts/*.c\"]\npublic.defines = [\"PARTS_COUNT=2\"]\n\n\
+         [target.registry]\nkind = \"lib\"\nsources = [\"registry/*.c\"]\n\n\
+         [target.app]\nkind = \"exe\"\nsources = [\"src/main.c\"]\ndeps = [\"parts\"]\nwhole-archive = [\"registry\"]\n",
+    );
+    project.write("parts/one.c", "int part_one(void) { return 1; }\n");
+    project.write("parts/two.c", "int part_two(void) { return 2; }\n");
+    project.write("registry/registry.c", "int registered = 0;\n");
+    project.write("registry/plugin.c", REGISTRY_PLUGIN);
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\nint part_one(void);\nint part_two(void);\nextern int registered;\n\
+         int main(void) { printf(\"parts %d %d registered %d\\n\", PARTS_COUNT, part_one() + part_two(), registered); return 0; }\n",
+    );
+    let anvil = |args: &[&str]| project.anvil(&with_toolchain(Some(toolchain), args));
+
+    let run = anvil(&["run", "app"]);
+    run.success();
+    assert_eq!(program_output(&run), "parts 2 3 registered 40");
+    assert!(
+        !run.actions()
+            .iter()
+            .any(|action| action.contains("Archiving") && action.contains("parts")),
+        "an object library was archived: {:?}",
+        run.actions()
+    );
+
+    // As a plain dependency, the linker leaves the unreferenced object out
+    project.edit("anvil.toml", "whole-archive = [\"registry\"]", "deps = [\"parts\", \"registry\"]");
+    project.edit("anvil.toml", "deps = [\"parts\"]\n", "");
+    let plain = anvil(&["run", "app"]);
+    plain.success();
+    assert_eq!(program_output(&plain), "parts 2 3 registered 0");
+}
+
+#[test]
+fn object_library_and_whole_archive_link_msvc() {
+    require!("msvc");
+    object_library_and_whole_archive("msvc", "objlib_msvc");
+}
+
+#[test]
+fn object_library_and_whole_archive_link_gcc() {
+    require!("gcc");
+    object_library_and_whole_archive("gcc", "objlib_gcc");
+}
+
+// 48. exports = true: a program exports a function to the plugin it loads, which links against the program
+
+const EXPORTS_HOST: &str = r#"#include <stdio.h>
+#ifdef _WIN32
+#include <windows.h>
+#define HOST_API __declspec(dllexport)
+#else
+#include <dlfcn.h>
+#define HOST_API
+#endif
+
+HOST_API int host_base(void) { return 40; }
+
+int main(void) {
+#ifdef _WIN32
+    HMODULE plugin = LoadLibraryA("plugin.dll");
+    int (*value)(void) = plugin ? (int (*)(void))GetProcAddress(plugin, "plugin_value") : NULL;
+#else
+    void *plugin = dlopen("./libplugin.so", RTLD_NOW);
+    int (*value)(void) = plugin ? (int (*)(void))dlsym(plugin, "plugin_value") : NULL;
+#endif
+    if (!value) { printf("no plugin\n"); return 1; }
+    printf("plugin %d\n", value());
+    return 0;
+}
+"#;
+
+const EXPORTS_PLUGIN: &str = r#"#ifdef _WIN32
+#define HOST_API __declspec(dllimport)
+#define PLUGIN_API __declspec(dllexport)
+#else
+#define HOST_API
+#define PLUGIN_API
+#endif
+HOST_API int host_base(void);
+PLUGIN_API int plugin_value(void) { return host_base() + 2; }
+"#;
+
+fn program_exports(toolchain: &str, test: &str) {
+    let project = Project::empty(test);
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"exports\"\n\n\
+         [target.host]\nkind = \"exe\"\nsources = [\"host/*.c\"]\nexports = true\n\n\
+         [target.plugin]\nkind = \"shared\"\nsources = [\"plugin/*.c\"]\ndeps = [\"host\"]\n",
+    );
+    project.write("host/host.c", EXPORTS_HOST);
+    project.write("plugin/plugin.c", EXPORTS_PLUGIN);
+
+    let build = project.anvil(&["build", "--toolchain", toolchain]);
+    build.success();
+    assert_eq!(build.linked(), 2, "{:?}", build.actions());
+    let run = project.anvil(&["run", "host", "--toolchain", toolchain]);
+    run.success();
+    assert_eq!(program_output(&run), "plugin 42");
+}
+
+#[test]
+fn program_exports_to_its_plugin_msvc() {
+    require!("msvc", "windows");
+    program_exports("msvc", "exports_msvc");
+}
+
+#[test]
+fn program_exports_to_its_plugin_gcc() {
+    require!("gcc", "windows");
+    program_exports("gcc", "exports_gcc");
+}
+
+// 49. A pre-build step runs before the first build and when the target's sources change; a depfile step runs again
+//     when a file only its depfile names changes
+
+const DEPFILE_GENERATOR: &str = r##"#define _CRT_SECURE_NO_WARNINGS
+/* gen <list> <output> <depfile>: the list names a file beside it; the header defines VALUE as that file's first
+   line, and the depfile names both */
+#include <stdio.h>
+#include <string.h>
+static void first_line(const char *path, char *line, int size) {
+    FILE *file = fopen(path, "r");
+    line[0] = 0;
+    if (file) {
+        if (!fgets(line, size, file)) line[0] = 0;
+        fclose(file);
+    }
+    line[strcspn(line, "\r\n")] = 0;
+}
+int main(int argc, char **argv) {
+    char name[512], folder[512], path[1100], value[256];
+    FILE *output, *depfile;
+    char *slash, *backslash;
+    if (argc != 4) return 2;
+    first_line(argv[1], name, sizeof name);
+    strcpy(folder, argv[1]);
+    slash = strrchr(folder, '/');
+    backslash = strrchr(folder, '\\');
+    if (backslash > slash) slash = backslash;
+    if (slash) slash[1] = 0; else folder[0] = 0;
+    snprintf(path, sizeof path, "%s%s", folder, name);
+    first_line(path, value, sizeof value);
+    output = fopen(argv[2], "w");
+    if (!output) return 3;
+    fprintf(output, "#define VALUE \"%s\"\n", value);
+    fclose(output);
+    depfile = fopen(argv[3], "w");
+    if (!depfile) return 4;
+    fprintf(depfile, "value.h: %s \\\n  %s\n", argv[1], path);
+    fclose(depfile);
+    return 0;
+}
+"##;
+
+#[test]
+fn pre_build_and_depfile_steps_rerun_when_needed() {
+    require!("default");
+    let project = Project::empty("depfile_steps");
+    project.write(
+        "anvil.toml",
+        r#"[project]
+name = "depfile"
+
+[target.gen]
+kind = "exe"
+sources = ["tools/gen.c"]
+
+[target.app]
+kind = "exe"
+sources = ["src/*.c"]
+
+[[target.app.pre-build]]
+shell = true
+message = "Stamping"
+command = "echo ran>>{root}/prebuild.log"
+
+[[target.app.run]]
+output = "{gen}/value.h"
+depfile = true
+command = ["{target:gen}", "{root}/data/list.txt", "{output}", "{depfile}"]
+"#,
+    );
+    project.write("tools/gen.c", DEPFILE_GENERATOR);
+    project.write("data/list.txt", "extra.txt\n");
+    project.write("data/extra.txt", "one\n");
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\n#include \"value.h\"\nint main(void) { printf(\"value %s\\n\", VALUE); return 0; }\n",
+    );
+    let runs = || project.read("prebuild.log").lines().filter(|line| line.trim() == "ran").count();
+
+    let first = project.anvil(&["run", "app"]);
+    first.success().contains("Stamping");
+    assert_eq!(program_output(&first), "value one");
+    assert_eq!(runs(), 1);
+    project.anvil(&["build"]).success().up_to_date();
+    assert_eq!(runs(), 1);
+
+    // extra.txt is named only by the depfile
+    project.write("data/extra.txt", "two\n");
+    let edited = project.anvil(&["run", "app"]);
+    edited.success();
+    assert_eq!(program_output(&edited), "value two");
+    assert!(edited.actions().contains(&"Running gen".to_string()), "{:?}", edited.actions());
+    project.anvil(&["build"]).success().up_to_date();
+
+    // A source edit runs the pre-build step again
+    project.edit("src/main.c", "value %s", "val %s");
+    let source = project.anvil(&["run", "app"]);
+    source.success().contains("Stamping");
+    assert_eq!(program_output(&source), "val two");
+    assert_eq!(runs(), 2);
+}
+
+// 50. anvil update moves a git dependency on a branch to the branch's newest commit; until then the pin holds
+
+#[test]
+fn update_moves_git_branch_pin() {
+    require!("default", "git");
+    let project = Project::empty("update_git");
+    let dependency = project.path("upd");
+    project.write("upd/anvil.toml", "[project]\nname = \"upd\"\n");
+    project.write("upd/include/upd/upd.h", "#pragma once\nint upd_value(void);\n");
+    project.write("upd/src/upd.c", "int upd_value(void) { return 1; }\n");
+    git(&dependency, &["init", "--quiet"]);
+    git(&dependency, &["add", "-A"]);
+    git(&dependency, &["commit", "--quiet", "-m", &format!("one, in {}", dependency.display())]);
+    let first_commit = git(&dependency, &["rev-parse", "HEAD"]);
+    let _checkouts = GitCheckouts::of(&project);
+
+    let url = format!("file:///{}", dependency.display().to_string().replace('\\', "/").trim_start_matches('/'));
+    project.write(
+        "user/anvil.toml",
+        &format!("[project]\nname = \"user\"\n\n[deps]\nupd = {{ git = \"{url}\", branch = \"main\" }}\n"),
+    );
+    project.write(
+        "user/src/main.c",
+        "#include <stdio.h>\n#include \"upd/upd.h\"\nint main(void) { printf(\"upd %d\\n\", upd_value()); return 0; }\n",
+    );
+
+    let run = project.anvil_in("user", &["run"]);
+    run.success();
+    assert_eq!(program_output(&run), "upd 1");
+    assert!(project.read("user/anvil.lock").contains(&first_commit));
+
+    // A new commit on the branch: the build stays on the pin
+    project.write("upd/src/upd.c", "int upd_value(void) { return 2; }\n");
+    git(&dependency, &["commit", "--quiet", "-am", "two"]);
+    let second_commit = git(&dependency, &["rev-parse", "HEAD"]);
+    let pinned = project.anvil_in("user", &["run"]);
+    pinned.success();
+    assert_eq!(program_output(&pinned), "upd 1");
+
+    project
+        .anvil_in("user", &["update", "nosuchdep"])
+        .code(1)
+        .contains("`nosuchdep` is not a git dependency");
+    project.anvil_in("user", &["update", "upd"]).success().contains("Updated");
+    let lock = project.read("user/anvil.lock");
+    assert!(lock.contains(&second_commit) && !lock.contains(&first_commit), "{lock}");
+    let moved = project.anvil_in("user", &["run"]);
+    moved.success();
+    assert_eq!(program_output(&moved), "upd 2");
+    project.anvil_in("user", &["update"]).success().contains("already has the newest");
+}
+
+// 51. anvil test --junit writes a JUnit report with the failures counted; --rerun-failed runs only those
+
+/// Checks that `text` is well-formed XML as far as a JUnit report needs: a declaration, then elements that close in
+/// order, attributes quoted.
+#[track_caller]
+fn assert_well_formed_xml(text: &str) {
+    let body = text.trim_start();
+    assert!(body.starts_with("<?xml "), "no XML declaration:\n{text}");
+    let body = &body[body.find("?>").expect("an ended declaration") + 2..];
+    let tag = regex::Regex::new(r#"<(/?)([A-Za-z_][\w.-]*)((?:\s+[\w:.-]+="[^"<]*")*)\s*(/?)>"#).unwrap();
+    let mut open: Vec<String> = Vec::new();
+    let mut position = 0;
+    let mut roots = 0;
+    for found in tag.captures_iter(body) {
+        let whole = found.get(0).unwrap();
+        let between = &body[position..whole.start()];
+        assert!(!between.contains('<'), "a malformed tag before byte {}:\n{text}", whole.start());
+        position = whole.end();
+        let name = found[2].to_string();
+        if &found[1] == "/" {
+            assert_eq!(open.pop().as_deref(), Some(name.as_str()), "</{name}> closes another element:\n{text}");
+        } else if &found[4] != "/" {
+            if open.is_empty() {
+                roots += 1;
+            }
+            open.push(name);
+        }
+    }
+    assert!(!body[position..].contains('<'), "a malformed tag at the end:\n{text}");
+    assert!(open.is_empty(), "unclosed {open:?}:\n{text}");
+    assert_eq!(roots, 1, "not one root element:\n{text}");
+}
+
+#[test]
+fn test_junit_report_and_rerun_failed() {
+    require!("default");
+    let project = Project::empty("junit_rerun");
+    project.write("anvil.toml", "[project]\nname = \"tt\"\n");
+    project.write("src/lib.c", "int lib_value(void) { return 1; }\n");
+    project.write("tests/good_one.c", "int main(void) { return 0; }\n");
+    project.write("tests/good_two.c", "int main(void) { return 0; }\n");
+    project.write(
+        "tests/bad.c",
+        "#include <stdio.h>\nint main(void) { printf(\"bad <output> & more\\n\"); return 3; }\n",
+    );
+
+    project
+        .anvil(&["test", "--junit", "report.xml"])
+        .code(1)
+        .contains("test bad ... FAILED")
+        .contains("1 of 3 tests failed: bad");
+    let report = project.read("report.xml");
+    assert_well_formed_xml(&report);
+    assert!(report.contains(r#"<testsuites tests="3" failures="1""#), "{report}");
+    assert!(report.contains(r#"<testcase name="bad""#), "{report}");
+    assert!(report.contains("bad &lt;output&gt; &amp; more"), "the output is not escaped:\n{report}");
+    assert_eq!(report.matches("<failure").count(), 1, "{report}");
+
+    // Only the failed test runs again, until it passes
+    project
+        .anvil(&["test", "--rerun-failed"])
+        .code(1)
+        .contains("Testing 1 test")
+        .lacks("good_one");
+    project.write("tests/bad.c", "int main(void) { return 0; }\n");
+    project
+        .anvil(&["test", "--rerun-failed", "--junit", "report.xml"])
+        .success()
+        .contains("Passed 1 of 1");
+    let report = project.read("report.xml");
+    assert_well_formed_xml(&report);
+    assert!(report.contains(r#"tests="1" failures="0""#), "{report}");
+    project.anvil(&["test", "--rerun-failed"]).success().contains("no test failed last time");
+    project.anvil(&["test"]).success().contains("Passed 3 of 3");
+}
+
+// 52. anvil build -k: a file that does not compile fails the build, the others still compile, and a fix compiles it
+//     alone
+
+#[test]
+fn keep_going_compiles_the_other_files() {
+    require!("default");
+    let project = Project::empty("keep_going");
+    project.write("anvil.toml", "[project]\nname = \"keep\"\n");
+    for name in ["a", "b", "d", "e"] {
+        project.write(&format!("src/{name}.c"), &format!("int {name}(void) {{ return 1; }}\n"));
+    }
+    project.write("src/c.c", "int c(void) { return missing; }\n");
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\nint a(void); int b(void); int c(void); int d(void); int e(void);\n\
+         int main(void) { printf(\"sum %d\\n\", a() + b() + c() + d() + e()); return 0; }\n",
+    );
+
+    let failed = project.anvil(&["build", "-k", "-j", "1"]);
+    assert_ne!(failed.code, 0, "{}", failed.output());
+    failed.contains("Compiling src/c.c failed").contains("build failed");
+    let actions = failed.actions();
+    for name in ["a", "b", "d", "e", "main"] {
+        assert!(
+            actions.contains(&format!("Compiling src/{name}.c")),
+            "{name}.c was not compiled: {actions:?}"
+        );
+    }
+    assert!(!actions.iter().any(|action| action.starts_with("Linking")), "{actions:?}");
+
+    project.write("src/c.c", "int c(void) { return 1; }\n");
+    let fixed = project.anvil(&["run"]);
+    fixed.success();
+    assert_eq!(fixed.compiled(), 1, "{:?}", fixed.actions());
+    assert_eq!(program_output(&fixed), "sum 5");
+}
+
+// 53. anvil clean deletes the profile's folders (each toolchain's too) and leaves the rest; clean -p <name> that
+//     profile's only; clean --all the output folder
+
+#[test]
+fn clean_removes_the_profile_folders_only() {
+    require!("msvc", "gcc");
+    let project = Project::empty("clean_profiles");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"cl\"\n\n[profile.rel]\ninherits = \"release\"\n\n[profile.rel-fast]\ninherits = \"release\"\n",
+    );
+    project.write("src/main.c", "#include <stdio.h>\nint main(void) { printf(\"clean\\n\"); return 0; }\n");
+    for args in [
+        &["--toolchain", "msvc"][..],
+        &["--toolchain", "gcc"],
+        &["--release", "--toolchain", "msvc"],
+        &["--release", "--toolchain", "gcc"],
+        &["-p", "rel", "--toolchain", "msvc"],
+        &["-p", "rel-fast", "--toolchain", "msvc"],
+    ] {
+        let mut run_args = vec!["run"];
+        run_args.extend_from_slice(args);
+        let run = project.anvil(&run_args);
+        run.success();
+        assert_eq!(program_output(&run), "clean");
+    }
+    let folders = || {
+        let mut names: Vec<String> = std::fs::read_dir(project.path("out"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        folders(),
+        [
+            ".anvil-out",
+            "compile_commands.json",
+            "debug-gcc",
+            "debug-msvc",
+            "rel-fast-msvc",
+            "rel-msvc",
+            "release-gcc",
+            "release-msvc"
+        ]
+    );
+
+    // Debug, each toolchain's folder; the source tree untouched
+    project.anvil(&["clean"]).success().contains("Removed");
+    assert_eq!(
+        folders(),
+        [
+            ".anvil-out",
+            "compile_commands.json",
+            "rel-fast-msvc",
+            "rel-msvc",
+            "release-gcc",
+            "release-msvc"
+        ]
+    );
+    assert!(project.path("src/main.c").is_file());
+
+    // `clean -p rel` leaves out/rel-fast-msvc, another profile's folder
+    project.anvil(&["clean", "-p", "rel"]).success();
+    assert_eq!(
+        folders(),
+        [".anvil-out", "compile_commands.json", "rel-fast-msvc", "release-gcc", "release-msvc"]
+    );
+
+    project.anvil(&["clean", "--release"]).success();
+    assert!(!folders().iter().any(|name| name.starts_with("release")), "{:?}", folders());
+    project.anvil(&["clean", "--release"]).success().contains("nothing built for `release`");
+
+    // A folder anvil did not make is left alone
+    project.write("out/notes/keep.txt", "mine\n");
+    project.anvil(&["clean", "-p", "notes"]).success();
+    assert!(project.path("out/notes/keep.txt").is_file());
+
+    // --all deletes the output folder only when it holds nothing but what anvil wrote
+    project
+        .anvil(&["clean", "--all"])
+        .code(1)
+        .contains("holds what Anvil did not write (notes)");
+    assert!(project.path("out/notes/keep.txt").is_file());
+    std::fs::remove_dir_all(project.path("out/notes")).unwrap();
+    project.anvil(&["clean", "--all"]).success();
+    assert!(!project.path("out").exists());
+    assert!(project.path("anvil.toml").is_file() && project.path("src/main.c").is_file());
+}
+
+// 54. anvil add of a vcpkg port, then a build that installs and links it
+
+#[test]
+fn add_vcpkg_port_then_build() {
+    require!("msvc", "windows", "vcpkg");
+    let project = Project::empty("add_vcpkg");
+    project.write("anvil.toml", "[project]\nname = \"usefmt\"\n");
+    project.write(
+        "src/main.cpp",
+        "#include <fmt/core.h>\nint main() { fmt::print(\"fmt {}\\n\", 6 * 7); }\n",
+    );
+
+    project.anvil(&["add", "fmt"]).success().contains("Added fmt");
+    let manifest = project.read("anvil.toml");
+    assert!(manifest.contains("[deps]\nfmt = \"vcpkg\""), "{manifest}");
+
+    // The program's line comes last (vcpkg's install prints on stdout too)
+    let run = project.anvil(&["run", "--toolchain", "msvc"]);
+    run.success();
+    assert_eq!(program_output(&run).lines().last(), Some("fmt 42"));
+    project.anvil(&["build", "--toolchain", "msvc"]).success().up_to_date();
+}
