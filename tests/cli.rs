@@ -1073,3 +1073,72 @@ fn completions_leave_out_hidden_commands() {
     let run = project.anvil(&["completions", "bash"]);
     run.success().contains("remove").lacks("cmake-e");
 }
+
+// 22. A test's background server outlives it for later tests; a process holding a test's output open does not keep
+// it waiting; arguments after `--` go to programs of the project only
+
+#[test]
+fn test_processes_outlive_tests_and_arguments_reach_programs() {
+    require!("default");
+    let project = Project::fixture("processes", "processes");
+
+    project.anvil(&["test", "server_"]).success().contains("test server_use ... ok");
+
+    let holder = project.anvil(&["test", "holder", "--show-output"]);
+    holder
+        .success()
+        .contains("parent done")
+        .contains("[output cut: a process the test started still holds its output open]");
+    assert!(
+        holder.elapsed < Duration::from_secs(4),
+        "the test waited for its child: {:?}",
+        holder.elapsed
+    );
+
+    project.anvil(&["test", "args_", "--", "extra"]).success().contains("Passed 2 of 2");
+}
+
+// 23. Libraries in link-flags link after the objects, as GNU ld needs them
+
+#[test]
+fn link_flags_libraries_follow_the_objects_gcc() {
+    require!("gcc");
+    let project = Project::empty("link_order_gcc");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"order\"\n\n[target.helper]\nkind = \"lib\"\nsources = [\"helper/*.c\"]\n\n\
+         [target.app]\nkind = \"exe\"\nsources = [\"src/*.c\"]\nlink-flags = [\"{target:helper}\"]\n",
+    );
+    project.write("helper/helper.c", "int helper_value(void) { return 42; }\n");
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\nint helper_value(void);\nint main(void) { printf(\"%d\\n\", helper_value()); return 0; }\n",
+    );
+
+    let run = project.anvil(&["run", "--toolchain", "gcc"]);
+    run.success();
+    assert_eq!(program_output(&run), "42");
+}
+
+// 24. Tests of the same name in two packages get their package's name; in one package the name is an error
+
+#[test]
+fn test_names_are_qualified_by_package() {
+    require!("default");
+    let project = Project::fixture("workspace", "test_names");
+    let smoke = "[[test]]\nname = \"smoke\"\ncommand = [\"cmake\", \"-E\", \"true\"]\n";
+    let after = "[[test]]\nname = \"later\"\ncommand = [\"cmake\", \"-E\", \"true\"]\nafter = [\"smoke\"]\n";
+    project.write("core/anvil.toml", &format!("{}\n{smoke}\n{after}", project.read("core/anvil.toml")));
+    project.write("app/anvil.toml", &format!("{}\n{smoke}", project.read("app/anvil.toml")));
+
+    let list = project.anvil(&["test", "--list"]);
+    list.success().contains("core/smoke").contains("app/smoke").contains("later");
+    project.anvil(&["test"]).success().contains("Passed 3 of 3");
+
+    project.write("app/one/tests.toml", smoke);
+    project.write("app/two/tests.toml", smoke);
+    project
+        .anvil(&["test", "--list"])
+        .code(1)
+        .contains("two tests are named `smoke`, in app/anvil.toml and in app/one/tests.toml");
+}

@@ -303,7 +303,8 @@ impl EnvCommand<'_> {
 }
 
 /// env [--unset=NAME | --modify NAME=OPERATION:VALUE | NAME=VALUE]... [--] command [args...], changes applied in order.
-pub fn parse_env(rest: &[String]) -> Result<EnvCommand<'_>> {
+/// `--modify` changes a variable's value in `base` (a test's `env`), else in Anvil's environment.
+pub fn parse_env<'a>(rest: &'a [String], base: &[(String, String)]) -> Result<EnvCommand<'a>> {
     let mut changes: Vec<(String, Option<String>)> = Vec::new();
     let mut command_start = rest.len();
     let mut index = 0;
@@ -317,7 +318,7 @@ pub fn parse_env(rest: &[String]) -> Result<EnvCommand<'_>> {
             set_variable(&mut changes, name, None);
         } else if word == "--modify" {
             let change = rest.get(index + 1).context("--modify needs NAME=OPERATION:VALUE")?;
-            modify_variable(&mut changes, change)?;
+            modify_variable(&mut changes, base, change)?;
             index += 1;
         } else if word.starts_with("--") {
             bail!("unknown option `{word}` (env takes --unset=NAME, --modify NAME=OPERATION:VALUE and NAME=VALUE)");
@@ -337,7 +338,7 @@ pub fn parse_env(rest: &[String]) -> Result<EnvCommand<'_>> {
 }
 
 fn run_with_env(rest: &[String]) -> Result<i32> {
-    let env = parse_env(rest)?;
+    let env = parse_env(rest, &[])?;
     let Some((program, args)) = env.command.split_first() else {
         bail!("env needs a command to run");
     };
@@ -350,13 +351,13 @@ fn run_with_env(rest: &[String]) -> Result<i32> {
 }
 
 /// One `--modify NAME=OPERATION:VALUE`, against the value earlier changes left.
-fn modify_variable(changes: &mut Vec<(String, Option<String>)>, change: &str) -> Result<()> {
+fn modify_variable(changes: &mut Vec<(String, Option<String>)>, base: &[(String, String)], change: &str) -> Result<()> {
     let Some((name, operation_value)) = change.split_once('=').filter(|(name, _)| !name.is_empty()) else {
         bail!("--modify {change}: expected NAME=OPERATION:VALUE");
     };
     let (operation, value) = operation_value.split_once(':').unwrap_or((operation_value, ""));
 
-    let current = variable(changes, name).unwrap_or_default();
+    let current = variable(changes, base, name).unwrap_or_default();
     let list_separator = if cfg!(windows) { ";" } else { ":" };
     let joined = |first: &str, separator: &str, second: &str| match (first.is_empty(), second.is_empty()) {
         (true, _) => second.to_string(),
@@ -388,10 +389,13 @@ fn modify_variable(changes: &mut Vec<(String, Option<String>)>, change: &str) ->
 }
 
 /// A variable's value with the changes so far applied.
-fn variable(changes: &[(String, Option<String>)], name: &str) -> Option<String> {
+fn variable(changes: &[(String, Option<String>)], base: &[(String, String)], name: &str) -> Option<String> {
     match changes.iter().rev().find(|(changed, _)| same_variable(changed, name)) {
         Some((_, value)) => value.clone(),
-        None => std::env::var(name).ok(),
+        None => match base.iter().rev().find(|(given, _)| same_variable(given, name)) {
+            Some((_, value)) => Some(value.clone()),
+            None => std::env::var(name).ok(),
+        },
     }
 }
 
@@ -561,19 +565,24 @@ mod tests {
     fn modifies_variables() {
         let mut changes = Vec::new();
         set_variable(&mut changes, "ANVIL_TEST_A", Some("a".into()));
-        modify_variable(&mut changes, "ANVIL_TEST_A=string_append:b").unwrap();
-        modify_variable(&mut changes, "ANVIL_TEST_A=cmake_list_prepend:x").unwrap();
-        assert_eq!(variable(&changes, "ANVIL_TEST_A").as_deref(), Some("x;ab"));
+        modify_variable(&mut changes, &[], "ANVIL_TEST_A=string_append:b").unwrap();
+        modify_variable(&mut changes, &[], "ANVIL_TEST_A=cmake_list_prepend:x").unwrap();
+        assert_eq!(variable(&changes, &[], "ANVIL_TEST_A").as_deref(), Some("x;ab"));
 
-        modify_variable(&mut changes, "ANVIL_TEST_B=path_list_append:y").unwrap();
-        assert_eq!(variable(&changes, "ANVIL_TEST_B").as_deref(), Some("y"));
-        modify_variable(&mut changes, "ANVIL_TEST_B=unset:").unwrap();
-        assert_eq!(variable(&changes, "ANVIL_TEST_B"), None);
-        modify_variable(&mut changes, "ANVIL_TEST_A=reset:").unwrap();
-        assert_eq!(variable(&changes, "ANVIL_TEST_A"), None);
+        modify_variable(&mut changes, &[], "ANVIL_TEST_B=path_list_append:y").unwrap();
+        assert_eq!(variable(&changes, &[], "ANVIL_TEST_B").as_deref(), Some("y"));
+        modify_variable(&mut changes, &[], "ANVIL_TEST_B=unset:").unwrap();
+        assert_eq!(variable(&changes, &[], "ANVIL_TEST_B"), None);
+        modify_variable(&mut changes, &[], "ANVIL_TEST_A=reset:").unwrap();
+        assert_eq!(variable(&changes, &[], "ANVIL_TEST_A"), None);
 
-        assert!(modify_variable(&mut changes, "ANVIL_TEST_A=bad:x").is_err());
-        assert!(modify_variable(&mut changes, "ANVIL_TEST_A").is_err());
+        // A test's env is what --modify starts from
+        let base = [("ANVIL_TEST_C".to_string(), "base".to_string())];
+        modify_variable(&mut changes, &base, "ANVIL_TEST_C=string_append:_x").unwrap();
+        assert_eq!(variable(&changes, &base, "ANVIL_TEST_C").as_deref(), Some("base_x"));
+
+        assert!(modify_variable(&mut changes, &[], "ANVIL_TEST_A=bad:x").is_err());
+        assert!(modify_variable(&mut changes, &[], "ANVIL_TEST_A").is_err());
     }
 
     #[test]

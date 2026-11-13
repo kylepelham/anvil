@@ -29,6 +29,8 @@ pub struct Profile {
 
     // Runtime
     pub debug_runtime: bool,
+    /// A [profile] table asks for the debug runtime itself (debug-runtime = true), not only the built-in `debug`.
+    pub debug_runtime_requested: bool,
     pub static_runtime: bool,
     pub assertions: bool,
 
@@ -208,6 +210,7 @@ impl Profile {
             lto: false,
             sanitize: Vec::new(),
             debug_runtime: debug,
+            debug_runtime_requested: false,
             static_runtime: false,
             assertions: debug,
             defines: Vec::new(),
@@ -226,6 +229,7 @@ impl Profile {
         self.debug = spec.debug.unwrap_or(self.debug);
         self.lto = spec.lto.unwrap_or(self.lto);
         self.debug_runtime = spec.debug_runtime.unwrap_or(self.debug_runtime);
+        self.debug_runtime_requested = spec.debug_runtime.unwrap_or(self.debug_runtime_requested);
         self.static_runtime = spec.static_runtime.unwrap_or(self.static_runtime);
         self.assertions = spec.assertions.unwrap_or(self.assertions);
         if spec.target.is_some() {

@@ -10,7 +10,7 @@ use std::process::Command;
 
 // Bump when the cached Toolchain layout changes (it is part of the cache file's name, so Anvils of different
 // versions sharing the cache folder do not overwrite each other's detections)
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 
 const PROBE_SOURCE: &str = "int main() { return 0; }\n";
 
@@ -54,6 +54,9 @@ pub struct Toolchain {
 
     /// clang: LLVM's linker is installed, so LTO builds link with it (GNU ld would need the LLVMgold plugin).
     pub lld: bool,
+
+    /// clang and clang-cl for the MSVC ABI: the folder of their AddressSanitizer runtime, as the compiler finds it.
+    pub sanitizer_runtime_dir: Option<PathBuf>,
 
     /// Windows programs with the MSVC ABI (cl, clang-cl, clang for *-windows-msvc), not MinGW's.
     msvc_abi: bool,
@@ -149,10 +152,14 @@ impl Toolchain {
                 .with_context(|| format!("toolchain `{name}`{for_platform} was requested but is not usable"));
         }
 
-        // CXX names a compiler explicitly: that one, or an error
-        if let Some(named) = named_compiler()? {
-            return Toolchain::find_named(named.family, platform, Some(&named))
-                .with_context(|| format!("CXX={} is set but cannot build{for_platform}", slash(&named.cxx)));
+        // CXX names a compiler explicitly: that one; one Anvil cannot use is said once, and `auto` picks instead
+        match named_compiler() {
+            Ok(Some(named)) => match Toolchain::find_named(named.family, platform, Some(&named)) {
+                Ok(toolchain) => return Ok(toolchain),
+                Err(error) => warn_unusable_cxx(&format!("{error:#}")),
+            },
+            Ok(None) => {}
+            Err(error) => warn_unusable_cxx(&format!("{error:#}")),
         }
 
         let mut failures = Vec::new();
@@ -224,6 +231,9 @@ impl Toolchain {
 
     /// A family for a platform, with CXX's program when it names one; from the cache when it is still valid.
     fn find_named(family: Family, platform: &Platform, named: Option<&NamedCompiler>) -> Result<Toolchain> {
+        // CXX=cl names no program of its own: MSVC is found the same way either way
+        let named = named.filter(|_| family != Family::Msvc);
+
         // A Windows ABI the family cannot build (clang builds both)
         let triple = platform.triple.as_deref().unwrap_or_default();
         match (family, platform.abi()) {
@@ -290,13 +300,14 @@ impl Toolchain {
 pub fn classify_compiler(compiler: &str) -> Option<Family> {
     let file_name = Path::new(compiler).file_stem()?.to_string_lossy().to_lowercase();
 
+    // Cross and distribution compilers carry a prefix: x86_64-w64-mingw32-g++, x86_64-conda-linux-gnu-c++
     if file_name == "cl" {
         Some(Family::Msvc)
     } else if file_name.starts_with("clang-cl") {
         Some(Family::ClangCl)
     } else if file_name.starts_with("clang") {
         Some(Family::Clang)
-    } else if file_name.contains("g++") || file_name.contains("gcc") || file_name == "c++" {
+    } else if file_name.contains("g++") || file_name.contains("gcc") || file_name == "c++" || file_name.ends_with("-c++") {
         Some(Family::Gcc)
     } else {
         None
@@ -308,8 +319,18 @@ fn named_compiler() -> Result<Option<NamedCompiler>> {
     let Some(text) = std::env::var("CXX").ok().filter(|text| !text.trim().is_empty()) else {
         return Ok(None);
     };
-    let cxx = resolve_program(&text).with_context(|| format!("CXX={text}: no such program (on PATH or as a path)"))?;
-    let family = classify_compiler(&text).with_context(|| format!("CXX={text}: not a compiler Anvil knows (cl, clang-cl, clang++, g++ or c++)"))?;
+    let program = without_launcher(&text);
+    let family = classify_compiler(&program).context("not a compiler Anvil knows (cl, clang-cl, clang++, g++ or c++)")?;
+
+    // cl is Visual Studio's, found as `msvc` finds it (it is on PATH only in a developer prompt)
+    if family == Family::Msvc {
+        return Ok(Some(NamedCompiler {
+            family,
+            cxx: PathBuf::from(program),
+            cc: None,
+        }));
+    }
+    let cxx = resolve_program(&program).context("no such program (on PATH or as a path)")?;
 
     // g++ and c++ may be clang (macOS has no gcc behind them)
     let family = if family == Family::Gcc && reports_clang(&cxx) {
@@ -319,11 +340,44 @@ fn named_compiler() -> Result<Option<NamedCompiler>> {
     };
 
     let cc = match std::env::var("CC").ok().filter(|text| !text.trim().is_empty()) {
-        Some(text) => Some(resolve_program(&text).with_context(|| format!("CC={text}: no such program (on PATH or as a path)"))?),
+        Some(text) => Some(resolve_program(&without_launcher(&text)).with_context(|| format!("CC={text}: no such program (on PATH or as a path)"))?),
         None => None,
     };
 
     Ok(Some(NamedCompiler { family, cxx, cc }))
+}
+
+/// The compiler of a CXX or CC that runs it through a compiler cache ("ccache g++" -> "g++").
+fn without_launcher(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let is_launcher = |word: &&str| {
+        let stem = Path::new(word)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        matches!(stem.as_str(), "ccache" | "sccache" | "buildcache" | "distcc" | "icecc")
+    };
+
+    words
+        .iter()
+        .copied()
+        .find(|word| !is_launcher(word))
+        .or(words.last().copied())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Says once that CXX is set to a compiler Anvil cannot use, so it chooses one itself.
+fn warn_unusable_cxx(reason: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+
+    let cxx = std::env::var("CXX").unwrap_or_default();
+    crate::ui::warn(&format!(
+        "CXX={cxx} is not used: {reason}. Choosing a compiler automatically (unset CXX, or pass --toolchain)"
+    ));
 }
 
 /// A program by name (on PATH) or path, made absolute.
@@ -443,6 +497,7 @@ fn detect_msvc(platform: &Platform) -> Result<Toolchain> {
         vc_tools_version: visual_studio.as_deref().and_then(read_vc_tools_version),
         visual_studio,
         lld: false,
+        sanitizer_runtime_dir: None,
         msvc_abi: true,
         cache_version: CACHE_VERSION,
     })
@@ -483,6 +538,7 @@ fn detect_clang_cl(platform: &Platform, named: Option<&NamedCompiler>) -> Result
     } else {
         (Vec::new(), Vec::new())
     };
+    let sanitizer_runtime_dir = clang_sanitizer_runtime_dir(&clang_cl, true, &compile_target_flags, platform.cpu);
 
     Ok(Toolchain {
         family: Family::ClangCl,
@@ -501,6 +557,7 @@ fn detect_clang_cl(platform: &Platform, named: Option<&NamedCompiler>) -> Result
         vc_tools_version: visual_studio.as_deref().and_then(read_vc_tools_version),
         visual_studio,
         lld: llvm_bin.join("lld-link.exe").is_file(),
+        sanitizer_runtime_dir,
         msvc_abi: true,
         cache_version: CACHE_VERSION,
     })
@@ -559,6 +616,16 @@ fn detect_clang(platform: &Platform, named: Option<&NamedCompiler>) -> Result<To
         Vec::new()
     };
 
+    // MinGW programs need MinGW's headers and libraries, which a clang finds only beside a MinGW of that machine
+    if platform.os == Os::Windows && !msvc_abi {
+        check_mingw_headers(&clang, &target_flags, platform)?;
+    }
+    let sanitizer_runtime_dir = if msvc_abi {
+        clang_sanitizer_runtime_dir(&clang, false, &target_flags, platform.cpu)
+    } else {
+        None
+    };
+
     Ok(Toolchain {
         family: Family::Clang,
         version,
@@ -576,6 +643,7 @@ fn detect_clang(platform: &Platform, named: Option<&NamedCompiler>) -> Result<To
         vc_tools_version: None,
         visual_studio: None,
         lld,
+        sanitizer_runtime_dir,
         msvc_abi,
         cache_version: CACHE_VERSION,
     })
@@ -646,6 +714,7 @@ fn detect_gcc(platform: &Platform, named: Option<&NamedCompiler>) -> Result<Tool
         vc_tools_version: None,
         visual_studio: None,
         lld: false,
+        sanitizer_runtime_dir: None,
         msvc_abi: false,
         cache_version: CACHE_VERSION,
     })
@@ -662,16 +731,11 @@ fn gcc_output(gxx: &Path, query: &str) -> Result<String> {
     Ok(text)
 }
 
-/// Does this gcc build and link a 32-bit program with -m32 (a multilib gcc)? Probed once per gcc: a working one
-/// ends up in the toolchain cache, a failure is remembered beside the probe.
+/// Does this gcc build and link a 32-bit program with -m32 (a multilib gcc)? A working one ends up in the toolchain
+/// cache; a failure is probed again next time (installing gcc-multilib does not change g++).
 fn check_m32(gxx: &Path) -> Result<()> {
-    let probe_folder = util::user_data_dir().join("gcc-probe");
-    let identity = format!("{}|{}", slash(gxx), util::mtime(gxx).unwrap_or(0));
-    let failure_file = probe_folder.join(format!("m32-{:016x}.failed", util::hash_bytes(identity.as_bytes())));
-    if let Ok(reason) = std::fs::read_to_string(&failure_file) {
-        bail!("{reason}");
-    }
-
+    // A folder of this process's own, so parallel Anvils do not write over each other's probe
+    let probe_folder = std::env::temp_dir().join(format!("anvil-probe-{}", std::process::id()));
     std::fs::create_dir_all(&probe_folder)?;
     std::fs::write(probe_folder.join("probe.cpp"), PROBE_SOURCE)?;
 
@@ -680,8 +744,10 @@ fn check_m32(gxx: &Path) -> Result<()> {
         .arg(probe_folder.join("probe.cpp"))
         .arg("-o")
         .arg(probe_folder.join(exe("probe32")))
-        .output()
-        .with_context(|| format!("running {}", slash(gxx)))?;
+        .output();
+    let _ = std::fs::remove_dir_all(&probe_folder);
+    let output = output.with_context(|| format!("running {}", slash(gxx)))?;
+
     if !output.status.success() {
         // The line saying what failed, not ld's "skipping incompatible" notes before it
         let error = String::from_utf8_lossy(&output.stderr);
@@ -691,12 +757,10 @@ fn check_m32(gxx: &Path) -> Result<()> {
             .or_else(|| error.lines().last())
             .unwrap_or_default()
             .trim();
-        let message = format!(
+        bail!(
             "{} cannot build 32-bit programs (-m32 failed: {reason}); install a multilib gcc (gcc-multilib) or an i686 cross compiler",
             slash(gxx)
         );
-        let _ = std::fs::write(&failure_file, &message);
-        bail!("{message}");
     }
 
     Ok(())
@@ -725,6 +789,48 @@ fn clang_default_target(clang: &Path) -> Option<String> {
     let output = Command::new(clang).arg("-dumpmachine").output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (output.status.success() && !text.is_empty()).then_some(text)
+}
+
+/// The folder a clang building for the MSVC ABI takes its AddressSanitizer runtime from (lib/clang/<version>/
+/// lib/windows), as it looks for the runtime itself; None when it has none.
+fn clang_sanitizer_runtime_dir(clang: &Path, clang_cl: bool, target_flags: &[String], cpu: Cpu) -> Option<PathBuf> {
+    let name = format!("clang_rt.asan_dynamic-{}.lib", crate::flags::asan_architecture(cpu));
+    let query = format!("{}-print-file-name={name}", if clang_cl { "/clang:" } else { "" });
+    let output = Command::new(clang).args(target_flags).arg(query).output().ok()?;
+
+    // An unknown file comes back as its bare name
+    let file = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    file.parent().filter(|_| file.is_absolute() && file.is_file()).map(Path::to_path_buf)
+}
+
+/// Does a clang building MinGW programs find MinGW's headers? Without them every compile would fail on
+/// "'stdio.h' file not found"; better to say so now, and let `auto` pick another toolchain.
+fn check_mingw_headers(clang: &Path, target_flags: &[String], platform: &Platform) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(clang)
+        .args(target_flags)
+        .args(["-x", "c", "-fsyntax-only", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {}", slash(clang)))?;
+    let _ = child.stdin.take().unwrap().write_all(b"#include <stdio.h>\n");
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let error = String::from_utf8_lossy(&output.stderr);
+    let reason = error.lines().find(|line| line.contains("error")).unwrap_or_default().trim();
+    bail!(
+        "{} has no MinGW headers and libraries for {} ({reason}); put a MinGW for it on PATH ({}gcc), or use llvm-mingw",
+        slash(clang),
+        platform.name(),
+        platform.gnu_prefix()
+    )
 }
 
 /// The environment of a Visual Studio developer prompt building for `cpu`: the current one when we are in one for
@@ -955,6 +1061,7 @@ impl Toolchain {
             system_dirs: Vec::new(),
             visual_studio: None,
             lld: false,
+            sanitizer_runtime_dir: None,
             msvc_abi,
             cache_version: CACHE_VERSION,
             compiler_mtime: 0,
@@ -973,6 +1080,11 @@ mod tests {
         assert_eq!(classify_compiler("/usr/bin/clang++-19"), Some(Family::Clang));
         assert_eq!(classify_compiler("clang-cl.exe"), Some(Family::ClangCl));
         assert_eq!(classify_compiler("x86_64-w64-mingw32-g++"), Some(Family::Gcc));
+        assert_eq!(classify_compiler("x86_64-conda-linux-gnu-c++"), Some(Family::Gcc));
+        assert_eq!(classify_compiler("cl.exe"), Some(Family::Msvc));
+        assert_eq!(without_launcher("ccache g++"), "g++");
+        assert_eq!(without_launcher("/usr/bin/sccache /usr/bin/clang++"), "/usr/bin/clang++");
+        assert_eq!(without_launcher(" g++ "), "g++");
     }
 
     #[test]

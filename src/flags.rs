@@ -446,6 +446,26 @@ impl Toolchain {
             );
         }
         if self.is_msvc_abi() && self.family != Family::Msvc {
+            // clang's AddressSanitizer runtime, where the compiler said it is when it was detected
+            let address = profile.sanitize.iter().any(|sanitizer| sanitizer == "address");
+            if address && self.sanitizer_runtime_dir.is_none() {
+                bail!(
+                    "profile `{}`: sanitize = [\"address\"] needs clang's AddressSanitizer runtime (clang_rt.asan_dynamic-{}.lib), which {} does not find; \
+                     install LLVM's compiler-rt libraries (the LLVM installer and Visual Studio's \"C++ Clang tools\" have them) and run \
+                     `anvil toolchains --refresh`, or build it with --toolchain msvc",
+                    profile.name,
+                    self.asan_architecture(),
+                    crate::util::slash(&self.cxx)
+                );
+            }
+
+            if profile.debug_runtime_requested {
+                crate::ui::warn(&format!(
+                    "profile `{}`: debug-runtime = true is not used with sanitize on {}: clang's sanitizers on Windows have no debug C runtime, so it links the release one",
+                    profile.name,
+                    self.family.name()
+                ));
+            }
             profile.debug_runtime = false;
         }
 
@@ -461,7 +481,7 @@ impl Toolchain {
         }
 
         let architecture = self.asan_architecture();
-        let (folders, names) = match self.family {
+        let (folders, names): (Vec<PathBuf>, Vec<String>) = match self.family {
             Family::Msvc => (
                 self.cxx.parent().into_iter().map(Path::to_path_buf).collect(),
                 vec![
@@ -469,7 +489,10 @@ impl Toolchain {
                     format!("clang_rt.asan_dbg_dynamic-{architecture}.dll"),
                 ],
             ),
-            _ => (self.clang_runtime_folders(), vec![format!("clang_rt.asan_dynamic-{architecture}.dll")]),
+            _ => (
+                self.sanitizer_runtime_dir.iter().cloned().collect(),
+                vec![format!("clang_rt.asan_dynamic-{architecture}.dll")],
+            ),
         };
 
         let Some(folder) = folders.iter().find(|folder| folder.join(&names[0]).is_file()) else {
@@ -796,8 +819,10 @@ impl Toolchain {
             args.push("-Wl,-rpath,@loader_path".into());
         }
 
-        // The target's and profile's options go before the inputs, as CMake puts them (-Wl,--as-needed, -Wl,-Bstatic)
-        args.extend(spec.flags.iter().cloned());
+        // The target's and profile's options go before the inputs, as CMake puts them (-Wl,--as-needed); the libraries
+        // among them after the objects, since GNU ld only resolves a library against what came before it
+        let (flag_options, flag_libraries) = split_link_flags(spec.flags);
+        args.extend(flag_options);
 
         args.extend(spec.objects.iter().map(|object| path_text(object)));
         args.extend(spec.lib_dirs.iter().map(|folder| format!("-L{}", path_text(folder))));
@@ -818,6 +843,8 @@ impl Toolchain {
                 args.push("-Wl,--no-whole-archive".into());
             }
         }
+        args.extend(flag_libraries);
+
         // A flag's value passes as it is ("-framework", "Cocoa")
         let mut flag_value = false;
         for lib in spec.libs {
@@ -853,28 +880,13 @@ impl Toolchain {
         }
     }
 
-    /// Folders a clang's runtime libraries are in: lib/clang/<version>/lib/windows under its LLVM.
-    fn clang_runtime_folders(&self) -> Vec<PathBuf> {
-        let Some(llvm) = self.cxx.parent().and_then(Path::parent) else {
-            return Vec::new();
-        };
-
-        std::fs::read_dir(llvm.join("lib").join("clang"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path().join("lib").join("windows"))
-            .collect()
-    }
-
     /// The AddressSanitizer libraries `clang-cl -fsanitize=address` links (lld-link and clang's driver get them from
     /// Anvil): the runtime's import library, and the thunk for the program's C runtime linked whole.
     fn clang_asan_libs(&self, profile: &Profile) -> Vec<String> {
         let architecture = self.asan_architecture();
         let runtime = format!("clang_rt.asan_dynamic-{architecture}.lib");
         let address = profile.sanitize.iter().any(|sanitizer| sanitizer == "address");
-        let folder = self.clang_runtime_folders().into_iter().find(|folder| folder.join(&runtime).is_file());
-        let Some(folder) = folder.filter(|_| address) else {
+        let Some(folder) = self.sanitizer_runtime_dir.as_ref().filter(|_| address) else {
             return Vec::new();
         };
 
@@ -898,12 +910,17 @@ impl Toolchain {
 
     /// The processor in the sanitizer runtime's file names.
     fn asan_architecture(&self) -> &'static str {
-        match self.platform.cpu {
-            Cpu::X64 => "x86_64",
-            Cpu::X86 => "i386",
-            Cpu::Arm64 => "aarch64",
-            Cpu::Arm => "armhf",
-        }
+        asan_architecture(self.platform.cpu)
+    }
+}
+
+/// The processor in the sanitizer runtime's file names (clang_rt.asan_dynamic-x86_64.lib).
+pub fn asan_architecture(cpu: Cpu) -> &'static str {
+    match cpu {
+        Cpu::X64 => "x86_64",
+        Cpu::X86 => "i386",
+        Cpu::Arm64 => "aarch64",
+        Cpu::Arm => "armhf",
     }
 }
 
@@ -918,6 +935,98 @@ pub fn takes_value(flag: &str) -> bool {
         flag,
         "-framework" | "-weak_framework" | "-needed_framework" | "-Xlinker" | "-u" | "-T" | "-L" | "-F" | "-l" | "-z"
     )
+}
+
+// GNU ld switches that change how the libraries after them link: a run of them with libraries keeps its place
+const POSITIONAL_LINKER_SWITCHES: &[&str] = &[
+    "--whole-archive",
+    "--no-whole-archive",
+    "-Bstatic",
+    "-Bdynamic",
+    "-static",
+    "--start-group",
+    "--end-group",
+    "-(",
+    "-)",
+    "--as-needed",
+    "--no-as-needed",
+    "--push-state",
+    "--pop-state",
+];
+
+/// What one link-flags entry (with its value) is to the order of a GNU link.
+#[derive(Debug, PartialEq)]
+enum LinkFlagKind {
+    /// A library or object file, or `-lname`.
+    Library,
+    /// A switch from POSITIONAL_LINKER_SWITCHES.
+    Positional,
+    Option,
+}
+
+/// Splits link flags into the options that go before the objects and the libraries that go after them: library
+/// files, `-l` names, and runs of positional switches around them (-Wl,--whole-archive x.a -Wl,--no-whole-archive)
+/// as a unit, in their order.
+fn split_link_flags(flags: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut options = Vec::new();
+    let mut libraries = Vec::new();
+    let mut run: Vec<String> = Vec::new();
+    let mut run_has_library = false;
+
+    let mut index = 0;
+    while index < flags.len() {
+        // An option and its value stay together ("-Xlinker", "--whole-archive")
+        let length = if takes_value(&flags[index]) && index + 1 < flags.len() { 2 } else { 1 };
+        let piece = &flags[index..index + length];
+        index += length;
+
+        match link_flag_kind(piece) {
+            LinkFlagKind::Library => {
+                run.extend(piece.iter().cloned());
+                run_has_library = true;
+            }
+            LinkFlagKind::Positional => run.extend(piece.iter().cloned()),
+            LinkFlagKind::Option => {
+                if run_has_library { &mut libraries } else { &mut options }.append(&mut run);
+                run_has_library = false;
+                options.extend(piece.iter().cloned());
+            }
+        }
+    }
+    if run_has_library { &mut libraries } else { &mut options }.append(&mut run);
+
+    (options, libraries)
+}
+
+fn link_flag_kind(piece: &[String]) -> LinkFlagKind {
+    let first = piece[0].as_str();
+    if first == "-l" || (first.starts_with("-l") && first.len() > 2) || is_library_file(first) {
+        return LinkFlagKind::Library;
+    }
+
+    // What the linker itself gets: -Wl,a,b or -Xlinker a
+    let linker_words: Vec<&str> = match first.strip_prefix("-Wl,") {
+        Some(list) => list.split(',').collect(),
+        None if first == "-Xlinker" => piece[1..].iter().map(String::as_str).collect(),
+        None => Vec::new(),
+    };
+    if linker_words
+        .iter()
+        .any(|word| is_library_file(word) || (word.starts_with("-l") && word.len() > 2))
+    {
+        LinkFlagKind::Library
+    } else if !linker_words.is_empty() && linker_words.iter().all(|word| POSITIONAL_LINKER_SWITCHES.contains(word)) {
+        LinkFlagKind::Positional
+    } else {
+        LinkFlagKind::Option
+    }
+}
+
+/// A library or object file a link takes as an input (libz.a, libz.so.1, z.lib, crt.o).
+fn is_library_file(word: &str) -> bool {
+    let lowered = word.to_ascii_lowercase();
+    let extensions = [".a", ".so", ".lib", ".dylib", ".tbd", ".o", ".obj"];
+    !word.starts_with('-') && (extensions.iter().any(|extension| lowered.ends_with(extension)) || lowered.contains(".so."))
 }
 
 fn msvc_standard_flag(standard: &str, clang_cl: bool) -> Vec<String> {
@@ -1060,6 +1169,7 @@ mod tests {
 
         let error = "app.obj : error LNK2019: unresolved external symbol WinMain referenced in function \"int __cdecl invoke_main(void)\"";
         assert!(link_failure_hint(error).is_some());
+        assert!(link_failure_hint("lld-link: error: undefined symbol: WinMain\n>>> msvcrtd.lib(exe_winmain.obj)").is_some());
         assert!(link_failure_hint("error LNK2019: unresolved external symbol foo").is_none());
     }
 
@@ -1086,6 +1196,64 @@ mod tests {
         let args = link_libs(&macos, false, Gui::Off, false, &libs);
         assert!(args.windows(2).any(|pair| pair == ["-framework", "Cocoa"]));
         assert!(args.windows(2).any(|pair| pair == ["-framework", "Metal"]));
+    }
+
+    #[test]
+    fn libraries_in_link_flags_follow_the_objects() {
+        let flags = [
+            "-Wl,--as-needed",
+            "/out/libhelper.a",
+            "-lws2_32",
+            "-Wl,--whole-archive",
+            "x.a",
+            "-Wl,--no-whole-archive",
+            "-Xlinker",
+            "--gc-sections",
+            "-Wl,-Bstatic",
+            "-l",
+            "z",
+        ]
+        .map(String::from);
+        let (options, libraries) = split_link_flags(&flags);
+        assert_eq!(options, ["-Xlinker", "--gc-sections"]);
+        assert_eq!(
+            libraries,
+            [
+                "-Wl,--as-needed",
+                "/out/libhelper.a",
+                "-lws2_32",
+                "-Wl,--whole-archive",
+                "x.a",
+                "-Wl,--no-whole-archive",
+                "-Wl,-Bstatic",
+                "-l",
+                "z"
+            ]
+        );
+
+        // An option alone stays before the objects; a library goes after them
+        let (options, libraries) = split_link_flags(&["-Wl,-Bstatic".to_string(), "-static".to_string()]);
+        assert_eq!((options.len(), libraries.len()), (2, 0));
+
+        let linux = Toolchain::for_tests(Family::Gcc, platform(Cpu::X64, Os::Linux), false);
+        let profile = Profile::resolve("debug", &Default::default()).unwrap();
+        let spec = LinkSpec {
+            profile: &profile,
+            shared: false,
+            gui: Gui::Off,
+            exports: false,
+            uses_program_exports: false,
+            objects: &[PathBuf::from("main.o")],
+            libs: &[],
+            whole: &[],
+            lib_dirs: &[],
+            flags: &["/out/libhelper.a".to_string()],
+            output: Path::new("/out/app"),
+            import_lib: None,
+        };
+        let args = linux.link_args(&spec);
+        let position = |wanted: &str| args.iter().position(|arg| arg == wanted).unwrap();
+        assert!(position("main.o") < position("/out/libhelper.a"));
     }
 
     #[test]
@@ -1117,7 +1285,13 @@ mod tests {
         let mingw = Toolchain::for_tests(Family::Gcc, platform(Cpu::X64, Os::Windows), false);
         assert!(mingw.adapt_profile(&mut profile.clone()).is_err());
 
-        let clang_cl = Toolchain::for_tests(Family::ClangCl, platform(Cpu::X64, Os::Windows), true);
+        let mut clang_cl = Toolchain::for_tests(Family::ClangCl, platform(Cpu::X64, Os::Windows), true);
+        assert!(clang_cl
+            .adapt_profile(&mut profile.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("AddressSanitizer runtime"));
+        clang_cl.sanitizer_runtime_dir = Some(PathBuf::from("/llvm/lib/clang/22/lib/windows"));
         clang_cl.adapt_profile(&mut profile).unwrap();
         assert!(!profile.debug_runtime);
     }

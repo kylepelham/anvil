@@ -12,7 +12,7 @@ use std::io::{PipeReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
@@ -25,6 +25,13 @@ const LAST_FAILED_FILE: &str = "last-failed";
 
 // The exit code of a run stopped by Ctrl-C
 const INTERRUPTED_EXIT_CODE: i32 = 130;
+
+// How long a test's output is still read after it ended: what it wrote is in the pipe by then, but a process that
+// left its tree may hold the pipe open, and is not waited for
+const OUTPUT_GRACE: Duration = Duration::from_secs(2);
+
+// The same when processes of the test still run after it ended by itself (a server later tests use)
+const SURVIVOR_OUTPUT_GRACE: Duration = Duration::from_millis(200);
 
 pub struct TestOptions {
     pub jobs: usize,
@@ -252,7 +259,7 @@ fn run_one(model: &Model, index: usize, test: &TestCase) -> TestResult {
             return result;
         }
     };
-    let output_reader = drain(reader);
+    let output_reader = OutputReader::start(reader);
 
     // Wait, stopping the whole tree at the timeout or Ctrl-C
     let timeout = Duration::from_secs(test.timeout.unwrap_or(DEFAULT_TIMEOUT_SECONDS));
@@ -272,9 +279,16 @@ fn run_one(model: &Model, index: usize, test: &TestCase) -> TestResult {
         }
     };
 
-    // What it left running ends with it, which also closes the pipe
-    tree.kill();
-    result.output = output_reader.join().unwrap_or_default();
+    // A timeout or Ctrl-C stops what it left running; after a normal end that goes on (a server later tests use)
+    let survivors = match ending {
+        Ending::Exited(_) => tree.has_survivors(),
+        Ending::TimedOut | Ending::Interrupted => {
+            tree.kill();
+            false
+        }
+    };
+    drop(tree);
+    result.output = output_reader.finish(if survivors { SURVIVOR_OUTPUT_GRACE } else { OUTPUT_GRACE });
     result.elapsed = started.elapsed();
 
     match ending {
@@ -302,7 +316,7 @@ fn test_command(words: &[String], test: &TestCase) -> std::result::Result<Comman
     };
 
     if cmake_args[0] == "env" {
-        let env = crate::cmake_tool::parse_env(&cmake_args[1..]).map_err(|error| format!("cmake -E env: {error:#}"))?;
+        let env = crate::cmake_tool::parse_env(&cmake_args[1..], &test.env).map_err(|error| format!("cmake -E env: {error:#}"))?;
         let Some((program, args)) = env.command.split_first() else {
             return Err("cmake -E env has no command to run".into());
         };
@@ -445,12 +459,51 @@ fn output_pipe(command: &mut Command) -> std::io::Result<PipeReader> {
     Ok(reader)
 }
 
-fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = pipe.read_to_end(&mut bytes);
-        String::from_utf8_lossy(&bytes).into_owned()
-    })
+/// Reads a test's output on a thread of its own, until every process holding the pipe has closed it.
+struct OutputReader {
+    /// What was read so far; taken by `finish`, after which the thread throws away the rest.
+    bytes: Arc<Mutex<Option<Vec<u8>>>>,
+    closed: mpsc::Receiver<()>,
+}
+
+impl OutputReader {
+    fn start(mut pipe: impl Read + Send + 'static) -> OutputReader {
+        let bytes = Arc::new(Mutex::new(Some(Vec::new())));
+        let (sender, closed) = mpsc::channel();
+
+        let shared = bytes.clone();
+        std::thread::spawn(move || {
+            // Keep reading after `finish`, so a process still writing never blocks on a full pipe
+            let mut chunk = [0u8; 16384];
+            while let Ok(count) = pipe.read(&mut chunk) {
+                if count == 0 {
+                    break;
+                }
+                if let Some(bytes) = shared.lock().unwrap().as_mut() {
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+            }
+            let _ = sender.send(());
+        });
+
+        OutputReader { bytes, closed }
+    }
+
+    /// The output, once the pipe closes or `grace` passes; a pipe still open then is left to the thread, and the
+    /// output says it was cut.
+    fn finish(self, grace: Duration) -> String {
+        let closed = !matches!(self.closed.recv_timeout(grace), Err(mpsc::RecvTimeoutError::Timeout));
+        let bytes = self.bytes.lock().unwrap().take().unwrap_or_default();
+
+        let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        if !closed {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str("[output cut: a process the test started still holds its output open]\n");
+        }
+        text
+    }
 }
 
 /// One line per test, and with --show-output a passing test's output under it.
@@ -535,7 +588,8 @@ fn write_junit(path: &Path, project: &str, results: &[TestResult], elapsed: Dura
     util::write_atomic(path, xml.as_bytes()).with_context(|| format!("writing the JUnit report {}", slash(path)))
 }
 
-/// Text for an XML attribute or element; characters XML cannot hold (most control characters) are left out.
+/// Text for an XML attribute or element; characters XML 1.0 cannot hold (control characters, U+FFFE, U+FFFF) are
+/// left out.
 fn xml_escape(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
@@ -544,9 +598,9 @@ fn xml_escape(text: &str) -> String {
             '<' => escaped.push_str("&lt;"),
             '>' => escaped.push_str("&gt;"),
             '"' => escaped.push_str("&quot;"),
-            '\t' | '\n' | '\r' => escaped.push(character),
-            character if character.is_control() => {}
-            character => escaped.push(character),
+            // XML 1.0's Char: #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+            '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}' => escaped.push(character),
+            _ => {}
         }
     }
     escaped
@@ -566,5 +620,6 @@ mod tests {
     #[test]
     fn escapes_xml() {
         assert_eq!(xml_escape("a<b> & \"c\"\u{1b}[0m\n"), "a&lt;b&gt; &amp; &quot;c&quot;[0m\n");
+        assert_eq!(xml_escape("x\u{FFFE}\u{FFFF}\u{FFFD}\u{1F600}y"), "x\u{FFFD}\u{1F600}y");
     }
 }
