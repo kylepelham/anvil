@@ -1341,6 +1341,7 @@ impl Interpreter {
             properties.expect = checked.expect;
             properties.reject = checked.reject;
             properties.exit_code = Some(checked.exit_code).filter(|code| *code != 0);
+            properties.env = checked.env;
         }
 
         self.tests.push(Test {
@@ -1907,7 +1908,16 @@ fn apply_test_property(properties: &mut TestProperties, property: &str, items: &
             }
             for item in items {
                 if let Some((name, value)) = item.split_once('=') {
-                    properties.env.push((name.to_string(), value.to_string()));
+                    // Folders from the converting machine's own PATH ($ENV{PATH}) are not the project's
+                    let value = if name.eq_ignore_ascii_case("PATH") {
+                        let own = std::env::var("PATH").unwrap_or_default();
+                        let own: Vec<&str> = own.split(';').filter(|folder| !folder.is_empty()).collect();
+                        let folders: Vec<&str> = value.split(';').filter(|folder| !own.contains(&folder.trim_end_matches('\\'))).collect();
+                        folders.join(";")
+                    } else {
+                        value.to_string()
+                    };
+                    properties.env.push((name.to_string(), value));
                 }
             }
         }

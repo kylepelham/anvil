@@ -1220,6 +1220,12 @@ fn is_marker(text: &str) -> bool {
     marked(text, OPTION_MARKER).is_some() || marked(text, SYMBOL_MARKER).is_some()
 }
 
+/// The condition a marker value stands for: an option read in a generator expression, or a check's result
+/// (`option_marker` of a whole condition, such as `!msvc`).
+pub fn marked_condition(text: &str) -> Option<&str> {
+    text.strip_prefix(OPTION_MARKER)?.strip_suffix(OPTION_MARKER_END)
+}
+
 /// A value read as a condition: true where its text is a true constant, or the option or platform value it names.
 fn truth_of(alternatives: &Alternatives) -> Truth {
     alternatives.iter().fold(Truth::Known(false), |result, (condition, text)| {
