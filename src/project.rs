@@ -1205,6 +1205,7 @@ impl Model {
         } = instance.install(&self.vcpkg_requests, &config)?;
         self.lock.as_mut().unwrap().set_vcpkg(baseline, &config.triplet, tree.versions());
         let debug_libs = self.profile.debug_runtime && self.toolchain.is_msvc_abi();
+        let build = crate::vcpkg_tree::BuildContext::new(&self.toolchain, &self.profile);
 
         // A package nothing links here (one used only on other platforms) may be missing
         let mut linked = vec![false; self.targets.len()];
@@ -1236,11 +1237,14 @@ impl Model {
             }
 
             let usage = tree
-                .usage(port, debug_libs, only_libs.as_deref())
+                .usage(port, debug_libs, only_libs.as_deref(), &build)
                 .with_context(|| format!("dependency `{}`", target.name))?;
             target.public_system_include.extend(usage.includes);
             target.public_defines.extend(usage.defines);
+            target.public_flags.extend(usage.flags);
+            target.public_language_flags.extend(usage.language_flags);
             target.libs.extend(usage.libs.iter().map(|lib| slash(lib)));
+            target.link_flags.extend(usage.link_flags);
             target.runtime_files.extend(usage.runtime);
         }
 

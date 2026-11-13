@@ -73,6 +73,12 @@ pub fn missing(what: &str) -> Option<String> {
         "default" => None,
         "windows" if !cfg!(windows) => Some("Windows only".into()),
         "windows" => None,
+        "vcpkg" => {
+            // `anvil vcpkg list` marks the instance builds use with "*"
+            let output = Command::new(ANVIL).args(["vcpkg", "list"]).env("NO_COLOR", "1").output();
+            let found = output.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).lines().any(|line| line.starts_with('*')));
+            (!found).then(|| "no vcpkg found".into())
+        }
         "git" => {
             let runs = Command::new("git").arg("--version").output().is_ok_and(|output| output.status.success());
             (!runs).then(|| "git is not on PATH".into())
