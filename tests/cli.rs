@@ -379,7 +379,6 @@ fn workspace_builds_from_root_and_member() {
 }
 
 #[test]
-#[ignore = "open bug: a [workspace] root with no [project] and no sources warns `\"*.{c,cc,cpp,cxx}\" matches no files`"]
 fn workspace_root_without_sources_does_not_warn() {
     require!("default");
     let project = Project::fixture("workspace", "workspace_warning");
