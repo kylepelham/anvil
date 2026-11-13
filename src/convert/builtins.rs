@@ -10,6 +10,7 @@ use anyhow::Result;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 // Commands with no effect on what gets built
 const IGNORED_COMMANDS: &[&str] = &[
@@ -270,7 +271,8 @@ impl Keywords {
 /// What the built-in commands keep besides variables.
 #[derive(Debug, Default)]
 pub struct BuiltinState {
-    /// cmake_dependent_option()s whose dependencies hold only on some platforms: the option reads as `OPT & (these)`.
+    /// Options that exist only on some platforms or under other options: declared inside a branch, or
+    /// cmake_dependent_option()s whose dependencies hold only there. The option reads as `OPT & (these)`.
     pub option_conditions: HashMap<String, String>,
     /// set_property(GLOBAL ...): each property's value.
     pub global_properties: HashMap<String, String>,
@@ -282,6 +284,22 @@ pub struct BuiltinState {
     pub install_writes: Vec<model::ConfigureWrite>,
     /// The ports in the project's vcpkg.json, read when a find_package() first needs them.
     pub manifest_ports: Option<Vec<String>>,
+    /// check_type_size() results that differ by platform, by variable.
+    pub type_sizes: HashMap<String, TypeSize>,
+    /// The vcpkg checkout optional find_package()s can take ports from, found when one first needs it.
+    pub vcpkg: Option<Option<crate::vcpkg::Instance>>,
+    /// Folders find_program() searches besides PATH (the MSVC tools'), found when a program is first not on PATH.
+    pub tool_folders: Option<Vec<PathBuf>>,
+}
+
+/// A type's size by platform: `otherwise` unless one of the `cases` conditions holds (the first that does). An empty
+/// size: the type does not exist there.
+#[derive(Debug, Clone)]
+pub struct TypeSize {
+    /// The size on this machine, as the variable holds it.
+    pub host: String,
+    pub cases: Vec<(String, String)>,
+    pub otherwise: String,
 }
 
 impl Interpreter {
@@ -335,7 +353,7 @@ impl Interpreter {
             "include" => self.command_include(command, &args)?,
             "add_subdirectory" => self.command_add_subdirectory(command, &args)?,
             "project" => self.command_project(&args),
-            "find_package" => self.command_find_package(&args),
+            "find_package" => self.command_find_package(command, &args),
             "pkg_check_modules" | "pkg_search_module" => self.command_pkg_check_modules(&args),
             "find_program" | "find_library" | "find_path" | "find_file" => self.command_find(command, &args),
             "configure_file" => self.command_configure_file(command, &args),
@@ -512,10 +530,17 @@ impl Interpreter {
         }
     }
 
-    /// option(NAME "doc" default): becomes an Anvil option, and tests of it become conditions.
+    /// option(NAME "doc" default): becomes an Anvil option, and tests of it become conditions. One declared inside a
+    /// branch exists only where the branch runs: it reads as `NAME & (branch condition)`, and declared again in
+    /// another branch, as `NAME & (either condition)`.
     fn command_option(&mut self, args: &[String]) {
         let Some(name) = args.first() else { return };
-        if self.get_variable(name).is_some() || self.options.contains_key(name) {
+        let branch = self.current_condition();
+        if self.options.contains_key(name) {
+            self.widen_option_condition(name, branch);
+            return;
+        }
+        if self.get_variable(name).is_some() {
             return;
         }
 
@@ -523,6 +548,32 @@ impl Interpreter {
         let description = args.get(1).cloned().unwrap_or_default();
         self.options.insert(name.clone(), (default, description));
         self.cache.insert(name.clone(), if default { "ON" } else { "OFF" }.into());
+        if let Some(branch) = branch {
+            self.builtin.option_conditions.insert(name.clone(), branch);
+        }
+    }
+
+    /// An option declared again under `branch`: it exists where it did before or where the branch runs.
+    fn widen_option_condition(&mut self, name: &str, branch: Option<String>) {
+        let Some(earlier) = self.builtin.option_conditions.get(name).cloned() else {
+            return;
+        };
+        let widened = match branch {
+            Some(branch) => Truth::Depends(earlier).or(Truth::Depends(branch)),
+            None => Truth::Known(true),
+        };
+        let widened = match widened {
+            Truth::Depends(condition) => model::simplify(&condition, None),
+            known => known,
+        };
+        match widened {
+            Truth::Depends(condition) => {
+                self.builtin.option_conditions.insert(name.to_string(), condition);
+            }
+            Truth::Known(_) => {
+                self.builtin.option_conditions.remove(name);
+            }
+        }
     }
 
     /// cmake_dependent_option(NAME "doc" default "dependencies" force): an option where its `;`-separated
@@ -554,6 +605,10 @@ impl Interpreter {
             Truth::Known(false) => self.set_variable(name, force),
             Truth::Depends(condition) => {
                 self.command_option(args);
+                let condition = match self.builtin.option_conditions.get(name.as_str()) {
+                    Some(branch) => model::and(branch, &condition),
+                    None => condition,
+                };
                 self.builtin.option_conditions.insert(name.clone(), condition);
             }
         }
@@ -561,44 +616,30 @@ impl Interpreter {
 
     // Lists
 
+    /// list(): items a branch this machine does not take added (conditional items) keep their place; operations that
+    /// count or index the list see it as this machine does with the options' defaults, and say so when options change
+    /// the answer.
     fn command_list(&mut self, command: &Command, args: &[String]) {
         let [operation, variable, rest @ ..] = args else { return };
         let mut items = model::list_elements(&self.get_variable(variable).unwrap_or_default());
+        let conditional = items.iter().any(|item| model::split_conditional_item(item).is_some());
+        let options = if conditional { self.option_defaults() } else { HashMap::new() };
+        let visible = visible_items(&items, &options);
 
         match operation.as_str() {
-            "LENGTH" => {
-                if let Some(output) = rest.first() {
-                    self.set_variable(output, &items.len().to_string());
-                }
-            }
-            "GET" => {
-                let Some((output, indexes)) = rest.split_last() else { return };
-                let picked: Vec<String> = indexes
-                    .iter()
-                    .filter_map(|index| list_index(index, items.len()))
-                    .map(|index| items[index].clone())
-                    .collect();
-                self.set_variable(output, &picked.join(";"));
-            }
-            "JOIN" => {
-                let [glue, output, ..] = rest else { return };
-                self.set_variable(output, &items.join(glue));
-            }
-            "SUBLIST" => {
-                let [begin, length, output, ..] = rest else { return };
-                let begin: usize = begin.parse().unwrap_or(0).min(items.len());
-                let length: i64 = length.parse().unwrap_or(-1);
-                let end = if length < 0 {
-                    items.len()
-                } else {
-                    (begin + length as usize).min(items.len())
+            "LENGTH" | "GET" | "JOIN" | "SUBLIST" | "FIND" => {
+                let Some((output, value)) = list_read(operation, &resolved_items(&items, &options), rest) else {
+                    return;
                 };
-                self.set_variable(output, &items[begin..end].join(";"));
-            }
-            "FIND" => {
-                let [value, output, ..] = rest else { return };
-                let index = items.iter().position(|item| item == value).map(|index| index as i64).unwrap_or(-1);
-                self.set_variable(output, &index.to_string());
+                if let Some(changed_by) = self.options_changing(&items, &|items| list_read(operation, items, rest)) {
+                    self.warn(
+                        command,
+                        &format!(
+                            "list({operation} {variable}) reads items that options add ({changed_by}); the result is the one with the options' defaults"
+                        ),
+                    );
+                }
+                self.set_variable(&output, &value);
             }
             "APPEND" => {
                 items.extend(rest.iter().cloned());
@@ -611,32 +652,40 @@ impl Interpreter {
             }
             "INSERT" => {
                 let Some((index, values)) = rest.split_first() else { return };
-                let index = list_index(index, items.len() + 1).unwrap_or(items.len());
-                items.splice(index..index, values.iter().cloned());
+                let index = list_index(index, visible.len() + 1).unwrap_or(visible.len());
+                let position = visible.get(index).copied().unwrap_or(items.len());
+                items.splice(position..position, values.iter().cloned());
                 self.set_variable(variable, &items.join(";"));
             }
             "POP_BACK" | "POP_FRONT" => {
-                let count = rest.len().max(1);
-                let mut popped = Vec::new();
-                for _ in 0..count.min(items.len()) {
-                    popped.push(if operation == "POP_BACK" {
-                        items.pop().unwrap()
-                    } else {
-                        items.remove(0)
-                    });
+                let count = rest.len().max(1).min(visible.len());
+                let taken: Vec<usize> = if operation == "POP_BACK" {
+                    visible.iter().rev().take(count).copied().collect()
+                } else {
+                    visible.iter().take(count).copied().collect()
+                };
+                for (output, index) in rest.iter().zip(&taken) {
+                    let value = item_text(&items[*index]).to_string();
+                    self.set_variable(output, &value);
                 }
-                for (output, value) in rest.iter().zip(&popped) {
-                    self.set_variable(output, value);
-                }
-                self.set_variable(variable, &items.join(";"));
+                let kept: Vec<String> = items
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(index, _)| !taken.contains(index))
+                    .map(|(_, item)| item)
+                    .collect();
+                self.set_variable(variable, &kept.join(";"));
             }
             "REMOVE_ITEM" => {
-                items.retain(|item| !rest.contains(item));
+                items.retain(|item| !rest.iter().any(|removed| removed == item_text(item)));
                 self.set_variable(variable, &items.join(";"));
             }
             "REMOVE_AT" => {
-                let length = items.len();
-                let removed: HashSet<usize> = rest.iter().filter_map(|index| list_index(index, length)).collect();
+                let removed: HashSet<usize> = rest
+                    .iter()
+                    .filter_map(|index| list_index(index, visible.len()))
+                    .map(|index| visible[index])
+                    .collect();
                 let kept: Vec<String> = items
                     .into_iter()
                     .enumerate()
@@ -657,9 +706,9 @@ impl Interpreter {
             "SORT" => {
                 let insensitive = rest.windows(2).any(|pair| pair[0] == "CASE" && pair[1] == "INSENSITIVE");
                 if insensitive {
-                    items.sort_by_key(|item| item.to_lowercase());
+                    items.sort_by_key(|item| item_text(item).to_lowercase());
                 } else {
-                    items.sort();
+                    items.sort_by(|left, right| item_text(left).cmp(item_text(right)));
                 }
                 if rest.windows(2).any(|pair| pair[0] == "ORDER" && pair[1] == "DESCENDING") {
                     items.reverse();
@@ -669,16 +718,50 @@ impl Interpreter {
             "FILTER" => {
                 let [mode, _, pattern, ..] = rest else { return };
                 let Some(pattern) = self.compile_regex(command, pattern) else { return };
-                items.retain(|item| pattern.is_match(item) == (mode == "INCLUDE"));
+                items.retain(|item| pattern.is_match(item_text(item)) == (mode == "INCLUDE"));
                 self.set_variable(variable, &items.join(";"));
             }
-            "TRANSFORM" => self.list_transform(command, variable, items, rest),
+            "TRANSFORM" => self.list_transform(command, variable, items, &visible, rest),
             _ => self.warn(command, &format!("list({operation}) is not supported")),
         }
     }
 
-    /// list(TRANSFORM var ACTION [args] [AT i... | FOR a b [step] | REGEX r] [OUTPUT_VARIABLE out]).
-    fn list_transform(&mut self, command: &Command, variable: &str, mut items: Vec<String>, rest: &[String]) {
+    /// The options whose values change what `read` gives for a list with conditional items, or None when they change
+    /// nothing.
+    fn options_changing(&self, items: &[String], read: &dyn Fn(&[String]) -> Option<(String, String)>) -> Option<String> {
+        let mut names: Vec<String> = Vec::new();
+        for item in items {
+            let Some((condition, _)) = model::split_conditional_item(item) else {
+                continue;
+            };
+            for atom in condition_atoms(&condition) {
+                if self.options.contains_key(&atom) && !names.contains(&atom) {
+                    names.push(atom);
+                }
+            }
+        }
+        if names.is_empty() {
+            return None;
+        }
+
+        let defaults = self.option_defaults();
+        let expected = read(&resolved_items(items, &defaults));
+        let changes = names.len() > MAX_TRIED_OPTIONS
+            || (1u32..(1 << names.len())).any(|flipped| {
+                let mut options = defaults.clone();
+                for (index, name) in names.iter().enumerate() {
+                    if flipped & (1 << index) != 0 {
+                        options.insert(name.clone(), !defaults.get(name).copied().unwrap_or(false));
+                    }
+                }
+                read(&resolved_items(items, &options)) != expected
+            });
+        changes.then(|| names.join(", "))
+    }
+
+    /// list(TRANSFORM var ACTION [args] [AT i... | FOR a b [step] | REGEX r] [OUTPUT_VARIABLE out]). Indexes count the
+    /// items this machine has (`visible`); a conditional item is transformed inside its condition.
+    fn list_transform(&mut self, command: &Command, variable: &str, mut items: Vec<String>, visible: &[usize], rest: &[String]) {
         let Some((action, rest)) = rest.split_first() else { return };
         let argument_count = match action.as_str() {
             "APPEND" | "PREPEND" => 1,
@@ -704,8 +787,8 @@ impl Interpreter {
                 "AT" => {
                     let mut indexes = HashSet::new();
                     position += 1;
-                    while let Some(index) = rest.get(position).and_then(|index| list_index(index, items.len())) {
-                        indexes.insert(index);
+                    while let Some(index) = rest.get(position).and_then(|index| list_index(index, visible.len())) {
+                        indexes.insert(visible[index]);
                         position += 1;
                     }
                     selected = Some(indexes);
@@ -717,7 +800,8 @@ impl Interpreter {
                         [start, stop, step, ..] => (*start, *stop, (*step).max(1)),
                         _ => (0, 0, 1),
                     };
-                    selected = Some((start..=stop).step_by(step).collect());
+                    let stop = stop.min(visible.len().saturating_sub(1));
+                    selected = Some((start..=stop).step_by(step).filter_map(|index| visible.get(index).copied()).collect());
                     position += 1 + numbers.len().min(3);
                 }
                 "REGEX" => {
@@ -734,28 +818,43 @@ impl Interpreter {
         } else {
             None
         };
+        let mut case_changed = Vec::new();
         for (index, item) in items.iter_mut().enumerate() {
+            let (condition, text) = match model::split_conditional_item(item) {
+                Some((condition, text)) => (Some(condition), text.to_string()),
+                None => (None, item.clone()),
+            };
             let chosen = selected.as_ref().map_or(true, |indexes| indexes.contains(&index))
-                && selector_regex.as_ref().map_or(true, |pattern| pattern.is_match(item));
+                && selector_regex.as_ref().map_or(true, |pattern| pattern.is_match(&text));
             if !chosen {
                 continue;
             }
 
-            *item = match action.as_str() {
-                "APPEND" => format!("{item}{}", action_args[0]),
-                "PREPEND" => format!("{}{item}", action_args[0]),
-                "TOLOWER" => item.to_lowercase(),
-                "TOUPPER" => item.to_uppercase(),
-                "STRIP" => item.trim().to_string(),
-                "GENEX_STRIP" => strip_genex(item),
+            let transformed = match action.as_str() {
+                "APPEND" => format!("{text}{}", action_args[0]),
+                "PREPEND" => format!("{}{text}", action_args[0]),
+                "TOLOWER" | "TOUPPER" => {
+                    let (converted, host_value) = self.change_case(&text, action == "TOUPPER");
+                    case_changed.extend(host_value);
+                    converted
+                }
+                "STRIP" => text.trim().to_string(),
+                "GENEX_STRIP" => strip_genex(&text),
                 "REPLACE" => match &replace_regex {
-                    Some(pattern) => pattern.replace_all(item, cmake_replacement(&action_args[1]).as_str()).into_owned(),
-                    None => item.clone(),
+                    Some(pattern) => pattern.replace_all(&text, cmake_replacement(&action_args[1]).as_str()).into_owned(),
+                    None => text,
                 },
-                _ => item.clone(),
+                _ => text,
+            };
+            *item = match condition {
+                Some(condition) => model::conditional_item(&condition, &transformed),
+                None => transformed,
             };
         }
 
+        if let Some(value) = case_changed.first() {
+            self.warn_platform_case(command, &format!("list(TRANSFORM {variable} {action})"), value);
+        }
         self.set_variable(&output, &items.join(";"));
     }
 
@@ -786,11 +885,10 @@ impl Interpreter {
             }
             "TOLOWER" | "TOUPPER" => {
                 let [input, output, ..] = rest else { return };
-                let value = if operation == "TOLOWER" {
-                    input.to_lowercase()
-                } else {
-                    input.to_uppercase()
-                };
+                let (value, host_value) = self.change_case(input, operation == "TOUPPER");
+                if let Some(host_value) = host_value {
+                    self.warn_platform_case(command, &format!("string({operation})"), &host_value);
+                }
                 self.set_variable(output, &value);
             }
             "LENGTH" => {
@@ -806,13 +904,7 @@ impl Interpreter {
                     return;
                 }
 
-                let begin: usize = begin.parse().unwrap_or(0).min(input.len());
-                let length: i64 = length.parse().unwrap_or(-1);
-                let end = if length < 0 {
-                    input.len()
-                } else {
-                    (begin + length as usize).min(input.len())
-                };
+                let (begin, end) = substring_range(begin, length, input.len());
                 self.set_variable(output, input.get(begin..end).unwrap_or(""));
             }
             "STRIP" => {
@@ -825,7 +917,13 @@ impl Interpreter {
             }
             "REPEAT" => {
                 let [input, count, output, ..] = rest else { return };
-                self.set_variable(output, &input.repeat(count.parse().unwrap_or(0)));
+                let count: usize = count.parse().unwrap_or(0);
+                if input.len().saturating_mul(count) > MAX_REPEATED_LENGTH {
+                    self.warn(command, &format!("string(REPEAT) of {count} copies is too long to convert; left empty"));
+                    self.set_variable(output, "");
+                    return;
+                }
+                self.set_variable(output, &input.repeat(count));
             }
             "REPLACE" => {
                 let [search, replacement, output, inputs @ ..] = rest else { return };
@@ -911,6 +1009,25 @@ impl Interpreter {
             }
             _ => self.warn(command, &format!("string({operation}) is not supported")),
         }
+    }
+
+    /// Text in upper or lower case, and whether it held a platform value (the compiler's ID, the system's name): that
+    /// cannot stay symbolic once its case changes, so it becomes this machine's value (given back for the warning).
+    /// Anvil's placeholders (`{out}`, `{config}`) keep their case.
+    fn change_case(&self, text: &str, upper: bool) -> (String, Option<String>) {
+        let host = self.marker_free_text(text);
+        let converted = change_case_keeping_placeholders(&host, upper);
+        let from_platform = host != text;
+        (converted.clone(), from_platform.then_some(converted))
+    }
+
+    fn warn_platform_case(&mut self, command: &Command, what: &str, value: &str) {
+        let message = if value.contains("{config}") {
+            format!("{what} of the build type keeps the profile's own case (`{{config}}`: Debug, Release)")
+        } else {
+            format!("{what} of a platform or compiler value gives this machine's (`{value}`); what tests the result holds as on this machine only")
+        };
+        self.warn(command, &message);
     }
 
     /// string(REGEX MATCH|MATCHALL|REPLACE ...); sets CMAKE_MATCH_<n> as CMake does.
@@ -1043,8 +1160,7 @@ impl Interpreter {
 
     /// Replaces @VAR@ (and ${VAR} unless `only_at`), as configure_file and string(CONFIGURE) do.
     pub(super) fn configure_text(&self, text: &str, only_at: bool) -> String {
-        let at_pattern = regex::Regex::new(r"@([A-Za-z_][A-Za-z0-9_]*)@").unwrap();
-        let replaced = at_pattern
+        let replaced = CONFIGURE_TEXT_AT
             .replace_all(text, |captures: &regex::Captures| self.get_variable(&captures[1]).unwrap_or_default())
             .into_owned();
 
@@ -1100,7 +1216,7 @@ impl Interpreter {
                     options.get(position + 1)?.parse::<usize>().ok()
                 };
                 let start = number("OFFSET").unwrap_or(0).min(text.len());
-                let end = number("LIMIT").map_or(text.len(), |limit| (start + limit).min(text.len()));
+                let end = number("LIMIT").map_or(text.len(), |limit| start.saturating_add(limit).min(text.len()));
                 let text = String::from_utf8_lossy(&text.as_bytes()[start..end]);
                 self.set_variable(output, &text);
             }
@@ -1250,7 +1366,7 @@ impl Interpreter {
             let depth = if recursive || full_pattern.contains("**") {
                 usize::MAX
             } else {
-                full_pattern[base.len()..].matches('/').count()
+                full_pattern.strip_prefix(base.as_str()).unwrap_or(&full_pattern).matches('/').count()
             };
             let mut matched: Vec<PathBuf> = walkdir::WalkDir::new(&base)
                 .min_depth(1)
@@ -1634,17 +1750,26 @@ impl Interpreter {
     }
 
     /// find_package(): remembered, so its imported targets map to dependencies. A REQUIRED package is found, and so is
-    /// an optional one Anvil has (Threads, Python) or can add (a known port, one in vcpkg.json, a fetched one); other
-    /// optional ones are not, as on a machine without them.
-    fn command_find_package(&mut self, args: &[String]) {
+    /// an optional one Anvil has (Threads, Python) or can add (a known port, one in vcpkg.json, a fetched one, a port
+    /// in the vcpkg checkout); other optional ones are not, as on a machine without them, and the warning says so.
+    fn command_find_package(&mut self, command: &Command, args: &[String]) {
         let Some(name) = args.first() else { return };
         let required = args.iter().any(|word| word == "REQUIRED");
-        let found = required || self.provides_package(name);
+        let absent_because = if required { None } else { self.package_absent_because(name) };
+        let found = absent_because.is_none();
 
         let found_value = if found { "ON" } else { "OFF" };
         self.set_variable(&format!("{name}_FOUND"), found_value);
         self.set_variable(&format!("{}_FOUND", name.to_uppercase()), found_value);
-        if !found {
+        if let Some(reason) = absent_because {
+            let when = self
+                .current_condition()
+                .map(|condition| format!(" (when `{condition}`)"))
+                .unwrap_or_default();
+            self.warn(
+                command,
+                &format!("find_package({name}){when} is optional and {reason}, so it is taken as not found: what {name}_FOUND turns on is left out"),
+            );
             return;
         }
         if !self.packages.contains(name) {
@@ -1693,9 +1818,9 @@ impl Interpreter {
         }
     }
 
-    /// Is an optional package one Anvil has or adds: a system package, a port it knows, one in the project's
-    /// vcpkg.json, or one fetched with FetchContent or CPM?
-    fn provides_package(&mut self, name: &str) -> bool {
+    /// Why an optional package is not one Anvil has or adds (a system package, a port it knows, one in the project's
+    /// vcpkg.json, one fetched with FetchContent or CPM, a port in the vcpkg checkout), or None when it is.
+    fn package_absent_because(&mut self, name: &str) -> Option<String> {
         let normalized = |text: &str| text.to_lowercase().replace(['-', '_'], "");
         let wanted = normalized(name);
 
@@ -1707,8 +1832,47 @@ impl Interpreter {
             .iter()
             .any(|(pattern, _)| normalized(pattern.trim_end_matches("::")) == wanted);
         let fetched = self.fetched.keys().any(|fetched| normalized(fetched) == wanted);
+        if SYSTEM_PACKAGES.contains(&name) || in_manifest || known_port || fetched {
+            return None;
+        }
 
-        SYSTEM_PACKAGES.contains(&name) || in_manifest || known_port || fetched
+        // A port of the package's name, as the emitter looks its imported targets up; not one that needs this project
+        // (harfbuzz for freetype), which vcpkg cannot install for it
+        let lower = name.to_lowercase();
+        let vcpkg = self.builtin.vcpkg.get_or_insert_with(|| crate::vcpkg::Instance::select(None).ok());
+        let Some(instance) = vcpkg.as_ref() else {
+            return Some("no vcpkg was found to take a port from".into());
+        };
+        let Some(port) = [lower.clone(), lower.replace('_', "-")]
+            .into_iter()
+            .find(|port| instance.has_port(port) == Some(true))
+        else {
+            return Some("Anvil has no port for it".into());
+        };
+        let project = self.project_name.as_deref().map(normalized).unwrap_or_default();
+        if port_dependencies(&instance.root, &port)
+            .iter()
+            .any(|dependency| normalized(dependency) == project)
+        {
+            return Some(format!("its port `{port}` depends on this project"));
+        }
+        None
+    }
+
+    /// Is a program on PATH, in one of `folders`, or among the MSVC tools (dumpbin beside link.exe, which build steps
+    /// find on the toolchain's PATH)?
+    fn finds_program(&mut self, name: &str, folders: &[PathBuf]) -> bool {
+        let in_folder = |folder: &Path| {
+            ["", ".exe", ".bat", ".cmd"]
+                .iter()
+                .any(|extension| folder.join(format!("{name}{extension}")).is_file())
+        };
+        if util::which(name).is_some() || folders.iter().any(|folder| in_folder(folder)) {
+            return true;
+        }
+
+        let tool_folders = self.builtin.tool_folders.get_or_insert_with(msvc_tool_folders);
+        tool_folders.iter().any(|folder| in_folder(folder))
     }
 
     /// pkg_check_modules(PREFIX [REQUIRED] [IMPORTED_TARGET] modules...): PkgConfig::PREFIX and PREFIX_LIBRARIES.
@@ -1755,14 +1919,17 @@ impl Interpreter {
                     vec![first_name.clone()]
                 };
                 let folders: Vec<PathBuf> = keywords.list("PATHS").iter().chain(&keywords.list("HINTS")).map(PathBuf::from).collect();
-                let found = names.iter().any(|name| {
-                    util::which(name).is_some()
-                        || folders.iter().any(|folder| {
-                            ["", ".exe", ".bat", ".cmd"]
-                                .iter()
-                                .any(|extension| folder.join(format!("{name}{extension}")).is_file())
-                        })
-                });
+                let found = names.iter().any(|name| self.finds_program(name, &folders));
+                if !found {
+                    let when = self
+                        .current_condition()
+                        .map(|condition| format!(" (when `{condition}`)"))
+                        .unwrap_or_default();
+                    self.warn(
+                        command,
+                        &format!("find_program({variable} {}){when}: not found on this machine, so build steps and tests that run it are left out; install it and convert again to keep them", names.join(" ")),
+                    );
+                }
                 let value = if found { first_name } else { format!("{variable}-NOTFOUND") };
                 self.set_variable(variable, &value);
             }
@@ -1954,15 +2121,14 @@ impl Interpreter {
         let ending = &line[body.len()..];
 
         // #cmakedefine VAR rest: `#define VAR rest`, or `/* #undef VAR */`; #cmakedefine01 VAR: `#define VAR 1` or 0
-        let define = regex::Regex::new(r"#([ \t]*)cmakedefine[ \t]+([A-Za-z0-9_]*)").unwrap();
-        let define01 = regex::Regex::new(r"#([ \t]*)cmakedefine01[ \t]+([A-Za-z0-9_]*)").unwrap();
-        let body = if let Some(captures) = define.captures(body) {
+        let has_define = body.contains("cmakedefine");
+        let body = if let Some(captures) = has_define.then(|| CMAKEDEFINE.captures(body)).flatten() {
             let indent = &captures[1];
             match value(&captures[2]).0 {
                 true => body.replacen(&format!("#{indent}cmakedefine"), &format!("#{indent}define"), 1),
                 false => format!("/* #undef {} */", &captures[2]),
             }
-        } else if let Some(captures) = define01.captures(body) {
+        } else if let Some(captures) = has_define.then(|| CMAKEDEFINE01.captures(body)).flatten() {
             let indent = &captures[1];
             let replaced = body.replacen(&format!("#{indent}cmakedefine01"), &format!("#{indent}define"), 1);
             format!("{replaced} {}", if value(&captures[2]).0 { 1 } else { 0 })
@@ -1979,11 +2145,13 @@ impl Interpreter {
                 text
             }
         };
-        let at_pattern = regex::Regex::new(r"@([A-Za-z0-9_./+-]+)@").unwrap();
-        let mut body = at_pattern.replace_all(&body, substitute).into_owned();
-        if !only_at {
-            let dollar_pattern = regex::Regex::new(r"\$\{([A-Za-z0-9_./+-]+)\}").unwrap();
-            body = dollar_pattern.replace_all(&body, substitute).into_owned();
+        let mut body = if body.contains('@') {
+            CONFIGURE_AT.replace_all(&body, substitute).into_owned()
+        } else {
+            body
+        };
+        if !only_at && body.contains('$') {
+            body = CONFIGURE_DOLLAR.replace_all(&body, substitute).into_owned();
             if body.contains("$ENV{") || body.contains("${") {
                 body = self.expand(&body);
             }
@@ -1993,9 +2161,49 @@ impl Interpreter {
     }
 
     /// A variable as configure_file reads it: whether it is on, and its text. One that depends on a condition (an
-    /// option, a platform, a check's result) takes `choice`'s answer for it.
+    /// option, a platform, a check's result) takes `choice`'s answer for it: a type's size by platform, the items
+    /// a branch not taken here set where `choice` takes the branch, an option or check's result as on or off.
     fn configure_value(&self, name: &str, choice: &dyn Fn(&str) -> bool) -> (bool, String) {
         let value = self.get_variable(name);
+
+        if let Some(size) = self
+            .builtin
+            .type_sizes
+            .get(name)
+            .filter(|size| value.as_deref() == Some(size.host.as_str()))
+        {
+            // Every condition is read, so each choice of them sees the same ones
+            let holding: Vec<bool> = size.cases.iter().map(|(condition, _)| choice(condition)).collect();
+            let text = size
+                .cases
+                .iter()
+                .zip(holding)
+                .find(|(_, holds)| *holds)
+                .map_or(&size.otherwise, |((_, size), _)| size)
+                .clone();
+            return (!text.is_empty(), text);
+        }
+
+        if let Some(value) = value.as_deref().filter(|value| value.contains("$<$<BOOL:")) {
+            let mut conditional = false;
+            let mut kept = Vec::new();
+            for item in model::list_elements(value) {
+                match model::split_conditional_item(&item) {
+                    Some((condition, text)) => {
+                        conditional = true;
+                        if choice(&condition) {
+                            kept.push(text.to_string());
+                        }
+                    }
+                    None => kept.push(item),
+                }
+            }
+            if conditional {
+                let text = self.marker_free_text(&kept.join(";"));
+                return (model::constant_truth(&text).unwrap_or(true), text);
+            }
+        }
+
         let truth = match &value {
             Some(_) => self.truthiness(name, false),
             None => self.option_truth(name).unwrap_or(Truth::Known(false)),
@@ -2012,7 +2220,16 @@ impl Interpreter {
                 };
                 (on, text.to_string())
             }
-            Truth::Known(on) => (on, self.host_text(&value.unwrap_or_default())),
+            Truth::Known(on) => (on, self.marker_free_text(&value.unwrap_or_default())),
+        }
+    }
+
+    /// Text as this machine has it (host_text), skipping the work for text without platform or check markers.
+    fn marker_free_text(&self, text: &str) -> String {
+        if text.contains('\u{1}') {
+            self.host_text(text)
+        } else {
+            text.to_string()
         }
     }
 
@@ -2086,11 +2303,8 @@ impl Interpreter {
             "check_struct_has_member" => (args.get(3).cloned(), names_truth(&names(2))),
             "check_type_size" => {
                 // check_type_size(type VAR): VAR is its size, HAVE_VAR whether it exists
-                let size = TYPE_SIZES.iter().find(|(name, _)| *name == arg(0)).map(|(_, size)| size.to_string());
-                if let (Some(variable), Some(size)) = (args.get(1), size) {
-                    if self.get_variable(variable).is_none() {
-                        self.set_variable(variable, &size);
-                    }
+                if let Some(variable) = args.get(1) {
+                    self.check_type_size(command, &arg(0), variable);
                 }
                 (args.get(1).map(|variable| format!("HAVE_{variable}")), names_truth(&names(0)))
             }
@@ -2104,12 +2318,18 @@ impl Interpreter {
             }
         };
 
-        // Flags and libraries the check is made with count too
+        // Flags and libraries the check is made with count too, unless they work on this machine: then they may be
+        // the ones the branch this machine takes set (`-WX` for MSVC where GCC gets `-Werror`), and say nothing about
+        // the other platforms, which set their own
         let required_flags = self.get_variable("CMAKE_REQUIRED_FLAGS").unwrap_or_default();
         let required_libraries = model::split_list(&self.get_variable("CMAKE_REQUIRED_LIBRARIES").unwrap_or_default());
-        let truth = required_libraries.iter().fold(truth.and(flags_truth(&required_flags)), |truth, library| {
-            truth.and(library_truth(library))
-        });
+        let required = required_libraries
+            .iter()
+            .fold(flags_truth(&required_flags), |truth, library| truth.and(library_truth(library)));
+        let truth = match required {
+            Truth::Depends(condition) if model::holds_on_host(&condition, &|_| None) => truth,
+            required => truth.and(required),
+        };
 
         let Some(variable) = result_variable else { return };
         if self.get_variable(&variable).is_some() {
@@ -2123,6 +2343,26 @@ impl Interpreter {
             Truth::Known(found) => if found { "1" } else { "" }.to_string(),
         };
         self.set_variable(&variable, &value);
+    }
+
+    /// check_type_size(type VAR): VAR is the size on this machine; where it differs by platform, configured files get
+    /// each platform's (see configure_value). A type not in TYPE_SIZES has no size known without compiling.
+    fn check_type_size(&mut self, command: &Command, type_name: &str, variable: &str) {
+        if self.get_variable(variable).is_some() {
+            return;
+        }
+        let Some(size) = type_size(type_name) else {
+            self.warn(
+                command,
+                &format!("check_type_size({type_name}): its size is not known without compiling; {variable} is left empty, so set it by hand where it is used"),
+            );
+            return;
+        };
+
+        self.set_variable(variable, &size.host);
+        if !size.cases.is_empty() {
+            self.builtin.type_sizes.insert(variable.to_string(), size);
+        }
     }
 
     /// get_property(var TARGET t PROPERTY p) and GLOBAL properties; other scopes read as empty.
@@ -2306,6 +2546,7 @@ const PLATFORM_NAMES: &[(&str, &str)] = &[
     ("semaphore.h", "!msvc"),
     ("libgen.h", "!msvc"),
     ("getopt.h", "!msvc"),
+    ("sys/file.h", "!msvc"),
     // POSIX headers
     ("dlfcn.h", "!windows"),
     ("sys/mman.h", "!windows"),
@@ -2319,7 +2560,6 @@ const PLATFORM_NAMES: &[(&str, &str)] = &[
     ("sys/utsname.h", "!windows"),
     ("sys/random.h", "!windows"),
     ("sys/syscall.h", "!windows"),
-    ("sys/file.h", "!windows"),
     ("sys/poll.h", "!windows"),
     ("sys/sysctl.h", "!windows"),
     ("sys/statvfs.h", "!windows"),
@@ -2349,7 +2589,7 @@ const PLATFORM_NAMES: &[(&str, &str)] = &[
     ("process.h", "windows"),
     ("winsock2.h", "windows"),
     ("ws2tcpip.h", "windows"),
-    ("intrin.h", "msvc"),
+    ("intrin.h", "windows"),
     // POSIX functions and types
     ("fseeko", "!msvc"),
     ("ftello", "!msvc"),
@@ -2360,18 +2600,20 @@ const PLATFORM_NAMES: &[(&str, &str)] = &[
     ("nanosleep", "!msvc"),
     ("usleep", "!msvc"),
     ("pthread_create", "!msvc"),
+    ("fopen64", "linux | mingw"),
+    ("pthread_setname_np", "!msvc"),
+    ("getpagesize", "!msvc"),
+    ("strtok_r", "!msvc"),
     ("ssize_t", "!msvc"),
     ("__int128", "!msvc"),
     ("arc4random", "!windows"),
     ("arc4random_buf", "!windows"),
     ("getentropy", "!windows"),
-    ("getpagesize", "!windows"),
     ("mmap", "!windows"),
     ("munmap", "!windows"),
     ("dlopen", "!windows"),
     ("posix_memalign", "!windows"),
     ("strerror_r", "!windows"),
-    ("strtok_r", "!windows"),
     ("localtime_r", "!windows"),
     ("gmtime_r", "!windows"),
     ("sysconf", "!windows"),
@@ -2383,7 +2625,6 @@ const PLATFORM_NAMES: &[(&str, &str)] = &[
     ("strndup", "!windows"),
     ("strlcpy", "!windows"),
     ("strlcat", "!windows"),
-    ("pthread_setname_np", "!windows"),
     ("u_int32_t", "!windows"),
     ("u_int64_t", "!windows"),
     ("getrandom", "linux"),
@@ -2391,7 +2632,7 @@ const PLATFORM_NAMES: &[(&str, &str)] = &[
     ("memalign", "linux"),
     ("pipe2", "linux"),
     ("getauxval", "linux"),
-    ("off64_t", "linux"),
+    ("off64_t", "linux | mingw"),
     // Windows functions and types
     ("_fseeki64", "windows"),
     ("_ftelli64", "windows"),
@@ -2404,7 +2645,7 @@ const PLATFORM_NAMES: &[(&str, &str)] = &[
 
 // Libraries check_library_exists() and CMAKE_REQUIRED_LIBRARIES find only where the condition holds
 const PLATFORM_LIBRARIES: &[(&str, &str)] = &[
-    ("m", "!windows"),
+    ("m", "!msvc"),
     ("dl", "!windows"),
     ("rt", "linux"),
     ("pthread", "!msvc"),
@@ -2413,49 +2654,145 @@ const PLATFORM_LIBRARIES: &[(&str, &str)] = &[
     ("execinfo", "!windows"),
 ];
 
-// What check_type_size() reports for a type of the same size everywhere (64-bit targets)
-const TYPE_SIZES: &[(&str, &str)] = &[
-    ("char", "1"),
-    ("short", "2"),
-    ("int", "4"),
-    ("long long", "8"),
-    ("__int64", "8"),
-    ("size_t", "8"),
-    ("ssize_t", "8"),
-    ("ptrdiff_t", "8"),
-    ("intptr_t", "8"),
-    ("uintptr_t", "8"),
-    ("void*", "8"),
-    ("void *", "8"),
-    ("off64_t", "8"),
-    ("int16_t", "2"),
-    ("uint16_t", "2"),
-    ("int32_t", "4"),
-    ("uint32_t", "4"),
-    ("int64_t", "8"),
-    ("uint64_t", "8"),
-    ("float", "4"),
-    ("double", "8"),
+// check_type_size()'s sizes: (types, sizes by condition (the first that holds), size otherwise). An empty size: the
+// type does not exist there. 32-bit targets are x86 and arm; Windows is LLP64 (long is 4 bytes) and MSVC's long
+// double is a double.
+const TYPE_SIZES: &[(&[&str], &[(&str, &str)], &str)] = &[
+    (&["char", "signed char", "unsigned char", "_Bool", "bool", "int8_t", "uint8_t"], &[], "1"),
+    (
+        &["short", "short int", "unsigned short", "unsigned short int", "int16_t", "uint16_t"],
+        &[],
+        "2",
+    ),
+    (&["int", "unsigned int", "unsigned", "int32_t", "uint32_t", "float"], &[], "4"),
+    (
+        &[
+            "long long",
+            "long long int",
+            "unsigned long long",
+            "unsigned long long int",
+            "int64_t",
+            "uint64_t",
+            "double",
+        ],
+        &[],
+        "8",
+    ),
+    (
+        &["long", "long int", "unsigned long", "unsigned long int"],
+        &[("windows | x86 | arm", "4")],
+        "8",
+    ),
+    (
+        &["size_t", "ptrdiff_t", "intptr_t", "uintptr_t", "void*", "char*"],
+        &[("x86 | arm", "4")],
+        "8",
+    ),
+    (&["ssize_t"], &[("msvc", ""), ("x86 | arm", "4")], "8"),
+    (&["wchar_t"], &[("windows", "2")], "4"),
+    (&["long double"], &[("msvc | (macos & arm64)", "8"), ("x86 & !windows", "12")], "16"),
+    (&["time_t"], &[("(x86 | arm) & !windows", "4")], "8"),
+    (&["off_t"], &[("windows | x86 | arm", "4")], "8"),
+    (&["off64_t"], &[("!(linux | mingw)", "")], "8"),
+    (&["__int64", "unsigned __int64"], &[("!windows", "")], "8"),
+    (&["__int128", "unsigned __int128"], &[("msvc | x86 | arm", "")], "16"),
+    (&["u_int32_t"], &[("windows", "")], "4"),
+    (&["u_int64_t"], &[("windows", "")], "8"),
 ];
+
+/// A type's sizes from TYPE_SIZES (any pointer is a void*'s size), with this machine's.
+fn type_size(type_name: &str) -> Option<TypeSize> {
+    let words: Vec<&str> = type_name.split_whitespace().collect();
+    let mut name = words.join(" ").replace(" *", "*");
+    if name.ends_with('*') {
+        name = "void*".into();
+    }
+    let (_, cases, otherwise) = TYPE_SIZES.iter().find(|(names, _, _)| names.contains(&name.as_str()))?;
+
+    let size_where = |holds: &dyn Fn(&str) -> bool| {
+        cases
+            .iter()
+            .find(|(condition, _)| holds(condition))
+            .map_or(*otherwise, |(_, size)| *size)
+            .to_string()
+    };
+    Some(TypeSize {
+        host: size_where(&|condition| model::holds_on_host(condition, &|_| None)),
+        cases: cases.iter().map(|(condition, size)| (condition.to_string(), size.to_string())).collect(),
+        otherwise: otherwise.to_string(),
+    })
+}
+
+// configure_file()'s patterns: #cmakedefine and #cmakedefine01 lines, @VAR@ and ${VAR}
+static CMAKEDEFINE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"#([ \t]*)cmakedefine[ \t]+([A-Za-z0-9_]*)").unwrap());
+static CMAKEDEFINE01: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"#([ \t]*)cmakedefine01[ \t]+([A-Za-z0-9_]*)").unwrap());
+static CONFIGURE_AT: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"@([A-Za-z0-9_./+-]+)@").unwrap());
+static CONFIGURE_DOLLAR: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\$\{([A-Za-z0-9_./+-]+)\}").unwrap());
+// string(CONFIGURE)'s @VAR@
+static CONFIGURE_TEXT_AT: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"@([A-Za-z_][A-Za-z0-9_]*)@").unwrap());
+// A check's source: its #includes and words
+static SOURCE_INCLUDE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"#\s*include\s*[<"]([^>"]+)[>"]"#).unwrap());
+static SOURCE_WORD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").unwrap());
+// A CMake regex replacement's group reference (\1)
+static REPLACEMENT_GROUP: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\\(\d)").unwrap());
 
 // Macros a check's source tests to pick a platform's code: then its names say nothing about where it compiles
 const PLATFORM_MACROS: &[&str] = &["_WIN32", "_MSC_VER", "WIN32", "__GNUC__", "__clang__", "__MINGW32__"];
 
-/// Where compiler or linker flags work: another compiler's syntax (`/W4` for cl, `-Wextra` for the rest) only there.
+/// Where compiler or linker flags pass check_*_flag() as CMake runs it: cl's options (`/W4`, and spelled with a dash,
+/// `-W4`) with MSVC, GCC's (`-Wextra`) with the rest, and a few with both. cl's options that fail its checks
+/// (CL_FAILING_FLAGS) pass nowhere when spelled with a slash.
 fn flags_truth(flags: &str) -> Truth {
     flags.split_whitespace().fold(Truth::Known(true), |truth, flag| {
         let flag = flag.strip_prefix("LINKER:").unwrap_or(flag);
-        let universal = ["-D", "-I", "-U"].iter().any(|prefix| flag.starts_with(prefix));
-        let single = if flag.starts_with('/') {
-            Truth::Depends("msvc".into())
-        } else if flag.starts_with('-') && !universal {
-            Truth::Depends("!msvc".into())
+        let single = if let Some(name) = flag.strip_prefix('/') {
+            if CL_FAILING_FLAGS.is_match(name) {
+                Truth::Known(false)
+            } else {
+                Truth::Depends("msvc".into())
+            }
+        } else if flag == "-fsanitize=address" {
+            // cl has AddressSanitizer too; MinGW's GCC has no runtime for it
+            Truth::Depends("!mingw".into())
+        } else if let Some(name) = flag.strip_prefix('-') {
+            let universal = ["D", "I", "U"].iter().any(|prefix| name.starts_with(prefix)) || BOTH_COMPILERS_FLAGS.is_match(name);
+            match (universal, is_cl_flag(name)) {
+                (true, _) => Truth::Known(true),
+                (false, true) => Truth::Depends("msvc".into()),
+                (false, false) => Truth::Depends("!msvc".into()),
+            }
         } else {
             Truth::Known(true)
         };
         truth.and(single)
     })
 }
+
+/// Is a flag (without its `/` or `-`) one cl takes in check_*_flag()? Those conflicting with the /RTC1 of the Debug
+/// flags that checks compile with (/O1, /O2, /Ox) fail there.
+fn is_cl_flag(name: &str) -> bool {
+    CL_FLAGS.is_match(name) && !CL_FAILING_FLAGS.is_match(name)
+}
+
+// cl's options, which GCC rejects (or reads as something else) except BOTH_COMPILERS_FLAGS
+static CL_FLAGS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"^(W[0-4]|Wall|WX-?|w|w[1-4]\d+|w[deo]\d+|O[12dgistxy]-?|Ob[0-3]|EH[acrs-]+|Z[7iIlsfH]|Zc:.+|Zp\d*|",
+        r"G[RSyFwLdrzv]-?|Gm-?|MP\d*|M[DT]d?|LDd?|J|T[CP]|utf-8|(source|execution)-charset:.+|validate-charset-?|",
+        r"permissive-?|std:.+|bigobj|sdl-?|guard:.+|fp:.+|arch:.+|nologo|diagnostics:.+|external:.+|experimental:.+|",
+        r"RTC.+|Q[a-z_]+.*|openmp.*|volatile:.+|F[SCI].*|F[dop].+|analyze.*|constexpr:.+|favor:.+|kernel-?|await.*|",
+        r"Zm\d+|d[12].+|Brepro|JMC-?|fsanitize=address)$"
+    ))
+    .unwrap()
+});
+
+// cl's options that fail its checks: they conflict with /RTC1 (or are deprecated)
+static CL_FAILING_FLAGS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^O[12gx]$").unwrap());
+
+// Dash-spelled flags both cl and GCC pass: the same option (-Wall, -w, -Os, -MD, -std=), or one GCC reads as
+// another (-utf-8 is -u tf-8, -openmp is -o penmp, -external:W0 is -e xternal:W0)
+static BOTH_COMPILERS_FLAGS: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^(Wall|w|Os|MD|std=.+|utf-8|openmp.*|external:.+|FS|F[CI].*)$").unwrap());
 
 /// Where headers, functions and types exist, from PLATFORM_NAMES.
 fn names_truth(names: &[String]) -> Truth {
@@ -2496,10 +2833,8 @@ fn source_truth(source: &str) -> Truth {
         return truth;
     }
 
-    let include = regex::Regex::new(r#"#\s*include\s*[<"]([^>"]+)[>"]"#).unwrap();
-    let word = regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").unwrap();
-    let mut names: Vec<String> = include.captures_iter(source).map(|captures| captures[1].to_string()).collect();
-    names.extend(word.find_iter(source).map(|found| found.as_str().to_string()));
+    let mut names: Vec<String> = SOURCE_INCLUDE.captures_iter(source).map(|captures| captures[1].to_string()).collect();
+    names.extend(SOURCE_WORD.find_iter(source).map(|found| found.as_str().to_string()));
     names.retain(|name| PLATFORM_NAMES.iter().any(|(known, _)| known == name) || name.starts_with("linux/"));
     names.sort();
     names.dedup();
@@ -2610,6 +2945,42 @@ fn is_install_only(path: &Path) -> bool {
     package_file || name.ends_with(".pc") || name.ends_with(".pc.gen") || name.ends_with("-config") || name.ends_with(".vcxproj.user")
 }
 
+/// The folders of the MSVC tools (link.exe's, and the rest of the toolchain's PATH), when MSVC is installed.
+fn msvc_tool_folders() -> Vec<PathBuf> {
+    let platform = crate::platform::Platform::host();
+    let Ok(toolchain) = crate::toolchain::Toolchain::find_family(crate::toolchain::Family::Msvc, &platform) else {
+        return Vec::new();
+    };
+
+    let mut folders: Vec<PathBuf> = toolchain.linker.parent().map(Path::to_path_buf).into_iter().collect();
+    let path = toolchain.env.iter().find(|(name, _)| name.eq_ignore_ascii_case("PATH"));
+    if let Some((_, path)) = path {
+        folders.extend(std::env::split_paths(path));
+    }
+    folders
+}
+
+/// The ports a vcpkg port needs by default: its dependencies and its default features'.
+fn port_dependencies(vcpkg_root: &Path, port: &str) -> Vec<String> {
+    let manifest = std::fs::read_to_string(vcpkg_root.join("ports").join(port).join("vcpkg.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let Some(manifest) = manifest else { return Vec::new() };
+
+    let mut names = crate::vcpkg::dependency_names(manifest.get("dependencies"));
+    let default_features = manifest
+        .get("default-features")
+        .and_then(|features| features.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for feature in default_features {
+        let feature = feature.as_str().or_else(|| feature.get("name").and_then(|name| name.as_str()));
+        let dependencies = feature.and_then(|feature| manifest.get("features")?.get(feature)?.get("dependencies"));
+        names.extend(crate::vcpkg::dependency_names(dependencies));
+    }
+    names
+}
+
 /// The ports a project's vcpkg.json lists.
 fn manifest_ports(root: &Path) -> Vec<String> {
     let manifest = std::fs::read_to_string(root.join("vcpkg.json"))
@@ -2636,17 +3007,148 @@ fn manifest_ports(root: &Path) -> Vec<String> {
 /// A list index, negative from the end, checked against the length.
 fn list_index(text: &str, length: usize) -> Option<usize> {
     let index: i64 = text.parse().ok()?;
-    let resolved = if index < 0 { length as i64 + index } else { index };
+    let resolved = if index < 0 { (length as i64).checked_add(index)? } else { index };
 
     (0..length as i64).contains(&resolved).then_some(resolved as usize)
+}
+
+// Above this many options, list() does not try every choice of them and says the result may change
+const MAX_TRIED_OPTIONS: usize = 6;
+
+// The longest text string(REPEAT) makes
+const MAX_REPEATED_LENGTH: usize = 1 << 24;
+
+/// The text of a list item: a conditional item's inside.
+fn item_text(item: &str) -> &str {
+    model::split_conditional_item(item).map_or(item, |(_, text)| text)
+}
+
+/// The positions of a list's items this machine has with `options`: plain ones, and conditional ones whose condition
+/// holds.
+fn visible_items(items: &[String], options: &HashMap<String, bool>) -> Vec<usize> {
+    let lookup = |name: &str| options.get(name).copied();
+    (0..items.len())
+        .filter(|index| match model::split_conditional_item(&items[*index]) {
+            Some((condition, _)) => model::holds_on_host(&condition, &lookup),
+            None => true,
+        })
+        .collect()
+}
+
+/// A list as this machine has it with `options`: conditional items where their condition holds, as plain items.
+fn resolved_items(items: &[String], options: &HashMap<String, bool>) -> Vec<String> {
+    visible_items(items, options)
+        .into_iter()
+        .map(|index| item_text(&items[index]).to_string())
+        .collect()
+}
+
+/// list(LENGTH|GET|JOIN|SUBLIST|FIND) of `items`: the output variable and its value.
+fn list_read(operation: &str, items: &[String], rest: &[String]) -> Option<(String, String)> {
+    match operation {
+        "LENGTH" => Some((rest.first()?.clone(), items.len().to_string())),
+        "GET" => {
+            let (output, indexes) = rest.split_last()?;
+            let picked: Vec<&str> = indexes
+                .iter()
+                .filter_map(|index| list_index(index, items.len()))
+                .map(|index| items[index].as_str())
+                .collect();
+            Some((output.clone(), picked.join(";")))
+        }
+        "JOIN" => {
+            let [glue, output, ..] = rest else { return None };
+            Some((output.clone(), items.join(glue)))
+        }
+        "SUBLIST" => {
+            let [begin, length, output, ..] = rest else { return None };
+            let (begin, end) = substring_range(begin, length, items.len());
+            Some((output.clone(), items[begin..end].join(";")))
+        }
+        "FIND" => {
+            let [value, output, ..] = rest else { return None };
+            let index = items.iter().position(|item| item == value).map_or(-1, |index| index as i64);
+            Some((output.clone(), index.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// string(SUBSTRING) and list(SUBLIST)'s begin and length (-1: to the end) as a range within `length` items.
+fn substring_range(begin: &str, length: &str, total: usize) -> (usize, usize) {
+    let begin: usize = begin.parse().unwrap_or(0).min(total);
+    let length: i64 = length.parse().unwrap_or(-1);
+    let end = match usize::try_from(length) {
+        Ok(length) => begin.saturating_add(length).min(total),
+        Err(_) => total,
+    };
+    (begin, end)
+}
+
+/// The names a condition tests.
+fn condition_atoms(condition: &str) -> Vec<String> {
+    fn collect(condition: &crate::cond::Cond, atoms: &mut Vec<String>) {
+        use crate::cond::Cond;
+        match condition {
+            Cond::Atom(name) => {
+                if !atoms.contains(name) {
+                    atoms.push(name.clone());
+                }
+            }
+            Cond::Not(inner) => collect(inner, atoms),
+            Cond::And(left, right) | Cond::Or(left, right) => {
+                collect(left, atoms);
+                collect(right, atoms);
+            }
+        }
+    }
+
+    let mut atoms = Vec::new();
+    if let Ok(parsed) = crate::cond::parse(condition) {
+        collect(&parsed, &mut atoms);
+    }
+    atoms
+}
+
+/// Text in upper or lower case, except Anvil's placeholders (`{out}`, `{config}`, `{hash:...}`).
+fn change_case_keeping_placeholders(text: &str, upper: bool) -> String {
+    let mut output = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('{') {
+        let (before, from_brace) = rest.split_at(start);
+        output.push_str(&ascii_case(before, upper));
+        let placeholder_end = from_brace[1..]
+            .starts_with(|character: char| character.is_ascii_lowercase())
+            .then(|| from_brace.find('}'))
+            .flatten();
+        match placeholder_end {
+            Some(end) => {
+                output.push_str(&from_brace[..=end]);
+                rest = &from_brace[end + 1..];
+            }
+            None => {
+                output.push('{');
+                rest = &from_brace[1..];
+            }
+        }
+    }
+    output.push_str(&ascii_case(rest, upper));
+    output
+}
+
+/// CMake changes the case of ASCII letters only.
+fn ascii_case(text: &str, upper: bool) -> String {
+    if upper {
+        text.to_ascii_uppercase()
+    } else {
+        text.to_ascii_lowercase()
+    }
 }
 
 /// A CMake regex replacement (`\1`) in the regex crate's syntax (`${1}`).
 fn cmake_replacement(replacement: &str) -> String {
     let escaped = replacement.replace('$', "$$");
-    let group = regex::Regex::new(r"\\(\d)").unwrap();
-
-    group.replace_all(&escaped, "$${$1}").into_owned()
+    REPLACEMENT_GROUP.replace_all(&escaped, "$${$1}").into_owned()
 }
 
 /// Removes generator expressions from text.
@@ -2690,7 +3192,7 @@ fn glob_pattern(absolute: &str, recursive: bool) -> String {
     }
 
     let base = glob_base(absolute);
-    let rest = absolute[base.len()..].trim_start_matches('/');
+    let rest = absolute.strip_prefix(base.as_str()).unwrap_or(absolute).trim_start_matches('/');
     match rest.rsplit_once('/') {
         Some((folders, name)) => format!("{base}/{folders}/**/{name}"),
         None => format!("{base}/**/{rest}"),
@@ -2784,7 +3286,7 @@ fn math_unary(tokens: &[String], position: &mut usize) -> Option<i64> {
     *position += 1;
 
     match token.as_str() {
-        "-" => math_unary(tokens, position).map(|value| -value),
+        "-" => math_unary(tokens, position).map(i64::wrapping_neg),
         "+" => math_unary(tokens, position),
         "~" => math_unary(tokens, position).map(|value| !value),
         "(" => {
@@ -2841,6 +3343,348 @@ mod tests {
     fn replacement() {
         let pattern = regex::Regex::new(r"([a-z]+)-([0-9]+)").unwrap();
         assert_eq!(pattern.replace_all("abc-12", cmake_replacement(r"\2_\1$").as_str()), "12_abc$");
+    }
+
+    /// Runs a project made of the given files (CMakeLists.txt first) in a fresh temporary folder.
+    fn run(name: &str, files: &[(&str, &str)]) -> Interpreter {
+        let folder = std::env::temp_dir().join(format!("anvil-builtins-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        for (path, text) in files {
+            let file = folder.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+
+        let mut interpreter = Interpreter::new(&folder);
+        interpreter.run_root().unwrap();
+        let _ = std::fs::remove_dir_all(&folder);
+        interpreter
+    }
+
+    fn variable(interpreter: &Interpreter, name: &str) -> String {
+        interpreter.get_variable(name).unwrap_or_default()
+    }
+
+    /// The configured file's text written where `condition` holds.
+    fn written(interpreter: &Interpreter, condition: Option<&str>) -> String {
+        let write = interpreter
+            .configure_writes
+            .iter()
+            .find(|write| write.condition.as_deref() == condition)
+            .unwrap_or_else(|| panic!("no write under {condition:?}: {:?}", interpreter.configure_writes));
+        write.text.clone().unwrap()
+    }
+
+    #[test]
+    fn an_option_declared_in_a_branch_exists_only_there() {
+        let cmake = r#"
+include(CMakeDependentOption)
+option(OPT "o" OFF)
+if(UNIX)
+  option(USE_X11 "x11" ON)
+  cmake_dependent_option(USE_XI "xi" ON "OPT" OFF)
+endif()
+if(WIN32)
+  option(BOTH "b" OFF)
+else()
+  option(BOTH "b" ON)
+endif()
+"#;
+        let interpreter = run("option-branch", &[("CMakeLists.txt", cmake)]);
+
+        assert_eq!(interpreter.option_truth("USE_X11"), Some(Truth::Depends("USE_X11 & unix".into())));
+        assert_eq!(interpreter.option_truth("USE_XI"), Some(Truth::Depends("USE_XI & (unix & OPT)".into())));
+        assert_eq!(interpreter.option_truth("BOTH"), Some(Truth::Depends("BOTH".into())));
+        assert_eq!(interpreter.option_truth("OPT"), Some(Truth::Depends("OPT".into())));
+    }
+
+    #[test]
+    fn type_sizes_that_differ_by_platform_become_if_blocks() {
+        let cmake = r#"
+project(sizes C)
+include(CheckTypeSize)
+check_type_size("long" SIZEOF_LONG)
+check_type_size("unsigned  long" SIZEOF_ULONG)
+check_type_size(wchar_t SIZEOF_WCHAR_T)
+check_type_size("char *" SIZEOF_CHAR_P)
+check_type_size(int SIZEOF_INT)
+check_type_size("struct thing" SIZEOF_THING)
+configure_file(config.h.in config.h)
+"#;
+        let template = "#define SIZEOF_LONG @SIZEOF_LONG@\n#cmakedefine SIZEOF_WCHAR_T @SIZEOF_WCHAR_T@\n#define SIZEOF_INT ${SIZEOF_INT}\n";
+        let interpreter = run("type-sizes", &[("CMakeLists.txt", cmake), ("config.h.in", template)]);
+
+        let host_long = if cfg!(windows) { "4" } else { "8" };
+        assert_eq!(variable(&interpreter, "SIZEOF_LONG"), host_long);
+        assert_eq!(variable(&interpreter, "SIZEOF_ULONG"), host_long);
+        assert_eq!(variable(&interpreter, "SIZEOF_CHAR_P"), "8");
+        assert_eq!(variable(&interpreter, "SIZEOF_INT"), "4");
+
+        let text = written(&interpreter, None);
+        assert!(
+            text.contains("#define SIZEOF_LONG 4\n") && text.contains("#define SIZEOF_LONG 8\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("#define SIZEOF_WCHAR_T 2\n") && text.contains("#define SIZEOF_WCHAR_T 4\n"),
+            "{text}"
+        );
+        assert!(text.contains("#if !defined(_WIN32)") || text.contains("#if defined(_WIN32)"), "{text}");
+        assert!(text.contains("#define SIZEOF_INT 4\n"), "{text}");
+        assert!(!text.contains("SIZEOF_LONG \n"), "{text}");
+
+        assert!(interpreter
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("check_type_size(struct thing)")));
+    }
+
+    #[test]
+    fn type_size_table() {
+        let long_double = type_size("long double").unwrap();
+        assert_eq!(long_double.otherwise, "16");
+        assert_eq!(long_double.cases[0], ("msvc | (macos & arm64)".to_string(), "8".to_string()));
+        assert_eq!(type_size("ssize_t").unwrap().host, if cfg!(windows) { "" } else { "8" });
+        assert_eq!(type_size("int *").unwrap().otherwise, "8");
+        assert!(type_size("time_t").is_some() && type_size("off_t").is_some() && type_size("size_t").is_some());
+        assert!(type_size("struct stat").is_none());
+    }
+
+    #[test]
+    fn a_value_a_branch_sets_is_configured_where_it_runs() {
+        let cmake = r#"
+project(values C)
+option(USE_FOO "foo" OFF)
+if(USE_FOO)
+  set(FOO_VALUE 42)
+endif()
+configure_file(config.h.in config.h)
+"#;
+        let template = "#define FOO_VALUE \"@FOO_VALUE@\"\n#cmakedefine FOO_VALUE\n";
+        let interpreter = run("branch-value", &[("CMakeLists.txt", cmake), ("config.h.in", template)]);
+
+        assert_eq!(written(&interpreter, Some("USE_FOO")), "#define FOO_VALUE \"42\"\n#define FOO_VALUE\n");
+        assert_eq!(
+            written(&interpreter, Some("!USE_FOO")),
+            "#define FOO_VALUE \"\"\n/* #undef FOO_VALUE */\n"
+        );
+    }
+
+    #[test]
+    fn lists_count_the_items_this_machine_has() {
+        let cmake = r#"
+option(WITH_EXTRA "extra" OFF)
+set(TOOLS one)
+if(WITH_EXTRA)
+  list(APPEND TOOLS two)
+endif()
+if(UNIX)
+  list(APPEND TOOLS three)
+endif()
+list(APPEND TOOLS four)
+list(LENGTH TOOLS LEN)
+list(GET TOOLS -1 LAST)
+list(GET TOOLS 1 SECOND)
+list(FIND TOOLS four WHERE)
+list(JOIN TOOLS "," JOINED)
+set(COPY ${TOOLS})
+list(REMOVE_ITEM COPY two)
+list(TRANSFORM TOOLS APPEND .c OUTPUT_VARIABLE FILES)
+"#;
+        let interpreter = run("list-items", &[("CMakeLists.txt", cmake)]);
+
+        let (length, second, joined) = if cfg!(unix) {
+            ("3", "three", "one,three,four")
+        } else {
+            ("2", "four", "one,four")
+        };
+        assert_eq!(variable(&interpreter, "LEN"), length);
+        assert_eq!(variable(&interpreter, "LAST"), "four");
+        assert_eq!(variable(&interpreter, "SECOND"), second);
+        assert_eq!(variable(&interpreter, "WHERE"), if cfg!(unix) { "2" } else { "1" });
+        assert_eq!(variable(&interpreter, "JOINED"), joined);
+        assert!(!variable(&interpreter, "COPY").contains("two"));
+        let files = model::list_elements(&variable(&interpreter, "FILES"));
+        assert_eq!(files[0], "one.c");
+        assert_eq!(
+            model::split_conditional_item(&files[1]).map(|(condition, text)| (condition, text.to_string())),
+            Some(("WITH_EXTRA".into(), "two.c".into()))
+        );
+
+        // LENGTH, SECOND (on Windows) and JOINED change with WITH_EXTRA; LAST and WHERE (on Windows) do not
+        let warned: Vec<&String> = interpreter
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("options add (WITH_EXTRA)"))
+            .collect();
+        assert!(warned.iter().any(|warning| warning.contains("list(LENGTH TOOLS)")), "{warned:?}");
+        assert!(
+            !warned
+                .iter()
+                .any(|warning| warning.contains("list(GET TOOLS)") && warning.contains(":12:")),
+            "{warned:?}"
+        );
+    }
+
+    #[test]
+    fn list_reads() {
+        let items = vec!["a".to_string(), model::conditional_item("OPT", "b"), model::conditional_item("!OPT", "c")];
+        let options: HashMap<String, bool> = [("OPT".to_string(), true)].into();
+        assert_eq!(resolved_items(&items, &options), vec!["a", "b"]);
+        assert_eq!(visible_items(&items, &HashMap::new()), vec![0, 2]);
+
+        let words = |text: &str| text.split(' ').map(String::from).collect::<Vec<String>>();
+        let plain = words("x y z");
+        assert_eq!(
+            list_read("SUBLIST", &plain, &words("1 9223372036854775807 out")),
+            Some(("out".into(), "y;z".into()))
+        );
+        assert_eq!(list_read("SUBLIST", &plain, &words("5 -1 out")), Some(("out".into(), String::new())));
+        assert_eq!(
+            list_read("GET", &plain, &words("-9223372036854775808 out")),
+            Some(("out".into(), String::new()))
+        );
+        assert_eq!(list_index("-1", 3), Some(2));
+    }
+
+    #[test]
+    fn check_tables_match_cmake() {
+        // What check_c_compiler_flag() gives with cl 19.5 and MinGW GCC 15
+        let depends = |condition: &str| Truth::Depends(condition.into());
+        for (flags, truth) in [
+            ("-Wall", Truth::Known(true)),
+            ("/W4", depends("msvc")),
+            ("-W4", depends("msvc")),
+            ("-EHsc -Zc:__cplusplus -wd4996 -GR -permissive-", depends("msvc")),
+            ("-Od", depends("msvc")),
+            ("-O2", depends("!msvc")),
+            ("/O2", Truth::Known(false)),
+            ("/Za /d2Something", depends("msvc")),
+            ("-Wextra", depends("!msvc")),
+            ("-fPIC", depends("!msvc")),
+            ("-DX=1 -Iinclude -std=c11 -MD -w", Truth::Known(true)),
+            ("LINKER:--as-needed", depends("!msvc")),
+            ("-fsanitize=address", depends("!mingw")),
+        ] {
+            assert_eq!(flags_truth(flags), truth, "{flags}");
+        }
+
+        assert_eq!(names_truth(&["intrin.h".into()]), depends("windows"));
+        assert_eq!(names_truth(&["sys/file.h".into()]), depends("!msvc"));
+        assert_eq!(library_truth("m"), depends("!msvc"));
+        assert_eq!(library_truth("pthread"), depends("!msvc"));
+        assert_eq!(library_truth("dl"), depends("!windows"));
+    }
+
+    #[test]
+    fn absent_optional_packages_and_programs_are_said() {
+        let cmake = r#"
+find_package(AnvilNoSuchPackage)
+find_program(NO_TOOL anvil-no-such-program)
+if(NOT NO_TOOL)
+  set(SKIPPED ON)
+endif()
+"#;
+        let interpreter = run("absent", &[("CMakeLists.txt", cmake)]);
+
+        assert_eq!(variable(&interpreter, "AnvilNoSuchPackage_FOUND"), "OFF");
+        assert_eq!(variable(&interpreter, "SKIPPED"), "ON");
+        assert!(interpreter
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("find_package(AnvilNoSuchPackage) is optional")));
+        assert!(interpreter
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("find_program(NO_TOOL anvil-no-such-program)")));
+    }
+
+    #[test]
+    fn required_flags_of_this_machines_branch_do_not_rule_out_the_others() {
+        let cmake = r#"
+include(CheckCSourceCompiles)
+if(MSVC)
+  set(CMAKE_REQUIRED_FLAGS "-WX")
+else()
+  set(CMAKE_REQUIRED_FLAGS "-Werror")
+endif()
+check_c_source_compiles("static void f(void) __attribute__((visibility(\"hidden\"))); int main(void) { return 0; }" HAVE_HIDDEN)
+check_c_source_compiles("int main(void) { return 0; }" HAVE_PLAIN)
+set(CMAKE_REQUIRED_FLAGS "-mavx2")
+check_c_source_compiles("int main(void) { return 0; }" HAVE_AVX2_FLAG)
+"#;
+        let interpreter = run("required-flags", &[("CMakeLists.txt", cmake)]);
+
+        assert_eq!(model::marked_condition(&variable(&interpreter, "HAVE_HIDDEN")), Some("!msvc"));
+        assert_eq!(variable(&interpreter, "HAVE_PLAIN"), "1");
+        if cfg!(windows) {
+            assert_eq!(model::marked_condition(&variable(&interpreter, "HAVE_AVX2_FLAG")), Some("!msvc"));
+        }
+    }
+
+    #[test]
+    fn port_dependencies_include_default_features() {
+        let root = std::env::temp_dir().join(format!("anvil-builtins-ports-{}", std::process::id()));
+        let port = root.join("ports/harfbuzz");
+        std::fs::create_dir_all(&port).unwrap();
+        let manifest = r#"{ "name": "harfbuzz", "dependencies": [{ "name": "vcpkg-tool-meson", "host": true }],
+            "default-features": ["freetype"],
+            "features": { "freetype": { "description": "", "dependencies": [{ "name": "freetype", "default-features": false }] },
+                          "cairo": { "description": "", "dependencies": ["cairo"] } } }"#;
+        std::fs::write(port.join("vcpkg.json"), manifest).unwrap();
+
+        let dependencies = port_dependencies(&root, "harfbuzz");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(dependencies, vec!["vcpkg-tool-meson", "freetype"]);
+    }
+
+    #[test]
+    fn huge_offsets_and_counts_do_not_panic() {
+        let cmake = r#"
+file(READ data.txt WHOLE OFFSET 2 LIMIT 18446744073709551615)
+string(SUBSTRING "abcdef" 2 9223372036854775807 SUB)
+set(L a b c)
+list(SUBLIST L 1 9223372036854775807 SUBL)
+list(TRANSFORM L APPEND x FOR 0 18446744073709551615 OUTPUT_VARIABLE T)
+string(REPEAT "ab" 99999999999 R)
+math(EXPR M "-(1 << 63)")
+file(GLOB G "")
+"#;
+        let interpreter = run("huge", &[("CMakeLists.txt", cmake), ("data.txt", "0123456789")]);
+
+        assert_eq!(variable(&interpreter, "WHOLE"), "23456789");
+        assert_eq!(variable(&interpreter, "SUB"), "cdef");
+        assert_eq!(variable(&interpreter, "SUBL"), "b;c");
+        assert_eq!(variable(&interpreter, "T"), "ax;bx;cx");
+        assert_eq!(variable(&interpreter, "R"), "");
+        assert_eq!(variable(&interpreter, "M"), i64::MIN.to_string());
+    }
+
+    #[test]
+    fn case_changes_of_platform_values_are_this_machines() {
+        let cmake = r#"
+string(TOLOWER "${CMAKE_C_COMPILER_ID}" CID)
+string(TOUPPER "${CMAKE_BUILD_TYPE}" BT)
+string(TOUPPER "{out}/gen-${CMAKE_SYSTEM_NAME}" OUT)
+set(IDS "${CMAKE_CXX_COMPILER_ID}")
+list(TRANSFORM IDS TOUPPER)
+string(TOUPPER "abc" PLAIN)
+"#;
+        let interpreter = run("case", &[("CMakeLists.txt", cmake)]);
+
+        let (id, system) = if cfg!(windows) { ("msvc", "WINDOWS") } else { ("gnu", "LINUX") };
+        assert_eq!(variable(&interpreter, "CID"), id);
+        assert_eq!(variable(&interpreter, "BT"), "{config}");
+        assert_eq!(variable(&interpreter, "OUT"), format!("{{out}}/GEN-{system}"));
+        assert_eq!(variable(&interpreter, "IDS"), id.to_uppercase());
+        assert_eq!(variable(&interpreter, "PLAIN"), "ABC");
+        let warned = interpreter
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("this machine's") || warning.contains("{config}"))
+            .count();
+        // A platform value inside longer text is this machine's already when expanded
+        assert_eq!(warned, 3, "{:?}", interpreter.warnings);
     }
 }
 
