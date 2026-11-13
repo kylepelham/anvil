@@ -5,6 +5,7 @@
 
 use crate::util;
 use anyhow::{bail, Context, Result};
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -25,10 +26,10 @@ const TAG_FORGET: u8 = 4;
 // Fold the journal into the main file once it holds this many records
 const COMPACT_AFTER_RECORDS: usize = 2000;
 
-/// The time stamp of an input that changed while its action ran: it matches no file, so the action runs again.
-pub const CHANGED_WHILE_RUNNING: i64 = i64::MIN;
+/// A time stamp no file has: an output missing once its action finished never passes for up to date.
+pub const NO_TIME_STAMP: i64 = i64::MIN;
 
-/// What one input looked like when its output was built. A hash of 0 never matches (the file changed mid-build).
+/// What one input looked like when its output was built. A hash of 0: it changed while its action ran, which runs again.
 #[derive(Debug, Clone, Copy)]
 pub struct Stamp {
     pub path: u32,
@@ -62,15 +63,31 @@ pub struct Database {
     paths: Vec<String>,
     path_ids: HashMap<String, u32>,
 
-    // Interned command arguments: id -> text, text -> id
-    arguments: Vec<String>,
-    argument_ids: HashMap<String, u32>,
+    // Interned command arguments, decoded on first use: a build with nothing to do never needs them
+    arguments: OnceCell<Arguments>,
+    argument_source: ArgumentSource,
 
     // Output path id -> record
     records: HashMap<u32, Record>,
 
     // Held for the database's lifetime: one build per output folder at a time
     _lock: File,
+}
+
+/// Interned command arguments: id -> text, text -> id.
+#[derive(Default)]
+struct Arguments {
+    texts: Vec<String>,
+    ids: HashMap<String, u32>,
+}
+
+/// Where the arguments come from until they are decoded: the main file's table as stored (its strings, without the
+/// count), then the journal's.
+#[derive(Default)]
+struct ArgumentSource {
+    table: Vec<u8>,
+    journal: Vec<String>,
+    count: u32,
 }
 
 /// Old ids to new ones while compacting, keeping only what records still use.
@@ -100,16 +117,17 @@ impl Database {
             generation: 0,
             paths: Vec::new(),
             path_ids: HashMap::new(),
-            arguments: Vec::new(),
-            argument_ids: HashMap::new(),
+            arguments: OnceCell::new(),
+            argument_source: ArgumentSource::default(),
             records: HashMap::new(),
             _lock: lock,
         };
 
-        // A damaged database only costs a rebuild
+        // A damaged database only costs a rebuild, once: its files are dropped so the next build starts clean
         if let Err(error) = database.load() {
             crate::ui::warn(&format!("build database unreadable ({error:#}); rebuilding everything"));
             database.clear();
+            let _ = std::fs::remove_file(&database.file);
             let _ = std::fs::remove_file(&database.journal_file);
         }
 
@@ -150,20 +168,22 @@ impl Database {
 
     /// The id of a command argument (exact text), interning it on first sight.
     pub fn intern_argument(&mut self, text: &str) -> u32 {
-        if let Some(id) = self.argument_ids.get(text) {
+        self.decode_arguments();
+        let arguments = self.arguments.get_mut().expect("arguments decoded");
+        if let Some(id) = arguments.ids.get(text) {
             return *id;
         }
 
-        let id = self.arguments.len() as u32;
-        self.arguments.push(text.to_string());
-        self.argument_ids.insert(text.to_string(), id);
+        let id = arguments.texts.len() as u32;
+        arguments.texts.push(text.to_string());
+        arguments.ids.insert(text.to_string(), id);
         self.journal_entry_text(TAG_ARGUMENT, text);
 
         id
     }
 
     pub fn argument(&self, id: u32) -> &str {
-        &self.arguments[id as usize]
+        &self.decode_arguments().texts[id as usize]
     }
 
     /// The record of an output, by its path id.
@@ -209,10 +229,11 @@ impl Database {
         // Renumber what records still use
         let mut paths = Renumbering::default();
         let mut arguments = Renumbering::default();
+        let argument_texts = &self.decode_arguments().texts;
         let mut body = Vec::new();
         for (output, record) in &self.records {
             put_u32(&mut body, paths.id(*output, &self.paths));
-            put_record_body(&mut body, record, |id| paths.id(id, &self.paths), |id| arguments.id(id, &self.arguments));
+            put_record_body(&mut body, record, |id| paths.id(id, &self.paths), |id| arguments.id(id, argument_texts));
         }
 
         // Header, path table, argument table, records
@@ -237,8 +258,8 @@ impl Database {
         self.generation = 0;
         self.paths.clear();
         self.path_ids.clear();
-        self.arguments.clear();
-        self.argument_ids.clear();
+        self.arguments = OnceCell::new();
+        self.argument_source = ArgumentSource::default();
         self.records.clear();
         self.journal_records = 0;
     }
@@ -263,9 +284,15 @@ impl Database {
             for path in reader.strings()? {
                 self.add_path(path);
             }
-            for argument in reader.strings()? {
-                self.add_argument(argument);
+            // Arguments: only measured here (decoded when needed)
+            let argument_count = reader.u32()?;
+            let table_start = reader.position;
+            for _ in 0..argument_count {
+                let length = reader.u32()? as usize;
+                reader.take(length)?;
             }
+            self.argument_source.table = bytes[table_start..reader.position].to_vec();
+            self.argument_source.count = argument_count;
 
             let record_count = reader.u32()?;
             for _ in 0..record_count {
@@ -294,7 +321,8 @@ impl Database {
                         }
                         TAG_ARGUMENT => {
                             let argument = reader.string()?;
-                            self.add_argument(argument);
+                            self.argument_source.journal.push(argument);
+                            self.argument_source.count += 1;
                         }
                         TAG_RECORD => {
                             let output = reader.u32()?;
@@ -327,7 +355,7 @@ impl Database {
     /// Every record must name known paths and arguments.
     fn validate(&self) -> Result<()> {
         let path_count = self.paths.len() as u32;
-        let argument_count = self.arguments.len() as u32;
+        let argument_count = self.argument_source.count;
         let valid = self.records.iter().all(|(output, record)| {
             *output < path_count
                 && record.inputs.iter().all(|stamp| stamp.path < path_count)
@@ -346,10 +374,30 @@ impl Database {
         self.paths.push(path);
     }
 
-    fn add_argument(&mut self, argument: String) {
-        let id = self.arguments.len() as u32;
-        self.argument_ids.insert(argument.clone(), id);
-        self.arguments.push(argument);
+    /// The arguments, decoded from where they were loaded on first use. A damaged text only loses its spelling: a
+    /// command is compared by its hash, its arguments only explain what changed.
+    fn decode_arguments(&self) -> &Arguments {
+        self.arguments.get_or_init(|| {
+            let source = &self.argument_source;
+            let mut arguments = Arguments {
+                texts: Vec::with_capacity(source.count as usize),
+                ids: HashMap::with_capacity(source.count as usize),
+            };
+
+            let mut reader = Reader {
+                bytes: &source.table,
+                position: 0,
+            };
+            while let Ok(length) = reader.u32() {
+                let text = String::from_utf8_lossy(reader.take(length as usize).unwrap_or_default()).into_owned();
+                arguments.add(text);
+            }
+            for text in &source.journal {
+                arguments.add(text.clone());
+            }
+
+            arguments
+        })
     }
 
     fn journal(&mut self) -> Option<&mut BufWriter<File>> {
@@ -391,6 +439,14 @@ impl Database {
             let _ = journal.flush();
         }
         self.journal_records += 1;
+    }
+}
+
+impl Arguments {
+    fn add(&mut self, text: String) {
+        let id = self.texts.len() as u32;
+        self.ids.insert(text.clone(), id);
+        self.texts.push(text);
     }
 }
 
@@ -601,6 +657,29 @@ mod tests {
         std::fs::write(dir.join("db"), b"ANVILDB2\0\0\0\0").unwrap();
         std::fs::write(dir.join("db.journal"), b"\x01\x02").unwrap();
 
+        {
+            let mut database = Database::open(&dir).unwrap();
+            let output = database.intern("C:/out/a.obj");
+            let record = sample_record(&mut database);
+            database.put(output, record);
+            database.finish().unwrap();
+        }
+
+        let mut database = Database::open(&dir).unwrap();
+        let output = database.intern("C:/out/a.obj");
+        assert!(database.record(output).is_some());
+
+        drop(database);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn starts_clean_after_damage() {
+        let dir = test_dir("damaged");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("db"), b"ANVILDB3\0\0\0\0\0\0\0\0\xff\xff\xff").unwrap();
+
+        // The damaged file goes, so what this build records survives the next open
         {
             let mut database = Database::open(&dir).unwrap();
             let output = database.intern("C:/out/a.obj");

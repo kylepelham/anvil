@@ -159,6 +159,10 @@ struct Planner<'a> {
 
     /// A cross build's programs that build steps run, built for this machine: name -> (program, its action).
     host_tools: HashMap<String, (PathBuf, usize)>,
+
+    /// Files of the package build steps name in their commands, by step action: inputs once planning ends (see
+    /// `add_named_files`).
+    named_files: Vec<(usize, Vec<PathBuf>)>,
 }
 
 impl Action {
@@ -239,6 +243,7 @@ pub fn plan(model: &Model, host: Option<&Model>, roots: &[usize], color: bool) -
             planner.host_tools.insert(name.clone(), (program, action));
         }
         planner.actions = host_planner.actions;
+        planner.named_files = host_planner.named_files;
     }
 
     let order = planner.order(roots)?;
@@ -247,6 +252,7 @@ pub fn plan(model: &Model, host: Option<&Model>, roots: &[usize], color: bool) -
             .plan_target(*target)
             .with_context(|| format!("planning target `{}`", model.targets[*target].name))?;
     }
+    planner.add_named_files();
 
     // compile_commands.json covers the whole project, not just what this build makes
     planner.write_compile_commands(&order)?;
@@ -484,6 +490,7 @@ impl<'a> Planner<'a> {
             runtime_files: HashMap::new(),
             copies: HashSet::new(),
             host_tools: HashMap::new(),
+            named_files: Vec::new(),
         }
     }
 
@@ -1375,6 +1382,7 @@ impl<'a> Planner<'a> {
         let mut words = Vec::new();
         let mut after = Vec::new();
         let mut extra_inputs = Vec::new();
+        let mut named_files = Vec::new();
         for word in &invocation.words {
             match word.as_str() {
                 "{inputs}" => words.extend(invocation.inputs.iter().map(|input| path_text(input))),
@@ -1409,7 +1417,7 @@ impl<'a> Planner<'a> {
 
                     // A file of the package the command names (a script it runs) re-runs it when it changes
                     if !names_build_files {
-                        extra_inputs.extend(self.package_file(index, &workdir, &word, &invocation.outputs));
+                        named_files.extend(self.package_file(index, &workdir, &word, &invocation.outputs));
                     }
                     words.push(substitute_targets(&word, self.model)?);
                 }
@@ -1473,11 +1481,93 @@ impl<'a> Planner<'a> {
             action.deps = DepsFormat::Make(depfile);
         }
 
-        Ok(self.push(action))
+        // A step that succeeds without writing an output would run again every build
+        for output in &action.outputs {
+            let message = format!(
+                "{}: the step succeeded but did not write {}: make its command write every file its `output` or `outputs` names",
+                action.description,
+                util::rel(output, &self.model.root)
+            );
+            action.must_create.push((output.clone(), message));
+        }
+
+        // Named files are left out of the command hash: they are stamped like any input once they are added
+        let action = self.push(action);
+        if !named_files.is_empty() {
+            self.named_files.push((action, named_files));
+        }
+
+        Ok(action)
+    }
+
+    /// Adds the files build steps name to their inputs, now that every action is planned, and orders each step after
+    /// the actions that write its inputs (a step's output in the package). A named file nothing writes must exist.
+    fn add_named_files(&mut self) {
+        let has_step_inputs = self
+            .actions
+            .iter()
+            .any(|action| action.kind == ActionKind::Run && !action.inputs.is_empty());
+        if self.named_files.is_empty() && !has_step_inputs {
+            return;
+        }
+
+        let mut producers: HashMap<String, usize> = HashMap::new();
+        for (index, action) in self.actions.iter().enumerate() {
+            for output in &action.outputs {
+                producers.insert(util::path_key(output), index);
+            }
+        }
+
+        // Named files (one written by a step that waits for this one would be read before it is made)
+        for (action, files) in std::mem::take(&mut self.named_files) {
+            for file in files {
+                let usable = match producers.get(&util::path_key(&file)) {
+                    Some(producer) => *producer != action && !self.depends_on(*producer, action),
+                    None => file.is_file(),
+                };
+                if usable && !self.actions[action].inputs.contains(&file) {
+                    self.actions[action].inputs.push(file);
+                }
+            }
+        }
+
+        // Steps after what makes their inputs (never into a cycle)
+        for action in 0..self.actions.len() {
+            if self.actions[action].kind != ActionKind::Run {
+                continue;
+            }
+
+            for position in 0..self.actions[action].inputs.len() {
+                let Some(producer) = producers.get(&util::path_key(&self.actions[action].inputs[position])).copied() else {
+                    continue;
+                };
+                let ordered = self.actions[action].after.contains(&producer);
+                if producer != action && !ordered && !self.depends_on(producer, action) {
+                    self.actions[action].after.push(producer);
+                }
+            }
+        }
+    }
+
+    /// Whether an action waits, directly or not, for another.
+    fn depends_on(&self, action: usize, other: usize) -> bool {
+        let mut visited = HashSet::new();
+        let mut pending = vec![action];
+
+        while let Some(index) = pending.pop() {
+            if index == other {
+                return true;
+            }
+            if visited.insert(index) {
+                pending.extend(self.actions[index].after.iter().copied());
+            }
+        }
+
+        false
     }
 
     /// The file a word of a step's command names, when it is one of the package's own (not the build's, not one the
-    /// step writes): a script the step runs, a table it reads.
+    /// step writes): a script the step runs, a table it reads. Whether it exists is checked once planning ends.
     fn package_file(&self, index: usize, workdir: &Path, word: &str, outputs: &[PathBuf]) -> Option<PathBuf> {
         if !word.contains(['/', '\\']) || word.starts_with('-') {
             return None;
@@ -1487,7 +1577,7 @@ impl<'a> Planner<'a> {
         let root = &self.model.packages[self.model.targets[index].package].root;
         let in_package = util::strip_prefix_ci(&file, root).is_some() && util::strip_prefix_ci(&file, &self.model.out_root).is_none();
         let written = outputs.iter().any(|output| util::path_key(output) == util::path_key(&file));
-        if !in_package || written || !file.is_file() {
+        if !in_package || written {
             return None;
         }
 
@@ -1990,9 +2080,10 @@ impl ShellValue {
     }
 }
 
-/// Fills placeholders into a shell command line and keeps the rest as written. A value with a space is quoted (its
-/// whole word, unless the word has quotes of its own); on Windows a path and the rest of its word take backslashes,
-/// since cmd's built-ins read `/` as the start of a switch.
+/// Fills placeholders into a shell command line and keeps the rest as written. A value with a space or a character
+/// the shell reads (`&`, `>`, ...) is quoted, from its start to the end of its word or the next redirection or pipe
+/// (only the value itself when the word has quotes of its own); on Windows a path and the rest of its word take
+/// backslashes, since cmd's built-ins read `/` as the start of a switch.
 fn fill_shell_line(line: &str, values: &[ShellValue], windows: bool) -> String {
     let quote_characters: &[char] = if windows { &['"'] } else { &['"', '\''] };
     let mut filled = String::with_capacity(line.len());
@@ -2023,34 +2114,38 @@ fn fill_shell_word(word: &str, values: &[ShellValue], windows: bool, quote_chara
     let mut filled = String::with_capacity(word.len());
     let mut quote: Option<char> = None;
     let mut backslashes = false;
-    let mut quote_word = false;
     let mut rest = word;
 
+    // A quote opened before a value, closed at the end of the word or before a redirection or pipe
+    let mut opened = false;
+
     while let Some(character) = rest.chars().next() {
-        // A placeholder: its items, each quoted when it holds a space and is not inside the user's quotes
+        // A placeholder: its items, each quoted when it needs it and is not inside quotes already
         let value = values
             .iter()
             .find(|value| character == '{' && rest.starts_with(value.placeholder.as_str()));
         if let Some(value) = value {
-            let items: Vec<String> = value
-                .items
-                .iter()
-                .map(|item| {
-                    let item = if windows && value.is_path {
-                        item.replace('/', "\\")
-                    } else {
-                        item.clone()
-                    };
-                    let needs_quotes = quote.is_none() && item.contains(char::is_whitespace);
-                    if needs_quotes && (has_quotes || value.items.len() > 1) {
-                        format!("\"{item}\"")
-                    } else {
-                        quote_word |= needs_quotes;
-                        item
+            for (position, item) in value.items.iter().enumerate() {
+                let item = if windows && value.is_path {
+                    item.replace('/', "\\")
+                } else {
+                    item.clone()
+                };
+                if position > 0 {
+                    filled.push(' ');
+                }
+
+                let needs_quotes = quote.is_none() && !opened && needs_shell_quotes(&item);
+                if needs_quotes && (has_quotes || value.items.len() > 1) {
+                    filled.push_str(&format!("\"{item}\""));
+                } else {
+                    if needs_quotes {
+                        filled.push('"');
+                        opened = true;
                     }
-                })
-                .collect();
-            filled.push_str(&items.join(" "));
+                    filled.push_str(&item);
+                }
+            }
             backslashes |= windows && value.is_path;
             rest = &rest[value.placeholder.len()..];
             continue;
@@ -2061,6 +2156,11 @@ fn fill_shell_word(word: &str, values: &[ShellValue], windows: bool, quote_chara
             None if quote_characters.contains(&character) => quote = Some(character),
             _ => {}
         }
+        if opened && SHELL_OPERATORS.contains(&character) {
+            filled.push('"');
+            opened = false;
+        }
+
         // A backslash before a quote would escape it, so that slash stays
         let before_quote = rest[character.len_utf8()..].starts_with(quote_characters);
         filled.push(if backslashes && character == '/' && !before_quote {
@@ -2071,19 +2171,35 @@ fn fill_shell_word(word: &str, values: &[ShellValue], windows: bool, quote_chara
         rest = &rest[character.len_utf8()..];
     }
 
-    if quote_word {
-        return format!("\"{filled}\"");
+    if opened {
+        filled.push('"');
     }
     filled
 }
 
-/// One word of a command list for the shell's line: quoted when it holds a space.
+/// One word of a command list for the shell's line: quoted when it holds a space or a character the shell reads,
+/// unless it is a redirection or pipe by itself (`>`, `2>&1`, `&&`).
 fn shell_quote(word: &str) -> String {
-    if word.is_empty() || word.contains(char::is_whitespace) {
+    let is_operator = !word.is_empty()
+        && word
+            .chars()
+            .all(|character| SHELL_OPERATORS.contains(&character) || character.is_ascii_digit());
+    if word.is_empty() || (needs_shell_quotes(word) && !is_operator) {
         format!("\"{word}\"")
     } else {
         word.to_string()
     }
+}
+
+// Characters that end a quoted value in a shell line: redirections and pipes
+const SHELL_OPERATORS: &[char] = &['<', '>', '|', '&'];
+
+// Characters cmd (or sh) reads specially outside quotes, besides whitespace
+const SHELL_SPECIALS: &[char] = &['&', '|', '<', '>', '(', ')', '^', '%', '!', ',', ';', '=', '$', '`'];
+
+/// A value holds whitespace or a character the shell would act on.
+fn needs_shell_quotes(text: &str) -> bool {
+    text.contains(char::is_whitespace) || text.contains(SHELL_SPECIALS)
 }
 
 /// Puts extra arguments before the source-and-output tail of a compile command (cl: before /c).
@@ -2155,6 +2271,18 @@ mod tests {
             fill_shell_line("cat '{root}/a' {root}/b", &values(), false),
             r#"cat 'C:/my project/a' "C:/my project/b""#
         );
+
+        // A redirection stays outside the quotes; a value with a character cmd reads is quoted too
+        assert_eq!(
+            fill_shell_line("echo hi>{root}/a.txt", &values(), true),
+            r#"echo hi>"C:\my project\a.txt""#
+        );
+        assert_eq!(
+            fill_shell_line("tool {root}/x>{out}/log 2>&1", &values(), true),
+            r#"tool "C:\my project\x">C:\p\out\log 2>&1"#
+        );
+        let values = vec![ShellValue::new("{root}", vec!["C:/s9&x".into()], true)];
+        assert_eq!(fill_shell_line("python {root}/w.py", &values, true), r#"python "C:\s9&x\w.py""#);
     }
 
     #[test]
@@ -2162,6 +2290,9 @@ mod tests {
         assert_eq!(shell_quote("plain"), "plain");
         assert_eq!(shell_quote("a b"), "\"a b\"");
         assert_eq!(shell_quote(""), "\"\"");
+        assert_eq!(shell_quote("C:/s9&x/a.txt"), "\"C:/s9&x/a.txt\"");
+        assert_eq!(shell_quote(">"), ">");
+        assert_eq!(shell_quote("2>&1"), "2>&1");
     }
 
     #[test]

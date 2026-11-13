@@ -2,7 +2,7 @@
 //! stamps, with content hashes so a touched-but-unchanged file rebuilds nothing), runs the rest in parallel, and
 //! records what each action read.
 
-use crate::db::{Database, Record, Stamp, CHANGED_WHILE_RUNNING};
+use crate::db::{Database, Record, Stamp, NO_TIME_STAMP};
 use crate::depfile;
 use crate::flags::DepsFormat;
 use crate::plan::{Action, ActionKind, Plan, ResponseStyle};
@@ -12,7 +12,7 @@ use crate::ui;
 use crate::util;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +31,9 @@ const COLOR_DIAGNOSTICS: &str = "-fdiagnostics-color=always";
 
 // How many changed arguments --explain shows on each side
 const EXPLAIN_ARGUMENTS: usize = 3;
+
+// The hash recorded for an input that could not be read: only its time stamp counts (0 means it changed mid-run)
+const UNREADABLE_HASH: u64 = 1;
 
 pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -92,8 +95,16 @@ struct Measured {
     mtime: i64,
     hash: u64,
 
-    // It changed while the action ran, so the action may have read an older version
+    // It changed while the action ran (its hash is 0 unless the content stayed the same)
     changed_while_running: bool,
+}
+
+/// A file an action read on its last run, as this build last saw it when the action was handed out: its time
+/// stamp, and its content hash when the record's stamp still holds (0: not known).
+struct Known {
+    path: String,
+    mtime: i64,
+    hash: u64,
 }
 
 /// Time stamps and content hashes by `util::path_key`, shared by the scheduler and the workers.
@@ -289,7 +300,7 @@ impl Executor<'_> {
         let total = dirty.iter().filter(|dirty| **dirty).count();
 
         let jobs_allowed = self.options.jobs.max(1);
-        let (job_sender, job_receiver) = mpsc::channel::<(usize, usize)>();
+        let (job_sender, job_receiver) = mpsc::channel::<(usize, usize, Vec<Known>)>();
         let (report_sender, report_receiver) = mpsc::channel::<Report>();
         let job_receiver = Mutex::new(job_receiver);
         let build_started = self.started;
@@ -313,8 +324,9 @@ impl Executor<'_> {
 
                     loop {
                         let job = jobs.lock().unwrap().recv();
-                        let Ok((index, lane)) = job else { break };
+                        let Ok((index, lane, known)) = job else { break };
                         let action = &actions[index];
+                        let before = stamp_before(action, known, &stamps);
 
                         let process_started = build_started.elapsed();
                         let mut outcome = run_action(index, action, low_priority);
@@ -330,7 +342,7 @@ impl Executor<'_> {
 
                         if outcome.success {
                             outcome.output_mtimes = action.outputs.iter().map(|output| util::mtime(output)).collect();
-                            outcome.measured = measure_inputs(action, &outcome, &stamps, &system_dirs);
+                            outcome.measured = measure_inputs(action, &outcome, &before, &stamps, &system_dirs);
                             hash_objects(action, &outcome.output_mtimes, &stamps);
                         }
                         let _ = reports.send(Report::Finished(outcome, timing));
@@ -391,11 +403,12 @@ impl Executor<'_> {
                             }
 
                             // Should it fail or stop halfway, nothing it leaves behind may pass for up to date
+                            let known = self.known_inputs(index);
                             self.database.forget(self.output_ids[index][0]);
 
                             let lane = lanes_busy.iter().position(|busy| !busy).expect("a lane is free below the job limit");
                             lanes_busy[lane] = true;
-                            job_sender.send((index, lane + 1)).context("worker pool stopped")?;
+                            job_sender.send((index, lane + 1, known)).context("worker pool stopped")?;
                             running += 1;
                             processes += 1;
                         }
@@ -507,18 +520,22 @@ impl Executor<'_> {
             }
         }
 
-        // Every input the last build read: a touched one counts only if its content changed
+        // Every input the last build read: a touched one counts only if its content changed; one without a hash
+        // changed while its action ran, which may have read either version
         let mut touched = Vec::new();
         for (position, stamp) in record.inputs.iter().enumerate() {
             let path = Path::new(self.database.path(stamp.path));
             let Some(mtime) = self.disk_mtime(stamp.path) else {
                 return Some(format!("{} was deleted", self.display(path)));
             };
+            if stamp.hash == 0 {
+                return Some(format!("{} changed while it last ran", self.display(path)));
+            }
             if mtime == stamp.mtime {
                 continue;
             }
 
-            if stamp.hash == 0 || self.stamps.hash(&util::path_key(path), path, mtime) != stamp.hash {
+            if self.stamps.hash(&util::path_key(path), path, mtime) != stamp.hash {
                 return Some(format!("{} changed", self.display(path)));
             }
             touched.push((position, mtime));
@@ -548,8 +565,8 @@ impl Executor<'_> {
             self.disk_mtimes[*id as usize] = *mtime;
         }
 
-        // What it read. An input that changed meanwhile never matches, unless the build makes it: then this action
-        // rewrote it in place (a post-build step signing a program), and the build's end stamps it as it is then.
+        // What it read. An input the build makes that changed meanwhile was rewritten in place by this action (a
+        // post-build step signing a program): the build's end stamps it as it is then.
         let mut inputs = Vec::with_capacity(outcome.measured.len());
         for measured in outcome.measured.drain(..) {
             let id = self.database.intern_keyed(measured.key, &measured.path.to_string_lossy());
@@ -557,14 +574,9 @@ impl Executor<'_> {
                 self.rewritten.push(id);
             }
 
-            let mtime = if measured.changed_while_running {
-                CHANGED_WHILE_RUNNING
-            } else {
-                measured.mtime
-            };
             inputs.push(Stamp {
                 path: id,
-                mtime,
+                mtime: measured.mtime,
                 hash: measured.hash,
             });
         }
@@ -579,15 +591,16 @@ impl Executor<'_> {
         let record = Record {
             command_hash: self.record_hash(action),
             command,
-            outputs: outcome.output_mtimes.iter().map(|mtime| mtime.unwrap_or(CHANGED_WHILE_RUNNING)).collect(),
+            outputs: outcome.output_mtimes.iter().map(|mtime| mtime.unwrap_or(NO_TIME_STAMP)).collect(),
             inputs,
         };
         self.database.put(output_ids[0], record);
         self.ran.push(outcome.action);
     }
 
-    /// Files the build makes that a later action rewrote in place: every record this build wrote takes their final
-    /// time stamps and content, so the next build does not take them for edited.
+    /// Files the build makes that a later action rewrote in place: the records of the actions that make them (whether
+    /// or not they ran) and of those that ran take their final time stamps and content, so the next build does not
+    /// take them for edited.
     fn restamp_rewritten(&mut self) {
         if self.rewritten.is_empty() {
             return;
@@ -601,8 +614,12 @@ impl Executor<'_> {
             }
         }
 
-        for index in &self.ran {
-            let output_ids = &self.output_ids[*index];
+        let ran: HashSet<usize> = self.ran.iter().copied().collect();
+        for (index, output_ids) in self.output_ids.iter().enumerate() {
+            let makes_rewritten = output_ids.iter().any(|id| finals.contains_key(id));
+            if !makes_rewritten && !ran.contains(&index) {
+                continue;
+            }
             let Some(record) = self.database.record(output_ids[0]) else { continue };
             let mut record = record.clone();
             let mut changed = false;
@@ -613,11 +630,15 @@ impl Executor<'_> {
                     *recorded = *mtime;
                 }
             }
-            for stamp in &mut record.inputs {
-                if let Some((mtime, hash)) = finals.get(&stamp.path) {
-                    changed |= stamp.mtime != *mtime;
-                    stamp.mtime = *mtime;
-                    stamp.hash = *hash;
+
+            // Only an action that ran read the file as it is now
+            if ran.contains(&index) {
+                for stamp in &mut record.inputs {
+                    if let Some((mtime, hash)) = finals.get(&stamp.path) {
+                        changed |= stamp.mtime != *mtime || stamp.hash != *hash;
+                        stamp.mtime = *mtime;
+                        stamp.hash = *hash;
+                    }
                 }
             }
 
@@ -625,6 +646,27 @@ impl Executor<'_> {
                 self.database.put(output_ids[0], record);
             }
         }
+    }
+
+    /// What the action read on its last run, as this build last saw it, for its worker to tell what changed while
+    /// it runs.
+    fn known_inputs(&self, index: usize) -> Vec<Known> {
+        let Some(record) = self.database.record(self.output_ids[index][0]) else {
+            return Vec::new();
+        };
+
+        record
+            .inputs
+            .iter()
+            .filter_map(|stamp| {
+                let mtime = self.disk_mtime(stamp.path)?;
+                Some(Known {
+                    path: self.database.path(stamp.path).to_string(),
+                    mtime,
+                    hash: if mtime == stamp.mtime { stamp.hash } else { 0 },
+                })
+            })
+            .collect()
     }
 
     /// The time stamp this build found for a path id; ids interned during the build are stat'ed now.
@@ -813,10 +855,52 @@ fn folder_stats(folder: &Path, files: &[(u32, &Path)]) -> Vec<(u32, Option<i64>)
     stats
 }
 
+/// What the action reads as it is before it runs, by `util::path_key`: what it read last time (as the scheduler last
+/// saw it), and its declared inputs. Each gets its content hash now, mostly from the record or the cache, so a file
+/// it rewrites in place with the same content can be told from one that really changed.
+fn stamp_before(action: &Action, known: Vec<Known>, stamps: &Stamps) -> HashMap<String, (i64, u64)> {
+    let mut before = HashMap::with_capacity(known.len() + action.inputs.len());
+
+    for file in known {
+        let path = Path::new(&file.path);
+        let key = util::path_key(path);
+        if file.hash != 0 {
+            before.insert(key, (file.mtime, file.hash));
+            continue;
+        }
+
+        // Changed since the record: hashed as it is now
+        if let Some(mtime) = util::mtime(path) {
+            let hash = stamps.hash(&key, path, mtime);
+            before.insert(key, (mtime, hash));
+        }
+    }
+
+    for input in &action.inputs {
+        let key = util::path_key(input);
+        if before.contains_key(&key) {
+            continue;
+        }
+        if let Some(mtime) = util::mtime(input) {
+            let hash = stamps.hash(&key, input, mtime);
+            before.insert(key, (mtime, hash));
+        }
+    }
+
+    before
+}
+
 /// What a successful action read: its declared inputs, then the headers it discovered (minus the toolchain's own,
 /// relative ones against its working folder), each with its time stamp and content hash. Declared inputs are stat'ed
-/// afresh, as the action may have rewritten one; a file changed since the action started gets no hash.
-fn measure_inputs(action: &Action, outcome: &Outcome, stamps: &Stamps, system_dirs: &[String]) -> Vec<Measured> {
+/// afresh, as the action may have rewritten one. A file whose time stamp moved since `before` changed while the
+/// action ran: it keeps its hash only when its content is the same (else 0, so the action runs again next time).
+fn measure_inputs(
+    action: &Action,
+    outcome: &Outcome,
+    before: &HashMap<String, (i64, u64)>,
+    stamps: &Stamps,
+    system_dirs: &[String],
+) -> Vec<Measured> {
     let mut paths: Vec<(String, PathBuf, bool)> = Vec::with_capacity(action.inputs.len() + outcome.discovered.len());
     for input in &action.inputs {
         paths.push((util::path_key(input), input.clone(), true));
@@ -835,6 +919,7 @@ fn measure_inputs(action: &Action, outcome: &Outcome, stamps: &Stamps, system_di
     paths.sort_by(|left, right| left.0.cmp(&right.0));
     paths.dedup_by(|later, earlier| later.0 == earlier.0);
 
+    let finished = util::now_ticks();
     paths
         .into_iter()
         .filter_map(|(key, path, declared)| {
@@ -847,8 +932,23 @@ fn measure_inputs(action: &Action, outcome: &Outcome, stamps: &Stamps, system_di
                 false => stamps.mtime(&key, &path)?,
             };
 
-            let changed_while_running = mtime > outcome.started;
-            let hash = if changed_while_running { 0 } else { stamps.hash(&key, &path, mtime) };
+            let (changed_while_running, hash) = match before.get(&key) {
+                // Unchanged: the hash it had (none when it could not be read then)
+                Some((before_mtime, before_hash)) if *before_mtime == mtime && *before_hash != 0 => (false, *before_hash),
+                Some((before_mtime, _)) if *before_mtime == mtime => (false, stamps.hash(&key, &path, mtime)),
+
+                // Rewritten while it ran: the same content still counts as read
+                Some((_, before_hash)) => {
+                    let hash = stamps.hash(&key, &path, mtime);
+                    (true, if hash == *before_hash { hash } else { 0 })
+                }
+
+                // A header first read this run: written while it ran when its time stamp falls in the run (one in
+                // the future, from another machine's clock, was not)
+                None if mtime > outcome.started && mtime <= finished => (true, 0),
+                None => (false, stamps.hash(&key, &path, mtime)),
+            };
+            let hash = if !changed_while_running && hash == 0 { UNREADABLE_HASH } else { hash };
             Some(Measured {
                 key,
                 path,

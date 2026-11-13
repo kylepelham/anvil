@@ -1397,3 +1397,121 @@ fn schema_prints_and_installs() {
     assert_eq!(serde_json::from_str::<serde_json::Value>(&installed).unwrap(), schema);
     assert!(data.join("anvil/anvil-tests.schema.json").is_file());
 }
+
+// 28. Build steps that rewrite files settle: a step touching a file it names, a step reading another step's output
+//     and a post-build step touching the program all leave the next build with nothing to do
+
+const REWRITE_STEPS: &str = r#"[project]
+name = "rewrite"
+
+[target.app]
+kind = "exe"
+
+[[target.app.run]]
+output = "data/table.txt"
+command = ["cmake", "-E", "copy", "data/source.txt", "data/table.txt"]
+
+[[target.app.run]]
+output = "{gen}/table.h"
+command = ["cmake", "-E", "copy", "data/table.txt", "{output}"]
+
+[[target.app.run]]
+output = "{gen}/lang.qm"
+command = ["cmake", "-E", "touch", "i18n/lang.ts", "{output}"]
+
+[[target.app.post-build]]
+command = ["cmake", "-E", "touch", "{out}/app.exe"]
+"#;
+
+#[test]
+fn build_steps_that_rewrite_files_settle() {
+    require!("default");
+    let project = Project::empty("rewrite_steps");
+    project.write(
+        "anvil.toml",
+        &REWRITE_STEPS.replace("app.exe", &format!("app{}", std::env::consts::EXE_SUFFIX)),
+    );
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+    project.write("data/source.txt", "one\n");
+    project.write("i18n/lang.ts", "<TS/>\n");
+
+    project.anvil(&["build"]).success();
+    project.anvil(&["build", "--explain"]).success().up_to_date();
+
+    // Only the post-build step changed: the program is not linked again, and then all is done
+    project.edit("anvil.toml", "\"touch\", \"{out}", "\"touch\", \"{gen}/signed.txt\", \"{out}");
+    let changed = project.anvil(&["build", "--explain"]);
+    changed.success();
+    assert_eq!(changed.linked(), 0, "{}", changed.output());
+    assert_eq!(changed.actions().len(), 1, "{:?}", changed.actions());
+    project.anvil(&["build", "--explain"]).success().up_to_date();
+
+    // A step reading another step's output runs after it, and again when it changes
+    project.write("data/source.txt", "two\n");
+    let edited = project.anvil(&["build", "--explain"]);
+    edited.success();
+    assert_eq!(project.read("out/debug/gen/app/table.h"), "two\n");
+    project.anvil(&["build"]).success().up_to_date();
+}
+
+// 29. A header with a time stamp in the future (another machine's clock) does not rebuild every time, and a damaged
+//     build database costs one rebuild, not one every build
+
+#[test]
+fn future_time_stamps_and_damaged_database_settle() {
+    require!("default");
+    let project = Project::empty("future_stamps");
+    project.write("anvil.toml", "[project]\nname = \"future\"\n\n[target.app]\nkind = \"exe\"\n");
+    project.write("src/main.c", "#include \"a.h\"\nint main(void) { return A; }\n");
+    project.write("src/a.h", "#define A 0\n");
+    let header = std::fs::File::options().write(true).open(project.path("src/a.h")).unwrap();
+    header.set_modified(std::time::SystemTime::now() + Duration::from_secs(86_400)).unwrap();
+    drop(header);
+
+    project.anvil(&["build"]).success();
+    project.anvil(&["build", "--explain"]).success().up_to_date();
+
+    project.write("out/debug/.anvil/db", "ANVILDB3 damaged");
+    project.anvil(&["build"]).success().contains("build database unreadable");
+    project.anvil(&["build", "--explain"]).success().up_to_date();
+}
+
+// 30. Shell steps in a folder whose path has a space and an `&`: values are quoted, redirections still work, and a
+//     step that does not write an output fails
+
+#[test]
+fn shell_steps_quote_paths_and_check_outputs() {
+    require!("default");
+    let project = Project::empty("shell_quoting");
+    let manifest = r#"[project]
+name = "quoting"
+
+[target.app]
+kind = "exe"
+
+[[target.app.run]]
+output = "{gen}/a.txt"
+shell = true
+command = "echo hello>{output}"
+
+[[target.app.run]]
+output = "{gen}/b.txt"
+shell = true
+command = ["cmake", "-E", "copy", "{root}/in.txt", "{output}"]
+"#;
+    project.write("a&b dir/anvil.toml", manifest);
+    project.write("a&b dir/src/main.c", "int main(void) { return 0; }\n");
+    project.write("a&b dir/in.txt", "in\n");
+
+    project.anvil_in("a&b dir", &["build"]).success();
+    assert_eq!(project.read("a&b dir/out/debug/gen/app/a.txt").trim(), "hello");
+    assert_eq!(project.read("a&b dir/out/debug/gen/app/b.txt"), "in\n");
+    project.anvil_in("a&b dir", &["build"]).success().up_to_date();
+
+    let missing = "\n[[target.app.run]]\noutputs = [\"{gen}/c.txt\", \"{gen}/d.txt\"]\ncommand = [\"cmake\", \"-E\", \"touch\", \"{output}\"]\n";
+    project.write("a&b dir/anvil.toml", &format!("{manifest}{missing}"));
+    project
+        .anvil_in("a&b dir", &["build"])
+        .code(1)
+        .contains("the step succeeded but did not write out/debug/gen/app/d.txt");
+}
