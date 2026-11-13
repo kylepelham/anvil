@@ -852,18 +852,23 @@ impl<'a> Planner<'a> {
         let name = source.file_name().unwrap_or_default().to_string_lossy();
         let hashed_name = format!("{:08x}_{name}", util::hash_bytes(slash(source).as_bytes()) as u32);
 
-        let relative = util::strip_prefix_ci(source, &target.dir)
-            .or_else(|| util::strip_prefix_ci(source, package_root))
-            .or_else(|| util::strip_prefix_ci(source, &self.model.out_dir))
-            .map(|relative| slash(&relative).replace("../", "__/"))
+        // Files Anvil generates (unity sources, {gen}) by their place in the output folder, marked so they never meet a
+        // source's path; then sources by their place in the target's folder or the package
+        let object_dir = self.object_dir(target);
+        let relative = util::strip_prefix_ci(source, &object_dir)
+            .map(|relative| format!("__obj/{}", slash(&relative)))
+            .or_else(|| util::strip_prefix_ci(source, &self.model.out_dir).map(|relative| format!("__out/{}", slash(&relative))))
+            .or_else(|| util::strip_prefix_ci(source, &target.dir).map(|relative| slash(&relative)))
+            .or_else(|| util::strip_prefix_ci(source, package_root).map(|relative| slash(&relative)))
+            .map(|relative| relative.replace("../", "__/"))
             .unwrap_or_else(|| format!("external/{hashed_name}"));
 
         // Room for the dependency file's extension after it (.json)
-        let object = self.object_dir(target).join(format!("{relative}.{extension}"));
+        let object = object_dir.join(format!("{relative}.{extension}"));
         if path_text(&object).len() + ".json".len() <= OBJECT_PATH_MAX {
             return object;
         }
-        self.object_dir(target).join(format!("{hashed_name}.{extension}"))
+        object_dir.join(format!("{hashed_name}.{extension}"))
     }
 
     fn plan_compile(
@@ -1079,6 +1084,7 @@ impl<'a> Planner<'a> {
         action.inputs = vec![source.to_path_buf()];
         action.outputs = vec![output];
         action.after = barrier.to_vec();
+        action.echo_line = self.compiler_echo(source);
 
         Ok(self.push(action))
     }

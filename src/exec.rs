@@ -1204,14 +1204,20 @@ fn quote_response(argument: &str, style: ResponseStyle) -> String {
     quoted
 }
 
-/// Removes tool noise: cl's echo of the file name, link's "Creating library" note and its /LTCG progress.
+/// Removes tool noise: cl's echo of the file name (ml64's "Assembling: <path>"), link's "Creating library" note and
+/// its /LTCG progress.
 fn clean_output(text: &str, echo_line: Option<&str>) -> String {
     let mut cleaned = String::new();
 
     for line in text.lines() {
         let trimmed = line.trim();
-        let is_echo =
-            echo_line.is_some_and(|echo| trimmed.eq_ignore_ascii_case(echo)) || (trimmed.starts_with("tmpxft_") && trimmed.ends_with(".cudafe1.cpp"));
+        let names_file = |echo: &str| {
+            let assembled = trimmed
+                .strip_prefix("Assembling: ")
+                .map(|path| path.rsplit(['/', '\\']).next().unwrap_or(path));
+            trimmed.eq_ignore_ascii_case(echo) || assembled.is_some_and(|name| name.eq_ignore_ascii_case(echo))
+        };
+        let is_echo = echo_line.is_some_and(names_file) || (trimmed.starts_with("tmpxft_") && trimmed.ends_with(".cudafe1.cpp"));
         let is_link_chatter = (trimmed.starts_with("LINK : ") && trimmed.ends_with("performing full link"))
             || trimmed == "Generating code"
             || trimmed == "Finished generating code";
