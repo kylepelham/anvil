@@ -40,6 +40,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "anvil",
+    bin_name = "anvil",
     version,
     about = "A fast, zero-ceremony build system for C and C++",
     propagate_version = true
@@ -70,7 +71,10 @@ enum CommandLine {
         all: bool,
 
         #[command(flatten)]
-        build: BuildArgs,
+        plan: PlanArgs,
+
+        #[command(flatten)]
+        run: RunArgs,
     },
 
     /// Build and run a program; arguments after `--` go to it.
@@ -80,8 +84,12 @@ enum CommandLine {
         target: Option<String>,
 
         #[command(flatten)]
-        build: BuildArgs,
+        plan: PlanArgs,
 
+        #[command(flatten)]
+        run: RunArgs,
+
+        /// Arguments for the program.
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -94,7 +102,10 @@ enum CommandLine {
         test: TestArgs,
 
         #[command(flatten)]
-        build: BuildArgs,
+        plan: PlanArgs,
+
+        #[command(flatten)]
+        run: RunArgs,
     },
 
     /// Build (with the release profile unless -p names another), then copy the programs, libraries and public headers
@@ -108,14 +119,19 @@ enum CommandLine {
         prefix: Option<PathBuf>,
 
         #[command(flatten)]
-        build: BuildArgs,
+        plan: PlanArgs,
+
+        #[command(flatten)]
+        run: RunArgs,
     },
 
     /// Delete build output (the profile's folder, or everything with --all).
     Clean {
+        /// The release profile's folders.
         #[arg(short, long, conflicts_with = "profile")]
         release: bool,
 
+        /// A named profile's folders.
         #[arg(short, long, value_name = "NAME")]
         profile: Option<String>,
 
@@ -126,6 +142,7 @@ enum CommandLine {
 
     /// Create a new project folder.
     New {
+        /// The project's name and folder.
         name: String,
 
         /// A library (with a test) instead of a program.
@@ -146,6 +163,7 @@ enum CommandLine {
     },
 
     /// Convert a CMake project's CMakeLists.txt into anvil.toml.
+    #[command(mut_group("PlanArgs", |group| group.requires("check")))]
     Convert {
         /// The CMake project's folder (default: here).
         path: Option<PathBuf>,
@@ -164,13 +182,13 @@ enum CommandLine {
         check: bool,
 
         #[command(flatten)]
-        build: BuildArgs,
+        plan: PlanArgs,
     },
 
     /// List the project's targets.
     Targets {
         #[command(flatten)]
-        build: BuildArgs,
+        plan: PlanArgs,
     },
 
     /// Show the compilers Anvil can use.
@@ -186,6 +204,10 @@ enum CommandLine {
     },
 
     /// See and choose vcpkg installations, or run vcpkg (`anvil vcpkg -- search fmt`).
+    #[command(
+        args_conflicts_with_subcommands = true,
+        override_usage = "anvil vcpkg [COMMAND]\n       anvil vcpkg -- <ARGS>..."
+    )]
     Vcpkg {
         #[command(subcommand)]
         action: Option<VcpkgCommand>,
@@ -198,7 +220,7 @@ enum CommandLine {
     /// Write compile_commands.json to the project root (for clangd).
     Compdb {
         #[command(flatten)]
-        build: BuildArgs,
+        plan: PlanArgs,
     },
 
     /// Print the JSON Schema of anvil.toml for editors (Taplo, Even Better TOML, JetBrains).
@@ -232,7 +254,10 @@ enum CommandLine {
         fix: bool,
 
         #[command(flatten)]
-        build: BuildArgs,
+        plan: PlanArgs,
+
+        #[command(flatten)]
+        exec: ExecArgs,
     },
 
     /// Move git dependencies to the newest commit of their branch or tag and vcpkg to its newest ports, and rewrite
@@ -242,7 +267,7 @@ enum CommandLine {
         names: Vec<String>,
 
         #[command(flatten)]
-        build: BuildArgs,
+        plan: PlanArgs,
     },
 
     /// Print a shell completion script (`anvil completions powershell >> $PROFILE`).
@@ -255,7 +280,10 @@ enum VcpkgCommand {
     List,
 
     /// Use this vcpkg from now on (a number from `list`, or a folder).
-    Use { which: String },
+    Use {
+        /// A number from `anvil vcpkg list`, or a vcpkg folder.
+        which: String,
+    },
 
     /// Register a vcpkg in a non-standard folder.
     Add { path: PathBuf },
@@ -264,7 +292,10 @@ enum VcpkgCommand {
     Setup,
 
     /// Search the selected vcpkg's ports.
-    Search { term: String },
+    Search {
+        /// Part of a port's name or description.
+        term: String,
+    },
 }
 
 #[derive(Args)]
@@ -288,12 +319,14 @@ pub struct TestArgs {
     #[arg(long, value_name = "FILE")]
     pub junit: Option<PathBuf>,
 
+    /// Arguments for the tests that run a program of the project.
     #[arg(last = true)]
     pub args: Vec<String>,
 }
 
+/// What a command plans: profile, toolchain, machine, options, lock.
 #[derive(Args, Clone, Default)]
-pub struct BuildArgs {
+pub struct PlanArgs {
     /// Build with the release profile.
     #[arg(short, long)]
     pub release: bool,
@@ -302,6 +335,27 @@ pub struct BuildArgs {
     #[arg(short, long, value_name = "NAME", conflicts_with = "release")]
     pub profile: Option<String>,
 
+    /// msvc, clang-cl, clang or gcc (default: the project's, else `anvil toolchains --set-default`'s, else the
+    /// compiler CXX names, else the best installed).
+    #[arg(long, value_name = "NAME")]
+    pub toolchain: Option<String>,
+
+    /// Build for another machine: x64, x86, arm64, arm, or a triple such as aarch64-linux-gnu.
+    #[arg(long = "target", id = "platform", value_name = "PLATFORM")]
+    pub platform: Option<String>,
+
+    /// Fail instead of changing anvil.lock (for CI).
+    #[arg(long)]
+    pub locked: bool,
+
+    /// Set an option: -o name=true|false (or -o name, -o !name).
+    #[arg(short = 'o', long = "option", value_name = "NAME=VALUE")]
+    pub options: Vec<String>,
+}
+
+/// How a command runs the actions it planned.
+#[derive(Args, Clone, Default)]
+pub struct ExecArgs {
     /// Parallel jobs (default: one per CPU, plus two).
     #[arg(short, long)]
     pub jobs: Option<usize>,
@@ -318,29 +372,61 @@ pub struct BuildArgs {
     #[arg(long)]
     pub explain: bool,
 
-    /// After the build, print the slowest actions and the time per kind of action.
-    #[arg(long)]
-    pub timings: bool,
-
-    /// msvc, clang-cl, clang or gcc (default: the project's, else the best installed).
-    #[arg(long, value_name = "NAME")]
-    pub toolchain: Option<String>,
-
-    /// Build for another machine: x64, x86, arm64, arm, or a triple such as aarch64-linux-gnu.
-    #[arg(long = "target", id = "platform", value_name = "PLATFORM")]
-    pub platform: Option<String>,
-
-    /// Fail instead of changing anvil.lock (for CI).
-    #[arg(long)]
-    pub locked: bool,
-
-    /// Set an option: -o name=true|false (or -o name, -o !name).
-    #[arg(short = 'o', long = "option", value_name = "NAME=VALUE")]
-    pub options: Vec<String>,
-
     /// Run compilers at below-normal priority (keeps the machine responsive).
     #[arg(long)]
     pub low_priority: bool,
+}
+
+/// How a build runs: its actions, and the timings it reports after.
+#[derive(Args, Clone, Default)]
+pub struct RunArgs {
+    #[command(flatten)]
+    pub exec: ExecArgs,
+
+    /// After the build, print the slowest actions and the time per kind of action.
+    #[arg(long)]
+    pub timings: bool,
+}
+
+/// What the commands that load a project take: the command line's planning and run options together.
+#[derive(Clone, Default)]
+pub struct BuildArgs {
+    pub release: bool,
+    pub profile: Option<String>,
+    pub jobs: Option<usize>,
+    pub keep_going: bool,
+    pub verbose: bool,
+    pub explain: bool,
+    pub timings: bool,
+    pub toolchain: Option<String>,
+    pub platform: Option<String>,
+    pub locked: bool,
+    pub options: Vec<String>,
+    pub low_priority: bool,
+}
+
+impl BuildArgs {
+    pub fn new(plan: PlanArgs, run: RunArgs) -> BuildArgs {
+        BuildArgs {
+            release: plan.release,
+            profile: plan.profile,
+            jobs: run.exec.jobs,
+            keep_going: run.exec.keep_going,
+            verbose: run.exec.verbose,
+            explain: run.exec.explain,
+            timings: run.timings,
+            toolchain: plan.toolchain,
+            platform: plan.platform,
+            locked: plan.locked,
+            options: plan.options,
+            low_priority: run.exec.low_priority,
+        }
+    }
+
+    /// A command that only plans: the run options keep their defaults.
+    pub fn planning(plan: PlanArgs) -> BuildArgs {
+        BuildArgs::new(plan, RunArgs::default())
+    }
 }
 
 fn main() {
@@ -387,32 +473,36 @@ fn main() {
     let command = cli.command.unwrap_or(CommandLine::Build {
         targets: Vec::new(),
         all: false,
-        build: BuildArgs::default(),
+        plan: PlanArgs::default(),
+        run: RunArgs::default(),
     });
 
     let result = match command {
-        CommandLine::Build { targets, all, build } => commands::build(&start_dir, &build, &targets, all).map(|_| 0),
-        CommandLine::Run { target, build, args } => commands::run(&start_dir, &build, target.as_deref(), &args),
-        CommandLine::Test { test, build } => commands::test(&start_dir, &build, &test),
-        CommandLine::Install { targets, prefix, build } => install::install(&start_dir, &build, &targets, prefix.as_deref()).map(|_| 0),
+        CommandLine::Build { targets, all, plan, run } => commands::build(&start_dir, &BuildArgs::new(plan, run), &targets, all).map(|_| 0),
+        CommandLine::Run { target, plan, run, args } => commands::run(&start_dir, &BuildArgs::new(plan, run), target.as_deref(), &args),
+        CommandLine::Test { test, plan, run } => commands::test(&start_dir, &BuildArgs::new(plan, run), &test),
+        CommandLine::Install { targets, prefix, plan, run } => {
+            install::install(&start_dir, &BuildArgs::new(plan, run), &targets, prefix.as_deref()).map(|_| 0)
+        }
         CommandLine::Clean { release, profile, all } => commands::clean(&start_dir, release, profile.as_deref(), all).map(|_| 0),
         CommandLine::New { name, lib } => scaffold::new_project(&start_dir, &name, lib, &shell_dir).map(|_| 0),
         CommandLine::Init => scaffold::init(&start_dir).map(|_| 0),
         CommandLine::Add(args) => scaffold::add(&start_dir, &args).map(|_| 0),
         CommandLine::Remove { name } => scaffold::remove(&start_dir, &name).map(|_| 0),
-        CommandLine::Convert {
-            path, check: true, build, ..
-        } => commands::convert_check(&start_dir, path.as_deref(), &build),
+        CommandLine::Convert { path, check: true, plan, .. } => commands::convert_check(&start_dir, path.as_deref(), &BuildArgs::planning(plan)),
         CommandLine::Convert { path, stdout, force, .. } => commands::convert(&start_dir, path.as_deref(), stdout, force).map(|_| 0),
-        CommandLine::Targets { build } => commands::list_targets(&start_dir, &build).map(|_| 0),
+        CommandLine::Targets { plan } => commands::list_targets(&start_dir, &BuildArgs::planning(plan)).map(|_| 0),
         CommandLine::Toolchains { refresh, set_default } => commands::toolchains(refresh, set_default.as_deref()).map(|_| 0),
         CommandLine::Vcpkg { action, args } => commands::vcpkg(&start_dir, action, &args),
-        CommandLine::Compdb { build } => commands::compdb(&start_dir, &build).map(|_| 0),
+        CommandLine::Compdb { plan } => commands::compdb(&start_dir, &BuildArgs::planning(plan)).map(|_| 0),
         CommandLine::Schema { install: true, .. } => schema::install().map(|_| 0),
         CommandLine::Schema { tests, .. } => schema::print(tests).map(|_| 0),
         CommandLine::Fmt { paths, check } => lint::format(&start_dir, check, &paths),
-        CommandLine::Tidy { targets, fix, build } => lint::tidy(&start_dir, &build, fix, &targets),
-        CommandLine::Update { names, build } => commands::update(&start_dir, &build, &names).map(|_| 0),
+        CommandLine::Tidy { targets, fix, plan, exec } => {
+            let run = RunArgs { exec, timings: false };
+            lint::tidy(&start_dir, &BuildArgs::new(plan, run), fix, &targets)
+        }
+        CommandLine::Update { names, plan } => commands::update(&start_dir, &BuildArgs::planning(plan), &names).map(|_| 0),
         CommandLine::Completions { shell } => {
             clap_complete::generate(shell, &mut <Cli as clap::CommandFactory>::command(), "anvil", &mut std::io::stdout());
             Ok(0)

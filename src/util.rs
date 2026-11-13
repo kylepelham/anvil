@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 const FILETIME_UNIX_EPOCH: i64 = 116_444_736_000_000_000;
 
 // GetFileAttributesExW fails on longer paths without the \\?\ prefix
+#[cfg(windows)]
 const WINDOWS_MAX_PATH: usize = 260;
 
 /// Lexically normalizes a path: drops `.`, resolves `..` against earlier components, never touches the disk.
@@ -410,6 +411,13 @@ pub fn split_command(text: &str) -> Vec<String> {
     }
 
     words
+}
+
+/// " (did you mean `close`?)" when a candidate is close to `word`, else nothing: put right after the word in a message.
+pub fn did_you_mean<'a>(word: &str, candidates: impl IntoIterator<Item = &'a str>) -> String {
+    suggest(word, candidates)
+        .map(|close| format!(" (did you mean `{close}`?)"))
+        .unwrap_or_default()
 }
 
 /// The closest candidate by edit distance, for "did you mean" hints.

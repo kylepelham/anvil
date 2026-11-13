@@ -520,10 +520,8 @@ pub fn parse_options(options: &IndexMap<String, toml::Value>) -> Result<IndexMap
         let default = match value {
             toml::Value::Boolean(default) => *default,
             toml::Value::Table(table) => {
-                for key in table.keys().filter(|key| !OPTION_KEYS.contains(&key.as_str())) {
-                    let hint = crate::util::suggest(key, OPTION_KEYS.iter().copied())
-                        .map(|close| format!(" (did you mean `{close}`?)"))
-                        .unwrap_or_default();
+                if let Some(key) = table.keys().find(|key| !OPTION_KEYS.contains(&key.as_str())) {
+                    let hint = crate::util::did_you_mean(key, OPTION_KEYS.iter().copied());
                     bail!("option `{name}`: unknown key `{key}`{hint}; an option takes `default` and `description`");
                 }
                 match (table.get("default"), table.get("description")) {
@@ -586,11 +584,36 @@ fn deserialize_tests<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::
         for test in expanded {
             let name = test.get("name").and_then(|name| name.as_str()).unwrap_or("?").to_string();
             let spec = TestSpec::deserialize(toml::Value::Table(test)).map_err(|error| D::Error::custom(format!("test `{name}`: {error}")))?;
+            if spec.command.to_command().is_empty() {
+                return Err(D::Error::custom(format!(
+                    "test `{name}`: `command` is empty; give the program and its arguments, such as [\"{{target:app}}\", \"--self-test\"]"
+                )));
+            }
             tests.push(spec);
         }
     }
 
     Ok(tests)
+}
+
+/// A build step's command must name a program: an empty one is a mistake, not a step that does nothing.
+fn check_step_commands(table: &str, spec: &TargetSpec) -> Result<()> {
+    let commands = spec
+        .run
+        .iter()
+        .map(|run| ("run", &run.command))
+        .chain(spec.pre_build.iter().map(|step| ("pre-build", &step.command)))
+        .chain(spec.post_build.iter().map(|step| ("post-build", &step.command)));
+    for (key, command) in commands {
+        if command.to_command().is_empty() {
+            bail!("{table} [[{key}]]: `command` is empty; give the program and its arguments, such as [\"python\", \"tools/gen.py\"]");
+        }
+    }
+    for (condition, block) in &spec.when {
+        check_step_commands(&format!("{table} when.\"{condition}\""), block)?;
+    }
+
+    Ok(())
 }
 
 pub fn parse_str(text: &str) -> Result<Manifest> {
@@ -602,17 +625,18 @@ pub fn parse_str(text: &str) -> Result<Manifest> {
                     bail!("[project] name = \"{name}\": a name cannot be empty or hold `/` or `\\` (it names the main target)");
                 }
             }
+            check_step_commands("[defaults]", &manifest.defaults)?;
+            for (table, specs) in [("target", &manifest.target), ("preset", &manifest.preset)] {
+                for (name, spec) in specs {
+                    check_step_commands(&format!("[{table}.{name}]"), spec)?;
+                }
+            }
             return Ok(manifest);
         }
         Err(error) => error,
     };
 
-    let mut message = error.to_string();
-    if let Some(hint) = misspelled_key_hint(&message) {
-        message.push_str(&hint);
-    }
-
-    bail!("{message}")
+    bail!("{}", explain_unknown_key(&error.to_string()))
 }
 
 fn parse_dep_table(name: &str, value: &toml::Value) -> Result<DepSpec> {
@@ -679,23 +703,27 @@ const RENAMED_KEYS: &[(&str, &str)] = &[
     ("private-deps", "deps are private unless public, so write `deps`"),
 ];
 
-/// serde says "unknown field `x`, expected one of `a`, `b`": turn that into "did you mean `a`?".
-fn misspelled_key_hint(message: &str) -> Option<String> {
+/// serde says "unknown field `x`, expected one of `a`, `b`": add "(did you mean `a`?)" after the key, or what a key
+/// an older format had is written as now.
+fn explain_unknown_key(message: &str) -> String {
     let pattern = regex::Regex::new(r"unknown field `([^`]+)`, expected (?:one of )?(.*)").unwrap();
-    let captures = pattern.captures(message)?;
+    let Some(captures) = pattern.captures(message) else {
+        return message.to_string();
+    };
 
     let misspelled = captures[1].to_string();
     if let Some((_, replacement)) = RENAMED_KEYS.iter().find(|(old, _)| *old == misspelled) {
-        return Some(format!("\nhint: `{misspelled}` is gone: {replacement}"));
+        return format!("{message}\nhint: `{misspelled}` is gone: {replacement}");
     }
 
     let known: Vec<String> = captures[2]
         .split(", ")
         .map(|key| key.trim_matches(|character| character == '`' || character == ' ').to_string())
         .collect();
+    let hint = crate::util::did_you_mean(&misspelled, known.iter().map(|key| key.as_str()));
+    let field = format!("unknown field `{misspelled}`");
 
-    let suggestion = crate::util::suggest(&misspelled, known.iter().map(|key| key.as_str()))?;
-    Some(format!("\nhint: did you mean `{suggestion}`?"))
+    message.replacen(&field, &format!("{field}{hint}"), 1)
 }
 
 #[cfg(test)]
@@ -711,7 +739,11 @@ mod tests {
     #[test]
     fn typo_hint() {
         let error = parse_str("[target.a]\nincldue = []\n").unwrap_err().to_string();
-        assert!(error.contains("did you mean `include`"), "{error}");
+        assert!(error.contains("unknown field `incldue` (did you mean `include`?), expected"), "{error}");
+
+        let manifest = parse_str("[options]\nx = { defualt = true }\n").unwrap();
+        let error = parse_options(&manifest.options).unwrap_err().to_string();
+        assert!(error.contains("unknown key `defualt` (did you mean `default`?)"), "{error}");
 
         let error = parse_str("[target.a]\npublic-defines = []\n").unwrap_err().to_string();
         assert!(error.contains("[target.X.public]"), "{error}");
@@ -723,6 +755,26 @@ mod tests {
         assert_eq!(parse_dep("fmt", &manifest.deps["fmt"]).unwrap().vcpkg.unwrap(), "fmt");
         assert_eq!(parse_dep("sdl3", &manifest.deps["sdl3"]).unwrap().features, vec!["vulkan"]);
         assert!(parse_dep("x", &toml::Value::String("bogus".into())).is_err());
+    }
+
+    #[test]
+    fn empty_commands_are_errors() {
+        let error = parse_str("[target.a]\n[[target.a.run]]\ncommand = []\noutput = \"x.h\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("[target.a] [[run]]: `command` is empty"), "{error}");
+
+        let error = parse_str("[target.a.when.windows]\npost-build = [{ command = \"\" }]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("[target.a] when.\"windows\" [[post-build]]: `command` is empty"),
+            "{error}"
+        );
+
+        let error = parse_str("[[test]]\nname = \"t\"\ncommand = []\n").unwrap_err().to_string();
+        assert!(error.contains("test `t`: `command` is empty"), "{error}");
+        assert!(parse_tests("[[test]]\nname = \"t\"\ncommand = \" \"\n").is_err());
     }
 
     #[test]

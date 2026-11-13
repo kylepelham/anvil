@@ -180,11 +180,9 @@ impl CondContext {
                 .chain(["debug", "release"])
                 .chain(self.all_profiles.iter().map(String::as_str))
                 .chain(self.options.keys().map(String::as_str));
-            let hint = crate::util::suggest(name, known)
-                .map(|close| format!(" Did you mean `{close}`?"))
-                .unwrap_or_default();
+            let hint = crate::util::did_you_mean(name, known);
             bail!(
-                "unknown condition `{name}`.{hint} Known: windows, linux, macos, unix, x64, x86, arm64, arm, cross, msvc, gnu, \
+                "unknown condition `{name}`{hint}. Known: windows, linux, macos, unix, x64, x86, arm64, arm, cross, msvc, gnu, \
                  cl, clang-cl, clang, gcc, mingw, debug, release, any profile name, any [options] name, true, false"
             );
         }
@@ -311,7 +309,7 @@ fn tokenize(source: &str) -> Result<Vec<String>> {
     }
 
     if tokens.is_empty() {
-        bail!("empty condition");
+        bail!("empty condition: write one, such as \"windows\" or \"debug & !msvc\", or leave it out");
     }
 
     Ok(tokens)
@@ -387,7 +385,10 @@ mod tests {
         let error = context.check("linux & tpyo").unwrap_err().to_string();
         assert!(error.contains("unknown condition `tpyo`"), "{error}");
         let error = context.check("editor_biuld").unwrap_err().to_string();
-        assert!(error.contains("Did you mean `editor_build`?"), "{error}");
+        assert!(
+            error.contains("unknown condition `editor_biuld` (did you mean `editor_build`?)"),
+            "{error}"
+        );
         assert!(context.check("!windows | (msvc & editor_build)").is_ok());
     }
 }

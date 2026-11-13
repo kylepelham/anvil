@@ -75,7 +75,7 @@ const LISTED_FOLDER_MIN_FILES: usize = 8;
 /// What a worker tells the scheduler: its process ended (its lane is free), then the action's result.
 enum Report {
     ProcessDone(usize),
-    Finished(Outcome, Timing),
+    Finished(Box<Outcome>, Timing),
 }
 
 /// What a worker reports back for one action.
@@ -349,7 +349,7 @@ impl Executor<'_> {
                             outcome.measured = measure_inputs(action, &outcome, &before, &stamps, &system_dirs);
                             hash_objects(action, &outcome.output_mtimes, &stamps);
                         }
-                        let _ = reports.send(Report::Finished(outcome, timing));
+                        let _ = reports.send(Report::Finished(Box::new(outcome), timing));
                     }
                 });
             }
@@ -446,7 +446,7 @@ impl Executor<'_> {
                     }
                     Report::Finished(outcome, timing) => {
                         self.timings.push(timing);
-                        outcome
+                        *outcome
                     }
                 };
                 running -= 1;

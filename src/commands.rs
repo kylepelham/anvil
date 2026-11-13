@@ -18,6 +18,13 @@ use std::path::{Path, PathBuf};
 // Marks a folder as Anvil's output, so `clean --all` never deletes anything else
 const OUT_MARKER: &str = ".anvil-out";
 
+// In a profile's output folder (`<out>/<folder>/.anvil/`): the profile it is built with, for `anvil clean -p`
+const PROFILE_MARKER: &str = "profile";
+
+// What else Anvil writes at the top of the output folder, beside the profiles' folders
+const OUT_FILES: &[&str] = &[OUT_MARKER, "compile_commands.json"];
+const OUT_FOLDERS: &[&str] = &["vcpkg", "install", "convert-check"];
+
 pub fn build(start_dir: &Path, build: &BuildArgs, names: &[String], include_tests: bool) -> Result<(Model, Plan)> {
     let model = load_model_naming(start_dir, build, names)?;
 
@@ -41,7 +48,11 @@ pub fn run(start_dir: &Path, build: &BuildArgs, name: Option<&str>, args: &[Stri
     check_runs_here(&model, "run")?;
 
     let (model, plan) = build_roots(model, build, &[target])?;
-    let program = plan.artifacts.get(&target).cloned().context("the target produced no program")?;
+    let program = plan
+        .artifacts
+        .get(&target)
+        .cloned()
+        .with_context(|| format!("`{}` produced no program to run", model.targets[target].name))?;
 
     ui::status(
         "Running",
@@ -90,6 +101,12 @@ pub fn test(start_dir: &Path, build: &BuildArgs, options: &TestArgs) -> Result<i
         } else {
             ""
         };
+
+        // Listing nothing is an answer, not a failure
+        if options.list {
+            ui::status("Listed", &format!("no tests{hint}"));
+            return Ok(0);
+        }
         bail!("no tests to run{hint}");
     }
 
@@ -145,29 +162,55 @@ pub fn test(start_dir: &Path, build: &BuildArgs, options: &TestArgs) -> Result<i
 
 pub fn clean(start_dir: &Path, release: bool, profile: Option<&str>, all: bool) -> Result<()> {
     let (root, manifest) = project::locate(start_dir)?;
-    let out_name = manifest
-        .project
-        .as_ref()
-        .and_then(|project| project.out.clone())
-        .unwrap_or_else(|| "out".into());
-    let out_root = util::absolute(&root, Path::new(&out_name));
+    let out_root = project::output_root(&root, &manifest)?;
 
     if all {
         if !out_root.join(OUT_MARKER).is_file() {
             bail!("{} does not look like Anvil's output folder; not deleting it", slash(&out_root));
         }
+
+        // Only what Anvil wrote: profiles' folders and its own files and folders
+        let profiles: Vec<&str> = ["debug", "release"]
+            .into_iter()
+            .chain(manifest.profile.keys().map(|name| name.as_str()))
+            .collect();
+        let mut strays: Vec<String> = std::fs::read_dir(&out_root)
+            .with_context(|| format!("reading {}", slash(&out_root)))?
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let path = entry.path();
+                let known = if path.is_dir() {
+                    OUT_FOLDERS.contains(&name.as_str())
+                        || path.join(".anvil").is_dir()
+                        || profiles.iter().any(|profile| is_profile_folder(&path, profile))
+                } else {
+                    OUT_FILES.contains(&name.as_str())
+                };
+                !known
+            })
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        strays.sort();
+        if !strays.is_empty() {
+            bail!(
+                "{} holds what Anvil did not write ({}); not deleting it. Delete it yourself, or `anvil clean -p <profile>` for one profile's folders",
+                slash(&out_root),
+                strays.join(", ")
+            );
+        }
+
         std::fs::remove_dir_all(&out_root).with_context(|| format!("deleting {}", slash(&out_root)))?;
         ui::status("Removed", &slash(&out_root));
         return Ok(());
     }
 
-    // The profile's folder and its per-toolchain variants (debug, debug-clang, ...)
+    // The profile's folder and its per-toolchain and per-machine variants (debug, debug-clang, debug-arm64, ...)
     let profile = profile.unwrap_or(if release { "release" } else { "debug" });
     let mut removed = 0;
     for entry in std::fs::read_dir(&out_root).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
         let ours = entry.path().join(".anvil").is_dir();
-        if ours && (name == profile || name.starts_with(&format!("{profile}-"))) {
+        if ours && is_profile_folder(&entry.path(), profile) {
             std::fs::remove_dir_all(entry.path()).with_context(|| format!("deleting {}", slash(&entry.path())))?;
             ui::status("Removed", &slash(&entry.path()));
             removed += 1;
@@ -178,6 +221,30 @@ pub fn clean(start_dir: &Path, release: bool, profile: Option<&str>, all: bool) 
         ui::status("Clean", &format!("nothing built for `{profile}`"));
     }
     Ok(())
+}
+
+/// Whether `folder`, in the output folder, holds a build with `profile`: the profile its build wrote down, else its
+/// name: the profile's, then the toolchain and machine picked on the command line (debug-gcc, debug-clang-arm64).
+fn is_profile_folder(folder: &Path, profile: &str) -> bool {
+    if let Ok(written) = std::fs::read_to_string(folder.join(".anvil").join(PROFILE_MARKER)) {
+        return written.trim() == profile;
+    }
+
+    let name = folder.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    if name == profile {
+        return true;
+    }
+    let Some(suffix) = name.strip_prefix(profile).and_then(|rest| rest.strip_prefix('-')) else {
+        return false;
+    };
+    let families = [Family::Msvc, Family::ClangCl, Family::Clang, Family::Gcc].map(Family::name);
+    let after_family = families.iter().any(|family| match suffix.strip_prefix(family) {
+        Some("") => true,
+        Some(rest) => rest.strip_prefix('-').is_some_and(|machine| Platform::parse(machine).is_ok()),
+        None => false,
+    });
+
+    after_family || Platform::parse(suffix).is_ok()
 }
 
 pub fn list_targets(start_dir: &Path, build: &BuildArgs) -> Result<()> {
@@ -393,14 +460,12 @@ pub fn update(start_dir: &Path, build: &BuildArgs, names: &[String]) -> Result<(
 
     // A name that is not one of them is a typo, not a request to do nothing
     if let Some(unknown) = names.iter().find(|name| !known.contains(name)) {
-        let hint = util::suggest(unknown, known.iter().map(|known| known.as_str()))
-            .map(|close| format!(" Did you mean `{close}`?"))
-            .unwrap_or_default();
+        let hint = util::did_you_mean(unknown, known.iter().map(|known| known.as_str()));
         if known.is_empty() {
             bail!("`{unknown}` is not a git dependency or vcpkg: this project has neither, so there is nothing to update");
         }
         bail!(
-            "`{unknown}` is not a git dependency or vcpkg.{hint} `anvil update` takes: {}",
+            "`{unknown}`{hint} is not a git dependency or vcpkg. `anvil update` takes: {}",
             known.join(", ")
         );
     }
@@ -449,6 +514,17 @@ fn load_model_with(start_dir: &Path, build: &BuildArgs, refresh: Refresh, list_o
         (None, false) => "debug".to_string(),
     };
 
+    // `--target game`: a target's name where the machine goes
+    if let Some(platform) = &build.platform {
+        if let Err(error) = Platform::parse(platform) {
+            let declared = project::locate(start_dir).is_ok_and(|(_, manifest)| manifest.target.contains_key(platform));
+            if declared || is_target_like(platform) {
+                bail!("`--target {platform}`: `--target` picks the machine to build for (x64, x86, arm64, arm, or a triple such as aarch64-linux-gnu); to build target `{platform}`, write `anvil build {platform}`");
+            }
+            return Err(error);
+        }
+    }
+
     Model::load(&LoadOptions {
         start_dir: start_dir.to_path_buf(),
         profile,
@@ -461,6 +537,11 @@ fn load_model_with(start_dir: &Path, build: &BuildArgs, refresh: Refresh, list_o
         list_only,
         named_targets: named_targets.to_vec(),
     })
+}
+
+/// A word that names a target rather than a machine: no triple's dashes, a target name's characters.
+fn is_target_like(text: &str) -> bool {
+    !text.contains('-') && !text.is_empty() && text.chars().all(|character| character.is_alphanumeric() || "_.+".contains(character))
 }
 
 /// Programs built for another machine cannot start here.
@@ -490,6 +571,9 @@ pub fn build_roots(mut model: Model, build: &BuildArgs, roots: &[usize]) -> Resu
         model.out_root.join(OUT_MARKER),
         "Anvil build output. `anvil clean --all` deletes this folder.\n",
     )?;
+    let state_dir = model.out_dir.join(".anvil");
+    std::fs::create_dir_all(&state_dir)?;
+    std::fs::write(state_dir.join(PROFILE_MARKER), format!("{}\n", model.profile.name))?;
 
     // A cross build's steps run programs built for this machine, from the project loaded for it
     let host = if model.toolchain.platform.is_cross() && !plan::step_programs(&model, roots)?.is_empty() {
@@ -687,4 +771,51 @@ fn project_vcpkg_root(start_dir: &Path) -> Option<PathBuf> {
     let (root, manifest) = project::locate(start_dir).ok()?;
     let configured = manifest.vcpkg?.root?;
     Some(util::absolute(&root, Path::new(&util::expand_env(&configured).ok()?)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_folders_by_marker_else_by_name() {
+        let out_root = std::env::temp_dir().join(format!("anvil_profile_folders_{}", std::process::id()));
+        for (folder, marker) in [
+            ("rel", None),
+            ("rel-fast", None),
+            ("rel-gcc", None),
+            ("rel-clang-cl-arm64", None),
+            ("rel-x86", None),
+            ("odd", Some("rel")),
+        ] {
+            std::fs::create_dir_all(out_root.join(folder).join(".anvil")).unwrap();
+            if let Some(profile) = marker {
+                std::fs::write(out_root.join(folder).join(".anvil").join(PROFILE_MARKER), format!("{profile}\n")).unwrap();
+            }
+        }
+        let matches = |folder: &str, profile: &str| is_profile_folder(&out_root.join(folder), profile);
+
+        // Without a marker: the profile's name, then a toolchain or machine
+        assert!(matches("rel", "rel"));
+        assert!(matches("rel-gcc", "rel"));
+        assert!(matches("rel-clang-cl-arm64", "rel"));
+        assert!(matches("rel-x86", "rel"));
+        assert!(!matches("rel-fast", "rel"));
+        assert!(matches("rel-fast", "rel-fast"));
+
+        // The marker decides
+        assert!(matches("odd", "rel"));
+        std::fs::write(out_root.join("rel-gcc").join(".anvil").join(PROFILE_MARKER), "rel-gcc\n").unwrap();
+        assert!(!matches("rel-gcc", "rel"));
+
+        let _ = std::fs::remove_dir_all(&out_root);
+    }
+
+    #[test]
+    fn target_names_where_the_machine_goes() {
+        assert!(is_target_like("game"));
+        assert!(is_target_like("game_tests"));
+        assert!(!is_target_like("aarch64-linux-gnu"));
+        assert!(!is_target_like(""));
+    }
 }

@@ -322,12 +322,10 @@ impl Instance {
             port_names.extend(entries.map(|entry| entry.file_name().to_string_lossy().into_owned()));
         }
 
-        let hint = util::suggest(name, port_names.iter().map(|port| port.as_str()))
-            .map(|close| format!(" Did you mean `{close}`?"))
-            .unwrap_or_default();
+        let hint = util::did_you_mean(name, port_names.iter().map(|port| port.as_str()));
         let overlays = if overlay_ports.is_empty() { "" } else { " or the overlay ports" };
         anyhow::anyhow!(
-            "vcpkg has no port `{name}` (in {}{overlays}).{hint} Search with `anvil vcpkg search {name}`.",
+            "vcpkg has no port `{name}`{hint} in {}{overlays}. Search with `anvil vcpkg search {name}`.",
             slash(&self.root.join("ports"))
         )
     }

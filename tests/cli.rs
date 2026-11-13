@@ -2052,7 +2052,7 @@ fn options_of_dependencies_that_are_off_are_known() {
     project
         .anvil(&["targets", "-o", "x_fastt"])
         .code(1)
-        .contains("unknown option `x_fastt`. Did you mean `x_fast`?");
+        .contains("unknown option `x_fastt` (did you mean `x_fast`?)");
 }
 
 #[test]
@@ -2355,4 +2355,171 @@ fn resource_script_keeps_a_debug_value_msvc() {
     run.success();
     let resource = run.output().lines().find(|line| line.contains("rc.exe")).unwrap().to_string();
     assert!(resource.contains("/D_DEBUG=1") && !resource.contains("/D_DEBUG "), "{resource}");
+}
+
+// 39. Hardening: an output folder that holds the project is refused and `clean` never deletes what Anvil did not write;
+//     `clean -p` takes only that profile's folders; folders where files go are errors; flags a command ignores are
+//     refused; `--target` given a target's name; unused and CMake-only dependencies; messages that say what to write
+
+#[test]
+fn output_folder_holding_the_project_is_refused() {
+    require!("default");
+    let project = Project::empty("harden_out");
+    project.write("src/main.cpp", "int main() { return 0; }\n");
+
+    for out in [".", "", "..", "src"] {
+        project.write("anvil.toml", &format!("[project]\nname = \"keep\"\nout = \"{out}\"\n"));
+        project.anvil(&["build"]).code(1).contains(&format!("[project] out = \"{out}\""));
+        project.anvil(&["clean", "--all"]).code(1).contains("anvil clean --all");
+        assert!(project.path("src/main.cpp").is_file(), "out = \"{out}\" lost the sources");
+    }
+
+    // An output folder holding something else is not deleted whole
+    project.write("anvil.toml", "[project]\nname = \"keep\"\nout = \"build\"\n");
+    project.anvil(&["build"]).success();
+    project.write("build/notes.txt", "mine\n");
+    project
+        .anvil(&["clean", "--all"])
+        .code(1)
+        .contains("holds what Anvil did not write (notes.txt)");
+    assert!(project.path("build/notes.txt").is_file());
+    std::fs::remove_file(project.path("build/notes.txt")).unwrap();
+    project.anvil(&["clean", "--all"]).success().contains("Removed");
+    assert!(!project.path("build").exists() && project.path("src/main.cpp").is_file());
+}
+
+#[test]
+fn clean_profile_takes_only_that_profiles_folders() {
+    require!("default");
+    let project = Project::empty("harden_clean");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"p\"\n[profile.rel]\ninherits = \"release\"\n[profile.rel-fast]\ninherits = \"release\"\n",
+    );
+    project.write("src/main.cpp", "int main() { return 0; }\n");
+    project.anvil(&["build", "-p", "rel"]).success();
+    project.anvil(&["build", "-p", "rel-fast"]).success();
+
+    project.anvil(&["clean", "-p", "rel"]).success().contains("out/rel").lacks("rel-fast");
+    assert!(!project.path("out/rel").exists());
+    assert!(project.path("out/rel-fast").is_dir());
+}
+
+#[test]
+fn folders_where_files_go_are_errors() {
+    require!("default");
+    let project = Project::empty("harden_folders");
+    project.write("src/main.cpp", "int main() { return 0; }\n");
+    project.write("inc/x.h", "\n");
+    let deps = |key: &str| format!("[project]\nname = \"f\"\n[deps]\nx = {{ include = [\"inc\"], {key} }}\n");
+
+    for entry in ["runtime = [\"src\"]", "runtime = [\"C:/\"]", "runtime = [\"/\"]"] {
+        project.write("anvil.toml", &deps(entry));
+        project
+            .anvil(&["build"])
+            .code(1)
+            .contains("is a folder; `runtime` lists the files copied beside the programs");
+    }
+    project.write("anvil.toml", &deps("libs = [\"./src\"]"));
+    project.anvil(&["build"]).code(1).contains("libs = [\"./src\"] is a folder");
+    project.write("anvil.toml", "[project]\nname = \"f\"\n[target.f]\nkind = \"exe\"\npch = \"src\"\n");
+    project
+        .anvil(&["build"])
+        .code(1)
+        .contains("pch = \"src\" is a folder; pch names a header");
+}
+
+#[test]
+fn flags_a_command_ignores_are_refused() {
+    let project = Project::empty("harden_flags");
+    project.write("anvil.toml", "[project]\nname = \"f\"\n");
+
+    project.anvil(&["convert", "-o", "X", "--toolchain", "gcc"]).code(2).contains("--check");
+    project.anvil(&["convert", "-j", "3"]).code(2).contains("unexpected argument '-j'");
+    for command in ["targets", "compdb", "update"] {
+        project.anvil(&[command, "--timings"]).code(2).contains("unexpected argument '--timings'");
+    }
+    project.anvil(&["tidy", "--timings"]).code(2);
+    project.anvil(&["vcpkg", "list", "--", "x"]).code(2);
+}
+
+#[test]
+fn target_flag_given_a_target_name_says_how_to_build_it() {
+    require!("default");
+    let project = Project::empty("harden_target");
+    project.write("anvil.toml", "[project]\nname = \"game\"\n");
+    project.write("src/main.cpp", "int main() { return 0; }\n");
+
+    project
+        .anvil(&["build", "--target", "game"])
+        .code(1)
+        .contains("`--target` picks the machine to build for")
+        .contains("write `anvil build game`");
+    project
+        .anvil(&["build", "--target", "aarch64-nowhere"])
+        .code(1)
+        .contains("cannot tell its operating system");
+}
+
+#[test]
+fn unused_and_cmake_only_dependencies_are_warned() {
+    require!("default");
+    let project = Project::empty("harden_deps");
+    project.write(
+        "app/anvil.toml",
+        "[project]\nname = \"app\"\n[deps]\nused = { path = \"../used\" }\nglm = { include = [\"inc\"] }\n\
+         [dev-deps]\ncheck = { include = [\"inc\"] }\n[target.app]\nkind = \"exe\"\ndeps = [\"used\"]\n",
+    );
+    project.write("app/inc/x.h", "\n");
+    project.write("app/src/main.cpp", "int used();\nint main() { return used(); }\n");
+    project.write("used/CMakeLists.txt", "add_library(used src/used.cpp)\n");
+    project.write("used/src/used.cpp", "int used() { return 0; }\n");
+
+    project
+        .anvil_in("app", &["build"])
+        .success()
+        .contains("`[deps] glm`: no target uses it")
+        .contains("`[dev-deps] check`: no test uses it")
+        .contains("has a CMakeLists.txt but no anvil.toml")
+        .contains("anvil convert")
+        .lacks("`[deps] used`");
+
+    // Under the layout conventions every target uses every entry
+    project.write("app/anvil.toml", "[project]\nname = \"app\"\n[deps]\nglm = { include = [\"inc\"] }\n");
+    project.write("app/src/main.cpp", "int main() { return 0; }\n");
+    project.anvil_in("app", &["build"]).success().lacks("no target uses it");
+}
+
+#[test]
+fn messages_say_what_to_write() {
+    require!("default");
+    let project = Project::empty("harden_messages");
+    project.write("src/main.cpp", "int main() { return 0; }\n");
+    let manifest = |rest: &str| format!("[project]\nname = \"m\"\n{rest}");
+
+    project.write("anvil.toml", &manifest("[[test]]\nname = \"t\"\ncommand = []\n"));
+    project.anvil(&["test"]).code(1).contains("test `t`: `command` is empty");
+    project.write(
+        "anvil.toml",
+        &manifest("[target.m]\nkind = \"exe\"\n[[target.m.run]]\ncommand = \"\"\noutput = \"x.h\"\n"),
+    );
+    project.anvil(&["build"]).code(1).contains("[target.m] [[run]]: `command` is empty");
+    project.write("anvil.toml", &manifest("[target.m]\nkind = \"exe\"\nstd = \"c++99\"\n"));
+    project.anvil(&["build"]).code(1).contains("C++ standards are 11, 14, 17, 20, 23 and 26");
+    project.write("anvil.toml", &manifest("[target.m]\nkind = \"exe\"\nif = \"\"\n"));
+    project.anvil(&["build"]).code(1).contains("empty condition: write one");
+    project.write("anvil.toml", &manifest("[target.m]\nkind = \"exe\"\ninclude = [\"missing\"]\n"));
+    project
+        .anvil(&["build"])
+        .success()
+        .contains("include folder missing does not exist (included by `m`)");
+    project.write("anvil.toml", "[project]\nname = \"game\"\n");
+    project
+        .anvil(&["build", "gmae"])
+        .code(1)
+        .contains("no target named `gmae` (did you mean `game`?)");
+
+    // Listing no tests is an answer; -q leaves notes out
+    project.anvil(&["test", "--list"]).success().contains("no tests");
+    project.anvil(&["-q", "new", "quiet"]).success().lacks("note:");
 }

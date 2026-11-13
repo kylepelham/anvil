@@ -154,9 +154,7 @@ impl Profile {
                 None if specs.contains_key(&current) => "release".to_string(),
                 None => {
                     let known: Vec<&str> = ["debug", "release"].into_iter().chain(specs.keys().map(|key| key.as_str())).collect();
-                    let hint = crate::util::suggest(&current, known.iter().copied())
-                        .map(|close| format!(" (did you mean `{close}`?)"))
-                        .unwrap_or_default();
+                    let hint = crate::util::did_you_mean(&current, known.iter().copied());
                     bail!("unknown profile `{current}`{hint}; known profiles: {}", known.join(", "));
                 }
             };
@@ -238,10 +236,8 @@ impl Profile {
 
         // Lists add up along the chain
         if let Some(sanitize) = &spec.sanitize {
-            for sanitizer in sanitize.iter().filter(|sanitizer| !SANITIZERS.contains(&sanitizer.as_str())) {
-                let hint = crate::util::suggest(sanitizer, SANITIZERS.iter().copied())
-                    .map(|close| format!(" (did you mean `{close}`?)"))
-                    .unwrap_or_default();
+            if let Some(sanitizer) = sanitize.iter().find(|sanitizer| !SANITIZERS.contains(&sanitizer.as_str())) {
+                let hint = crate::util::did_you_mean(sanitizer, SANITIZERS.iter().copied());
                 bail!("sanitize: unknown sanitizer `{sanitizer}`{hint}; common ones are address, undefined, thread, memory and leak");
             }
             self.sanitize = sanitize.clone();

@@ -151,7 +151,10 @@ pub fn normalize_standard(text: &str, language: Language) -> Result<String> {
         ["89", "90", "99", "11", "17", "18", "23"].contains(&digits)
     };
     if !valid {
-        bail!("unsupported language standard \"{text}\"");
+        if cxx {
+            bail!("std = \"{text}\": C++ standards are 11, 14, 17, 20, 23 and 26 (\"c++20\", \"20\", or \"gnu++20\" with GNU extensions)");
+        }
+        bail!("c-std = \"{text}\": C standards are 89, 90, 99, 11, 17, 18 and 23 (\"c17\", or \"17\")");
     }
 
     Ok(if !cxx {
@@ -1115,6 +1118,12 @@ mod tests {
         assert_eq!(normalize_standard("gnu++17", Language::Cxx).unwrap(), "gnu++17");
         assert_eq!(normalize_standard("c17", Language::C).unwrap(), "c17");
         assert!(normalize_standard("c++21", Language::Cxx).is_err());
+
+        // A wrong one names what is accepted
+        let error = normalize_standard("c++99", Language::Cxx).unwrap_err().to_string();
+        assert!(error.contains("std = \"c++99\": C++ standards are 11, 14, 17, 20, 23 and 26"), "{error}");
+        let error = normalize_standard("c98", Language::C).unwrap_err().to_string();
+        assert!(error.contains("c-std = \"c98\": C standards are 89, 90, 99"), "{error}");
     }
 
     #[test]
