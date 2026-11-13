@@ -21,6 +21,7 @@ mod platform;
 mod profile;
 mod project;
 mod scaffold;
+mod schema;
 mod settings;
 mod source_hash;
 mod targets;
@@ -198,6 +199,17 @@ enum CommandLine {
     Compdb {
         #[command(flatten)]
         build: BuildArgs,
+    },
+
+    /// Print the JSON Schema of anvil.toml for editors (Taplo, Even Better TOML, JetBrains).
+    Schema {
+        /// The schema of tests.toml instead.
+        #[arg(long, conflicts_with = "install")]
+        tests: bool,
+
+        /// Write both schemas to the user's data folder (beside settings.json) and say how to point an editor at them.
+        #[arg(long)]
+        install: bool,
     },
 
     /// Format the C and C++ files with clang-format, as the project's .clang-format says.
@@ -396,6 +408,8 @@ fn main() {
         CommandLine::Toolchains { refresh, set_default } => commands::toolchains(refresh, set_default.as_deref()).map(|_| 0),
         CommandLine::Vcpkg { action, args } => commands::vcpkg(&start_dir, action, &args),
         CommandLine::Compdb { build } => commands::compdb(&start_dir, &build).map(|_| 0),
+        CommandLine::Schema { install: true, .. } => schema::install().map(|_| 0),
+        CommandLine::Schema { tests, .. } => schema::print(tests).map(|_| 0),
         CommandLine::Fmt { paths, check } => lint::format(&start_dir, check, &paths),
         CommandLine::Tidy { targets, fix, build } => lint::tidy(&start_dir, &build, fix, &targets),
         CommandLine::Update { names, build } => commands::update(&start_dir, &build, &names).map(|_| 0),

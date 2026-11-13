@@ -1341,3 +1341,37 @@ fn data_files_copy_beside_the_program_when_changed() {
         .code(1)
         .contains("data: \"sounds/*.wav\" matches no files (in tool)");
 }
+
+// 27. anvil schema prints the JSON Schemas of anvil.toml and tests.toml; --install writes them to the data folder
+
+#[test]
+fn schema_prints_and_installs() {
+    let project = Project::empty("schema");
+
+    let run = project.anvil(&["schema"]);
+    run.success();
+    let schema: serde_json::Value = serde_json::from_str(&run.stdout).expect("anvil schema prints JSON");
+    assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
+    assert_eq!(schema["properties"]["target"]["additionalProperties"]["$ref"], "#/definitions/target");
+
+    let run = project.anvil(&["schema", "--tests"]);
+    run.success();
+    let tests: serde_json::Value = serde_json::from_str(&run.stdout).expect("anvil schema --tests prints JSON");
+    let keys: Vec<&String> = tests["properties"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["test"]);
+
+    // --install, into a data folder of the test's own
+    let data = project.path("data");
+    let output = Command::new(common::ANVIL)
+        .args(["schema", "--install"])
+        .env("LOCALAPPDATA", &data)
+        .env("XDG_CACHE_HOME", &data)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("evenBetterToml.schema.associations"));
+    let installed = std::fs::read_to_string(data.join("anvil/anvil.schema.json")).expect("anvil.schema.json written");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&installed).unwrap(), schema);
+    assert!(data.join("anvil/anvil-tests.schema.json").is_file());
+}

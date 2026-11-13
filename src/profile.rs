@@ -44,7 +44,7 @@ pub struct Profile {
 }
 
 // What `sanitize` may name: the sanitizers and the checks of -fsanitize in clang, gcc and MSVC
-const SANITIZERS: &[&str] = &[
+pub const SANITIZERS: &[&str] = &[
     "address",
     "hwaddress",
     "kernel-address",

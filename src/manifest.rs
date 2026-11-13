@@ -484,7 +484,7 @@ pub struct DepSpec {
 const DEFAULT_UNITY_BATCH: usize = 8;
 
 // The keys of an option's table form
-const OPTION_KEYS: &[&str] = &["default", "description"];
+pub const OPTION_KEYS: &[&str] = &["default", "description"];
 
 /// Reads one `[deps]` entry, from its short form ("vcpkg", "pkg-config", "system") or its table.
 pub fn parse_dep(name: &str, value: &toml::Value) -> Result<DepSpec> {
