@@ -700,8 +700,9 @@ fn missing_compiler_cache_is_an_error() {
     command.env("ANVIL_LAUNCHER", "");
     let output = command.output().expect("starting anvil");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
 
-// 18. A build that runs something writes a Chrome trace of it, failed actions too; --timings sums it up
+// 19. A build that runs something writes a Chrome trace of it, failed actions too; --timings sums it up
 
 /// The trace's complete events ("ph": "X"), from the file `--timings` names in its "Trace: <path>" line.
 #[track_caller]
