@@ -1,7 +1,7 @@
 //! Build profiles: the built-in `debug` and `release`, and user profiles that inherit from them.
 
 use crate::manifest::ProfileSpec;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,8 +41,82 @@ pub struct Profile {
     pub target: Option<String>,
 }
 
-// Profiles nested deeper than this are certainly an inheritance cycle
-const MAX_INHERITANCE_DEPTH: usize = 32;
+// What `sanitize` may name: the sanitizers and the checks of -fsanitize in clang, gcc and MSVC
+const SANITIZERS: &[&str] = &[
+    "address",
+    "hwaddress",
+    "kernel-address",
+    "kernel-hwaddress",
+    "memory",
+    "kernel-memory",
+    "thread",
+    "leak",
+    "undefined",
+    "dataflow",
+    "cfi",
+    "cfi-cast-strict",
+    "cfi-derived-cast",
+    "cfi-unrelated-cast",
+    "cfi-nvcall",
+    "cfi-vcall",
+    "cfi-icall",
+    "cfi-mfcall",
+    "kcfi",
+    "safe-stack",
+    "shadow-call-stack",
+    "fuzzer",
+    "fuzzer-no-link",
+    "scudo",
+    "memtag",
+    "memtag-stack",
+    "memtag-heap",
+    "memtag-globals",
+    "realtime",
+    "type",
+    "numerical",
+    "function",
+    "vptr",
+    "alignment",
+    "bool",
+    "builtin",
+    "bounds",
+    "bounds-strict",
+    "array-bounds",
+    "local-bounds",
+    "enum",
+    "float-cast-overflow",
+    "float-divide-by-zero",
+    "implicit-conversion",
+    "implicit-integer-truncation",
+    "implicit-unsigned-integer-truncation",
+    "implicit-signed-integer-truncation",
+    "implicit-integer-sign-change",
+    "implicit-integer-arithmetic-value-change",
+    "implicit-bitfield-conversion",
+    "integer",
+    "integer-divide-by-zero",
+    "nonnull-attribute",
+    "null",
+    "nullability",
+    "nullability-arg",
+    "nullability-assign",
+    "nullability-return",
+    "objc-cast",
+    "object-size",
+    "pointer-overflow",
+    "pointer-compare",
+    "pointer-subtract",
+    "return",
+    "returns-nonnull-attribute",
+    "shift",
+    "shift-base",
+    "shift-exponent",
+    "signed-integer-overflow",
+    "unreachable",
+    "unsigned-integer-overflow",
+    "unsigned-shift-base",
+    "vla-bound",
+];
 
 impl Opt {
     pub fn parse(value: &toml::Value) -> Result<Opt> {
@@ -85,7 +159,7 @@ impl Profile {
                 }
             };
 
-            if chain.contains(&parent) || chain.len() > MAX_INHERITANCE_DEPTH {
+            if chain.contains(&parent) {
                 bail!("profile `{name}` inherits from itself (through {})", chain.join(" -> "));
             }
 
@@ -105,6 +179,19 @@ impl Profile {
         profile.chain = chain;
 
         Ok(profile)
+    }
+
+    /// Checks every `[profile]` table, used or not: what it inherits, its values, the machine it names.
+    pub fn check_all(specs: &IndexMap<String, ProfileSpec>) -> Result<()> {
+        for (name, spec) in specs {
+            let context = || format!("in [profile.{name}]");
+            Profile::resolve(name, specs).with_context(context)?;
+            if let Some(target) = &spec.target {
+                crate::platform::Platform::parse(target).with_context(context)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn builtin(name: &str) -> Option<Profile> {
@@ -147,6 +234,12 @@ impl Profile {
 
         // Lists add up along the chain
         if let Some(sanitize) = &spec.sanitize {
+            for sanitizer in sanitize.iter().filter(|sanitizer| !SANITIZERS.contains(&sanitizer.as_str())) {
+                let hint = crate::util::suggest(sanitizer, SANITIZERS.iter().copied())
+                    .map(|close| format!(" (did you mean `{close}`?)"))
+                    .unwrap_or_default();
+                bail!("sanitize: unknown sanitizer `{sanitizer}`{hint}; common ones are address, undefined, thread, memory and leak");
+            }
             self.sanitize = sanitize.clone();
         }
         self.defines.extend(spec.defines.iter().flatten().cloned());

@@ -34,11 +34,15 @@ pub fn expand(text: &str, inputs: &HashInputs) -> Result<String> {
     let mut rest = text;
     while let Some(start) = rest.find(HASH_START) {
         let after = &rest[start + HASH_START.len()..];
-        let Some(end) = after.find('}') else {
+        let Some(end) = closing_brace(after) else {
             bail!("`{text}`: `{HASH_START}` has no closing `}}`");
         };
 
-        let items: Vec<&str> = after[..end].split(',').map(str::trim).filter(|item| !item.is_empty()).collect();
+        let items: Vec<&str> = split_items(&after[..end])
+            .into_iter()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .collect();
         if items.is_empty() {
             bail!("`{text}`: `{HASH_START}}}` lists nothing to hash");
         }
@@ -61,9 +65,9 @@ fn add_item(item: &str, inputs: &HashInputs, hashed: &mut Vec<u8>) -> Result<()>
     match item {
         "compiler" => hashed.extend_from_slice(inputs.compiler.as_bytes()),
         "flags" => hashed.extend_from_slice((inputs.flags)().as_bytes()),
-        pattern if pattern.contains(['*', '?', '[']) => {
+        pattern if pattern.contains(['*', '?', '[', '{']) => {
             let mut files = targets::walk_glob(inputs.dir, pattern, inputs.out_root)?;
-            files.sort_by_key(|file| util::path_key(file));
+            files.sort_by_cached_key(|file| util::path_key(file));
             if files.is_empty() {
                 bail!("{HASH_START}...}}: `{pattern}` matches no files");
             }
@@ -83,6 +87,44 @@ fn add_file(file: &Path, inputs: &HashInputs, hashed: &mut Vec<u8>) -> Result<()
     hashed.push(0);
     hashed.extend_from_slice(&contents);
     Ok(())
+}
+
+/// Where the `}` that closes `{hash:` is, past the `{a,b}` groups of globs inside it.
+fn closing_brace(text: &str) -> Option<usize> {
+    let mut depth = 0;
+
+    for (position, character) in text.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' if depth == 0 => return Some(position),
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// The items between `{hash:` and its `}`, split at the commas outside `{a,b}` groups.
+fn split_items(text: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+
+    for (position, character) in text.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                items.push(&text[start..position]);
+                start = position + 1;
+            }
+            _ => {}
+        }
+    }
+
+    items.push(&text[start..]);
+    items
 }
 
 #[cfg(test)]
@@ -125,6 +167,12 @@ mod tests {
         assert!(format!("{missing:#}").contains("cannot read"), "{missing:#}");
         let empty = hash("{hash:inc/*.hpp}").unwrap_err();
         assert!(format!("{empty:#}").contains("matches no files"), "{empty:#}");
+
+        // Brace groups inside the item list
+        std::fs::write(dir.join("inc/d.hpp"), "d").unwrap();
+        let grouped = hash("A{hash:inc/*.{h,hpp},b.cpp}B").unwrap();
+        assert!(grouped.starts_with('A') && grouped.ends_with('B') && grouped.len() == 18, "{grouped}");
+        assert_ne!(grouped, hash("A{hash:inc/*.h,b.cpp}B").unwrap());
 
         std::fs::remove_dir_all(&dir).ok();
     }

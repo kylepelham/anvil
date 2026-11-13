@@ -3,15 +3,19 @@
 
 use crate::cond::CondContext;
 use crate::flags::{normalize_standard, Arch, Gui, Language, Warnings};
-use crate::manifest::{self, ExportHeaderSpec, FileRule, RunSpec, StepSpec, TargetSpec};
+use crate::manifest::{self, ExportHeaderSpec, FileRule, Manifest, RunSpec, StepSpec, TargetSpec};
 use crate::profile::Opt;
 use crate::util::{self, slash};
 use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use indexmap::IndexMap;
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 
 pub const SOURCE_GLOB: &str = "**/*.{c,cc,cpp,cxx,c++,cu}";
+
+// Characters that make a pattern a glob
+const GLOB_CHARACTERS: &[char] = &['*', '?', '[', '{'];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -162,14 +166,18 @@ struct Accumulated {
     when_sources: Vec<String>,
     claimed_sources: Vec<String>,
 
-    // Own settings; None for include folders means the convention
+    // Own settings; None for include folders means the convention. Include folders from [defaults], presets and
+    // when blocks add to the target's own (or the convention): those applied before the target's table go first
     include: Option<Vec<String>>,
+    added_include: (Vec<String>, Vec<String>),
     system_include: Vec<String>,
     defines: Vec<String>,
     flags: Vec<String>,
 
     // What dependents get too, and only they
     public_include: Option<Vec<String>>,
+    added_public_include: (Vec<String>, Vec<String>),
+    own_table_applied: bool,
     public_system_include: Vec<String>,
     public_defines: Vec<String>,
     public_flags: Vec<String>,
@@ -401,41 +409,43 @@ impl Target {
         let include_dir = root.join("include");
         let mut targets = Vec::new();
 
-        // The main target
-        let (sources, kind) = if source_dir.is_dir() {
-            let sources = expand_patterns(root, &[format!("src/{SOURCE_GLOB}")], scope.out_root, false)?;
-            let has_main = sources
-                .iter()
-                .any(|source| is_main_file(source) && source.parent() == Some(source_dir.as_path()));
-            let kind = if has_main { Kind::Exe } else { Kind::Static };
-            (sources, kind)
+        // The main target: a program when src/ has a main file, else a library; without src/, a program from the
+        // files beside anvil.toml, else headers. Its sources are the convention's, as for any target
+        let kind = if source_dir.is_dir() {
+            match folder_has_source(&source_dir, true) {
+                true => Kind::Exe,
+                false => Kind::Static,
+            }
         } else {
-            let sources = expand_patterns(root, &["*.{c,cc,cpp,cxx}".to_string()], scope.out_root, false)?;
-            let kind = if sources.is_empty() { Kind::Headers } else { Kind::Exe };
-            (sources, kind)
+            match folder_has_source(root, false) {
+                true => Kind::Exe,
+                false => Kind::Headers,
+            }
         };
 
-        let has_main_target = !sources.is_empty() || include_dir.is_dir();
-        if has_main_target {
-            let mut accumulated = Accumulated::default();
-            accumulated.apply(defaults, scope.condition, Table::Shared)?;
-            accumulated
-                .sources
-                .get_or_insert_with(|| sources.iter().map(|source| slash(source)).collect());
-            accumulated.deps.extend(all_deps.iter().map(|dep| (dep.clone(), true)));
+        let mut accumulated = Accumulated::default();
+        accumulated.apply(defaults, scope.condition, Table::Shared)?;
+        accumulated.deps.extend(all_deps.iter().map(|dep| (dep.clone(), true)));
 
-            let mut target = Target::new(scope.name, scope.index, kind, root);
-            target.fill(accumulated, scope)?;
+        let mut target = Target::new(scope.name, scope.index, kind, root);
+        target.fill(accumulated, scope)?;
+        if !target.sources.is_empty() || include_dir.is_dir() {
             targets.push(target);
         }
 
-        // Tests
+        // Tests; one named like the main target gets a `test_` prefix
+        let main_name = targets.first().map(|target| target.name.clone());
         let library = targets
             .first()
             .filter(|target| target.kind.is_library())
             .map(|target| target.name.clone());
         let test_deps: Vec<String> = all_deps.iter().chain(dev_deps).cloned().collect();
-        targets.extend(Target::conventional_tests(scope, defaults, &test_deps, library)?);
+        let mut tests = Target::conventional_tests(scope, defaults, &test_deps, library)?;
+        for test in tests.iter_mut().filter(|test| Some(&test.name) == main_name.as_ref()) {
+            test.name = format!("test_{}", test.name);
+            test.output_name = test.name.clone();
+        }
+        targets.extend(tests);
 
         Ok(targets)
     }
@@ -446,12 +456,12 @@ impl Target {
             return Ok(Vec::new());
         }
 
-        let files = expand_patterns(&tests_dir, &["*.{c,cc,cpp,cxx}".to_string()], scope.out_root, false)?;
+        let files = expand_pattern_list(&tests_dir, &["*.{c,cc,cpp,cxx}".to_string()], scope.out_root, false, false)?;
         let single_program = files.iter().any(|file| is_main_file(file));
 
         // One test program from all of tests/, or one per file
         let groups: Vec<(String, Vec<PathBuf>)> = if single_program {
-            let all = expand_patterns(&tests_dir, &[SOURCE_GLOB.to_string()], scope.out_root, false)?;
+            let all = expand_pattern_list(&tests_dir, &[SOURCE_GLOB.to_string()], scope.out_root, false, false)?;
             vec![("tests".to_string(), all)]
         } else {
             files
@@ -485,46 +495,71 @@ impl Target {
                 .collect()
         };
 
-        // Sources: given, or the layout convention for compiled kinds minus what when blocks claim; then those of
-        // the when blocks that hold
+        // Sources: given, or the layout convention for compiled kinds minus what when blocks claim (also when the
+        // target lists only exclusions); then those of the when blocks that hold; then every `!` exclusion
         let compiles = !matches!(self.kind, Kind::Headers | Kind::Custom | Kind::External);
-        self.conventional_sources = compiles && settings.sources.is_none();
-        let expand = |patterns: &[String], check_literals: bool| -> Result<Vec<PathBuf>> {
-            let expanded: Vec<String> = patterns
-                .iter()
-                .map(|pattern| expand_path_text(pattern, scope, &self.name))
-                .collect::<Result<_>>()?;
-            expand_patterns(&dir, &expanded, scope.out_root, check_literals)
+        let (own_patterns, mut excludes) = split_excludes(settings.sources.as_deref().unwrap_or_default());
+        let (when_patterns, when_excludes) = split_excludes(&settings.when_sources);
+        let only_excludes = own_patterns.is_empty() && !excludes.is_empty();
+        excludes.extend(when_excludes);
+        self.conventional_sources = compiles && (settings.sources.is_none() || only_excludes);
+
+        let expand_text =
+            |patterns: &[String]| -> Result<Vec<String>> { patterns.iter().map(|pattern| expand_path_text(pattern, scope, &self.name)).collect() };
+        let expand = |patterns: &[String], given: bool| -> Result<Vec<PathBuf>> {
+            let expanded = expand_text(patterns)?;
+            if given {
+                for pattern in &expanded {
+                    let (base, glob) = split_pattern(&dir, pattern);
+                    if glob.is_none() && base.is_dir() {
+                        bail!("sources: \"{pattern}\" is a folder; list its files with a glob such as \"{pattern}/**/*.cpp\"");
+                    }
+                }
+            }
+            expand_pattern_list(&dir, &expanded, scope.out_root, given, given)
         };
 
-        self.sources = match &settings.sources {
-            Some(patterns) => expand(patterns, true)?,
-            None if compiles => {
-                let convention = if dir.join("src").is_dir() {
-                    format!("src/{SOURCE_GLOB}")
-                } else {
-                    "*.{c,cc,cpp,cxx}".to_string()
-                };
-                let claimed: Vec<String> = settings
-                    .claimed_sources
-                    .iter()
-                    .filter(|pattern| !pattern.starts_with('!'))
-                    .cloned()
-                    .collect();
-                let claimed = expand(&claimed, false)?;
-                let mut sources = expand(&[convention], false)?;
-                sources.retain(|source| !claimed.contains(source));
-                sources
+        let mut sources = if self.conventional_sources {
+            let convention = if dir.join("src").is_dir() {
+                format!("src/{SOURCE_GLOB}")
+            } else {
+                "*.{c,cc,cpp,cxx}".to_string()
+            };
+            let claimed: Vec<String> = settings
+                .claimed_sources
+                .iter()
+                .filter(|pattern| !pattern.starts_with('!'))
+                .cloned()
+                .collect();
+            let claimed: HashSet<String> = expand(&claimed, false)?.iter().map(|source| util::path_key(source)).collect();
+            let mut sources = expand(&[convention], false)?;
+            if !claimed.is_empty() {
+                sources.retain(|source| !claimed.contains(&util::path_key(source)));
             }
-            None => Vec::new(),
+            sources
+        } else {
+            expand(&own_patterns, true)?
         };
-        for source in expand(&settings.when_sources, true)? {
-            if !self.sources.contains(&source) {
-                self.sources.push(source);
-            }
+
+        // A file both listed and found by a glob (spelled in another case on Windows) compiles once
+        let when_sources = expand(&when_patterns, true)?;
+        if !when_sources.is_empty() {
+            let mut seen: HashSet<String> = sources.iter().map(|source| util::path_key(source)).collect();
+            sources.extend(when_sources.into_iter().filter(|source| seen.insert(util::path_key(source))));
         }
 
-        // Include folders: given, or src/ (the target's own) and include/ (public) when they exist
+        if !excludes.is_empty() {
+            let mut builder = GlobSetBuilder::new();
+            for pattern in expand_text(&excludes)? {
+                builder.add(compile_glob(&absolute_glob(&dir, &pattern)).with_context(|| format!("bad pattern \"!{pattern}\""))?);
+            }
+            let excluded = builder.build()?;
+            sources.retain(|source| !excluded.is_match(slash(source)));
+        }
+        self.sources = sources;
+
+        // Include folders: given, or src/ (the target's own) and include/ (public) when they exist; with those
+        // [defaults], presets and when blocks add
         let existing = |folder: &str| {
             if dir.join(folder).is_dir() {
                 vec![folder.to_string()]
@@ -532,8 +567,12 @@ impl Target {
                 Vec::new()
             }
         };
-        self.private_include = paths(&settings.include.unwrap_or_else(|| existing("src")))?;
-        self.include = paths(&settings.public_include.unwrap_or_else(|| existing("include")))?;
+        let combine = |(before, after): (Vec<String>, Vec<String>), own: Vec<String>| [before, own, after].concat();
+        self.private_include = paths(&combine(settings.added_include, settings.include.unwrap_or_else(|| existing("src"))))?;
+        self.include = paths(&combine(
+            settings.added_public_include,
+            settings.public_include.unwrap_or_else(|| existing("include")),
+        ))?;
         self.system_include = paths(&settings.system_include)?;
         self.public_system_include = paths(&settings.public_system_include)?;
         self.interface_include = paths(&settings.interface_include)?;
@@ -596,7 +635,8 @@ impl Target {
 
         // The export header is on the public include path, and exports while the target builds as a shared library
         if let Some((_, macro_name)) = &self.export_header {
-            self.include.push(gen_dir(scope.out_dir, &self.name));
+            self.include
+                .push(gen_dir(&package_out_dir(scope.out_dir, scope.index, scope.name), &self.name));
             if self.kind == Kind::Shared {
                 let base = crate::export_header::base(macro_name);
                 self.public_defines.push(format!("{base}_SHARED"));
@@ -662,6 +702,143 @@ pub fn default_export_macro(target_name: &str) -> String {
     format!("{}_EXPORT", sanitize_name(target_name).to_uppercase().replace(['-', '.'], "_"))
 }
 
+/// Checks every target, `[defaults]` and preset table of a package once, whether or not it applies here: each
+/// condition's words, the values, which table a key belongs in, and the presets targets name.
+pub fn check_package(manifest: &Manifest, condition: &CondContext) -> Result<()> {
+    check_spec(&manifest.defaults, Table::Shared, condition).context("in [defaults]")?;
+    for (name, preset) in &manifest.preset {
+        check_spec(preset, Table::Shared, condition).with_context(|| format!("in [preset.{name}]"))?;
+    }
+
+    for (name, spec) in &manifest.target {
+        let context = || format!("in [target.{name}]");
+        if let Some(text) = &spec.cond {
+            condition.check(text).with_context(context)?;
+        }
+        for preset_name in spec.preset.iter().flat_map(|names| names.to_vec()) {
+            if !manifest.preset.contains_key(&preset_name) {
+                let hint = util::suggest(&preset_name, manifest.preset.keys().map(String::as_str))
+                    .map(|known| format!(" (did you mean `{known}`?)"))
+                    .unwrap_or_default();
+                return Err(anyhow::anyhow!("preset = \"{preset_name}\": there is no [preset.{preset_name}]{hint}")).with_context(context);
+            }
+        }
+        check_spec(spec, Table::Target, condition).with_context(context)?;
+
+        // Test settings on a target that is never a test would be ignored
+        if !can_be_test(spec) {
+            if let Some(key) = test_key(spec) {
+                return Err(anyhow::anyhow!(
+                    "`{key}` is a test setting, and this target is not kind = \"test\"; for a test that runs a program, \
+                     write a [[test]] table with command = [\"{{target:{name}}}\"]"
+                ))
+                .with_context(context);
+            }
+        }
+    }
+
+    for spec in &manifest.write {
+        if let Some(text) = &spec.cond {
+            condition.check(text).with_context(|| format!("in [[write]] {}", spec.path))?;
+        }
+    }
+    // A test's condition may take matrix parameters (`{backend}`), filled in per test
+    for spec in &manifest.test {
+        if let Some(text) = spec.cond.as_ref().filter(|text| !text.contains('{')) {
+            condition.check(text).with_context(|| format!("in [[test]] `{}`", spec.name))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// One table's keys and values, and those of its when blocks.
+fn check_spec(spec: &TargetSpec, table: Table, condition: &CondContext) -> Result<()> {
+    let target_only = spec.dir.is_some() || spec.cond.is_some() || spec.default.is_some() || spec.preset.is_some();
+    if table != Table::Target && target_only {
+        bail!("dir, if, default and preset belong to a [target] table, not to [defaults], a preset or a when block");
+    }
+    if table == Table::Shared && spec.kind.is_some() {
+        bail!("kind belongs to a [target] table or its when blocks, not to [defaults] or a preset");
+    }
+
+    // Values
+    if let Some(kind) = &spec.kind {
+        Kind::parse(kind)?;
+    }
+    if let Some(warnings) = &spec.warnings {
+        Warnings::parse(warnings)?;
+    }
+    if let Some(arch) = &spec.arch {
+        Arch::parse(arch)?;
+    }
+    if let Some(std) = &spec.std {
+        normalize_standard(std, Language::Cxx)?;
+    }
+    if let Some(c_std) = &spec.c_std {
+        normalize_standard(c_std, Language::C)?;
+    }
+    if let Some(unity) = &spec.unity {
+        manifest::parse_unity(unity)?;
+    }
+
+    // Per-file settings and build steps
+    for rule in &spec.file {
+        if let Some(text) = &rule.cond {
+            condition.check(text)?;
+        }
+        rule.warnings.as_deref().map(Warnings::parse).transpose()?;
+        rule.arch.as_deref().map(Arch::parse).transpose()?;
+        rule.opt.as_ref().map(Opt::parse).transpose()?;
+    }
+    let step_conditions = spec
+        .run
+        .iter()
+        .map(|run| &run.cond)
+        .chain(spec.pre_build.iter().chain(&spec.post_build).map(|step| &step.cond));
+    for text in step_conditions.flatten() {
+        condition.check(text)?;
+    }
+
+    for (text, block) in &spec.when {
+        let context = || format!("in when.\"{text}\"");
+        condition.check(text).with_context(context)?;
+        check_spec(block, Table::When, condition).with_context(context)?;
+    }
+
+    Ok(())
+}
+
+/// A target table, or one of its when blocks, makes it a test.
+fn can_be_test(spec: &TargetSpec) -> bool {
+    spec.kind.as_deref() == Some("test") || spec.when.values().any(can_be_test)
+}
+
+/// The first test-only key a table or its when blocks set.
+fn test_key(spec: &TargetSpec) -> Option<&'static str> {
+    let keys = [
+        ("args", spec.args.is_some()),
+        ("workdir", spec.workdir.is_some()),
+        ("timeout", spec.timeout.is_some()),
+        ("env", spec.env.is_some()),
+        ("will-fail", spec.will_fail.is_some()),
+        ("after", spec.after.is_some()),
+        ("serial", spec.serial.is_some()),
+        ("pass-regex", spec.pass_regex.is_some()),
+        ("fail-regex", spec.fail_regex.is_some()),
+        ("skip-exit-code", spec.skip_exit_code.is_some()),
+        ("skip-regex", spec.skip_regex.is_some()),
+        ("expect", spec.expect.is_some()),
+        ("reject", spec.reject.is_some()),
+        ("exit-code", spec.exit_code.is_some()),
+    ];
+
+    keys.iter()
+        .find(|(_, given)| *given)
+        .map(|(key, _)| *key)
+        .or_else(|| spec.when.values().find_map(test_key))
+}
+
 impl Accumulated {
     /// Adds one table's settings (lists append, single values replace), then its true `when` blocks, recursively.
     fn apply(&mut self, spec: &TargetSpec, condition: &CondContext, table: Table) -> Result<()> {
@@ -680,11 +857,21 @@ impl Accumulated {
             replace_or_extend(&mut self.sources, &spec.sources);
         }
 
-        // Include folders replace the convention when given
+        // Include folders: the target's own replace the convention; the rest add to it
         let public = spec.public.clone().unwrap_or_default();
         let interface = spec.interface.clone().unwrap_or_default();
-        replace_or_extend(&mut self.include, &spec.include);
-        replace_or_extend(&mut self.public_include, &public.include);
+        if table == Table::Target {
+            replace_or_extend(&mut self.include, &spec.include);
+            replace_or_extend(&mut self.public_include, &public.include);
+            self.own_table_applied = true;
+        } else {
+            let (include, public_include) = match self.own_table_applied {
+                false => (&mut self.added_include.0, &mut self.added_public_include.0),
+                true => (&mut self.added_include.1, &mut self.added_public_include.1),
+            };
+            include.extend(spec.include.iter().flatten().cloned());
+            public_include.extend(public.include.iter().flatten().cloned());
+        }
 
         // Lists that add up
         self.system_include.extend(spec.system_include.iter().flatten().cloned());
@@ -768,24 +955,28 @@ fn collect_sources(spec: &TargetSpec, patterns: &mut Vec<String>) {
     }
 }
 
-/// Expands globs (`*`, `**`, `{a,b}`) relative to `dir`; `!pattern` removes matches. A plain path must exist unless
-/// it lies in the output folder (generated). Results are sorted and without duplicates.
+/// Expands globs (`*`, `**`, `{a,b}`) relative to `dir`; `!pattern` removes matches (`!folder` everything in it). A
+/// plain path must exist unless it lies in the output folder (generated). Results are sorted and without duplicates.
 pub fn expand_patterns(dir: &Path, patterns: &[String], out_root: &Path, check_literals: bool) -> Result<Vec<PathBuf>> {
+    expand_pattern_list(dir, patterns, out_root, check_literals, true)
+}
+
+/// `expand_patterns`, saying so when a glob matches nothing only when `warn_empty` (not for the layout convention).
+fn expand_pattern_list(dir: &Path, patterns: &[String], out_root: &Path, check_literals: bool, warn_empty: bool) -> Result<Vec<PathBuf>> {
     let mut included: Vec<PathBuf> = Vec::new();
     let mut excludes = GlobSetBuilder::new();
     let mut has_excludes = false;
 
     for pattern in patterns {
         if let Some(excluded) = pattern.strip_prefix('!') {
-            let absolute_pattern = slash(&util::absolute(dir, Path::new(excluded)));
-            excludes.add(compile_glob(&absolute_pattern).with_context(|| format!("bad pattern \"{pattern}\""))?);
+            excludes.add(compile_glob(&absolute_glob(dir, excluded)).with_context(|| format!("bad pattern \"{pattern}\""))?);
             has_excludes = true;
             continue;
         }
 
         // A plain file
-        if !pattern.contains(['*', '?', '[', '{']) {
-            let file = util::absolute(dir, Path::new(pattern));
+        let (file, glob) = split_pattern(dir, pattern);
+        if glob.is_none() {
             let generated = util::strip_prefix_ci(&file, out_root).is_some();
             if check_literals && !generated && !file.exists() {
                 bail!("file not found: {}", slash(&file));
@@ -795,7 +986,7 @@ pub fn expand_patterns(dir: &Path, patterns: &[String], out_root: &Path, check_l
         }
 
         let found = walk_glob(dir, pattern, out_root)?;
-        if found.is_empty() {
+        if found.is_empty() && warn_empty {
             crate::ui::warn(&format!("\"{pattern}\" matches no files (in {})", slash(dir)));
         }
         included.extend(found);
@@ -806,10 +997,77 @@ pub fn expand_patterns(dir: &Path, patterns: &[String], out_root: &Path, check_l
         let excludes = excludes.build()?;
         included.retain(|file| !excludes.is_match(slash(file)));
     }
-    included.sort_by_key(|file| util::path_key(file));
-    included.dedup_by_key(|file| util::path_key(file));
+    let mut keyed: Vec<(String, PathBuf)> = included.into_iter().map(|file| (util::path_key(&file), file)).collect();
+    keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    keyed.dedup_by(|right, left| right.0 == left.0);
 
-    Ok(included)
+    Ok(keyed.into_iter().map(|(_, file)| file).collect())
+}
+
+/// Splits `!` exclusions from a list of patterns: (patterns, exclusions without the `!`).
+fn split_excludes(patterns: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut included = Vec::new();
+    let mut excluded = Vec::new();
+
+    for pattern in patterns {
+        match pattern.strip_prefix('!') {
+            Some(exclusion) => excluded.push(exclusion.to_string()),
+            None => included.push(pattern.clone()),
+        }
+    }
+
+    (included, excluded)
+}
+
+/// A pattern as an absolute path, split where the glob starts: (the folder or file before it, the glob from there).
+/// A part with glob characters that names an existing folder (`C:/work/game[1]`) is taken as written.
+pub fn split_pattern(dir: &Path, pattern: &str) -> (PathBuf, Option<String>) {
+    let mut literal = PathBuf::new();
+    let mut components = Path::new(pattern).components();
+
+    while let Some(component) = components.next() {
+        let text = component.as_os_str().to_string_lossy();
+        let has_glob = matches!(component, Component::Normal(_)) && text.contains(GLOB_CHARACTERS);
+        if has_glob && !util::absolute(dir, &literal.join(&*text)).is_dir() {
+            let rest: Vec<String> = std::iter::once(text.into_owned())
+                .chain(components.map(|component| component.as_os_str().to_string_lossy().into_owned()))
+                .collect();
+            return (util::absolute(dir, &literal), Some(rest.join("/")));
+        }
+        literal.push(component);
+    }
+
+    (util::absolute(dir, &literal), None)
+}
+
+/// An absolute glob for `pattern` that matches files by their full path: the folder part escaped so that `[` and
+/// `{` in it match themselves; a plain folder means everything in it.
+pub fn absolute_glob(dir: &Path, pattern: &str) -> String {
+    let (base, glob) = split_pattern(dir, pattern);
+    let escaped = escape_glob(slash(&base).trim_end_matches('/'));
+
+    match glob {
+        Some(glob) => format!("{escaped}/{glob}"),
+        None if base.is_dir() => format!("{escaped}/**"),
+        None => escaped,
+    }
+}
+
+/// Text that a glob matches literally: each special character in a class of its own (`[` as `[[]`).
+fn escape_glob(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+
+    for character in text.chars() {
+        if "*?[]{}".contains(character) {
+            escaped.push('[');
+            escaped.push(character);
+            escaped.push(']');
+        } else {
+            escaped.push(character);
+        }
+    }
+
+    escaped
 }
 
 /// Placeholders in manifest paths: {root} {out} {gen} {dir} {name} {profile}, then environment variables.
@@ -823,20 +1081,15 @@ pub fn expand_placeholders(text: &str, scope: &PackageScope, target_name: &str) 
         return text.to_string();
     }
 
-    let profile = scope
-        .out_dir
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // The profile's own name, not the output folder's (`debug-gcc`, `host`)
+    let profile = scope.condition.profiles.first().map(String::as_str).unwrap_or_default();
+    let package_out = package_out_dir(scope.out_dir, scope.index, scope.name);
     text.replace("{root}", &slash(scope.root))
         .replace("{out}", &slash(scope.out_dir))
-        .replace("{gen}", &slash(&gen_dir(scope.out_dir, target_name)))
+        .replace("{gen}", &slash(&gen_dir(&package_out, target_name)))
         .replace("{name}", target_name)
-        .replace("{profile}", &profile)
-        .replace(
-            "{config}",
-            &config_name(scope.condition.profiles.first().map(String::as_str).unwrap_or_default()),
-        )
+        .replace("{profile}", profile)
+        .replace("{config}", &config_name(profile))
         .replace("{version}", scope.version)
         .replace("{vcpkg}", &slash(scope.vcpkg_dir))
         .replace("{cxx}", &slash(scope.cxx))
@@ -858,9 +1111,20 @@ pub fn config_name(profile: &str) -> String {
     }
 }
 
-/// Generated files of a target live here.
+/// Generated files of a target live here (`out_dir` is its package's output folder: `package_out_dir`).
 pub fn gen_dir(out_dir: &Path, target_name: &str) -> PathBuf {
     out_dir.join("gen").join(sanitize_name(target_name))
+}
+
+/// Where a package's objects, generated files and static libraries go: the output folder for the root package,
+/// `packages/<name>` in it for the others, so targets of the same name in two packages stay apart (and a member's
+/// program named like its package does not collide with the folder on Linux).
+pub fn package_out_dir(out_dir: &Path, package_index: usize, package_name: &str) -> PathBuf {
+    if package_index == 0 {
+        out_dir.to_path_buf()
+    } else {
+        out_dir.join("packages").join(sanitize_name(package_name))
+    }
 }
 
 /// A target name usable as a folder name.
@@ -877,20 +1141,16 @@ pub fn sanitize_name(name: &str) -> String {
 }
 
 pub fn walk_glob(dir: &Path, pattern: &str, out_root: &Path) -> Result<Vec<PathBuf>> {
-    // Walk from the pattern's literal folder prefix, matching the rest
-    let absolute_pattern = util::absolute(dir, Path::new(pattern));
-    let pattern_text = slash(&absolute_pattern);
-    let literal_end = pattern_text.find(['*', '?', '[', '{']).unwrap_or(pattern_text.len());
-    let base = match pattern_text[..literal_end].rfind('/') {
-        Some(slash_index) => PathBuf::from(&pattern_text[..slash_index.max(1)]),
-        None => dir.to_path_buf(),
+    // Walk from the pattern's literal folder prefix, matching the rest as deep as it reaches
+    let (base, glob) = split_pattern(dir, pattern);
+    let Some(glob) = glob else {
+        return Ok(if base.is_file() { vec![base] } else { Vec::new() });
     };
 
-    let matcher = compile_glob(&pattern_text)
+    let matcher = compile_glob(&glob)
         .with_context(|| format!("bad pattern \"{pattern}\""))?
         .compile_matcher();
-    let recursive = pattern_text[literal_end..].contains("**") || pattern_text[literal_end..].contains('/');
-    let max_depth = if recursive { usize::MAX } else { 1 };
+    let max_depth = if glob.contains("**") { usize::MAX } else { glob.split('/').count() };
 
     let mut files = Vec::new();
     let walker = walkdir::WalkDir::new(&base)
@@ -898,7 +1158,11 @@ pub fn walk_glob(dir: &Path, pattern: &str, out_root: &Path) -> Result<Vec<PathB
         .into_iter()
         .filter_entry(|entry| !is_skipped_dir(entry, out_root));
     for entry in walker.flatten() {
-        if entry.file_type().is_file() && matcher.is_match(slash(entry.path())) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(&base) else { continue };
+        if matcher.is_match(slash(relative)) {
             files.push(util::normalize(entry.path()));
         }
     }
@@ -924,6 +1188,24 @@ fn is_main_file(path: &Path) -> bool {
     path.file_stem().is_some_and(|stem| stem == "main")
 }
 
+/// Whether a folder directly holds a source file the convention takes: a `main` one in src/ (`main_only`), else one
+/// of the `*.{c,cc,cpp,cxx}` files beside anvil.toml.
+fn folder_has_source(folder: &Path, main_only: bool) -> bool {
+    let extensions: &[&str] = if main_only {
+        &["c", "cc", "cpp", "cxx", "c++", "cu"]
+    } else {
+        &["c", "cc", "cpp", "cxx"]
+    };
+    let Ok(entries) = std::fs::read_dir(folder) else { return false };
+
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        let extension = path.extension().map(|extension| extension.to_string_lossy().to_lowercase());
+        let wanted = extension.is_some_and(|extension| extensions.contains(&extension.as_str()));
+        wanted && (!main_only || is_main_file(&path)) && entry.file_type().is_ok_and(|kind| kind.is_file())
+    })
+}
+
 /// A lib entry: a name ("user32", "Cocoa.framework") stays; a path (has a slash or an extension) becomes absolute.
 fn expand_lib(lib: &str, dir: &Path, scope: &PackageScope, target_name: &str) -> Result<String> {
     let expanded = expand_path_text(lib, scope, target_name)?;
@@ -947,8 +1229,7 @@ fn resolve_file_rule(rule: &FileRule, dir: &Path, scope: &PackageScope, target_n
     // Patterns match absolute source paths
     let mut builder = GlobSetBuilder::new();
     for pattern in rule.patterns.to_vec() {
-        let absolute_pattern = slash(&util::absolute(dir, Path::new(&pattern)));
-        builder.add(compile_glob(&absolute_pattern).with_context(|| format!("bad file pattern \"{pattern}\""))?);
+        builder.add(compile_glob(&absolute_glob(dir, &pattern)).with_context(|| format!("bad file pattern \"{pattern}\""))?);
     }
 
     // Definitions and flags may name folders, as the target's do
@@ -981,4 +1262,45 @@ fn set_if_some<T: Clone>(target: &mut Option<T>, value: &Option<T>) {
 /// A glob where `*` stays within one folder, case-insensitive on Windows.
 pub fn compile_glob(pattern: &str) -> std::result::Result<Glob, globset::Error> {
     GlobBuilder::new(pattern).literal_separator(true).case_insensitive(cfg!(windows)).build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patterns_in_folders_with_glob_characters() {
+        let dir = std::env::temp_dir()
+            .join(format!("anvil_targets_{}", std::process::id()))
+            .join("game{x}[1]");
+        std::fs::create_dir_all(dir.join("src/old")).unwrap();
+        for file in ["src/a.cpp", "src/b.cpp", "src/old/c.cpp"] {
+            std::fs::write(dir.join(file), "").unwrap();
+        }
+        let out_root = dir.join("out");
+        let names = |patterns: &[&str]| -> Vec<String> {
+            let patterns: Vec<String> = patterns.iter().map(|pattern| pattern.to_string()).collect();
+            let found = expand_patterns(&dir, &patterns, &out_root, true).unwrap();
+            found.iter().map(|file| util::rel(file, &dir)).collect()
+        };
+
+        // The folder's `{x}` and `[1]` match themselves; `!folder` takes out everything in it
+        assert_eq!(names(&["src/**/*.cpp"]), ["src/a.cpp", "src/b.cpp", "src/old/c.cpp"]);
+        assert_eq!(names(&["src/**/*.cpp", "!src/old"]), ["src/a.cpp", "src/b.cpp"]);
+        assert_eq!(names(&["src/*.cpp", "!src/b.cpp"]), ["src/a.cpp"]);
+
+        // A file listed twice, in another case on Windows, once
+        if cfg!(windows) {
+            assert_eq!(names(&["src/*.cpp", "SRC/A.cpp"]).len(), 2);
+        }
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn exclusions_split_off() {
+        let patterns = ["src/*.cpp".to_string(), "!src/win/**".to_string()];
+        assert_eq!(split_excludes(&patterns), (vec!["src/*.cpp".to_string()], vec!["src/win/**".to_string()]));
+        assert_eq!(escape_glob("C:/a[1]/{b}"), "C:/a[[]1[]]/[{]b[}]");
+    }
 }

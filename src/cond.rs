@@ -94,15 +94,41 @@ impl Cond {
                 ),
             },
             Cond::Not(inner) => !inner.eval(lookup)?,
-            Cond::And(left, right) => left.eval(lookup)? && right.eval(lookup)?,
-            Cond::Or(left, right) => left.eval(lookup)? || right.eval(lookup)?,
+
+            // Both sides always, so an unknown word fails wherever it stands
+            Cond::And(left, right) => {
+                let (left, right) = (left.eval(lookup)?, right.eval(lookup)?);
+                left && right
+            }
+            Cond::Or(left, right) => {
+                let (left, right) = (left.eval(lookup)?, right.eval(lookup)?);
+                left || right
+            }
         })
+    }
+
+    fn atoms<'a>(&'a self, atoms: &mut Vec<&'a str>) {
+        match self {
+            Cond::Atom(name) => atoms.push(name),
+            Cond::Not(inner) => inner.atoms(atoms),
+            Cond::And(left, right) | Cond::Or(left, right) => {
+                left.atoms(atoms);
+                right.atoms(atoms);
+            }
+        }
     }
 }
 
 impl CondContext {
     pub fn test(&self, source: &str) -> Result<bool> {
-        parse(source)?.eval(&|name| self.lookup(name))
+        let condition = parse(source)?;
+        self.check_words(&condition)?;
+        condition.eval(&|name| self.lookup(name))
+    }
+
+    /// Checks that every word of a condition is known, whether or not the condition holds here.
+    pub fn check(&self, source: &str) -> Result<()> {
+        self.check_words(&parse(source)?)
     }
 
     pub fn lookup(&self, name: &str) -> Option<bool> {
@@ -137,6 +163,33 @@ impl CondContext {
         };
 
         Some(value)
+    }
+
+    fn check_words(&self, condition: &Cond) -> Result<()> {
+        let mut atoms = Vec::new();
+        condition.atoms(&mut atoms);
+
+        for name in atoms {
+            if self.lookup(name).is_some() {
+                continue;
+            }
+
+            let known = BUILTIN_WORDS
+                .iter()
+                .copied()
+                .chain(["debug", "release"])
+                .chain(self.all_profiles.iter().map(String::as_str))
+                .chain(self.options.keys().map(String::as_str));
+            let hint = crate::util::suggest(name, known)
+                .map(|close| format!(" Did you mean `{close}`?"))
+                .unwrap_or_default();
+            bail!(
+                "unknown condition `{name}`.{hint} Known: windows, linux, macos, unix, x64, x86, arm64, arm, cross, msvc, gnu, \
+                 cl, clang-cl, clang, gcc, mingw, debug, release, any profile name, any [options] name, true, false"
+            );
+        }
+
+        Ok(())
     }
 
     fn lookup_profile_or_option(&self, name: &str) -> Option<bool> {
@@ -310,5 +363,31 @@ mod tests {
     fn unknown_is_error() {
         assert!(parse("zz").unwrap().eval(&|_| None).is_err());
         assert!(parse("a &").is_err());
+    }
+
+    #[test]
+    fn unknown_words_never_short_circuit() {
+        let lookup = |name: &str| match name {
+            "a" => Some(true),
+            "b" => Some(false),
+            _ => None,
+        };
+        assert!(parse("b & zz").unwrap().eval(&lookup).is_err());
+        assert!(parse("a | zz").unwrap().eval(&lookup).is_err());
+
+        let mut options = IndexMap::new();
+        options.insert("editor_build".to_string(), true);
+        let context = CondContext {
+            family: Family::Msvc,
+            platform: Platform::host(),
+            profiles: vec!["debug".into()],
+            all_profiles: Vec::new(),
+            options,
+        };
+        let error = context.check("linux & tpyo").unwrap_err().to_string();
+        assert!(error.contains("unknown condition `tpyo`"), "{error}");
+        let error = context.check("editor_biuld").unwrap_err().to_string();
+        assert!(error.contains("Did you mean `editor_build`?"), "{error}");
+        assert!(context.check("!windows | (msvc & editor_build)").is_ok());
     }
 }

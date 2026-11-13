@@ -26,8 +26,13 @@ pub fn text(macro_name: &str, custom_content: &str) -> String {
 #  define {macro_name}
 #endif
 
+#if defined(_MSC_VER)
+#  define {base}_DEPRECATED __declspec(deprecated)
+#else
+#  define {base}_DEPRECATED __attribute__((__deprecated__))
+#endif
+
 #define {base}_NO_EXPORT
-#define {base}_DEPRECATED [[deprecated]]
 #define {base}_DEPRECATED_EXPORT {macro_name} {base}_DEPRECATED
 #define {base}_DEPRECATED_NO_EXPORT {base}_NO_EXPORT {base}_DEPRECATED
 {custom_content}"#
