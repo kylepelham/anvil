@@ -1015,7 +1015,9 @@ impl Interpreter {
         }
 
         let items: Vec<String> = values.iter().flat_map(|value| model::split_list(value)).collect();
-        apply_test_property(&mut test.properties, property, &items, append);
+        if let Some(warning) = apply_test_property(&mut test.properties, property, &items, append) {
+            self.warn(command, &format!("test `{name}`: {warning}"));
+        }
     }
 
     /// One target property; list properties append when `append`, else replace.
@@ -1578,7 +1580,9 @@ impl Interpreter {
                 workdir = Some(self.resolve_text_path(&pair[1]));
                 continue;
             }
-            apply_test_property(&mut properties, &pair[0], &model::split_list(&pair[1]), false);
+            if let Some(warning) = apply_test_property(&mut properties, &pair[0], &model::split_list(&pair[1]), false) {
+                self.warnings.push(format!("gtest_discover_tests({target}): {warning}"));
+            }
         }
 
         self.tests.push(Test {
@@ -2243,10 +2247,32 @@ impl Interpreter {
     }
 }
 
-/// A test property in Anvil's terms; one Anvil has no key for becomes a note on the test.
-fn apply_test_property(properties: &mut TestProperties, property: &str, items: &[String], append: bool) {
+/// A test property in Anvil's terms; one Anvil has no key for becomes a note on the test. Returns a warning for regexes
+/// Rust cannot read even in its syntax.
+fn apply_test_property(properties: &mut TestProperties, property: &str, items: &[String], append: bool) -> Option<String> {
     let joined = items.join(";");
     let truthy = model::constant_truth(&joined).unwrap_or(false);
+
+    // The regex properties, as one Rust regex each (any of CMake's list matches)
+    let regex_key = match property {
+        "PASS_REGULAR_EXPRESSION" => Some(("pass-regex", &mut properties.pass_regex)),
+        "FAIL_REGULAR_EXPRESSION" => Some(("fail-regex", &mut properties.fail_regex)),
+        "SKIP_REGULAR_EXPRESSION" => Some(("skip-regex", &mut properties.skip_regex)),
+        _ => None,
+    };
+    if let Some((key, value)) = regex_key {
+        let (pattern, unreadable) = test_regex(items);
+        *value = Some(pattern);
+        if unreadable.is_empty() {
+            return None;
+        }
+        let note = format!(
+            "{property} {} is not a regex Anvil reads, so {key} matches it as plain text",
+            unreadable.join(", ")
+        );
+        properties.notes.push(note.clone());
+        return Some(note);
+    }
 
     match property {
         "WILL_FAIL" => properties.will_fail = truthy,
@@ -2257,11 +2283,8 @@ fn apply_test_property(properties: &mut TestProperties, property: &str, items: &
         "RESOURCE_LOCK" | "RESOURCE_GROUPS" => properties.serial = true,
 
         "SKIP_RETURN_CODE" => properties.skip_exit_code = joined.parse().ok(),
-        "SKIP_REGULAR_EXPRESSION" => properties.skip_regex = Some(items.join("|")),
 
         "TIMEOUT" => properties.timeout = joined.parse::<f64>().ok().map(|seconds| seconds.ceil() as u64),
-        "PASS_REGULAR_EXPRESSION" => properties.pass_regex = Some(items.join("|")),
-        "FAIL_REGULAR_EXPRESSION" => properties.fail_regex = Some(items.join("|")),
         "DEPENDS" => extend_or_replace(&mut properties.after, items, append),
         "FIXTURES_SETUP" => extend_or_replace(&mut properties.fixtures_setup, items, append),
         "FIXTURES_REQUIRED" => extend_or_replace(&mut properties.fixtures_required, items, append),
@@ -2287,6 +2310,26 @@ fn apply_test_property(properties: &mut TestProperties, property: &str, items: &
         _ if IGNORED_TEST_PROPERTIES.contains(&property) => {}
         _ => properties.notes.push(format!("test property {property} = \"{joined}\" is not converted")),
     }
+
+    None
+}
+
+/// CMake's regexes for a test as one Rust regex (any of them matches), and those Rust cannot read even translated,
+/// which match as plain text.
+fn test_regex(items: &[String]) -> (String, Vec<String>) {
+    let mut alternatives = Vec::new();
+    let mut unreadable = Vec::new();
+    for item in items {
+        let translated = super::check_script::anvil_regex(item);
+        if regex::Regex::new(&translated).is_ok() {
+            alternatives.push(translated);
+        } else {
+            alternatives.push(regex::escape(item));
+            unreadable.push(format!("`{item}`"));
+        }
+    }
+
+    (alternatives.join("|"), unreadable)
 }
 
 fn extend_or_replace(list: &mut Vec<String>, items: &[String], append: bool) {
@@ -3205,5 +3248,23 @@ target_link_libraries(user PRIVATE iface)
             "{toml}"
         );
         assert!(toml.contains("deps = [\"iface\"]\nc-std = \"gnu17\""), "{toml}");
+    }
+
+    #[test]
+    fn test_regexes_are_translated_to_rusts() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(regexes C)
+enable_testing()
+add_executable(app main.c)
+add_test(NAME json COMMAND app)
+set_tests_properties(json PROPERTIES PASS_REGULAR_EXPRESSION "\"source-location\": {;done" FAIL_REGULAR_EXPRESSION "[unclosed")
+"#;
+        let toml = convert_files("regexes", &[("CMakeLists.txt", cmake), ("main.c", "int main(void) { return 0; }\n")]);
+
+        // Braces are literal in CMake; one Rust cannot read matches as plain text, with a TODO
+        assert!(toml.contains(r#"pass-regex = '"source-location": \{|done'"#), "{toml}");
+        assert!(toml.contains(r#"fail-regex = '\[unclosed'"#), "{toml}");
+        assert!(toml.contains("# TODO: FAIL_REGULAR_EXPRESSION `[unclosed` is not a regex"), "{toml}");
     }
 }

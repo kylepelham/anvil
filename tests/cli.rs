@@ -2663,6 +2663,38 @@ fn convert_checks_gcc() {
     convert_checks("gcc", "convert_checks_gcc");
 }
 
+// 35b. A loop that keeps the first flag that passes (break()), FindThreads' variables, an optional pkg-config module
+//      this machine lacks and a test regex with a brace convert to what CMake does with each compiler
+
+fn convert_loops(toolchain: &str, test: &str) {
+    let project = Project::fixture("convert_loops", test);
+    project
+        .anvil(&["convert"])
+        .success()
+        .contains("pkg_check_modules(NOPE anvil-no-such-module)");
+    let toml = project.read("anvil.toml");
+    assert!(toml.contains(r#"pass-regex = '"picked": "(msvc|gnu)"\}'"#), "{toml}");
+
+    // MSVC takes the first flag and has no pthreads; GCC and Clang take the second and have them
+    let (pthread, picked) = if toolchain == "msvc" { (0, "msvc") } else { (1, "gnu") };
+    let run = project.anvil(&["run", "--toolchain", toolchain]);
+    run.success();
+    assert_eq!(program_output(&run), format!("{{\"pthread\": {pthread}, \"picked\": \"{picked}\"}}"));
+    project.anvil(&["test", "--toolchain", toolchain]).success().contains("test json ... ok");
+}
+
+#[test]
+fn convert_loops_msvc() {
+    require!("msvc");
+    convert_loops("msvc", "convert_loops_msvc");
+}
+
+#[test]
+fn convert_loops_gcc() {
+    require!("gcc");
+    convert_loops("gcc", "convert_loops_gcc");
+}
+
 // 36. Package loading: a dependency's version is free-form, two packages of one name are an error, a broken workspace
 //     above a project it does not list is ignored (and said inside one of its members)
 

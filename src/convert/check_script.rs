@@ -315,29 +315,81 @@ fn literal_regex(value: &str, characters: &str) -> Option<String> {
 // Characters CMake's regexes give a meaning (braces are literal there)
 const CMAKE_REGEX_CHARACTERS: &str = ".+*?^$()[]|\\";
 
-/// A CMake regex in Anvil's (Rust's) syntax: braces are literal in CMake, and `.` matches line ends too.
+/// A CMake regex in Anvil's (Rust's) syntax. CMake's has `^ $ . [ ] [^ ] * + ? ( ) |`, and `\` before a character
+/// that stands for itself (`\d` is a `d`); braces are literal, a bracket expression takes what is up to its `]`
+/// literally (`^` first and ranges aside, `\` included), and `.` matches line ends too.
 pub(super) fn anvil_regex(cmake: &str) -> String {
+    let characters: Vec<char> = cmake.chars().collect();
     let mut converted = String::new();
-    let mut characters = cmake.chars();
-    while let Some(character) = characters.next() {
+    let mut any_character = false;
+
+    let mut index = 0;
+    while let Some(&character) = characters.get(index) {
+        index += 1;
         match character {
-            '\\' => {
-                converted.push('\\');
-                converted.extend(characters.next());
-            }
-            '{' | '}' => {
-                converted.push('\\');
-                converted.push(character);
+            '\\' => match characters.get(index) {
+                Some(&escaped) => {
+                    push_literal(&mut converted, escaped);
+                    index += 1;
+                }
+                None => converted.push_str(r"\\"),
+            },
+            '{' | '}' => push_literal(&mut converted, character),
+            '[' => index = push_bracket(&mut converted, &characters, index),
+            '.' => {
+                any_character = true;
+                converted.push('.');
             }
             _ => converted.push(character),
         }
     }
 
-    if converted.contains('.') {
+    if any_character {
         format!("(?s){converted}")
     } else {
         converted
     }
+}
+
+/// A character matched as itself, in or out of a class.
+fn push_literal(converted: &mut String, character: char) {
+    if "\\.+*?()|[]{}^$#&-~".contains(character) {
+        converted.push('\\');
+    }
+    converted.push(character);
+}
+
+/// A CMake bracket expression from `start` (after its `[`) as a Rust class; returns where it ends. A `]` first is
+/// literal, `a-z` is a range and any other `-` literal. One without its `]` is left unclosed, which Rust rejects too.
+fn push_bracket(converted: &mut String, characters: &[char], start: usize) -> usize {
+    let mut index = start;
+    converted.push('[');
+    if characters.get(index) == Some(&'^') {
+        converted.push('^');
+        index += 1;
+    }
+
+    let first = index;
+    while let Some(&character) = characters.get(index) {
+        if character == ']' && index > first {
+            converted.push(']');
+            return index + 1;
+        }
+
+        // A range, or one character
+        let range_end = characters.get(index + 2).filter(|end| characters[index + 1] == '-' && **end != ']');
+        push_literal(converted, character);
+        match range_end {
+            Some(&end) => {
+                converted.push('-');
+                push_literal(converted, end);
+                index += 3;
+            }
+            None => index += 1,
+        }
+    }
+
+    index
 }
 
 /// The script without `#` comments (outside quotes).
@@ -519,5 +571,24 @@ endif ()
         // A backslash escapes the next character, as in CMake's regexes (gflags' `\\gflags.cc:` on Windows)
         let test = words(&["cmake", "-DCOMMAND=app", r"-DEXPECTED_OUTPUT=\\gflags.cc:", "-P", "execute_test.cmake"]);
         assert_eq!(convert(&test, &read).unwrap().expect, words(&[r"\\gflags\.cc:"]));
+    }
+
+    #[test]
+    fn cmake_regexes_read_as_in_cmake() {
+        let matches = |cmake: &str, text: &str| regex::Regex::new(&anvil_regex(cmake)).unwrap().is_match(text);
+
+        // Braces and escaped letters are literal; `.` matches line ends
+        assert_eq!(anvil_regex(r#""source-location": {"#), r#""source-location": \{"#);
+        assert!(matches(r"a{2}", "a{2}") && !matches(r"a{2}", "aa"));
+        assert!(matches(r"\d\.", "d.") && !matches(r"\d", "1"));
+        assert!(matches("a.b", "a\nb"));
+
+        // A bracket expression takes `\`, `[` and `&&` literally, `]` first and `-` last too
+        assert!(matches(r"[/\]x", r"\x") && matches(r"[/\]x", "/x"));
+        assert!(matches(r"[]a]", "]") && matches(r"[a-]", "-") && matches(r"[^a-c]", "d") && !matches(r"[^a-c]", "b"));
+        assert!(matches(r"[[&&]", "[") && matches(r"[[&&]", "&"));
+
+        // Unclosed brackets do not read
+        assert!(regex::Regex::new(&anvil_regex("[abc")).is_err());
     }
 }
