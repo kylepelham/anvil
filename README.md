@@ -76,6 +76,8 @@ Every build that runs something, failed and interrupted ones too, writes a Chrom
 
 `CXX` (and `CC`) name the compiler when no toolchain is chosen, or the program of the chosen one when it is of that family. A compiler cache in front (`ccache g++`) is skipped; a `CXX` Anvil cannot use is reported and ignored.
 
+MSVC, clang-cl and clang on Windows use the newest Visual Studio with the C++ tools (vswhere, previews included); run Anvil from a Developer Prompt (`VSINSTALLDIR` set) to use another.
+
 ## Conventions
 
 With no `[target]` tables, a package builds from its layout:
@@ -201,7 +203,7 @@ overlay-triplets = ["triplets"]
 | `if` | The target exists only when this condition holds. |
 | `default` | Built by a plain `anvil build` (default true; tests false). |
 | `preset` | A `[preset.<name>]` or a list of them, applied before the target's own settings. |
-| `sources` | Globs; `!pattern` excludes. C, C++, CUDA (`.cu`), Objective-C (`.m`, `.mm`; clang and gcc), `.rc` (with `_DEBUG` under the MSVC ABI's debug runtime, as cl), and assembly (`.asm` with MSVC through ml64, `.s`/`.S` with GCC and Clang). `.def` and `.manifest` files go to the link (a manifest with the MSVC ABI only) and relink when they change; headers (`.h`, `.inl`, `.ipp`, ...) are ignored; C++20 module files (`.cppm`, `.ixx`) are an error. Objects link in the order the sources are listed, whatever their language (a glob's files sorted by path), generated sources after them, as CMake links them. |
+| `sources` | Globs; `!pattern` excludes. C, C++, CUDA (`.cu`), Objective-C (`.m`, `.mm`; clang and gcc), `.rc` (with `_DEBUG` under the MSVC ABI's debug runtime, as cl), and assembly (`.asm` with MSVC through ml64, `.s`/`.S` with GCC and Clang). `.def` and `.manifest` files go to the link (a manifest with the MSVC ABI only) and relink when they change; headers (`.h`, `.inl`, `.ipp`, ...) are ignored. C++20 modules are not supported: module files (`.cppm`, `.ixx`) are an error; use headers and a `pch`. Objects link in the order the sources are listed, whatever their language (a glob's files sorted by path), generated sources after them, as CMake links them. |
 | `include`, `system-include` | Include folders, the second with warnings silenced (default: `src/`). One that does not exist is warned about (not under the output folder, nor in a package with build steps). |
 | `defines`, `flags`, `link-flags` | Definitions; raw compiler and linker settings. `{target:X}` in `link-flags` is X's file, linked first. |
 | `deps` | Targets and `[deps]` entries this one uses; `pkg/target` names a target of a path or git dependency. |
@@ -514,9 +516,21 @@ Both find their tool on `PATH`, in Visual Studio's `VC/Tools/Llvm`, or in LLVM's
 | `vs` | `<project>.sln` at the root; a Makefile project per target in `.anvil/vs/` | Build, Rebuild and Clean of a project run `anvil build <target>` and `anvil clean <target>` (Rebuild cleans first); F5 debugs the startup project (`default-run`, else the first program) with Visual Studio's debugger. A configuration per profile that builds for Windows (`Debug`, `Release`, `Shipping`), each described by its own profile (its targets, programs, arguments and IntelliSense), so the files are the same whichever profile builds. IntelliSense takes each target's include folders, definitions and standard from that profile's `compile_commands.json`, once a build of it wrote one. A workspace gets a solution folder per package. |
 | `vscode` | `.vscode/tasks.json`, `launch.json`, `settings.json` | Tasks `anvil: build` (the default build task), `anvil: build <program>` and `anvil: test` (the default test task), with problem matchers for cl and GCC; a launch configuration `anvil: <program>` per program, built first (`cppvsdbg` for the MSVC ABI, else `cppdbg` with gdb or lldb); settings pointing cpptools at the root `compile_commands.json` and, for gcc and clang, clangd's `--query-driver` at the compiler (each unless set), and Even Better TOML at Anvil's schemas. |
 | `clion` | `.idea/tools/Anvil.xml`, `.idea/customTargets.xml`, `.idea/runConfigurations/anvil_<program>.xml`, `.idea/misc.xml` (when there is none) | A compilation database project (the root `compile_commands.json`) with custom build targets that run anvil, and a Custom Build Application run configuration per program. |
-| `zed` | `.zed/tasks.json`, `.zed/debug.json` | Tasks `anvil: build` and `anvil: test`; a debug configuration per program, built first (GDB's adapter for gdb, else CodeLLDB). |
+| `zed` | `.zed/tasks.json`, `.zed/debug.json` | Tasks `anvil: build` and `anvil: test`; a debug configuration per program, built first (GDB's adapter for gdb, which needs GDB 14.1 or later; else CodeLLDB). Zed's C++ adapters are those two, so MSVC-ABI programs get CodeLLDB too: LLDB reads their PDBs, less completely than DWARF (Visual Studio's debugger is for Visual Studio and VS Code only). |
 
 Programs include test targets, which run as their tests do. CLion's and Zed's files are written to their formats but untested: no CLion or Zed was at hand.
+
+What each editor gets:
+
+| Editor | Project files | Build | F5 / debug | Test UI | IntelliSense | anvil.toml highlighting, diagnostics | Status |
+|---|---|---|---|---|---|---|---|
+| VS Code + Anvil extension | none | tasks | C/C++ extension (`cppvsdbg`, `cppdbg` with gdb or lldb) | Test Explorer | cpptools, clangd | grammar; `anvil lsp` | tested (its suites, in a downloaded VS Code) |
+| VS Code, `anvil ide vscode` | `.vscode/` | tasks | C/C++ extension | none | cpptools, clangd | Even Better TOML with Anvil's schema | untested in the editor (files checked) |
+| Visual Studio | `anvil ide vs` | Build, Rebuild, Clean | Visual Studio's debugger | none | from `compile_commands.json` | none | tested (MSBuild builds the solution; F5 by its settings) |
+| CLion | `anvil ide clion` | custom build targets | Custom Build Application | none | compilation database | TOML plugin with `anvil schema` | experimental |
+| Zed | `anvil ide zed` | tasks | GDB, CodeLLDB | none | clangd | `anvil lsp` through a small extension | experimental |
+| Neovim, Helix, Emacs, Sublime Text | none | none | none | none | clangd (`anvil compdb`) | `anvil lsp` | untested |
+| Drift | none | none | none | none | none | `anvil lsp` diagnostics | tested (Drift's client simulated) |
 
 In files the user edits too (VS Code's and Zed's lists, CLion's `customTargets.xml`), Anvil writes its entries, named `anvil: ...`, and replaces or removes only those and the ones it wrote before, which `.anvil/ide.toml` lists; every other entry, and every comment, stays. A file it cannot read as UTF-8 stays as it is, with a warning saying what Anvil would add (the next build after it is fixed adds it). A byte-order mark and CRLF line endings are kept.
 
@@ -552,7 +566,7 @@ The Anvil extension in `editors/vscode` needs no generated files: open a folder 
 
 ```sh
 cd editors/vscode
-npm install
+npm ci
 npm run package                            # anvil-0.1.0.vsix
 code --install-extension anvil-0.1.0.vsix
 ```
@@ -567,7 +581,7 @@ It needs `anvil` on `PATH`, in `~/.cargo/bin` or named by the `anvil.path` setti
 
 ## Language server
 
-`anvil lsp` is a language server (LSP 3.17 over stdin and stdout) for `anvil.toml` and `tests.toml`; it ignores other files, so attaching it to every TOML file is harmless. It runs the load `anvil targets` runs (nothing fetched, installed or built; only the `cmake` package-lookup cache is written, inside an output folder already there) on the editor's unsaved text, 200 ms after the last edit and at once on save, so every mistake a build would stop at shows before anything builds: TOML syntax, unknown keys (with did-you-mean), wrong value types, condition words, targets, packages, profiles, options, presets, tests and their `after`, cycles, duplicate names, workspace members, `[deps]` entries; and as warnings unused dependencies, missing include folders, globs that match nothing, path dependencies with only a `CMakeLists.txt`. Diagnostics mark the key or value at fault, in the file that holds it (a path dependency's manifest, a `tests.toml`), and every error of a kind shows at once (all unknown keys, all unknown dependencies, ...); errors found by a later stage of the check show once the earlier ones are fixed. The editor pulls them when it can, else the server pushes them.
+`anvil lsp` is a language server (LSP 3.17 over stdin and stdout) for `anvil.toml` and `tests.toml`; it ignores other files, so attaching it to every TOML file is harmless. It runs the load `anvil targets` runs (nothing fetched, installed or built; only the `cmake` package-lookup cache is written, inside an output folder already there) on the editor's unsaved text, 200 ms after the last edit and at once on save, so every mistake a build would stop at shows before anything builds: TOML syntax, unknown keys (with did-you-mean), wrong value types, condition words, targets, packages, profiles, options, presets, tests and their `after`, cycles, duplicate names, workspace members, `[deps]` entries; and as warnings unused dependencies, missing include folders, globs that match nothing, path dependencies with only a `CMakeLists.txt`. Diagnostics mark the key or value at fault, in the file that holds it (a path dependency's manifest, a `tests.toml`), and every error of a kind shows at once (all unknown keys, all unknown dependencies, ...); errors found by a later stage of the check show once the earlier ones are fixed. The editor pulls them when it can, else the server pushes them. While the compiler is first detected (seconds, once per machine; then cached), a pull waits up to a second, then gets what needs no compiler (syntax, keys, values, each table's checks), and the whole check follows: editors that take a refresh are told to pull again, others get it at their next pull (they get the early answer only when it holds errors, so an empty one never stands for the whole check); pushed diagnostics come twice.
 
 It completes keys, values, condition words, target and dependency names, placeholders and vcpkg ports (with snippets for tables and build steps where the editor takes them); shows each key's documentation and what a name is on hover (Markdown when the editor offers it, else plain text); goes to definitions, finds references and renames targets, `[deps]` entries, options, profiles, presets and tests across files; lists symbols; colours what Anvil gives a meaning (condition words, placeholders, target names); and offers quick fixes: the did-you-mean, removing an unused dependency, adding a vcpkg port to `[deps]`.
 
@@ -579,7 +593,7 @@ Settings, in `initializationOptions` or the editor's `anvil` settings: `profile`
 - Emacs: `(add-to-list 'eglot-server-programs '((toml-ts-mode conf-toml-mode) . ("anvil" "lsp")))` (eglot runs one server per mode, so this replaces taplo).
 - Sublime Text (LSP package): `"clients": { "anvil": { "enabled": true, "command": ["anvil", "lsp"], "selector": "source.toml" } }`.
 - Zed: a small extension whose `extension.toml` has `[language_servers.anvil]` with `name = "Anvil"` and `languages = ["TOML"]`, and whose `language_server_command` returns `anvil` with `["lsp"]`.
-- Drift: command `["anvil", "lsp"]`, extensions `["anvil.toml", "tests.toml"]`, language `"toml"`.
+- Drift: a `drift.json` entry `"lsp": { "anvil": { "command": ["anvil", "lsp"], "extensions": ["anvil.toml", "tests.toml"], "language": "toml" } }`, or a language plugin's `language-server` record with those and `id = "anvil"`, `label = "Anvil"` and a `setup`. Drift picks a server by the end of the file name, so `mytests.toml` reaches it too; the server answers files other than `anvil.toml` and `tests.toml` with nothing.
 
 ## Speed
 

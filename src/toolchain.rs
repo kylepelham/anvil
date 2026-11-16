@@ -263,6 +263,11 @@ impl Toolchain {
             let programs = format!("{}|{}", slash(&named.cxx), named.cc.as_deref().map(slash).unwrap_or_default());
             suffix.push_str(&format!("-{:08x}", util::hash_bytes(programs.as_bytes()) as u32));
         }
+
+        // A developer prompt's Visual Studio gets a cache of its own: the newest one's stays for other shells
+        if let Some(prompt) = prompt_visual_studio().filter(|_| family != Family::Gcc) {
+            suffix.push_str(&format!("-vs{:08x}", util::hash_bytes(util::path_key(&prompt).as_bytes()) as u32));
+        }
         let cache_name = format!("toolchain-{}{suffix}.v{CACHE_VERSION}.json", family.name());
         let cache_file = util::user_data_dir().join(cache_name);
 
@@ -494,11 +499,8 @@ fn reports_clang(compiler: &Path) -> bool {
 
 /// The newest Visual Studio with the C++ tools, through vswhere (or the developer prompt's VSINSTALLDIR).
 pub fn find_visual_studio() -> Option<PathBuf> {
-    if let Ok(folder) = std::env::var("VSINSTALLDIR") {
-        let folder = PathBuf::from(folder);
-        if folder.join("VC").is_dir() {
-            return Some(folder);
-        }
+    if let Some(folder) = prompt_visual_studio() {
+        return Some(folder);
     }
 
     let program_files = std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
@@ -516,6 +518,14 @@ pub fn find_visual_studio() -> Option<PathBuf> {
 
     let folder = String::from_utf8_lossy(&output.stdout).lines().next()?.trim().to_string();
     (!folder.is_empty()).then(|| PathBuf::from(folder))
+}
+
+/// The Visual Studio of the developer prompt Anvil runs in (VSINSTALLDIR), if any.
+fn prompt_visual_studio() -> Option<PathBuf> {
+    let folder = std::env::var("VSINSTALLDIR").ok()?;
+    let folder = PathBuf::from(folder.trim_end_matches(['\\', '/']));
+
+    folder.join("VC").is_dir().then_some(folder)
 }
 
 fn read_vc_tools_version(visual_studio: &Path) -> Option<String> {

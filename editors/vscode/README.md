@@ -31,9 +31,9 @@ build logic of its own:
   Optional keys: `profile`, `toolchain`, `args` (in place of `anvil run`'s), `cwd`, `env` (added), `build` (false skips
   the build), `stopAtEntry`; any other key (`visualizerFile`, `setupCommands`, `console`, ...) goes to the C/C++
   debugger as is.
-- **Test Explorer:** the tests of `anvil.toml` and every `tests.toml`, at their declarations. Running them calls
-  `anvil test` and shows each test's result and output; debugging one builds and debugs its program with the test's
-  arguments and folder.
+- **Test Explorer:** the tests of `anvil.toml` and every `tests.toml`, at their declarations (from `anvil lsp`'s
+  document symbols). Running them calls `anvil test` and shows each test's result and output; debugging one builds and
+  debugs its program with the test's arguments and folder.
 - **anvil.toml and tests.toml** (from `anvil lsp`): the errors `anvil build` would report, on the word they are about,
   as you type (the real loader runs on the unsaved text); completion of keys, values, target and dependency names,
   condition words, `{placeholders}` and vcpkg ports; snippets for `[target.x]`, `[deps]`, `[[test]]`, `[profile.x]`,
@@ -79,13 +79,13 @@ server still runs on them (it goes by file name), but then both check the TOML s
 |---|---|
 | Problems, completion, hover, navigation, quick fixes and semantic colours in anvil.toml / tests.toml | `anvil lsp` (vscode-languageclient, stdio) |
 | Syntax colours of anvil.toml / tests.toml | `syntaxes/anvil-toml.tmLanguage.json` (plain TOML) |
-| Status bar, tasks, F5 / Run and Debug, Test Explorer, IntelliSense settings | `anvil targets --json`, `anvil build`, `anvil run`, `anvil test` |
+| Status bar, tasks, F5 / Run and Debug, Test Explorer, IntelliSense settings | `anvil targets --json`, `anvil build`, `anvil run`, `anvil test` (the tests' places: `anvil lsp`) |
 | Compiler errors in Problems | the tasks' problem matchers |
 
 ## Building the extension
 
 ```sh
-npm install
+npm ci
 npm run compile                 # type check and bundle into dist/
 cargo build                     # (in the repository) the anvil whose `anvil lsp` the lsp suite runs
 npm test                        # downloads VS Code; runs the suites against a fake anvil, and the lsp suite against

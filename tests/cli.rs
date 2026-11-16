@@ -3802,6 +3802,36 @@ fn add_vcpkg_port_then_build() {
     project.anvil(&["build", "--toolchain", "msvc"]).success().up_to_date();
 }
 
+// 54b. anvil add of a port [deps] has already but vcpkg.json lacks: vcpkg.json gets it, with the entry's features
+
+#[test]
+fn add_puts_a_listed_port_into_vcpkg_json() {
+    let project = Project::empty("add_listed_port");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"usegtest\"\n\n[deps]\ngtest = { vcpkg = \"gtest\", features = [\"gmock\"] }\n",
+    );
+    project.write("vcpkg.json", "{\n  \"name\": \"usegtest\",\n  \"dependencies\": [\"fmt\"]\n}\n");
+
+    // What the build's error tells the user to run puts it there, with its features
+    project.anvil(&["add", "gtest"]).success().contains("Added gtest to");
+    let json: serde_json::Value = serde_json::from_str(&project.read("vcpkg.json")).unwrap();
+    assert_eq!(
+        json["dependencies"],
+        serde_json::json!(["fmt", { "name": "gtest", "features": ["gmock"] }])
+    );
+    assert!(project
+        .read("anvil.toml")
+        .contains("gtest = { vcpkg = \"gtest\", features = [\"gmock\"] }"));
+
+    // A new feature goes to both; then nothing is left to do
+    project.anvil(&["add", "gtest", "--features", "extra"]).success();
+    let json: serde_json::Value = serde_json::from_str(&project.read("vcpkg.json")).unwrap();
+    assert_eq!(json["dependencies"][1]["features"], serde_json::json!(["gmock", "extra"]));
+    assert!(project.read("anvil.toml").contains("features = [\"gmock\", \"extra\"]"));
+    project.anvil(&["add", "gtest"]).success().contains("already in [deps]").lacks("Added");
+}
+
 // 55. anvil install never deletes or overwrites what it did not write, and a default install suits CMake's generators:
 //     headers beside a library's sources install; installing one target keeps the others' files; files another project
 //     or the user put in the prefix are never removed; a prefix holding the project is refused; a library removed

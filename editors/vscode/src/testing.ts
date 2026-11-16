@@ -308,40 +308,52 @@ function unescapeXml(text: string): string {
     .replace(/&amp;/g, "&");
 }
 
-/** Where each test is declared: the `name = "..."` line of its [[test]] in anvil.toml or a tests.toml. */
+/**
+ * Where each test is declared, as the language server's document symbols of anvil.toml and tests.toml files say: a
+ * [[test]] table's name (a matrix's `name = "a_{v}"` covers each test it makes), or a kind = "test" target. None
+ * while the server is not running.
+ */
 async function testLocations(project: Project, tests: Test[]): Promise<Map<string, vscode.Location>> {
   const locations = new Map<string, vscode.Location>();
   if (tests.length === 0) {
     return locations;
   }
-  const short = (name: string) => name.slice(name.lastIndexOf("/") + 1);
-  const wanted = new Set(tests.map((test) => short(test.name)));
-  const found = new Map<string, vscode.Location>();
   const files = await vscode.workspace.findFiles(
     new vscode.RelativePattern(vscode.Uri.file(project.root), "**/{anvil,tests}.toml"),
     "**/{out,node_modules,.git,vcpkg_installed}/**",
   );
-  for (const file of files.map((uri) => uri.fsPath).sort()) {
-    let text: string;
-    try {
-      text = fs.readFileSync(file, "utf8");
-    } catch {
-      continue;
-    }
-    const lines = text.split(/\r?\n/);
-    lines.forEach((line, index) => {
-      const match = /^\s*name\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(line);
-      const name = match?.[1] ?? match?.[2];
-      if (name !== undefined && wanted.has(name) && !found.has(name)) {
-        found.set(name, new vscode.Location(vscode.Uri.file(file), new vscode.Range(index, 0, index, line.length)));
+
+  // Each declaration: the names it matches and where its name is written
+  const declarations: { name: string; matches: (name: string) => boolean; location: vscode.Location }[] = [];
+  for (const file of files.sort((left, right) => left.fsPath.localeCompare(right.fsPath))) {
+    const symbols = await vscode.commands
+      .executeCommand<vscode.DocumentSymbol[] | undefined>("vscode.executeDocumentSymbolProvider", file)
+      .then((found) => found ?? [], () => []);
+    for (const symbol of symbols) {
+      const declared = symbol.detail === "[[test]]" ? [symbol] : symbol.name === "[target]" ? (symbol.children ?? []).filter((child) => child.detail === "test") : [];
+      for (const test of declared) {
+        declarations.push({ name: test.name, matches: namePattern(test.name), location: new vscode.Location(file, test.selectionRange ?? test.range) });
       }
-    });
+    }
   }
+
+  // A name written out wins over a matrix's pattern
   for (const test of tests) {
-    const location = found.get(short(test.name));
-    if (location) {
-      locations.set(test.name, location);
+    const short = test.name.slice(test.name.lastIndexOf("/") + 1);
+    const found = declarations.find((declaration) => declaration.name === short) ?? declarations.find((declaration) => declaration.matches(short));
+    if (found) {
+      locations.set(test.name, found.location);
     }
   }
   return locations;
+}
+
+/** Whether a test's name is one a declared name makes: itself, or a matrix name with each `{param}` filled in. */
+function namePattern(declared: string): (name: string) => boolean {
+  if (!declared.includes("{")) {
+    return (name) => name === declared;
+  }
+  const parts = declared.split(/\{[^}]*\}/).map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const pattern = new RegExp(`^${parts.join(".+")}$`);
+  return (name) => pattern.test(name);
 }

@@ -225,13 +225,26 @@ pub fn add(start_dir: &Path, args: &AddArgs) -> Result<()> {
     let added = !deps.contains_key(&args.name);
     let mut changed = added;
     match deps.get_mut(&args.name) {
-        Some(existing) if !args.features.is_empty() => {
-            let port = vcpkg_port_of(existing, &args.name)
-                .with_context(|| format!("`{}` in [{table_name}] is not a vcpkg port; features belong to vcpkg ports", args.name))?;
-            add_to_vcpkg_json(&root, &vcpkg_spec, &port, &args.features)?;
-            changed = add_features(existing, &args.name, &args.features)?;
+        Some(existing) => {
+            let port = vcpkg_port_of(existing, &args.name);
+            if port.is_none() && !args.features.is_empty() {
+                bail!("`{}` in [{table_name}] is not a vcpkg port; features belong to vcpkg ports", args.name);
+            }
+
+            // A port the project's vcpkg.json lacks, or lacks features of, gets them there (the entry's and the new ones)
+            if let Some(port) = port {
+                let mut features = listed_features(existing);
+                for feature in &args.features {
+                    if !features.contains(feature) {
+                        features.push(feature.clone());
+                    }
+                }
+                add_to_vcpkg_json(&root, &vcpkg_spec, &port, &features)?;
+            }
+            if !args.features.is_empty() {
+                changed = add_features(existing, &args.name, &args.features)?;
+            }
         }
-        Some(_) => {}
         None => {
             deps.insert(&args.name, dependency_entry(args, &root, &vcpkg_spec)?);
         }
@@ -529,6 +542,20 @@ fn vcpkg_port_of(item: &toml_edit::Item, name: &str) -> Option<String> {
         return Some(name.to_string());
     }
     item.as_table_like()?.get("vcpkg")?.as_str().map(|port| port.to_string())
+}
+
+/// The features a [deps] entry lists.
+fn listed_features(item: &toml_edit::Item) -> Vec<String> {
+    let listed = item
+        .as_table_like()
+        .and_then(|table| table.get("features"))
+        .and_then(|features| features.as_array());
+
+    listed
+        .into_iter()
+        .flatten()
+        .filter_map(|feature| feature.as_str().map(str::to_string))
+        .collect()
 }
 
 /// Adds features to an existing vcpkg entry (the short form becomes a table); says whether anything changed.

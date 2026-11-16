@@ -123,6 +123,16 @@ suite("anvil lsp", () => {
     assert.deepStrictEqual(snippets.sort(), ["[[test]]", "[[test]] with expect"]);
   });
 
+  test("Test Explorer places each test at its declaration, from the server's symbols", async () => {
+    const anvil = await api();
+    const runs = await waitFor("the test's place", () => {
+      const item = anvil.tests.findItem("runs");
+      return item?.range ? item : undefined;
+    });
+    assert.strictEqual(path.relative(PROJECT, runs.uri!.fsPath), path.join("tests", "tests.toml"));
+    assert.deepStrictEqual([runs.range!.start.line, runs.range!.start.character], [1, 8]);
+  });
+
   test("the status bar's profile reaches the server", async () => {
     const anvil = await api();
     const project = anvil.project()!;
