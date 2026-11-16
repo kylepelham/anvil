@@ -502,6 +502,16 @@ pub fn check_sources(target: &Target) -> Result<()> {
     }
 }
 
+/// Is this a header moc runs over: one with Q_OBJECT or its kin (for `anvil convert`, which keeps such headers in a
+/// Qt target's sources).
+pub fn is_moc_header(path: &Path) -> bool {
+    if !HEADER_EXTENSIONS.contains(&extension(path).as_str()) {
+        return false;
+    }
+
+    std::fs::read(path).is_ok_and(|bytes| scan_text(&String::from_utf8_lossy(&bytes)).has_macro)
+}
+
 /// The moc, uic and rcc runs a target needs, and the sources they write that compile into it.
 pub fn plan(model: &Model, index: usize, qt: &Qt, settings: &CompileSettings) -> Result<Generated> {
     let target = &model.targets[index];

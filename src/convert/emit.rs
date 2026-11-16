@@ -1041,12 +1041,62 @@ impl Emitter {
             return;
         }
 
+        // Headers with a Q_OBJECT class and no source of their name, which Anvil's moc reads only when they are listed
+        for item in self.moc_headers(target) {
+            converted
+                .blocks
+                .push(relative_condition(&item.condition), "sources", self.path_text(&item.value, dir));
+        }
+
         // A target with no compiled sources under any condition still needs `sources = []` so the convention adds none
         let has_sources = converted.blocks.blocks.values().any(|block| block.contains_key("sources"));
         if compiles && !has_sources {
             converted.blocks.set(None, "sources", Value::List(Vec::new()));
             converted.notes.push("no source files: check this target".into());
         }
+    }
+
+    /// Headers of a target that uses Qt that moc must read and Anvil would not find by itself, which it does beside a
+    /// source of their name (`window.h`, `window_p.h` beside `window.cpp`).
+    fn moc_headers<'a>(&self, target: &'a Target) -> Vec<&'a Item<PathBuf>> {
+        let moc_off = target
+            .settings
+            .iter()
+            .any(|item| item.condition.is_none() && item.value == ("qt", "false".into()));
+        if moc_off || !self.uses_qt(target, &mut Vec::new()) {
+            return Vec::new();
+        }
+
+        let source_names: HashSet<String> = target
+            .sources
+            .iter()
+            .filter(|item| is_compiled(&item.value))
+            .map(|item| util::path_key(&item.value.with_extension("")))
+            .collect();
+        let has_source = |header: &Path| {
+            let stem = header.file_stem().unwrap_or_default().to_string_lossy();
+            let name = stem.strip_suffix("_p").unwrap_or(&stem);
+            source_names.contains(&util::path_key(&header.with_file_name(name)))
+        };
+
+        target
+            .sources
+            .iter()
+            .filter(|item| !has_source(&item.value) && crate::qt::is_moc_header(&item.value))
+            .collect()
+    }
+
+    /// Does a target link Qt, itself or through a target of the project it links?
+    fn uses_qt(&self, target: &Target, visiting: &mut Vec<String>) -> bool {
+        if visiting.contains(&target.name) {
+            return false;
+        }
+        visiting.push(target.name.clone());
+
+        target.links.iter().any(|item| {
+            let linked = self.cmake.targets.get(&self.cmake.resolve_alias(&item.value));
+            super::qt_commands::is_qt_link(&item.value.to_lowercase()) || linked.is_some_and(|linked| self.uses_qt(linked, visiting))
+        })
     }
 
     /// Would Anvil's convention for a target in `dir` find exactly these files?
@@ -1848,7 +1898,7 @@ impl Emitter {
 
         for (run, input) in runs {
             let Some(input) = input else {
-                single.push(run);
+                single.push((run, None));
                 continue;
             };
 
@@ -1869,7 +1919,11 @@ impl Emitter {
             let mut template = run.clone();
             template.command = run.command.iter().map(template_word).collect();
             template.outputs = run.outputs.iter().map(template_word).collect();
-            template.inputs = run.inputs.iter().skip(1).map(template_word).collect();
+
+            // Its other inputs (generated headers before it too), which runs of one template share
+            let inputs: Vec<String> = run.inputs.iter().map(template_word).collect();
+            let starts_with_input = inputs.first().is_some_and(|first| first == "{input}");
+            template.inputs = inputs.into_iter().skip(usize::from(starts_with_input)).collect();
             template.message = None;
 
             let key = format!(
@@ -1883,14 +1937,14 @@ impl Emitter {
                     template.depfile
                 )
             );
-            groups.entry(key).or_insert_with(|| (template, Vec::new())).1.push(input);
-            single.push(run);
+            groups.entry(key.clone()).or_insert_with(|| (template, Vec::new())).1.push(input);
+            single.push((run, Some(key)));
         }
 
         // Groups of two or more replace their single runs
         let mut merged = Vec::new();
-        let mut merged_outputs: HashSet<String> = HashSet::new();
-        for (_, (mut template, inputs)) in groups {
+        let mut merged_keys: HashSet<String> = HashSet::new();
+        for (key, (mut template, inputs)) in groups {
             if inputs.len() < 2 {
                 continue;
             }
@@ -1905,18 +1959,14 @@ impl Emitter {
                 Some((pattern, _)) => vec![self.path_text(Path::new(pattern), &dir)],
                 None => inputs.iter().map(|input| self.path_text(input, &dir)).collect(),
             };
-            merged_outputs.extend(inputs.iter().map(|input| util::path_key(input)));
+            merged_keys.insert(key);
             merged.push(template);
         }
 
-        let dir_for_inputs = dir.clone();
-        merged.extend(single.into_iter().filter(|run| {
-            let first_input = run
-                .inputs
-                .first()
-                .map(|input| util::path_key(&util::absolute(&dir_for_inputs, Path::new(input))));
-            !first_input.is_some_and(|key| merged_outputs.contains(&key))
-        }));
+        let unmerged = single
+            .into_iter()
+            .filter(|(_, key)| !key.as_ref().is_some_and(|key| merged_keys.contains(key)));
+        merged.extend(unmerged.map(|(run, _)| run));
 
         merged
     }
@@ -2674,11 +2724,12 @@ impl Emitter {
 
         // [[write]]: files CMake writes at configure time, when their text is known now
         let mut unconverted_writes = Vec::new();
-        for write in &self.cmake.configure_writes {
+        for write in self.cmake.configure_writes.clone() {
             let Some(text) = write.text.as_ref().and_then(|text| self.found_header_text(text)) else {
                 unconverted_writes.push(write.location.clone());
                 continue;
             };
+            let text = self.header_dep_text(&text, &write.path);
 
             let path = self.command_word(&slash(&write.path));
             let _ = writeln!(output, "\n[[write]]\npath = {}", quote(&path));
@@ -3004,6 +3055,49 @@ impl Emitter {
             result = result.replace(&format!("{{found-header:{header}}}"), &format!("{{vcpkg}}/include/{header}"));
         }
         Some(result)
+    }
+
+    /// Text with the include folders of what `{header-dep:X}` names (a find module's X_INCLUDE_DIRS, a target's
+    /// INTERFACE_INCLUDE_DIRECTORIES), which [[write]] cannot fill in: vcpkg's include folder for a vcpkg port, a
+    /// project target's public include folders, nothing for a package the compiler finds by itself.
+    fn header_dep_text(&mut self, text: &str, path: &Path) -> String {
+        let mut result = text.to_string();
+        while let Some(name) = header_dep_name(&result) {
+            let mut folders: Vec<String> = Vec::new();
+            for (_, link) in self.classify_link(&name, &self.root.clone()) {
+                match link {
+                    Link::Target(target) => folders.extend(self.public_include_texts(&target)),
+                    Link::Dependency(dependency) => match self.dependencies.get(&dependency) {
+                        Some(DependencyEntry::Vcpkg { .. }) => folders.push("{vcpkg}/include".into()),
+                        Some(DependencyEntry::System) | None => {}
+                        Some(_) => self.warnings.push(format!(
+                            "{}: the include folders of {name} (`{dependency}` in [deps]) are not known before the build, so the file gets none; \
+                             add them to its [[write]] text by hand",
+                            slash(path)
+                        )),
+                    },
+                    _ => {}
+                }
+            }
+
+            folders.dedup();
+            result = result.replace(&format!("{{header-dep:{name}}}"), &folders.join(";"));
+        }
+
+        result
+    }
+
+    /// A project target's public include folders, as paths from the project root ({root}/include).
+    fn public_include_texts(&self, name: &str) -> Vec<String> {
+        let Some(target) = self.cmake.targets.get(name) else { return Vec::new() };
+        let public = target.includes.iter().filter(|item| item.public);
+
+        public
+            .chain(&target.interface_includes)
+            .map(|item| slash(&item.value.0))
+            .filter(|folder| !folder.contains("{header-dep:"))
+            .map(|folder| self.command_word(&folder))
+            .collect()
     }
 
     fn uses_vcpkg(&self) -> bool {

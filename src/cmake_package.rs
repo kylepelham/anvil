@@ -749,7 +749,8 @@ impl<'a> Reader<'a> {
 
     /// The targets the dependency's users link: those `targets` names, else its components' (a target
     /// `<namespace>::<component>`, else the libraries of package `<Package><Component>` beside it, as Qt has them), else
-    /// the package's libraries (all its targets when it has none).
+    /// the target named for the package (`SDL2::SDL2`, `fmt::fmt`, `TBB::tbb`), else the package's libraries (all its
+    /// targets when it has none) less test helpers and the static twins of shared ones.
     fn wanted_targets(&mut self, request: &Request, main: usize) -> Result<Vec<String>> {
         let dependency = request.dependency;
         let package_name = self.packages[main].name.clone();
@@ -785,8 +786,14 @@ impl<'a> Reader<'a> {
             return Ok(wanted);
         }
 
+        // The target named for the package, what CMake users link
+        let own = format!("{package_name}::{package_name}").to_lowercase();
+        if let Some(named) = self.packages[main].targets.iter().find(|name| name.to_lowercase() == own) {
+            return Ok(vec![named.clone()]);
+        }
+
         // Its libraries
-        let wanted = self.libraries_of(main);
+        let wanted = default_libraries(self.libraries_of(main));
         if wanted.is_empty() {
             bail!(
                 "dependency `{dependency}`: {} defines no imported targets Anvil can read (a package that only sets variables, \
@@ -1117,6 +1124,35 @@ impl<'a> Reader<'a> {
         if !system {
             vcpkg_tree::push_new(&mut usage.link_flags, &[format!("-Wl,-rpath,{folder_text}")]);
         }
+    }
+}
+
+/// A package's libraries as a dependency links them by default: less test helpers (`SDL2::SDL2test`) and the static
+/// twin of a shared library (`SDL2::SDL2-static`, `zstd::libzstd_static`); all of them when that leaves none.
+fn default_libraries(names: Vec<String>) -> Vec<String> {
+    let short = |name: &str| name.rsplit("::").next().unwrap_or(name).to_lowercase();
+    let is_test = |name: &str| ["test", "tests", "testing"].iter().any(|suffix| short(name).ends_with(suffix));
+    let is_static = |name: &str| ["-static", "_static"].iter().any(|suffix| short(name).ends_with(suffix));
+    let base = |name: &str| {
+        let short = short(name);
+        let suffix = ["-static", "_static", "-shared", "_shared"]
+            .iter()
+            .find(|suffix| short.ends_with(*suffix));
+        short[..short.len() - suffix.map_or(0, |suffix| suffix.len())].to_string()
+    };
+
+    let not_tests: Vec<&String> = names.iter().filter(|name| !is_test(name)).collect();
+    let has_shared_twin = |name: &str| not_tests.iter().any(|other| !is_static(other) && base(other) == base(name));
+    let kept: Vec<String> = not_tests
+        .iter()
+        .filter(|name| !(is_static(name) && has_shared_twin(name)))
+        .map(|name| name.to_string())
+        .collect();
+
+    if kept.is_empty() {
+        names
+    } else {
+        kept
     }
 }
 
@@ -1884,6 +1920,46 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn links_the_target_named_for_the_package_by_default() {
+        let prefix = scratch("default-targets");
+
+        // SDL2's targets: the shared library, its static twin, the entry-point and test libraries
+        write(
+            &prefix.join("lib/cmake/SDL2/SDL2Config.cmake"),
+            "add_library(SDL2::SDL2 SHARED IMPORTED)\nadd_library(SDL2::SDL2-static STATIC IMPORTED)\n\
+             add_library(SDL2::SDL2main STATIC IMPORTED)\nadd_library(SDL2::SDL2test STATIC IMPORTED)\n",
+        );
+        let session = Session::default();
+        let mut reader = Reader::new(test_build(), false, platform(Os::Linux), "sdl2", &[], &session);
+        let places = vec![(Place::Prefix(prefix.clone()), "`prefix`".to_string())];
+        let located = reader.locate("SDL2", &places, None).ok().unwrap();
+        let main = reader.read_package(&located);
+        let request = Request {
+            dependency: "sdl2",
+            package: "SDL2",
+            components: &[],
+            version: None,
+            targets: None,
+            prefixes: &[],
+        };
+        assert_eq!(reader.wanted_targets(&request, main).unwrap(), vec!["SDL2::SDL2"]);
+
+        // Without one: the libraries, less test helpers and static twins
+        let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            default_libraries(names(&["zstd::libzstd_shared", "zstd::libzstd_static", "zstd::zstdtest"])),
+            names(&["zstd::libzstd_shared"])
+        );
+        assert_eq!(
+            default_libraries(names(&["absl::base", "absl::strings_static", "absl::time"])),
+            names(&["absl::base", "absl::strings_static", "absl::time"])
+        );
+        assert_eq!(default_libraries(names(&["Only::unittest"])), names(&["Only::unittest"]));
+
+        std::fs::remove_dir_all(&prefix).ok();
     }
 
     #[test]

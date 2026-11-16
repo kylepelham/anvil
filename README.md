@@ -289,7 +289,7 @@ In paths, `defines`, `flags`, `link-flags` (of targets, file rules and profiles)
 
 In a package other than the root, `{target:X}` means that package's own X when it has one; `{target:pkg/X}` names another package's.
 
-Tests and `[[write]]` take `{root}`, `{out}`, `{profile}`, `{config}`, `{version}` and `{vcpkg}`; tests with a matrix also take their parameters and `{name}`. Build steps also take `{input}`, `{stem}`, `{filename}` (with `for-each`), `{inputs}`, `{output}`, `{outputs}`, `{depfile}`, and `{target:X}` (target X's file; also makes the step wait for X).
+Tests and `[[write]]` take `{root}`, `{out}`, `{profile}`, `{config}`, `{version}`, `{vcpkg}`, `{cxx}` and `{cc}`; tests with a matrix also take their parameters and `{name}`. Build steps also take `{input}`, `{stem}`, `{filename}` (with `for-each`), `{inputs}`, `{output}`, `{outputs}`, `{depfile}`, and `{target:X}` (target X's file; also makes the step wait for X).
 
 ### Build steps
 

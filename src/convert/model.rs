@@ -95,8 +95,9 @@ pub struct Target {
     pub visibility: Vec<Item<(&'static str, String)>>,
     /// add_library without a type under an unset BUILD_SHARED_LIBS: shared when this holds.
     pub shared_condition: Option<String>,
-    /// DEFINE_SYMBOL: what a shared build defines instead of `<target>_EXPORTS` (empty: nothing).
-    pub define_symbol: Option<String>,
+    /// DEFINE_SYMBOL, each under its condition: what a shared build defines instead of `<target>_EXPORTS` (empty:
+    /// nothing).
+    pub define_symbols: Vec<Item<String>>,
     /// Flags and definitions for its files of one language only (C flags in a target that also compiles C++).
     pub language_rules: Vec<LanguageRule>,
     /// generate_export_header as Anvil's key: the header's path under its include folder, and the macro.
@@ -273,7 +274,7 @@ impl Target {
             settings: Vec::new(),
             visibility: Vec::new(),
             shared_condition: None,
-            define_symbol: None,
+            define_symbols: Vec::new(),
             language_rules: Vec::new(),
             export_header: None,
             helper: None,
