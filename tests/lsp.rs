@@ -32,8 +32,13 @@ struct Client {
 
 impl Client {
     fn start() -> Client {
+        Client::start_with(&[])
+    }
+
+    fn start_with(variables: &[(&str, &str)]) -> Client {
         let mut child = Command::new(env!("CARGO_BIN_EXE_anvil"))
             .arg("lsp")
+            .envs(variables.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -79,7 +84,10 @@ impl Client {
     }
 
     fn send(&mut self, message: Value) {
-        let body = message.to_string();
+        self.send_body(&message.to_string());
+    }
+
+    fn send_body(&mut self, body: &str) {
         write!(self.input, "Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
         self.input.flush().unwrap();
     }
@@ -95,6 +103,28 @@ impl Client {
         self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
 
         self.wait_for(|message| message["id"] == id && message.get("method").is_none())
+    }
+
+    /// `textDocument/diagnostic` for a document: its items.
+    fn pull(&mut self, uri: &str) -> Value {
+        let report = self.request("textDocument/diagnostic", json!({ "textDocument": { "uri": uri } }));
+        report["result"]["items"].clone()
+    }
+
+    fn open(&mut self, uri: &str, version: i32, text: &str) {
+        let document = json!({ "uri": uri, "languageId": "toml", "version": version, "text": text });
+        self.notify("textDocument/didOpen", json!({ "textDocument": document }));
+    }
+
+    fn close(&mut self, uri: &str) {
+        self.notify("textDocument/didClose", json!({ "textDocument": { "uri": uri } }));
+    }
+
+    /// shutdown, then exit: the exit code.
+    fn stop(mut self) -> Option<i32> {
+        self.request("shutdown", Value::Null);
+        self.notify("exit", Value::Null);
+        self.child.wait().unwrap().code()
     }
 
     /// The next message `wanted` accepts, within 60 seconds.
@@ -138,9 +168,9 @@ fn range(line: u32, start: u32, end: u32) -> Value {
     json!({ "start": position(line, start), "end": position(line, end) })
 }
 
-/// A project in a fresh temp folder.
-fn project() -> PathBuf {
-    let root = std::env::temp_dir().join("anvil-it").join(format!("lsp-{}", std::process::id()));
+/// A project in a fresh temp folder of its own (the tests run at once).
+fn project(name: &str) -> PathBuf {
+    let root = std::env::temp_dir().join("anvil-it").join(format!("lsp-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("anvil.toml"), MANIFEST).unwrap();
@@ -152,7 +182,7 @@ fn project() -> PathBuf {
 
 #[test]
 fn language_server_session() {
-    let root = project();
+    let root = project("session");
     let uri = file_uri(&root.join("anvil.toml"));
     let mut client = Client::start();
 
@@ -262,4 +292,191 @@ fn exit_without_shutdown_fails() {
     client.notify("exit", Value::Null);
 
     assert_eq!(client.child.wait().unwrap().code(), Some(1));
+}
+
+// The capabilities of the owner's editor: pull diagnostics without refresh, so its first answer must be right
+fn pull_capabilities() -> Value {
+    json!({ "textDocument": { "diagnostic": { "dynamicRegistration": true } } })
+}
+
+const BROKEN: &str = "[project]\nname = \"demo\"\n\n[target.app]\nkind = \"exx\"\nsources = [\"src/main.cpp\"]\n";
+
+#[test]
+fn a_document_closed_and_reopened_at_the_same_version_is_checked_again() {
+    let root = project("reopen");
+    let uri = file_uri(&root.join("anvil.toml"));
+    let mut client = Client::start();
+    client.request("initialize", json!({ "processId": null, "capabilities": pull_capabilities() }));
+    client.notify("initialized", json!({}));
+
+    // Broken, then closed and reopened fixed at version 1 again (as VS Code numbers a reopened document)
+    client.open(&uri, 1, BROKEN);
+    let items = client.pull(&uri);
+    assert_eq!(items[0]["code"], "invalid-value", "{items}");
+    client.close(&uri);
+    client.open(&uri, 1, MANIFEST.replace("lnux", "linux").as_str());
+    assert_eq!(client.pull(&uri), json!([]));
+
+    // And back: the error returns
+    client.close(&uri);
+    client.open(&uri, 1, BROKEN);
+    let items = client.pull(&uri);
+    assert_eq!(items[0]["code"], "invalid-value", "{items}");
+
+    assert_eq!(client.stop(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_pull_before_the_compiler_is_known_waits_for_the_whole_check() {
+    let root = project("coldpull");
+    let uri = file_uri(&root.join("anvil.toml"));
+    let mut client = Client::start_with(&[("ANVIL_LSP_TEST_TOOLCHAIN_DELAY_MS", "1500")]);
+    client.request("initialize", json!({ "processId": null, "capabilities": pull_capabilities() }));
+    client.notify("initialized", json!({}));
+
+    // An unknown dependency only the load finds (with no compiler on the machine, the load says that instead): the
+    // files-only check before the compiler is known has nothing to say, and must not be the answer
+    let text = MANIFEST
+        .replace("lnux", "linux")
+        .replace(r#"deps = ["core"]"#, r#"deps = ["core", "nopedep"]"#);
+    client.open(&uri, 1, &text);
+    let items = client.pull(&uri);
+    assert!(!items.as_array().unwrap().is_empty(), "the first pull answered before the load: {items}");
+
+    assert_eq!(client.stop(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn configuration_changes_only_the_settings_given() {
+    let root = project("config");
+    let uri = file_uri(&root.join("anvil.toml"));
+    let text = MANIFEST.replace("lnux", "linux");
+    let mut client = Client::start();
+    let options = json!({ "anvil": { "profile": "nosuchprofile" } });
+    client.request(
+        "initialize",
+        json!({ "processId": null, "capabilities": {}, "initializationOptions": options }),
+    );
+    client.notify("initialized", json!({}));
+
+    client.open(&uri, 1, &text);
+    let published = client.diagnostics(&uri, |params| params["diagnostics"].as_array().is_some_and(|list| !list.is_empty()));
+    assert_eq!(published["diagnostics"][0]["code"], "unknown-profile", "{published}");
+
+    // Neovim's `{ "settings": {} }` after `initialized`, and another tool's settings: the profile stays
+    for settings in [json!({}), json!({ "other": { "profile": "release" } })] {
+        client.notify("workspace/didChangeConfiguration", json!({ "settings": settings }));
+    }
+    let codes = |published: &Value| -> Vec<String> {
+        published["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|diagnostic| diagnostic["code"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // A second mistake, so that the check publishes again: the profile's is still there
+    let text = text.replace("[project]\n", "[project]\nnme = 1\n");
+    let change = |version: i32| json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": text }] });
+    client.notify("textDocument/didChange", change(2));
+    let published = client.diagnostics(&uri, |params| params["version"] == 2);
+    assert!(codes(&published).contains(&"unknown-profile".to_string()), "{published}");
+    assert!(codes(&published).contains(&"unknown-key".to_string()), "{published}");
+
+    // Anvil's settings: a null clears the profile, the toolchain (not given) stays as it was
+    client.notify(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "anvil": { "profile": null } } }),
+    );
+    client.notify("textDocument/didChange", change(3));
+    let published = client.diagnostics(&uri, |params| params["version"] == 3);
+    assert_eq!(codes(&published), vec!["unknown-key".to_string()], "{published}");
+
+    assert_eq!(client.stop(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn workspace_folders_added_are_checked_and_removed_ones_cleared() {
+    let root = project("folders");
+    std::fs::write(root.join("anvil.toml"), BROKEN).unwrap();
+    let uri = file_uri(&root.join("anvil.toml"));
+    let folder = json!([{ "uri": file_uri(&root), "name": "folders" }]);
+    let mut client = Client::start();
+    client.request(
+        "initialize",
+        json!({ "processId": null, "capabilities": { "workspace": { "workspaceFolders": true } } }),
+    );
+    client.notify("initialized", json!({}));
+
+    // Added: its project is checked without a document open
+    client.notify(
+        "workspace/didChangeWorkspaceFolders",
+        json!({ "event": { "added": folder, "removed": [] } }),
+    );
+    let published = client.diagnostics(&uri, |params| params["diagnostics"].as_array().is_some_and(|list| !list.is_empty()));
+    assert_eq!(published["diagnostics"][0]["code"], "invalid-value", "{published}");
+    let symbols = client.request("workspace/symbol", json!({ "query": "" }));
+    assert!(
+        symbols["result"].as_array().unwrap().iter().any(|symbol| symbol["name"] == "app"),
+        "{symbols}"
+    );
+
+    // Removed: its diagnostics and its targets go
+    client.notify(
+        "workspace/didChangeWorkspaceFolders",
+        json!({ "event": { "added": [], "removed": folder } }),
+    );
+    client.diagnostics(&uri, |params| params["diagnostics"] == json!([]));
+    let symbols = client.request("workspace/symbol", json!({ "query": "" }));
+    assert_eq!(symbols["result"], json!([]));
+
+    assert_eq!(client.stop(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_project_outside_the_folders_goes_with_its_last_document() {
+    let root = project("outside");
+    let uri = file_uri(&root.join("anvil.toml"));
+    let mut client = Client::start();
+    client.request("initialize", json!({ "processId": null, "capabilities": {} }));
+    client.notify("initialized", json!({}));
+
+    client.open(&uri, 1, BROKEN);
+    client.diagnostics(&uri, |params| params["diagnostics"].as_array().is_some_and(|list| !list.is_empty()));
+    client.close(&uri);
+    client.diagnostics(&uri, |params| params["diagnostics"] == json!([]));
+
+    assert_eq!(client.stop(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn messages_before_initialized_and_broken_ones_are_answered() {
+    let mut client = Client::start();
+    client.request("initialize", json!({ "processId": null, "capabilities": {} }));
+
+    // Between the answer to initialize and `initialized`: notifications and requests are handled, the server lives
+    client.notify("$/setTrace", json!({ "value": "off" }));
+    client.notify("workspace/didChangeConfiguration", json!({ "settings": {} }));
+    client.notify("$/cancelRequest", json!({ "id": 99 }));
+    let symbols = client.request("workspace/symbol", json!({ "query": "" }));
+    assert_eq!(symbols["result"], json!([]));
+    let again = client.request("initialize", json!({ "processId": null, "capabilities": {} }));
+    assert_eq!(again["error"]["code"], -32600, "{again}");
+    client.notify("initialized", json!({}));
+
+    // Not JSON: a parse error with a null id; not a message: an invalid request with its id
+    client.send_body("{bad}");
+    let parse_error = client.wait_for(|message| message["error"]["code"] == -32700);
+    assert_eq!(parse_error["id"], Value::Null);
+    client.send_body(r#"{"jsonrpc":"2.0","id":41,"method":7}"#);
+    let invalid = client.wait_for(|message| message["id"] == 41);
+    assert_eq!(invalid["error"]["code"], -32600, "{invalid}");
+
+    assert_eq!(client.stop(), Some(0));
 }

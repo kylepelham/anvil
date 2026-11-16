@@ -1583,6 +1583,11 @@ impl Model {
             return Ok(());
         }
 
+        // The language server builds nothing, and nothing found here is one of its diagnostics
+        if crate::lsp::session::active() {
+            return Ok(());
+        }
+
         // Without a usable toolkit only building a .cu file fails, not every build of the project
         let cuda = match crate::cuda::Cuda::find(&self.toolchain) {
             Ok(cuda) => cuda,
@@ -1768,7 +1773,9 @@ impl Model {
                     }
                 }
 
-                if crate::lsp::session::active() || std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
+                // Listing (`anvil targets`, the language server) writes nothing
+                let listing = crate::lsp::session::active() || self.options.list_only;
+                if listing || std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
                     continue;
                 }
 
@@ -1927,7 +1934,7 @@ pub fn locate(start: &Path) -> Result<(PathBuf, Manifest)> {
 
     let nearest = start
         .ancestors()
-        .find(|folder| folder.join(MANIFEST_NAME).is_file())
+        .find(|folder| crate::lsp::session::is_file(&folder.join(MANIFEST_NAME)))
         .map(|folder| folder.to_path_buf());
     let Some(nearest) = nearest else {
         return zero_config(&start);
@@ -1937,7 +1944,7 @@ pub fn locate(start: &Path) -> Result<(PathBuf, Manifest)> {
     // are not this project's business, and one that does not parse is skipped with a warning
     for ancestor in nearest.ancestors().skip(1) {
         let candidate = ancestor.join(MANIFEST_NAME);
-        if !candidate.is_file() {
+        if !crate::lsp::session::is_file(&candidate) {
             continue;
         }
 
@@ -2388,19 +2395,24 @@ fn update_submodules(name: &str, url: &str, folder: &Path) -> Result<()> {
 fn apply_pkg_config(target: &mut Target, module: &str, platform: &Platform) -> Result<()> {
     let program = pkg_config_program(platform)?;
     let query = |argument: &str| -> Result<Vec<String>> {
-        let output = Command::new(&program)
-            .arg(argument)
-            .arg(module)
-            .output()
-            .with_context(|| format!("running {}", slash(&program)))?;
-        if !output.status.success() {
-            bail!(
-                "{} does not know `{module}`: {}",
-                slash(&program),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(util::split_command(&String::from_utf8_lossy(&output.stdout)))
+        // Asked once per language server check burst, not on each edit (a .bat pkg-config runs cmd and perl)
+        let variables = ["PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "PKG_CONFIG_SYSROOT_DIR"].map(std::env::var_os);
+        let key = format!("pkg-config|{}|{}|{argument}|{module}|{variables:?}", slash(&program), platform.name());
+        crate::lsp::session::ask(&key, || {
+            let output = Command::new(&program)
+                .arg(argument)
+                .arg(module)
+                .output()
+                .with_context(|| format!("running {}", slash(&program)))?;
+            if !output.status.success() {
+                bail!(
+                    "{} does not know `{module}`: {}",
+                    slash(&program),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(util::split_command(&String::from_utf8_lossy(&output.stdout)))
+        })
     };
 
     for flag in query("--cflags")? {

@@ -531,6 +531,8 @@ fn main() {
         run: RunArgs::default(),
     });
 
+    // The language server leaves nothing running behind it (a cold vcvarsall.bat, pkg-config): its job ends them
+    let server = matches!(command, CommandLine::Lsp { .. });
     let result = match command {
         CommandLine::Build { targets, all, plan, run } => commands::build(&start_dir, &BuildArgs::new(plan, run), &targets, all).map(|_| 0),
         CommandLine::Run { target, plan, run, args } => commands::run(&start_dir, &BuildArgs::new(plan, run), target.as_deref(), &args),
@@ -584,7 +586,9 @@ fn main() {
         }
     };
 
-    job::release();
+    if !server {
+        job::release();
+    }
     match result {
         Ok(code) => std::process::exit(code),
         Err(error) => {
