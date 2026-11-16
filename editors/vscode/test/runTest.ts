@@ -1,9 +1,10 @@
 // Runs the extension's tests in a downloaded VS Code (never the installed one), against copies of the fixture projects.
 //
-// Suites: `fake` and `convert` (always) drive the extension with test/fixtures/fake-anvil; `real` runs when ANVIL_REAL
-// names an anvil that has `targets --json`, and builds and debugs test/fixtures/real with it (ANVIL_TEST_GCC=1 debugs a
-// gcc build with gdb too). The C/C++, clangd and Even Better TOML extensions are installed into .vscode-test/extensions,
-// the test instance's own.
+// Suites: `fake` and `convert` (always) drive the extension with test/fixtures/fake-anvil (which has no `lsp`); `lsp`
+// runs the language server of a real anvil (ANVIL_LSP, else the repository's target/debug/anvil) on test/fixtures/lsp;
+// `real` runs when ANVIL_REAL names an anvil that has `targets --json`, and builds and debugs test/fixtures/real with it
+// (ANVIL_TEST_GCC=1 debugs a gcc build with gdb too). The C/C++, clangd and Even Better TOML extensions are installed
+// into .vscode-test/extensions, the test instance's own (Even Better TOML to check it leaves anvil.toml alone).
 
 import * as childProcess from "child_process";
 import * as fs from "fs";
@@ -48,6 +49,16 @@ async function main(): Promise<void> {
   suites.push({ name: "fake", project: path.join(work, "hello"), anvil: fake });
   fs.cpSync(path.join(fixtures, "cmake"), path.join(work, "cmake"), { recursive: true });
   suites.push({ name: "convert", project: path.join(work, "cmake"), anvil: fake });
+
+  // The language server suite: the anvil built in this repository unless ANVIL_LSP names one
+  const built = path.resolve(extensionRoot, "../../target/debug", process.platform === "win32" ? "anvil.exe" : "anvil");
+  const server = process.env.ANVIL_LSP ?? (fs.existsSync(built) ? built : undefined);
+  if (server) {
+    fs.cpSync(path.join(fixtures, "lsp"), path.join(work, "lsp"), { recursive: true });
+    suites.push({ name: "lsp", project: path.join(work, "lsp"), anvil: path.resolve(server) });
+  } else {
+    console.warn(`No anvil for the lsp suite: build it (cargo build) or set ANVIL_LSP. Skipped.`);
+  }
 
   const real = process.env.ANVIL_REAL;
   if (real) {

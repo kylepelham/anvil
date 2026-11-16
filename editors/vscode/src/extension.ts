@@ -1,19 +1,21 @@
-// Anvil for VS Code: everything comes from `anvil targets --json`; nothing is generated into the project.
+// Anvil for VS Code: the project comes from `anvil targets --json`, editing anvil.toml from `anvil lsp`; nothing is
+// generated into the project.
 
 import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { findAnvil, quoteCommand, shellArgs } from "./anvil";
-import { SnippetCompletions } from "./completion";
 import { AnvilDebugProvider, DEBUG_TYPE } from "./debug";
 import { IntelliSense } from "./intellisense";
+import { LanguageServer } from "./languageServer";
 import { Project, findManifestDir } from "./project";
-import { pointSchemaAssociations, updateSchemas } from "./schema";
 import { StatusBar, pickProfile, pickTarget, pickToolchain } from "./statusBar";
 import { AnvilCommand, AnvilTaskProvider, AnvilTaskDefinition, TASK_SOURCE, TASK_TYPE, createTask, runTask } from "./tasks";
 import { AnvilTests } from "./testing";
 
 const REFRESH_DELAY_MS = 300;
+
+let languageServer: LanguageServer | undefined;
 
 /** What the extension hands to other extensions and to its tests. */
 export interface AnvilApi {
@@ -25,16 +27,16 @@ export interface AnvilApi {
   /** The launch configurations listed in Run and Debug. */
   debugConfigurations(): vscode.DebugConfiguration[];
   tests: AnvilTests;
+  /** The `anvil lsp` client. */
+  languageServer: LanguageServer;
 }
 
 export function activate(context: vscode.ExtensionContext): AnvilApi {
-  // Before Even Better TOML starts and reads the schema URLs
-  pointSchemaAssociations(context);
-
   const output = vscode.window.createOutputChannel("Anvil");
-  const diagnostics = vscode.languages.createDiagnosticCollection("anvil");
   let project: Project | undefined;
   const current = () => project;
+  const server = new LanguageServer(() => ({ profile: project?.profile, toolchain: project?.toolchainChoice }));
+  languageServer = server;
 
   const statusBar = new StatusBar(current);
   const tests = new AnvilTests(current);
@@ -42,21 +44,17 @@ export function activate(context: vscode.ExtensionContext): AnvilApi {
   const debugProvider = new AnvilDebugProvider(current);
   context.subscriptions.push(
     output,
-    diagnostics,
+    server,
     statusBar,
     tests,
     vscode.tasks.registerTaskProvider(TASK_TYPE, new AnvilTaskProvider(current)),
     vscode.debug.registerDebugConfigurationProvider(DEBUG_TYPE, debugProvider, vscode.DebugConfigurationProviderTriggerKind.Initial),
     vscode.debug.registerDebugConfigurationProvider(DEBUG_TYPE, debugProvider, vscode.DebugConfigurationProviderTriggerKind.Dynamic),
-    vscode.languages.registerCompletionItemProvider(
-      [{ scheme: "file", pattern: "**/anvil.toml" }, { scheme: "file", pattern: "**/tests.toml" }],
-      new SnippetCompletions(),
-      "[",
-    ),
   );
 
   const onProjectChanged = async () => {
     statusBar.update();
+    server.updateSettings().catch((error) => output.appendLine(`Sending the settings to anvil lsp failed: ${error}`));
     await tests.update();
     if (project) {
       await intelliSense.configure(project);
@@ -64,7 +62,7 @@ export function activate(context: vscode.ExtensionContext): AnvilApi {
   };
 
   /** Find the workspace's anvil.toml and read its model; the first folder that has one wins. */
-  const discover = async () => {
+  const discover = async (restartServer = false) => {
     let found: Project | undefined;
     for (const folder of vscode.workspace.workspaceFolders ?? []) {
       const manifestDir = await findManifestDir(folder);
@@ -72,7 +70,7 @@ export function activate(context: vscode.ExtensionContext): AnvilApi {
         if (project && project.folder === folder && project.manifestDir === manifestDir) {
           found = project;
         } else {
-          found = new Project(context, folder, manifestDir, output, diagnostics);
+          found = new Project(context, folder, manifestDir, output);
           found.onDidChange(onProjectChanged);
         }
         break;
@@ -80,16 +78,16 @@ export function activate(context: vscode.ExtensionContext): AnvilApi {
     }
     if (found !== project) {
       project?.dispose();
-      diagnostics.clear();
       project = found;
     }
     await vscode.commands.executeCommand("setContext", "anvil.active", project !== undefined);
+
+    // The language server runs for any anvil.toml opened, with or without a project in the workspace
+    const folder = project?.folder ?? vscode.workspace.workspaceFolders?.[0];
+    void server.start(findAnvil(folder), project?.manifestDir ?? folder?.uri.fsPath, restartServer);
+
     if (project) {
       await project.refresh();
-      const anvil = project.anvil;
-      if (anvil) {
-        updateSchemas(context, anvil, output).catch((error) => output.appendLine(`Writing the schemas failed: ${error}`));
-      }
     } else {
       await onProjectChanged();
     }
@@ -129,7 +127,7 @@ export function activate(context: vscode.ExtensionContext): AnvilApi {
     }),
   );
 
-  registerCommands(context, current, discover, output);
+  registerCommands(context, current, discover);
   const ready = discover().catch((error) => output.appendLine(`Anvil: ${error}`));
   return {
     project: current,
@@ -137,16 +135,19 @@ export function activate(context: vscode.ExtensionContext): AnvilApi {
     resolveDebugConfiguration: (configuration) => debugProvider.resolveDebugConfiguration(undefined, configuration),
     debugConfigurations: () => debugProvider.provideDebugConfigurations(),
     tests,
+    languageServer: server,
   };
 }
 
-export function deactivate(): void {}
+export async function deactivate(): Promise<void> {
+  await languageServer?.stop();
+  languageServer = undefined;
+}
 
 function registerCommands(
   context: vscode.ExtensionContext,
   current: () => Project | undefined,
-  discover: () => Promise<void>,
-  output: vscode.OutputChannel,
+  discover: (restartServer?: boolean) => Promise<void>,
 ): void {
   /** Run a command that needs the project; errors become messages. */
   const withProject = (action: (project: Project) => unknown) => async () => {
@@ -196,13 +197,7 @@ function registerCommands(
     "anvil.selectProfile": withProject(pickProfile),
     "anvil.selectToolchain": withProject(pickToolchain),
     "anvil.selectTarget": withProject(pickTarget),
-    "anvil.refresh": async () => {
-      await discover();
-      const anvil = current()?.anvil;
-      if (anvil) {
-        await updateSchemas(context, anvil, output);
-      }
-    },
+    "anvil.refresh": () => discover(true),
     "anvil.openManifest": withProject(async (project) => {
       const document = await vscode.workspace.openTextDocument(path.join(project.root, "anvil.toml"));
       await vscode.window.showTextDocument(document);

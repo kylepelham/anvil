@@ -204,6 +204,20 @@ fn language_server_session() {
     assert!(items.iter().any(|item| item["label"] == "core"), "{completion}");
     assert!(!items.iter().any(|item| item["label"] == "app"), "{completion}");
 
+    // On an empty line: table snippets, as plain text for a client without snippet support
+    let completion = client.request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": position(11, 0) }),
+    );
+    let items = completion["result"]["items"].as_array().cloned().unwrap_or_default();
+    let snippet = items
+        .iter()
+        .find(|item| item["label"] == "[target.name] (program)")
+        .expect("a table snippet");
+    assert_eq!(snippet["kind"], 15);
+    assert_eq!(snippet["insertTextFormat"], Value::Null);
+    assert_eq!(snippet["textEdit"]["newText"], "[target.app]\nkind = \"exe\"\ndir = \"app\"\ndeps = []\n");
+
     // Definition: `core` leads to its [target.core] header
     let definition = client.request(
         "textDocument/definition",

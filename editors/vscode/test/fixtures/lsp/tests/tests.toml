@@ -1,0 +1,3 @@
+[[test]]
+name = "runs"
+command = ["{target:app}"]

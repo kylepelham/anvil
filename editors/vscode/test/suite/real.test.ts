@@ -67,10 +67,7 @@ suite("real anvil", () => {
     assert.match(failed!.message, /failing on purpose/);
   });
 
-  test("Even Better TOML flags an unknown key with anvil's own schema", async function () {
-    if (!vscode.extensions.getExtension("tamasfe.even-better-toml")) {
-      this.skip();
-    }
+  test("anvil lsp flags an unknown key, once", async () => {
     const file = path.join(PROJECT, "anvil.toml");
     const old = fs.readFileSync(file, "utf8");
     const document = await vscode.workspace.openTextDocument(file);
@@ -80,15 +77,17 @@ suite("real anvil", () => {
     await vscode.workspace.applyEdit(edit);
     try {
       const diagnostics = await waitFor(
-        "a schema diagnostic",
+        "the server's diagnostic",
         () => {
-          const found = vscode.languages.getDiagnostics(document.uri).filter((diagnostic) => diagnostic.source !== "anvil");
+          const found = vscode.languages.getDiagnostics(document.uri);
           return found.length > 0 ? found : undefined;
         },
         40000,
       );
       console.log(`      ${diagnostics.map((diagnostic) => `${diagnostic.source}: ${diagnostic.message}`).join(" | ")}`);
-      assert.ok(diagnostics.some((diagnostic) => diagnostic.message.includes("linkflags")));
+      assert.strictEqual(diagnostics.length, 1);
+      assert.strictEqual(diagnostics[0].source, "anvil");
+      assert.ok(diagnostics[0].message.includes("linkflags"));
     } finally {
       await vscode.commands.executeCommand("workbench.action.files.revert");
       assert.strictEqual(fs.readFileSync(file, "utf8"), old);

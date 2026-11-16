@@ -1,6 +1,5 @@
 // The Anvil project open in the workspace: its model from `anvil targets --json` and the selections the status bar shows.
 
-import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { Model, Target, Test, findAnvil, runAnvil } from "./anvil";
@@ -29,7 +28,6 @@ export class Project implements vscode.Disposable {
     /** The folder holding the anvil.toml found, where anvil runs. */
     readonly manifestDir: string,
     readonly output: vscode.OutputChannel,
-    readonly diagnostics: vscode.DiagnosticCollection,
   ) {}
 
   dispose(): void {
@@ -165,7 +163,6 @@ export class Project implements vscode.Disposable {
       if (result.code === 0) {
         this.model = parseModel(result.stdout);
         this.error = undefined;
-        this.diagnostics.clear();
         if (stderr) {
           this.output.appendLine(stderr);
         }
@@ -178,35 +175,10 @@ export class Project implements vscode.Disposable {
       stderr = `anvil ${args.join(" ")}: ${error instanceof Error ? error.message : String(error)}`;
     }
 
+    // The status bar shows it; the manifest's own errors are the language server's, in Problems
     this.error = stderr;
     this.output.appendLine(stderr);
-    this.showManifestError(stderr);
     return undefined;
-  }
-
-  /** Put anvil's message on the manifest it names, at the line it names (or the table it names) when it can. */
-  private showManifestError(message: string): void {
-    this.diagnostics.clear();
-    const located = /^error: (.+?\.toml): ([\s\S]*)$/.exec(message);
-    const file = located ? path.resolve(this.manifestDir, located[1]) : path.join(this.manifestDir, "anvil.toml");
-    const text = located ? located[2] : message.replace(/^error: /, "");
-
-    let range = new vscode.Range(0, 0, 0, 0);
-    const position = /at line (\d+), column (\d+)/.exec(text);
-    if (position) {
-      const line = Number(position[1]) - 1;
-      const column = Number(position[2]) - 1;
-      range = new vscode.Range(line, column, line, column + 1);
-    } else {
-      const table = /in \[\[?([^\]]+)\]\]?/.exec(text);
-      const line = table ? findTableLine(file, table[1]) : undefined;
-      if (line !== undefined) {
-        range = new vscode.Range(line, 0, line, Number.MAX_SAFE_INTEGER);
-      }
-    }
-    const diagnostic = new vscode.Diagnostic(range, text, vscode.DiagnosticSeverity.Error);
-    diagnostic.source = "anvil";
-    this.diagnostics.set(vscode.Uri.file(file), [diagnostic]);
   }
 }
 
@@ -241,22 +213,4 @@ export async function findManifestDir(folder: vscode.WorkspaceFolder): Promise<s
 
 function findTarget(targets: Target[], name: string): Target | undefined {
   return targets.find((target) => target.qualified === name) ?? targets.find((target) => target.name === name);
-}
-
-function findTableLine(file: string, table: string): number | undefined {
-  const document = vscode.workspace.textDocuments.find((open) => open.uri.fsPath === file);
-  let text: string;
-  if (document) {
-    text = document.getText();
-  } else {
-    try {
-      text = fs.readFileSync(file, "utf8");
-    } catch {
-      return undefined;
-    }
-  }
-  const lines = text.split(/\r?\n/);
-  const wanted = table.replace(/\s+/g, "");
-  const index = lines.findIndex((line) => /^\s*\[/.test(line) && line.replace(/\s+/g, "").replace(/#.*$/, "").replace(/^\[+|\]+$/g, "") === wanted);
-  return index >= 0 ? index : undefined;
 }

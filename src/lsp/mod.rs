@@ -140,6 +140,7 @@ struct Server<'a> {
     pull: bool,
     refresh_support: bool,
     hierarchical_symbols: bool,
+    snippets: bool,
     workspace_folders: Vec<PathBuf>,
 
     settings: CheckSettings,
@@ -203,6 +204,7 @@ impl<'a> Server<'a> {
             pull: !capabilities["textDocument"]["diagnostic"].is_null(),
             refresh_support: capabilities["workspace"]["diagnostics"]["refreshSupport"] == true,
             hierarchical_symbols: capabilities["textDocument"]["documentSymbol"]["hierarchicalDocumentSymbolSupport"] == true,
+            snippets: capabilities["textDocument"]["completion"]["completionItem"]["snippetSupport"] == true,
             workspace_folders,
             settings,
             documents: HashMap::new(),
@@ -945,11 +947,22 @@ impl<'a> Server<'a> {
                     if range.start.line != cursor.line || range.end.line != cursor.line || range.start > cursor || range.end < cursor {
                         range = lsp_types::Range::new(cursor, cursor);
                     }
+                    // Snippets after the other items; as plain text for a client without snippets
+                    let text = match item.snippet && !self.snippets {
+                        true => completion::plain_text(&item.edit.1),
+                        false => item.edit.1,
+                    };
                     let mut json = json!({
                         "label": item.label,
                         "kind": item.kind,
-                        "textEdit": { "range": range, "newText": item.edit.1 },
+                        "textEdit": { "range": range, "newText": text },
                     });
+                    if item.snippet {
+                        json["sortText"] = json!(format!("~{}", item.label));
+                        if self.snippets {
+                            json["insertTextFormat"] = json!(2);
+                        }
+                    }
                     if let Some(detail) = item.detail {
                         json["detail"] = json!(detail);
                     }
