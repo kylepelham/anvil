@@ -4,17 +4,20 @@
 
 use super::{project_path, Project, Record, TargetInfo, Writer, OWNED_PREFIX};
 use crate::commands::RunSetup;
-use crate::util::slash;
+use crate::util::{self, slash};
 use anyhow::Result;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 const PROJECT_DIR: &str = "$PROJECT_DIR$";
 
+// The project's folder as external tools name it
+const TOOL_PROJECT_DIR: &str = "$ProjectFileDir$";
+
 // The external tools' group, which names their actions (`Tool_Anvil_<name>`)
 const TOOL_GROUP: &str = "Anvil";
 
-// Run configuration files Anvil writes start so; it deletes those of programs that are gone
+// Run configuration files Anvil writes start so; it deletes those it wrote for programs that are gone
 const RUN_CONFIGURATION_PREFIX: &str = "anvil_";
 
 pub fn outputs(root: &Path) -> Vec<PathBuf> {
@@ -38,28 +41,43 @@ pub fn generate(project: &Project, record: &Record, writer: &mut Writer) -> Resu
     let clean = ("clean".to_string(), record.args(&["clean"], Some(&record.profile)));
     writer.write(
         &idea.join("tools").join(format!("{TOOL_GROUP}.xml")),
-        &tools_text(project, record, &targets, &clean),
+        &tools_text(record, &targets, &clean),
     )?;
 
+    // Build targets in the user's file: Anvil's (those it wrote last time, and those of the same names) replaced
     let custom_file = idea.join("customTargets.xml");
-    let existing = std::fs::read_to_string(&custom_file).unwrap_or_default();
-    writer.write(&custom_file, &custom_targets_text(project, &existing, &targets, &clean.0))?;
+    let labels: Vec<String> = targets.iter().map(|(name, _)| format!("{OWNED_PREFIX}{name}")).collect();
+    let previous = record.entries_of(&util::rel(&custom_file, &project.root));
+    let owned = |name: &str, element: &str| match previous {
+        _ if labels.iter().any(|owned| owned == name) => true,
+        Some(previous) => previous.iter().any(|owned| owned == name),
+        None => name.starts_with(OWNED_PREFIX) && element.contains(&format!("actionId=\"Tool_{TOOL_GROUP}_")),
+    };
+    writer.merge(
+        &custom_file,
+        Some(labels.clone()),
+        || custom_targets_text(project, "", &targets, &clean.0, &owned),
+        |text| Ok(custom_targets_text(project, text, &targets, &clean.0, &owned)),
+    )?;
 
-    // A run configuration per program, and none for those that are gone
+    // A run configuration per program, and none for those Anvil wrote for programs that are gone
     let folder = idea.join("runConfigurations");
     let mut current = Vec::new();
     for (target, run) in project.runnable() {
-        let file = folder.join(format!("{RUN_CONFIGURATION_PREFIX}{}.xml", file_name(&target.qualified)));
-        writer.write(&file, &run_configuration_text(project, target, run))?;
+        let file = format!("{RUN_CONFIGURATION_PREFIX}{}.xml", file_name(&target.qualified));
+        writer.write(&folder.join(&file), &run_configuration_text(project, target, run))?;
         current.push(file);
     }
-    for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
-        let path = entry.path();
-        let ours = entry.file_name().to_string_lossy().starts_with(RUN_CONFIGURATION_PREFIX);
-        if ours && !current.contains(&path) {
-            writer.remove(&path)?;
+    let previous: Vec<String> = match record.entries_of(&util::rel(&folder, &project.root)) {
+        Some(previous) => previous.to_vec(),
+        None => legacy_run_configurations(&folder),
+    };
+    for file in previous {
+        if !current.contains(&file) {
+            writer.remove(&folder.join(file))?;
         }
     }
+    writer.entries.push((folder, current));
 
     // A compilation database project, when CLion has not made the folder its own kind of project yet
     let misc = idea.join("misc.xml");
@@ -89,8 +107,22 @@ const MISC_TEXT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </project>
 "#;
 
+/// The run configurations an anvil before the record's lists wrote: named `anvil_...`, building an `anvil: ` target.
+fn legacy_run_configurations(folder: &Path) -> Vec<String> {
+    let built_by_anvil =
+        |path: &Path| std::fs::read_to_string(path).is_ok_and(|text| text.contains(&format!("TARGET_NAME=\"{}build ", xml(OWNED_PREFIX))));
+
+    std::fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(RUN_CONFIGURATION_PREFIX) && built_by_anvil(&entry.path()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
 /// The external tools: one per build target, and clean.
-fn tools_text(project: &Project, record: &Record, targets: &[(String, Vec<String>)], clean: &(String, Vec<String>)) -> String {
+fn tools_text(record: &Record, targets: &[(String, Vec<String>)], clean: &(String, Vec<String>)) -> String {
     let mut text = String::from("<toolSet name=\"Anvil\">\n");
 
     for (name, args) in targets.iter().chain(std::iter::once(clean)) {
@@ -107,7 +139,7 @@ fn tools_text(project: &Project, record: &Record, targets: &[(String, Vec<String
             xml(name),
             xml(&record.anvil),
             xml(&parameters(args)),
-            xml(&slash(&project.root))
+            TOOL_PROJECT_DIR
         );
     }
 
@@ -115,8 +147,14 @@ fn tools_text(project: &Project, record: &Record, targets: &[(String, Vec<String
     text
 }
 
-/// customTargets.xml: Anvil's targets (named `anvil: ...`) replaced, the user's kept as they are.
-fn custom_targets_text(project: &Project, existing: &str, targets: &[(String, Vec<String>)], clean: &str) -> String {
+/// customTargets.xml: Anvil's targets (those `owned` picks by name) replaced, the user's kept as they are.
+fn custom_targets_text(
+    project: &Project,
+    existing: &str,
+    targets: &[(String, Vec<String>)],
+    clean: &str,
+    owned: &dyn Fn(&str, &str) -> bool,
+) -> String {
     let mut ours = String::new();
     for (name, _) in targets {
         let label = format!("{OWNED_PREFIX}{name}");
@@ -140,13 +178,13 @@ fn custom_targets_text(project: &Project, existing: &str, targets: &[(String, Ve
         );
     }
 
-    // The user's targets: every <target> element not named `anvil: ...`
+    // The user's targets: every <target> element Anvil does not own
     let mut kept = String::new();
     let mut rest = existing;
     while let Some(start) = rest.find("<target ") {
         let Some(length) = rest[start..].find("</target>") else { break };
         let element = &rest[start..start + length + "</target>".len()];
-        if !element.contains(&format!("name=\"{}", xml(OWNED_PREFIX))) {
+        if !owned(&element_name(element), element) {
             let line_start = rest[..start].rfind('\n').map(|newline| newline + 1).unwrap_or(start);
             let _ = writeln!(kept, "{}{element}", &rest[line_start..start]);
         }
@@ -194,6 +232,21 @@ fn run_configuration_text(project: &Project, target: &TargetInfo, run: &RunSetup
         params = xml(&parameters(&run.args)),
         workdir = xml(&project_path(&run.workdir, root, PROJECT_DIR)),
     )
+}
+
+/// The `name` attribute of an element's opening tag, its XML escapes read.
+fn element_name(element: &str) -> String {
+    let tag = &element[..element.find('>').unwrap_or(element.len())];
+    let Some(start) = tag.find(" name=\"").map(|start| start + " name=\"".len()) else {
+        return String::new();
+    };
+    let value = &tag[start..start + tag[start..].find('"').unwrap_or(tag.len() - start)];
+
+    value
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 /// Arguments as one line, quoted where they hold spaces.
@@ -249,13 +302,19 @@ mod tests {
 </project>
 "#;
         let targets = vec![("build".to_string(), vec!["build".to_string()])];
-        let text = custom_targets_text(&project, existing, &targets, "clean");
+        let owned = |name: &str, _: &str| ["anvil: old", "anvil: build"].contains(&name);
+        let text = custom_targets_text(&project, existing, &targets, "clean", &owned);
 
         assert!(text.contains(r#"<target id="1" name="mine" defaultType="TOOL">"#));
         assert!(!text.contains("anvil: old"));
         assert!(text.contains(r#"name="anvil: build""#));
         assert!(text.contains(r#"<tool actionId="Tool_Anvil_build" />"#));
-        assert_eq!(custom_targets_text(&project, &text, &targets, "clean"), text);
+        assert_eq!(custom_targets_text(&project, &text, &targets, "clean", &owned), text);
+
+        // A target of the user's named like Anvil's, but not written by it, stays
+        let mine = existing.replace("anvil: old", "anvil: mine");
+        assert!(custom_targets_text(&project, &mine, &targets, "clean", &owned).contains(r#"name="anvil: mine""#));
+        assert_eq!(element_name(r#"<target id="3" name="a &amp; b">"#), "a & b");
     }
 
     #[test]

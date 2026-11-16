@@ -228,7 +228,10 @@ pub fn test(start_dir: &Path, build: &BuildArgs, options: &TestArgs) -> Result<i
     crate::testrun::run_tests(&model, &tests, &options)
 }
 
-pub fn clean(start_dir: &Path, release: bool, profile: Option<&str>, all: bool) -> Result<()> {
+pub fn clean(start_dir: &Path, build: &BuildArgs, targets: &[String], all: bool) -> Result<()> {
+    if !targets.is_empty() {
+        return clean_targets(start_dir, build, targets);
+    }
     let (root, manifest) = project::locate(start_dir)?;
     let out_root = project::output_root(&root, &manifest)?;
 
@@ -274,8 +277,20 @@ pub fn clean(start_dir: &Path, release: bool, profile: Option<&str>, all: bool) 
         return Ok(());
     }
 
+    // With a toolchain or machine picked, the one folder its builds use
+    if build.toolchain.is_some() || build.platform.is_some() {
+        let model = load_model_for_listing(start_dir, build)?;
+        if !model.out_dir.join(".anvil").is_dir() {
+            ui::status("Clean", &format!("nothing built in {}", slash(&model.out_dir)));
+            return Ok(());
+        }
+        remove_folder(&model.out_dir)?;
+        ui::status("Removed", &slash(&model.out_dir));
+        return Ok(());
+    }
+
     // The profile's folder and its per-toolchain and per-machine variants (debug, debug-clang, debug-arm64, ...)
-    let profile = profile.unwrap_or(if release { "release" } else { "debug" });
+    let profile = build.profile.as_deref().unwrap_or(if build.release { "release" } else { "debug" });
     let mut removed = 0;
     for entry in std::fs::read_dir(&out_root).into_iter().flatten().flatten() {
         let ours = entry.path().join(".anvil").is_dir();
@@ -289,6 +304,57 @@ pub fn clean(start_dir: &Path, release: bool, profile: Option<&str>, all: bool) 
     if removed == 0 {
         ui::status("Clean", &format!("nothing built for `{profile}`"));
     }
+    Ok(())
+}
+
+/// `anvil clean <targets>`: each target's objects, and its program or library with its import library, so the next build
+/// makes them again (an IDE's Clean and Rebuild of one project). It waits for a build of the folder to finish first.
+fn clean_targets(start_dir: &Path, build: &BuildArgs, names: &[String]) -> Result<()> {
+    let model = load_model_for_listing(start_dir, build)?;
+    let indices = names.iter().map(|name| model.find_target(name)).collect::<Result<Vec<_>>>()?;
+
+    // One build or clean of a folder at a time, as the build database's lock
+    let state_dir = model.out_dir.join(".anvil");
+    if !state_dir.is_dir() {
+        ui::status("Clean", &format!("nothing built in {}", slash(&model.out_dir)));
+        return Ok(());
+    }
+    let lock = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state_dir.join("lock"))?;
+    if lock.try_lock().is_err() {
+        ui::status("Waiting", "for another anvil build of this folder to finish");
+        lock.lock().context("locking the build folder")?;
+    }
+
+    for index in indices {
+        let target = &model.targets[index];
+        let mut files: Vec<PathBuf> = plan::artifact_path(&model, target).into_iter().collect();
+        if target.kind == Kind::Shared || (target.exports && model.toolchain.targets_windows()) {
+            let import_lib = model.toolchain.shared_lib_names(&crate::targets::sanitize_name(&target.name)).1;
+            files.extend(import_lib.map(|name| model.package_out_dir(target.package).join("lib").join(name)));
+        }
+
+        let objects = model
+            .package_out_dir(target.package)
+            .join("obj")
+            .join(crate::targets::sanitize_name(&target.name));
+        if objects.is_dir() {
+            remove_folder(&objects)?;
+        }
+        for file in &files {
+            match std::fs::remove_file(file) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error).with_context(|| format!("deleting {}", slash(file)));
+                }
+                _ => {}
+            }
+        }
+        ui::status("Cleaned", &model.qualified_name(index));
+    }
+
     Ok(())
 }
 

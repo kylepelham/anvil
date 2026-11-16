@@ -1,14 +1,15 @@
 //! Visual Studio: a solution at the project root (`<name>.sln`, to double-click) and a Makefile project per target in
-//! `.anvil/vs/`, with a configuration per profile. Building runs anvil; IntelliSense gets each target's include
-//! folders, definitions and standard from the profile's compile_commands.json; the debugger starts the program as
-//! `anvil run` does.
+//! `.anvil/vs/`, with a configuration per profile, each described by the project loaded for that profile (so they are
+//! the same whichever profile builds). Building runs anvil; IntelliSense gets each target's include folders,
+//! definitions and standard from the profile's compile_commands.json; the debugger starts the program as `anvil run`
+//! does.
 
 use super::{Project, Record, TargetInfo, Writer, STATE_FOLDER};
-use crate::commands::RunSetup;
 use crate::platform::{Cpu, Os, Platform};
 use crate::profile::Profile;
 use crate::project::Model;
 use crate::targets::Kind;
+use crate::ui;
 use crate::util::{self, slash};
 use anyhow::{bail, Result};
 use std::fmt::Write as _;
@@ -24,12 +25,20 @@ const SOLUTION_FOLDER: &str = "{2150E333-8FDC-42A3-9474-1A3956D46DE8}";
 // Header files shown in a project, from its include folders
 const HEADER_PATTERNS: &[&str] = &["h", "hh", "hpp", "hxx", "inl", "ipp"];
 
-/// A solution configuration: a profile, for the Windows machine it builds for.
-struct Configuration {
+/// A solution configuration: a profile, for the Windows machine it builds for, and the project as it describes it.
+struct Configuration<'a> {
     profile: String,
     name: String,
     platform: &'static str,
-    out_dir: PathBuf,
+    description: Description<'a>,
+}
+
+/// How a configuration knows the project.
+enum Description<'a> {
+    /// From the project loaded for its profile.
+    Own(Box<Project>),
+    /// Its profile did not load: this build's project, its paths moved to the profile's output folder.
+    Moved(&'a Project, PathBuf),
 }
 
 /// What IntelliSense reads for a target in one configuration.
@@ -49,50 +58,82 @@ struct CompileEntry {
     arguments: Vec<String>,
 }
 
+impl Configuration<'_> {
+    fn project(&self) -> &Project {
+        match &self.description {
+            Description::Own(project) => project.as_ref(),
+            Description::Moved(project, _) => project,
+        }
+    }
+
+    fn out_dir(&self) -> &Path {
+        match &self.description {
+            Description::Own(project) => &project.out_dir,
+            Description::Moved(_, out_dir) => out_dir,
+        }
+    }
+
+    /// The target in this configuration; None when its profile leaves it out.
+    fn target(&self, qualified: &str) -> Option<&TargetInfo> {
+        self.project().targets.iter().find(|target| target.qualified == qualified)
+    }
+
+    /// A path or argument of the project it describes, in its output folder.
+    fn relocate(&self, text: &str) -> String {
+        match &self.description {
+            Description::Own(_) => text.to_string(),
+            Description::Moved(project, out_dir) => relocate(text, &project.out_dir, out_dir),
+        }
+    }
+}
+
 pub fn solution_path(root: &Path, project_name: &str) -> PathBuf {
     root.join(format!("{project_name}.sln"))
 }
 
-/// The files `generate` writes.
-pub fn outputs(project: &Project) -> Vec<PathBuf> {
-    let mut files = vec![solution_path(&project.root, &project.name)];
-    files.extend(projects(project).iter().map(|(target, _)| project_file(project, target)));
+/// The files `generate` writes: the solution and the projects.
+pub fn outputs(root: &Path, project_name: &str) -> Vec<PathBuf> {
+    let mut projects: Vec<PathBuf> = std::fs::read_dir(root.join(STATE_FOLDER).join(PROJECTS_FOLDER))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "vcxproj"))
+        .collect();
+    projects.sort();
+
+    let mut files = vec![solution_path(root, project_name)];
+    files.extend(projects);
     files
 }
 
-/// The output folders of the configurations, whose compile commands IntelliSense reads.
-pub fn configuration_out_dirs(model: &Model, project: &Project, record: &Record) -> Vec<PathBuf> {
-    configurations(model, project, record)
-        .map(|configurations| configurations.into_iter().map(|configuration| configuration.out_dir).collect())
-        .unwrap_or_default()
-}
-
 pub fn generate(model: &Model, project: &Project, record: &Record, writer: &mut Writer) -> Result<()> {
-    let configurations = configurations(model, project, record)?;
+    let configurations = configurations(model, project, record, writer)?;
     if configurations.is_empty() {
         bail!("no profile builds for Windows, so Visual Studio has nothing to build");
     }
 
-    // Each configuration's compile commands; a profile not built yet borrows this one's
-    let entries: Vec<(PathBuf, Vec<CompileEntry>)> = configurations
+    // Each configuration's compile commands; none for a profile not built yet (its first build fills them in)
+    let entries: Vec<Vec<CompileEntry>> = configurations
         .iter()
         .map(|configuration| {
-            let own = read_compile_commands(&configuration.out_dir);
-            match own {
-                Some(entries) => (configuration.out_dir.clone(), entries),
-                None => (project.out_dir.clone(), read_compile_commands(&project.out_dir).unwrap_or_default()),
-            }
+            writer.watched.push(configuration.out_dir().join(".anvil").join("compile_commands.stamp"));
+            read_compile_commands(configuration.out_dir()).unwrap_or_default()
         })
         .collect();
 
-    // A project per target
-    let projects = projects(project);
+    // A project per target of any configuration
+    let projects = projects(&configurations, record);
     for (target, display_name) in &projects {
-        let intellisense: Vec<IntelliSense> = entries
+        let intellisense: Vec<IntelliSense> = configurations
             .iter()
-            .map(|(out_dir, entries)| target_intellisense(project, target, out_dir, entries))
+            .zip(&entries)
+            .map(|(configuration, entries)| match configuration.target(&target.qualified) {
+                Some(own) => target_intellisense(&configuration.relocate(&slash(&own.object_dir)), entries),
+                None => IntelliSense::default(),
+            })
             .collect();
-        let text = project_text(model, project, record, target, display_name, &configurations, &intellisense);
+        let text = project_text(project, record, target, display_name, &configurations, &intellisense);
         writer.write(&project_file(project, target), &text)?;
     }
 
@@ -112,16 +153,26 @@ pub fn generate(model: &Model, project: &Project, record: &Record, writer: &mut 
     Ok(())
 }
 
-/// The targets that get a project, the startup one first (Visual Studio starts the first project of a solution it has
-/// no settings for), with their names in the solution: the target's, or `package.target` where two packages share one.
-fn projects(project: &Project) -> Vec<(&TargetInfo, String)> {
-    let mut targets: Vec<&TargetInfo> = project
-        .targets
+/// The targets that get a project, those of `anvil ide`'s profile first, then those only other profiles have, the
+/// startup one first (Visual Studio starts the first project of a solution it has no settings for), with their names in
+/// the solution: the target's, or `package.target` where two packages share one.
+fn projects<'a>(configurations: &'a [Configuration], record: &Record) -> Vec<(&'a TargetInfo, String)> {
+    let primary = configurations
         .iter()
-        .filter(|target| !matches!(target.kind, Kind::Headers | Kind::External))
-        .collect();
+        .position(|configuration| configuration.profile == record.profile)
+        .unwrap_or(0);
+    let mut targets: Vec<&TargetInfo> = Vec::new();
+    for configuration in std::iter::once(&configurations[primary]).chain(configurations) {
+        for target in &configuration.project().targets {
+            let listed = targets.iter().any(|listed| listed.qualified == target.qualified);
+            if !listed && !matches!(target.kind, Kind::Headers | Kind::External) {
+                targets.push(target);
+            }
+        }
+    }
 
-    let startup = project
+    let startup = configurations[primary]
+        .project()
         .default_run
         .as_deref()
         .and_then(|name| targets.iter().position(|target| target.qualified == name))
@@ -131,15 +182,15 @@ fn projects(project: &Project) -> Vec<(&TargetInfo, String)> {
         targets.insert(0, first);
     }
 
-    let shared = |name: &str| project.targets.iter().filter(|target| target.name == name).count() > 1;
+    let shared = |name: &str| targets.iter().filter(|target| target.name == name).count() > 1;
     targets
-        .into_iter()
+        .iter()
         .map(|target| {
             let name = match shared(&target.name) {
                 true => format!("{}.{}", target.package, target.name),
                 false => target.name.clone(),
             };
-            (target, name)
+            (*target, name)
         })
         .collect()
 }
@@ -150,9 +201,10 @@ fn project_file(project: &Project, target: &TargetInfo) -> PathBuf {
 }
 
 /// A configuration per profile that builds for Windows, named like the profile (`Debug`, `Release`, `Shipping`), on
-/// the platform it builds for, with the output folder its builds use (a toolchain or machine `anvil ide` was given
-/// gets its own, as on the command line).
-fn configurations(model: &Model, project: &Project, record: &Record) -> Result<Vec<Configuration>> {
+/// the platform it builds for, described by the project loaded for that profile (with the toolchain, machine and
+/// options `anvil ide` was given). A profile that does not load keeps this build's description, moved to its output
+/// folder, with a warning.
+fn configurations<'a>(model: &Model, project: &'a Project, record: &Record, writer: &mut Writer) -> Result<Vec<Configuration<'a>>> {
     let manifest = &model.packages[0].manifest;
     let mut configurations = Vec::new();
 
@@ -168,41 +220,64 @@ fn configurations(model: &Model, project: &Project, record: &Record) -> Result<V
             continue;
         }
 
-        let out_dir = match *profile == project.profile {
-            true => project.out_dir.clone(),
-            false => {
-                let mut folder = profile.clone();
-                if record.toolchain.is_some() {
-                    folder.push_str(&format!("-{}", model.toolchain.family.name()));
-                }
-                if record.target.is_some() && platform.is_cross() {
-                    folder.push_str(&format!("-{}", platform.name()));
-                }
-                project.out_root.join(folder)
+        let mut name: Vec<char> = profile.chars().collect();
+        name[0] = name[0].to_ascii_uppercase();
+        let name: String = name.into_iter().collect();
+
+        // The project as that profile's builds see it, and the manifests it read (an edit to one refreshes)
+        let (described, read) = super::gather_profile(&project.root, record, profile);
+        writer.watched.extend(read);
+        let description = match described {
+            Ok(described) => Description::Own(Box::new(described)),
+            Err(error) => {
+                let out_dir = moved_out_dir(model, project, record, profile, &platform);
+                ui::warn(&format!(
+                    "Visual Studio's {name} configuration describes the project as `-p {}` does, moved to {}: loading it for `{profile}` failed: {error:#}",
+                    project.profile,
+                    slash(&out_dir)
+                ));
+                Description::Moved(project, out_dir)
             }
         };
 
-        let mut name: Vec<char> = profile.chars().collect();
-        name[0] = name[0].to_ascii_uppercase();
         configurations.push(Configuration {
             profile: profile.clone(),
-            name: name.into_iter().collect(),
+            name,
             platform: match platform.cpu {
                 Cpu::X64 => "x64",
                 Cpu::X86 => "Win32",
                 Cpu::Arm64 => "ARM64",
                 Cpu::Arm => "ARM",
             },
-            out_dir,
+            description,
         });
     }
+    writer.watched.sort();
+    writer.watched.dedup();
 
     Ok(configurations)
 }
 
-/// A target's Makefile project: anvil builds it, IntelliSense reads the compile commands, the debugger starts it.
+/// The output folder of a profile's builds, as the model names it: a toolchain or machine `anvil ide` was given gets its
+/// own, as on the command line.
+fn moved_out_dir(model: &Model, project: &Project, record: &Record, profile: &str, platform: &Platform) -> PathBuf {
+    if profile == project.profile {
+        return project.out_dir.clone();
+    }
+
+    let mut folder = profile.to_string();
+    if record.toolchain.is_some() {
+        folder.push_str(&format!("-{}", model.toolchain.family.name()));
+    }
+    if record.target.is_some() && platform.is_cross() {
+        folder.push_str(&format!("-{}", platform.name()));
+    }
+    project.out_root.join(folder)
+}
+
+/// A target's Makefile project: anvil builds and cleans it, IntelliSense reads the compile commands, the debugger
+/// starts it; each configuration as its profile describes the target.
 fn project_text(
-    model: &Model,
     project: &Project,
     record: &Record,
     target: &TargetInfo,
@@ -215,7 +290,7 @@ fn project_text(
     let anvil_words = |words: &[&str], profile: &str| {
         let mut command = vec![record.anvil.clone(), "-C".to_string(), slash(root)];
         command.extend(record.args(words, Some(profile)));
-        property(&command_line(&command))
+        command_line(&command)
     };
 
     text.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n");
@@ -251,22 +326,24 @@ fn project_text(
     }
     text.push_str("  <Import Project=\"$(VCTargetsPath)\\Microsoft.Cpp.props\" />\r\n");
 
-    // Per configuration: the build commands, IntelliSense, the debugger
+    // Per configuration: the build commands (a rebuild cleans the target first), IntelliSense, the debugger
     for (configuration, intellisense) in configurations.iter().zip(intellisense) {
         let profile = configuration.profile.as_str();
-        let relocate = |text: &str| relocate(text, &project.out_dir, &configuration.out_dir);
+        let own = configuration.target(&target.qualified);
+        let path = |path: &Path| property(&windows_path(&configuration.relocate(&slash(path))));
+
         let _ = write!(text, "  <PropertyGroup Condition=\"{}\">\r\n", condition(configuration));
         let build = anvil_words(&["build", &target.qualified], profile);
-        let _ = write!(text, "    <NMakeBuildCommandLine>{build}</NMakeBuildCommandLine>\r\n");
-        let _ = write!(text, "    <NMakeReBuildCommandLine>{build}</NMakeReBuildCommandLine>\r\n");
-        let clean = anvil_words(&["clean"], profile);
-        let _ = write!(text, "    <NMakeCleanCommandLine>{clean}</NMakeCleanCommandLine>\r\n");
-        if let Some(output) = &target.output {
-            let _ = write!(
-                text,
-                "    <NMakeOutput>{}</NMakeOutput>\r\n",
-                property(&windows_path(&relocate(&slash(output))))
-            );
+        let clean = anvil_words(&["clean", &target.qualified], profile);
+        let _ = write!(text, "    <NMakeBuildCommandLine>{}</NMakeBuildCommandLine>\r\n", property(&build));
+        let _ = write!(
+            text,
+            "    <NMakeReBuildCommandLine>{}</NMakeReBuildCommandLine>\r\n",
+            property(&format!("{clean} && {build}"))
+        );
+        let _ = write!(text, "    <NMakeCleanCommandLine>{}</NMakeCleanCommandLine>\r\n", property(&clean));
+        if let Some(output) = own.and_then(|own| own.output.as_deref()) {
+            let _ = write!(text, "    <NMakeOutput>{}</NMakeOutput>\r\n", path(output));
         }
 
         let lists = [
@@ -285,14 +362,15 @@ fn project_text(
         text.push_str("    <OutDir>$(MSBuildProjectDirectory)\\bin\\$(ProjectName)\\$(Configuration)\\</OutDir>\r\n");
         text.push_str("    <IntDir>$(MSBuildProjectDirectory)\\obj\\$(ProjectName)\\$(Configuration)\\</IntDir>\r\n");
 
-        if let (Some(run), Some(output), true) = (&target.run, &target.output, target.runnable) {
-            let (args, env) = debug_arguments(model, project, target, run, configuration);
-            let environment: Vec<String> = env.iter().map(|(name, value)| format!("{name}={value}")).collect();
-            let _ = write!(
-                text,
-                "    <LocalDebuggerCommand>{}</LocalDebuggerCommand>\r\n",
-                property(&windows_path(&relocate(&slash(output))))
-            );
+        // The debugger starts the program as `anvil run` does in that profile
+        if let Some((run, output)) = own.filter(|own| own.runnable).and_then(|own| own.run.as_ref().zip(own.output.as_deref())) {
+            let args: Vec<String> = run.args.iter().map(|arg| configuration.relocate(arg)).collect();
+            let environment: Vec<String> = run
+                .env
+                .iter()
+                .map(|(name, value)| format!("{name}={}", configuration.relocate(value)))
+                .collect();
+            let _ = write!(text, "    <LocalDebuggerCommand>{}</LocalDebuggerCommand>\r\n", path(output));
             let _ = write!(
                 text,
                 "    <LocalDebuggerCommandArguments>{}</LocalDebuggerCommandArguments>\r\n",
@@ -301,7 +379,7 @@ fn project_text(
             let _ = write!(
                 text,
                 "    <LocalDebuggerWorkingDirectory>{}</LocalDebuggerWorkingDirectory>\r\n",
-                property(&windows_path(&relocate(&slash(&run.workdir))))
+                path(&run.workdir)
             );
             let _ = write!(
                 text,
@@ -332,35 +410,8 @@ fn project_text(
     text
 }
 
-/// The arguments and environment the debugger starts a program with in a configuration: a test target's, its own
-/// with their placeholders filled for that profile (`{profile}`, `{out}`); another program's, those of `anvil run`.
-fn debug_arguments(
-    model: &Model,
-    project: &Project,
-    target: &TargetInfo,
-    run: &RunSetup,
-    configuration: &Configuration,
-) -> (Vec<String>, Vec<(String, String)>) {
-    let relocate = |text: &str| relocate(text, &project.out_dir, &configuration.out_dir);
-    if target.kind != Kind::Test {
-        let env = run.env.iter().map(|(name, value)| (name.clone(), relocate(value))).collect();
-        return (run.args.iter().map(|arg| relocate(arg)).collect(), env);
-    }
-
-    let spec = &model.targets[target.index];
-    let package = &model.packages[spec.package];
-    let fill = |text: &str| {
-        let filled = crate::project::fill_test_text(text, package, &configuration.out_dir, &model.vcpkg_dir, &configuration.profile);
-        relocate(&super::substitute_targets(&filled, model).unwrap_or(filled))
-    };
-    let args = spec.args.iter().map(|arg| fill(arg)).collect();
-    let env = spec.env.iter().map(|(name, value)| (name.clone(), fill(value))).collect();
-
-    (args, env)
-}
-
 /// The solution: the projects (startup first), a folder per package in a workspace, every configuration; each
-/// configuration builds the targets a plain `anvil build --all` builds (non-default ones only when asked).
+/// configuration builds the targets a plain `anvil build --all` of its profile builds (non-default ones only when asked).
 fn solution_text(project: &Project, projects: &[(&TargetInfo, String)], configurations: &[Configuration]) -> String {
     let mut text = String::from("\u{feff}\r\nMicrosoft Visual Studio Solution File, Format Version 12.00\r\n");
     text.push_str("# Visual Studio Version 17\r\n");
@@ -410,7 +461,10 @@ fn solution_text(project: &Project, projects: &[(&TargetInfo, String)], configur
         for configuration in configurations {
             let pair = format!("{}|{}", configuration.name, configuration.platform);
             let _ = write!(text, "\t\t{project_guid}.{pair}.ActiveCfg = {pair}\r\n");
-            if target.default || target.kind == Kind::Test {
+            let built = configuration
+                .target(&target.qualified)
+                .is_some_and(|own| own.default || own.kind == Kind::Test);
+            if built {
                 let _ = write!(text, "\t\t{project_guid}.{pair}.Build.0 = {pair}\r\n");
             }
         }
@@ -437,13 +491,9 @@ fn solution_text(project: &Project, projects: &[(&TargetInfo, String)], configur
 }
 
 /// The include folders, definitions, forced includes and standard of a target's first C++ file (else its first
-/// file) in a configuration's compile commands.
-fn target_intellisense(project: &Project, target: &TargetInfo, out_dir: &Path, entries: &[CompileEntry]) -> IntelliSense {
-    let object_dir = match util::strip_prefix_ci(&target.object_dir, &project.out_dir) {
-        Some(relative) => out_dir.join(relative),
-        None => target.object_dir.clone(),
-    };
-    let prefix = format!("{}/", slash(&object_dir).to_lowercase());
+/// file) in a configuration's compile commands: the entries whose objects go to its `object_dir`.
+fn target_intellisense(object_dir: &str, entries: &[CompileEntry]) -> IntelliSense {
+    let prefix = format!("{}/", object_dir.to_lowercase());
 
     let mut own = entries.iter().filter(|entry| entry.output.to_lowercase().starts_with(&prefix));
     let first = own.clone().next();

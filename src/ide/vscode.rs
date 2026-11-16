@@ -1,11 +1,12 @@
 //! VS Code: `.vscode/tasks.json` (the build as the default build task, a build per program, the tests),
 //! `.vscode/launch.json` (a debug configuration per program, which builds it first) and `.vscode/settings.json`
 //! (cpptools reads the root compile_commands.json; Even Better TOML gets Anvil's schemas). Anvil's entries are those
-//! named `anvil: ...`; every other entry, and every comment, is the user's and stays.
+//! it wrote (named `anvil: ...`, listed in .anvil/ide.toml); every other entry, and every comment, is the user's and
+//! stays.
 
 use super::jsonc::{self, Node, NodeKind};
-use super::{project_path, Debugger, Project, Record, Writer, OWNED_PREFIX};
-use crate::util::slash;
+use super::{entry_names, owned_entry, project_path, Debugger, Project, Record, Writer, OWNED_PREFIX};
+use crate::util::{self, slash};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -31,19 +32,24 @@ pub fn outputs(root: &Path) -> Vec<PathBuf> {
 pub fn generate(project: &Project, record: &Record, writer: &mut Writer) -> Result<()> {
     let [tasks_file, launch_file, settings_file] = <[PathBuf; 3]>::try_from(outputs(&project.root)).unwrap();
 
-    merge_list(&tasks_file, "tasks", "label", "2.0.0", &tasks(project, record), writer)?;
-    merge_list(&launch_file, "configurations", "name", "0.2.0", &launches(project), writer)?;
+    let lists = [
+        (&tasks_file, "tasks", "label", "2.0.0", tasks(project, record)),
+        (&launch_file, "configurations", "name", "0.2.0", launches(project)),
+    ];
+    for (file, list, name_key, version, entries) in lists {
+        let previous = record.entries_of(&util::rel(file, &project.root));
+        merge_list(file, list, name_key, version, &entries, previous, &record.anvil, writer)?;
+    }
 
     // Settings: the compilation database unless the user names one, the schemas always
     let (manifest_url, tests_url) = crate::schema::install_files()?;
-    let text = std::fs::read_to_string(&settings_file).unwrap_or_else(|_| "{}\n".to_string());
     let query_driver = project
         .toolchain
         .compiler
         .parent()
         .map(|folder| format!("{QUERY_DRIVER}{}/*", slash(folder)));
-    let merged = (|| {
-        let mut text = text;
+    let merge = |text: &str| -> Result<String> {
+        let mut text = text.to_string();
         let settings = jsonc::parse(&text)?;
         if settings.member(COMPILE_COMMANDS_SETTING).is_none() {
             let value = json!(format!("{WORKSPACE}/compile_commands.json"));
@@ -58,8 +64,9 @@ pub fn generate(project: &Project, record: &Record, writer: &mut Writer) -> Resu
             text = jsonc::set_member(&text, &[SCHEMA_SETTING], pattern, &json!(url))?;
         }
         Ok(text)
-    })();
-    writer.merge(&settings_file, merged)
+    };
+    let empty = || "{}\n".to_string();
+    writer.merge(&settings_file, None, || merge(&empty()).unwrap_or_else(|_| empty()), merge)
 }
 
 /// The tasks: building everything (the default build task), building each program (what its launch runs first), and
@@ -160,21 +167,28 @@ fn build_label(target: &str) -> String {
     format!("{OWNED_PREFIX}build {target}")
 }
 
-/// Replaces Anvil's entries of the file's list (those whose `name_key` starts with `anvil: `), or writes the file.
-fn merge_list(file: &Path, list: &str, name_key: &str, version: &str, entries: &[Value], writer: &mut Writer) -> Result<()> {
-    let text = match std::fs::read_to_string(file) {
-        Ok(text) => {
-            let owned = |node: &Node| {
-                node.member(name_key)
-                    .and_then(Node::text)
-                    .is_some_and(|name| name.starts_with(OWNED_PREFIX))
-            };
-            jsonc::replace_entries(&text, &[list], &owned, entries)
-        }
-        Err(_) => Ok(jsonc::document(&json!({ "version": version, list: entries }))),
-    };
+/// Replaces Anvil's entries of the file's list (those it wrote last time, `previous`, and those of the same names), or
+/// writes the file.
+#[allow(clippy::too_many_arguments)]
+fn merge_list(
+    file: &Path,
+    list: &str,
+    name_key: &str,
+    version: &str,
+    entries: &[Value],
+    previous: Option<&[String]>,
+    anvil: &str,
+    writer: &mut Writer,
+) -> Result<()> {
+    let names = entry_names(entries, name_key);
+    let owned = |node: &Node| owned_entry(node, name_key, previous, &names, anvil);
 
-    writer.merge(file, text)
+    writer.merge(
+        file,
+        Some(names.clone()),
+        || jsonc::document(&json!({ "version": version, list: entries })),
+        |text| jsonc::replace_entries(text, &[list], &owned, entries),
+    )
 }
 
 #[cfg(test)]
@@ -201,6 +215,31 @@ mod tests {
         assert_eq!(tasks[0]["group"]["isDefault"], json!(true));
         assert_eq!(tasks[1]["args"], json!(["build", "game", "-p", "debug"]));
         assert_eq!(tasks[0]["problemMatcher"][0]["base"], json!("$msCompile"));
+    }
+
+    #[test]
+    fn only_the_entries_anvil_wrote_are_replaced() {
+        let folder = std::env::temp_dir().join(format!("anvil_vscode_merge_{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("tasks.json");
+        std::fs::write(
+            &file,
+            "{\n    \"tasks\": [\n        { \"label\": \"anvil: mine\" },\n        { \"label\": \"anvil: old\" },\n        { \"label\": \"anvil: build\" }\n    ]\n}\n",
+        )
+        .unwrap();
+
+        // The user's `anvil: mine` stays; what Anvil wrote last time (`anvil: old`) and `anvil: build` are replaced
+        let mut writer = Writer::default();
+        let entries = [json!({ "label": "anvil: build", "command": "anvil" })];
+        let previous = ["anvil: old".to_string()];
+        merge_list(&file, "tasks", "label", "2.0.0", &entries, Some(&previous), "anvil", &mut writer).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("anvil: mine"));
+        assert!(!text.contains("anvil: old"));
+        assert!(text.contains("\"command\": \"anvil\""));
+        assert_eq!(writer.entries, [(file.clone(), vec!["anvil: build".to_string()])]);
+
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]

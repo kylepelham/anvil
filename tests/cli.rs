@@ -5257,3 +5257,151 @@ fn delay_load_names_dlls_of_linked_binaries() {
     assert_ne!(run.code, 0, "{}", run.output());
     run.contains("delay-load: a lib target links no binary of its own");
 }
+
+// 67. IDE files: Visual Studio's configurations are each their own profile's (outputs, targets a profile leaves out,
+// test arguments), the same files whichever profile builds; Clean and Rebuild of a project clean only its target, also
+// with MSBuild's /m. VS Code's files that cannot be merged (not UTF-8) stay byte for byte; a file with a byte-order
+// mark and CRLF keeps them; a task the user named `anvil: ...` stays
+
+#[cfg(windows)]
+const IDE_PROFILES_MANIFEST: &str = "[project]\nname = \"profiled\"\n\n[target.app]\nkind = \"exe\"\nsources = [\"src/main.c\"]\n\n\
+     [target.app.when.debug]\noutput-name = \"app_d\"\n\n[target.relonly]\nkind = \"exe\"\nif = \"release\"\nsources = [\"src/main.c\"]\n\n\
+     [target.unit]\nkind = \"test\"\nsources = [\"src/main.c\"]\nargs = [\"{profile}\"]\n";
+
+/// The text of every file Visual Studio reads, by name.
+#[cfg(windows)]
+fn vs_files(project: &Project) -> Vec<(String, String)> {
+    let mut files = vec![("profiled.sln".to_string(), project.read("profiled.sln"))];
+    let mut projects: Vec<PathBuf> = std::fs::read_dir(project.path(".anvil/vs"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "vcxproj"))
+        .collect();
+    projects.sort();
+    for path in projects {
+        files.push((path.display().to_string(), std::fs::read_to_string(&path).unwrap()));
+    }
+    files
+}
+
+#[test]
+#[cfg(windows)]
+fn ide_vs_configurations_are_their_profiles_whichever_builds() {
+    require!("msvc", "windows");
+    let project = Project::empty("ide_vs_profiles");
+    project.write("anvil.toml", IDE_PROFILES_MANIFEST);
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+    project.anvil(&["ide", "vs", "--toolchain", "msvc"]).success();
+
+    // Debug's program is app_d.exe, Release's app.exe; relonly builds in Release only
+    let app = project.read(".anvil/vs/app.vcxproj");
+    assert!(app.contains("out\\debug-msvc\\app_d.exe</NMakeOutput>"), "{app}");
+    assert!(app.contains("out\\release-msvc\\app.exe</LocalDebuggerCommand>"), "{app}");
+    assert!(!app.contains("out\\release-msvc\\app_d.exe"), "{app}");
+    let unit = project.read(".anvil/vs/unit.vcxproj");
+    assert!(
+        unit.contains("<LocalDebuggerCommandArguments>release</LocalDebuggerCommandArguments>"),
+        "{unit}"
+    );
+    let solution = project.read("profiled.sln");
+    let relonly = project.read(".anvil/vs/relonly.vcxproj");
+    let relonly_guid = relonly.split("<ProjectGuid>").nth(1).unwrap().split('<').next().unwrap();
+    assert!(solution.contains(&format!("{relonly_guid}.Release|x64.Build.0")), "{solution}");
+    assert!(!solution.contains(&format!("{relonly_guid}.Debug|x64.Build.0")), "{solution}");
+
+    // A rebuild cleans its target first; clean takes only its target
+    assert!(app.contains("clean app -p debug --toolchain msvc &amp;&amp; "), "{app}");
+    assert!(app.contains("clean app -p release --toolchain msvc</NMakeCleanCommandLine>"), "{app}");
+
+    // Once each profile has built, the files are the same whichever profile builds
+    project.anvil(&["build", "-p", "release", "--toolchain", "msvc"]).success();
+    project.anvil(&["build", "--toolchain", "msvc"]).success();
+    let before = vs_files(&project);
+    for profile in ["release", "debug", "release"] {
+        project.anvil(&["build", "-p", profile, "--toolchain", "msvc"]).success().lacks("Updated");
+        assert!(
+            vs_files(&project) == before,
+            "the Visual Studio files changed with a `-p {profile}` build"
+        );
+    }
+
+    // `anvil clean <target>`: its program and objects only
+    project
+        .anvil(&["clean", "app", "-p", "release", "--toolchain", "msvc"])
+        .success()
+        .contains("Cleaned app");
+    assert!(!project.path("out/release-msvc/app.exe").exists());
+    assert!(project.path("out/release-msvc/relonly.exe").is_file());
+    project.anvil(&["build", "-p", "release", "--toolchain", "msvc"]).success();
+
+    // MSBuild with /m: Clean and Rebuild each clean their own target once, Build after them builds
+    let Some(msbuild) = msbuild() else {
+        eprintln!("skipped the MSBuild part: no MSBuild");
+        return;
+    };
+    let msbuild_parallel = |target: &str| {
+        let output = Command::new(&msbuild)
+            .args([
+                "profiled.sln",
+                "-m",
+                "-nologo",
+                "-v:minimal",
+                "-p:Configuration=Release",
+                "-p:Platform=x64",
+            ])
+            .arg(format!("-t:{target}"))
+            .current_dir(&project.root)
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("running MSBuild");
+        let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "{text}");
+        text
+    };
+    let cleaned = msbuild_parallel("Clean");
+    assert_eq!(cleaned.matches("Cleaned").count(), 3, "{cleaned}");
+    assert!(!project.path("out/release-msvc/app.exe").exists() && !project.path("out/release-msvc/relonly.exe").exists());
+    let rebuilt = msbuild_parallel("Rebuild");
+    assert_eq!(rebuilt.matches("Cleaned").count(), 3, "{rebuilt}");
+    assert!(project.path("out/release-msvc/app.exe").is_file() && project.path("out/release-msvc/relonly.exe").is_file());
+    assert!(!rebuilt.contains("Updated"), "{rebuilt}");
+    assert!(vs_files(&project) == before, "MSBuild's builds changed the Visual Studio files");
+}
+
+#[test]
+fn ide_vscode_never_loses_what_it_cannot_merge() {
+    require!("default");
+    let project = Project::empty("ide_vscode_kept");
+    project.write("anvil.toml", "[project]\nname = \"kept\"\n");
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+    project.anvil(&["ide", "vscode"]).success();
+
+    // A Latin-1 launch.json stays byte for byte, with a warning naming what Anvil would add
+    let latin1 = b"{\n  \"version\": \"0.2.0\",\n  \"configurations\": [ { \"name\": \"caf\xe9\", \"type\": \"cppvsdbg\" } ]\n}\n";
+    std::fs::write(project.path(".vscode/launch.json"), latin1).unwrap();
+    project
+        .anvil(&["build"])
+        .success()
+        .contains("launch.json left as it is (it is not UTF-8 text; save it as UTF-8)")
+        .contains("\"anvil: kept\"");
+    assert_eq!(std::fs::read(project.path(".vscode/launch.json")).unwrap(), latin1);
+
+    // A byte-order mark and CRLF stay, Anvil's entries come back in CRLF, the user's `anvil: mine` stays
+    let tasks = project.read(".vscode/tasks.json");
+    let start = tasks.find("\"tasks\": [").unwrap() + "\"tasks\": [".len();
+    let end = tasks.rfind(']').unwrap();
+    let mine = format!(
+        "\u{feff}{}\n        {{ \"label\": \"anvil: mine\", \"type\": \"shell\", \"command\": \"echo\" }}\n    {}",
+        &tasks[..start],
+        &tasks[end..]
+    );
+    std::fs::write(project.path(".vscode/tasks.json"), mine.replace('\n', "\r\n")).unwrap();
+    project.anvil(&["build"]).success().contains("Updated .vscode/tasks.json");
+    let bytes = std::fs::read(project.path(".vscode/tasks.json")).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.starts_with('\u{feff}'), "{text}");
+    assert_eq!(text.matches('\n').count(), text.matches("\r\n").count(), "{text}");
+    assert!(text.contains("anvil: mine") && text.contains("\"label\": \"anvil: build\""), "{text}");
+    project.anvil(&["build"]).success().lacks("Updated");
+}
