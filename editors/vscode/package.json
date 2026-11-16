@@ -25,10 +25,26 @@
   "main": "./dist/extension.js",
   "activationEvents": [
     "workspaceContains:**/anvil.toml",
+    "onLanguage:anvil-toml",
     "onDebugDynamicConfigurations:anvil",
     "onDebugResolve:anvil"
   ],
   "contributes": {
+    "languages": [
+      {
+        "id": "anvil-toml",
+        "aliases": ["Anvil TOML"],
+        "filenames": ["anvil.toml", "tests.toml"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "anvil-toml",
+        "scopeName": "source.toml.anvil",
+        "path": "./syntaxes/anvil-toml.tmLanguage.json"
+      }
+    ],
     "configuration": {
       "title": "Anvil",
       "properties": {
@@ -52,6 +68,17 @@
           ],
           "default": "integratedTerminal",
           "markdownDescription": "Where a debugged program's console goes (`console` of `cppvsdbg`; `cppdbg` uses the Debug Console unless `externalTerminal`)."
+        },
+        "anvil.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "scope": "window",
+          "markdownDescription": "Log the messages between VS Code and the language server (`anvil lsp`), and what the server does, to the Anvil Language Server output."
         }
       }
     },
@@ -268,16 +295,6 @@
           }
         ]
       }
-    ],
-    "tomlValidation": [
-      {
-        "fileMatch": "anvil.toml",
-        "url": "https://anvil.invalid/schema/anvil.schema.json"
-      },
-      {
-        "fileMatch": "tests.toml",
-        "url": "https://anvil.invalid/schema/tests.schema.json"
-      }
     ]
   },
   "scripts": {
@@ -298,5 +315,8 @@
     "esbuild": "^0.24.0",
     "mocha": "^10.8.2",
     "typescript": "^5.6.3"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
   }
 }

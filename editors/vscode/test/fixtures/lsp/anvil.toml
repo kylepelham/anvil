@@ -1,0 +1,7 @@
+[project]
+name = "lsp"
+version = "0.1.0"
+
+[target.app]
+kind = "exe"
+when.debug.defines = ["APP_DEBUG"]

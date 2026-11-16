@@ -3,7 +3,6 @@
 import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
-import * as url from "url";
 import * as vscode from "vscode";
 import { PROJECT, api, clearFakeCalls, fakeCalls, hasCall, processArgs, rewrite, slash, waitFor } from "./helpers";
 import { chooseFilter, parseJunit } from "../../src/testing";
@@ -318,24 +317,33 @@ suite("fake anvil", () => {
     await waitFor("the new test in Test Explorer", () => anvil.tests.controller.items.get("added_later"));
   });
 
-  test("a manifest error shows on anvil.toml at its line, and clears when fixed", async () => {
+  test("a manifest error from anvil targets --json goes to the status bar, not to Problems", async () => {
     const anvil = await api();
     const file = path.join(PROJECT, "anvil.toml");
-    const uri = vscode.Uri.file(file);
     const old = fs.readFileSync(file, "utf8");
     await rewrite(file, old.replace('version = "0.1.0"', 'version = "0.1.0"\nbogus = 1'));
-    const diagnostics = await waitFor("the manifest error", () => {
-      const found = vscode.languages.getDiagnostics(uri).filter((diagnostic) => diagnostic.source === "anvil");
-      return found.length > 0 ? found : undefined;
-    });
-    assert.strictEqual(diagnostics[0].range.start.line, 3);
-    assert.match(diagnostics[0].message, /unknown field `bogus`/);
-    assert.ok(anvil.project()!.error);
-    assert.ok(anvil.project()!.model, "the last good model stays");
+    try {
+      await waitFor("the manifest error", () => anvil.project()!.error);
+      assert.match(anvil.project()!.error!, /unknown field `bogus`/);
+      assert.ok(anvil.project()!.model, "the last good model stays");
+      assert.deepStrictEqual(vscode.languages.getDiagnostics(vscode.Uri.file(file)), [], "the language server's alone");
+    } finally {
+      await rewrite(file, old);
+    }
+    await waitFor("the error to clear", () => anvil.project()!.error === undefined);
+  });
 
-    await rewrite(file, old);
-    await waitFor("the error to clear", () => vscode.languages.getDiagnostics(uri).every((diagnostic) => diagnostic.source !== "anvil"));
-    assert.strictEqual(anvil.project()!.error, undefined);
+  test("an anvil without `lsp`: one message, and everything else still works", async () => {
+    const anvil = await api();
+    const failure = await waitFor("the language server's failure", () => anvil.languageServer.failure);
+    assert.match(failure, /`anvil lsp` did not start/);
+    assert.strictEqual(anvil.languageServer.running, false);
+
+    // Another look at the project does not start it again, so no second message
+    await vscode.commands.executeCommand("anvil.openManifest");
+    await anvil.project()!.refresh();
+    assert.strictEqual(anvil.languageServer.failure, failure);
+    assert.ok(anvil.project()!.model);
   });
 
   test("IntelliSense: the C/C++ extension is pointed at compile_commands.json", async function () {
@@ -354,65 +362,5 @@ suite("fake anvil", () => {
     }
     const value = await waitFor("clangd.arguments", () => vscode.workspace.getConfiguration("clangd").inspect("arguments")?.workspaceValue);
     assert.deepStrictEqual(value, ["--compile-commands-dir=${workspaceFolder}/out"]);
-  });
-
-  test("schemas from anvil schema, and the tomlValidation URLs point at them", async () => {
-    const extension = vscode.extensions.getExtension("anvil.anvil")!;
-    const rules = extension.packageJSON.contributes.tomlValidation as { fileMatch: string; url: string }[];
-    for (const rule of rules) {
-      assert.ok(rule.url.startsWith("file:"), rule.url);
-      const file = url.fileURLToPath(rule.url);
-      const schema = await waitFor(`${file} written`, () => fs.existsSync(file) && JSON.parse(fs.readFileSync(file, "utf8")));
-      assert.match(schema.description, new RegExp(`^${rule.fileMatch.replace(".", "\\.")}: fake schema`));
-    }
-    // Another extension sees the same manifest, as Even Better TOML reads it
-    const seen = vscode.extensions.all.find((candidate) => candidate.id === extension.id)!;
-    assert.strictEqual(seen.packageJSON.contributes.tomlValidation[0].url, rules[0].url);
-  });
-
-  test("Even Better TOML validates anvil.toml against the schema", async function () {
-    if (!vscode.extensions.getExtension("tamasfe.even-better-toml")) {
-      this.skip();
-    }
-    const file = path.join(PROJECT, "anvil.toml");
-    const old = fs.readFileSync(file, "utf8");
-    await rewrite(file, old + "\n[not_a_table]\nx = 1\n");
-    try {
-      const document = await vscode.workspace.openTextDocument(file);
-      await vscode.window.showTextDocument(document);
-      const diagnostics = await waitFor(
-        "a schema diagnostic",
-        () => {
-          const found = vscode.languages.getDiagnostics(document.uri).filter((diagnostic) => diagnostic.source !== "anvil");
-          return found.length > 0 ? found : undefined;
-        },
-        40000,
-      );
-      assert.ok(diagnostics.some((diagnostic) => /not_a_table|not allowed|additional/i.test(diagnostic.message)), diagnostics.map((d) => d.message).join("\n"));
-    } finally {
-      await rewrite(file, old);
-    }
-  });
-
-  test("table snippets in anvil.toml, only [[test]] ones in tests.toml", async () => {
-    const manifest = vscode.Uri.file(path.join(PROJECT, "anvil.toml"));
-    const document = await vscode.workspace.openTextDocument(manifest);
-    const end = new vscode.Position(document.lineCount, 0);
-    const list = await vscode.commands.executeCommand<vscode.CompletionList>("vscode.executeCompletionItemProvider", manifest, end);
-    const labels = list.items.map((item) => (typeof item.label === "string" ? item.label : item.label.label));
-    for (const wanted of ["[target.name]", "[deps]", "[[test]]", "[profile.name]"]) {
-      assert.ok(labels.includes(wanted), `${wanted} in ${labels.join(", ")}`);
-    }
-
-    const testsFile = vscode.Uri.file(path.join(PROJECT, "tests.toml"));
-    const testsDocument = await vscode.workspace.openTextDocument(testsFile);
-    const testsList = await vscode.commands.executeCommand<vscode.CompletionList>(
-      "vscode.executeCompletionItemProvider",
-      testsFile,
-      new vscode.Position(testsDocument.lineCount, 0),
-    );
-    const testsLabels = testsList.items.filter((item) => item.kind === vscode.CompletionItemKind.Snippet).map((item) => item.label);
-    assert.ok(testsLabels.includes("[[test]]"));
-    assert.ok(!testsLabels.includes("[deps]"));
   });
 });
