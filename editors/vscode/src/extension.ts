@@ -82,9 +82,10 @@ export function activate(context: vscode.ExtensionContext): AnvilApi {
     }
     await vscode.commands.executeCommand("setContext", "anvil.active", project !== undefined);
 
-    // The language server runs for any anvil.toml opened, with or without a project in the workspace
+    // The language server runs for any anvil.toml opened, with or without a project in the workspace; the tests'
+    // places come from it
     const folder = project?.folder ?? vscode.workspace.workspaceFolders?.[0];
-    void server.start(findAnvil(folder), project?.manifestDir ?? folder?.uri.fsPath, restartServer);
+    void server.start(findAnvil(folder), project?.manifestDir ?? folder?.uri.fsPath, restartServer).then(() => tests.update());
 
     if (project) {
       await project.refresh();

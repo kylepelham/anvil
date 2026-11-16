@@ -1933,9 +1933,10 @@ impl Model {
                 }
                 if let Some(manifest) = &own_manifest {
                     bail!(
-                        "vcpkg did not install `{port}` (used in anvil.toml) for {}: {} does not list it for this platform, and no package it lists needs it. Add \"{port}\" to its \"dependencies\", or run `anvil add {port}`, which does it for you.",
+                        "vcpkg did not install `{port}` (used in anvil.toml) for {}: {} does not list it for this platform, and no package it lists needs it. Add \"{port}\" to its \"dependencies\", or run `anvil add {}`, which does it for you.",
                         config.triplet,
-                        slash(manifest)
+                        slash(manifest),
+                        target.name
                     );
                 }
             }

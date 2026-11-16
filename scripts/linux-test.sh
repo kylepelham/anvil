@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Runs Anvil's test suite on Linux, in Docker: the build, the unit tests, and the integration tests twice (clang, then
-# gcc as the default toolchain), both compilers required (ANVIL_IT_TOOLCHAINS=gcc,clang). Works from Git Bash on
-# Windows, from WSL, or on Linux.
+# Runs Anvil's test suite on Linux, in Docker: the build, the unit tests, the language server tests, and the integration
+# tests twice (clang, then gcc as the default toolchain), both compilers required (ANVIL_IT_TOOLCHAINS=gcc,clang). Works
+# from Git Bash on Windows, from WSL, or on Linux.
 #
 #   scripts/linux-test.sh                    everything
 #   scripts/linux-test.sh shared_library     integration tests whose name contains `shared_library` (any arguments
-#                                            go to `cargo test --test cli`, e.g. `-- --test-threads=4`)
+#                                            go to `cargo test --test cli`, e.g. `-- --test-threads=4`; the language
+#                                            server tests run only with no arguments)
 #   scripts/linux-test.sh shell              a shell in the container, in the source's copy, with Anvil built and on PATH
 #
 # The image (`anvil-linux`, from scripts/linux/Dockerfile) is built on first use; `docker rmi anvil-linux` rebuilds it.
@@ -48,11 +49,17 @@ if [ "${1:-}" = "shell" ]; then
         TTY_PREFIX=()
     fi
 else
+    # The language server tests on a full run only
+    LSP_STEPS=""
+    if [ $# -eq 0 ]; then
+        LSP_STEPS="echo '=== language server tests'; cargo test --test lsp || failed=1"
+    fi
     STEPS="
         cargo build || exit 1
         failed=0
         echo '=== unit tests'
         cargo test --bins || failed=1
+        $LSP_STEPS
         echo '=== integration tests (gcc and clang; clang the default toolchain)'
         cargo test --test cli$TEST_ARGS || failed=1
         echo '=== integration tests (gcc and clang; gcc the default toolchain)'
@@ -64,7 +71,8 @@ fi
 
 # Copy the source into its volume (a fresh copy each run; tar keeps the time stamps, so cargo rebuilds only what
 # changed), then run
-tar -C "$ROOT" --exclude=./target --exclude=./out --exclude=./.git -cf - . \
+tar -C "$ROOT" --exclude=./target --exclude=./out --exclude=./.git \
+    --exclude=./editors/vscode/node_modules --exclude=./editors/vscode/.vscode-test -cf - . \
     | docker run --rm -i -v "$SOURCE_VOLUME:/source" "$IMAGE" \
         bash -c 'rm -rf /source/anvil && mkdir -p /source/anvil && tar -C /source/anvil -xf -' || exit 1
 

@@ -349,6 +349,74 @@ fn a_pull_before_the_compiler_is_known_waits_for_the_whole_check() {
 }
 
 #[test]
+fn a_pull_waits_a_second_for_the_compiler_then_takes_the_files_errors() {
+    let root = project("slowpull");
+    let uri = file_uri(&root.join("anvil.toml"));
+    let mut client = Client::start_with(&[("ANVIL_LSP_TEST_TOOLCHAIN_DELAY_MS", "4000")]);
+    client.request("initialize", json!({ "processId": null, "capabilities": pull_capabilities() }));
+    client.notify("initialized", json!({}));
+
+    // A misspelled key the files show, and an unknown dependency only the load finds: the first pull is answered with
+    // the files' error well before the compiler is known (debug builds delay it)
+    let started = Instant::now();
+    let text = MANIFEST
+        .replace("lnux", "linux")
+        .replace(r#"deps = ["core"]"#, "deps = [\"core\", \"nopedep\"]\ndefnies = [\"X\"]");
+    client.open(&uri, 1, &text);
+    let first = client.pull(&uri);
+    assert_eq!(first[0]["code"], "unknown-key", "{first}");
+    if cfg!(debug_assertions) {
+        assert!(started.elapsed() < Duration::from_millis(3000), "answered after {:?}", started.elapsed());
+        assert_eq!(first.as_array().unwrap().len(), 1, "{first}");
+    }
+
+    // A later pull, once the compiler is known, has the load's too
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let items = client.pull(&uri);
+        if items.as_array().unwrap().len() > first.as_array().unwrap().len() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no pull had the load's diagnostics: {items}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    assert_eq!(client.stop(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_client_told_to_pull_again_gets_the_files_only_check_first() {
+    let root = project("refreshpull");
+    let uri = file_uri(&root.join("anvil.toml"));
+    let mut client = Client::start_with(&[("ANVIL_LSP_TEST_TOOLCHAIN_DELAY_MS", "4000")]);
+    let capabilities = json!({
+        "textDocument": { "diagnostic": { "dynamicRegistration": true } },
+        "workspace": { "diagnostics": { "refreshSupport": true } },
+    });
+    client.request("initialize", json!({ "processId": null, "capabilities": capabilities }));
+    client.notify("initialized", json!({}));
+
+    // Nothing the files show: answered empty before the compiler is known, then told to pull again
+    let started = Instant::now();
+    let text = MANIFEST
+        .replace("lnux", "linux")
+        .replace(r#"deps = ["core"]"#, r#"deps = ["core", "nopedep"]"#);
+    client.open(&uri, 1, &text);
+    let first = client.pull(&uri);
+    if cfg!(debug_assertions) {
+        assert!(started.elapsed() < Duration::from_millis(3000), "answered after {:?}", started.elapsed());
+        assert_eq!(first, json!([]));
+        client.wait_for(|message| message["method"] == "workspace/diagnostic/refresh");
+    }
+    let items = client.pull(&uri);
+    assert!(!items.as_array().unwrap().is_empty(), "the pull after the refresh: {items}");
+
+    assert_eq!(client.stop(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn configuration_changes_only_the_settings_given() {
     let root = project("config");
     let uri = file_uri(&root.join("anvil.toml"));

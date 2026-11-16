@@ -1,5 +1,6 @@
-# Builds Anvil and runs its unit and integration tests on Linux (gcc and clang), Windows (MSVC and MinGW gcc) and
-# macOS (Apple clang). ANVIL_IT_TOOLCHAINS makes a missing compiler a failure instead of a skipped test.
+# Builds Anvil and runs its unit, language server and integration tests on Linux (gcc and clang), Windows (MSVC and
+# MinGW gcc) and macOS (Apple clang). ANVIL_IT_TOOLCHAINS makes a missing compiler a failure instead of a skipped test.
+# The VS Code extension's suites run on Linux in a job of their own.
 name: CI
 
 on:
@@ -82,6 +83,9 @@ jobs:
       - name: Unit tests
         run: cargo test --bins
 
+      - name: Language server tests
+        run: cargo test --test lsp
+
       - name: Default toolchain
         shell: bash
         run: |
@@ -90,3 +94,42 @@ jobs:
 
       - name: Integration tests
         run: cargo test --test cli
+
+  # The VS Code extension (editors/vscode) in a downloaded VS Code on a virtual display: the fake anvil's suites, the
+  # language server suite, and a real project built, tested and debugged with gdb (ANVIL_REAL, ANVIL_TEST_GCC)
+  vscode:
+    name: VS Code extension (Linux)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc g++ gdb xvfb
+
+      - name: Build anvil
+        working-directory: .
+        run: cargo build
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        run: xvfb-run -a npm test
+        env:
+          ANVIL_REAL: ../../target/debug/anvil
+          ANVIL_TEST_GCC: "1"

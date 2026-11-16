@@ -42,6 +42,9 @@ use crate::util;
 // How long after an edit the project is checked again
 const DEBOUNCE: Duration = Duration::from_millis(200);
 
+// How long a pull waits for the compiler's detection before the files-only check answers it
+const PROVISIONAL_WAIT: Duration = Duration::from_secs(1);
+
 // LSP error codes lsp-server does not name
 const SERVER_NOT_INITIALIZED: i32 = -32002;
 const REQUEST_CANCELLED: i32 = -32800;
@@ -97,7 +100,8 @@ struct Root {
     from_folder: bool,
     /// Whether the next check walks folders again (else it reuses the last check's walks: only text changed).
     walk_again: bool,
-    /// The analysis was made before the compiler was known (files only): a pull waits for the next one.
+    /// The analysis was made before the compiler was known (files only): a pull waits for the next one, for a while
+    /// (PROVISIONAL_WAIT, see answers_files_only).
     provisional: bool,
 }
 
@@ -114,6 +118,8 @@ struct Parked {
     id: RequestId,
     uri: String,
     previous: Option<String>,
+    /// Until when it waits for the compiler's detection; None once that passed (the files-only check may answer).
+    patience: Option<Instant>,
 }
 
 struct Job {
@@ -330,10 +336,14 @@ impl<'a> Server<'a> {
             // Checks start once what has arrived is handled (a close and a reopen are one change, not two checks)
             self.schedule();
 
-            // Wait for a message, a finished check, or the next check to be due
-            let timeout = self
-                .next_due()
-                .map_or(Duration::from_secs(3600), |due| due.saturating_duration_since(Instant::now()));
+            // Pulls that waited long enough for the compiler take the files-only check
+            if self.patience_ends().is_some_and(|end| end <= Instant::now()) {
+                self.answer_parked();
+            }
+
+            // Wait for a message, a finished check, the next check to be due, or a pull to wait no more
+            let wake = [self.next_due(), self.patience_ends()].into_iter().flatten().min();
+            let timeout = wake.map_or(Duration::from_secs(3600), |due| due.saturating_duration_since(Instant::now()));
             crossbeam_channel::select! {
                 recv(self.connection.receiver) -> message => match message {
                     Ok(message) => self.queue.push_back(message),
@@ -777,6 +787,14 @@ impl<'a> Server<'a> {
         self.roots.values().filter(|root| !root.running).filter_map(|root| root.due).min()
     }
 
+    /// When the first parked pull stops waiting for the compiler's detection (None once the compiler is known).
+    fn patience_ends(&self) -> Option<Instant> {
+        if self.toolchain_ready {
+            return None;
+        }
+        self.parked.iter().filter_map(|waiting| waiting.patience).min()
+    }
+
     /// Starts the checks that are due (one project at a time on the worker; the others wait their turn).
     fn schedule(&mut self) {
         let now = Instant::now();
@@ -934,11 +952,17 @@ impl<'a> Server<'a> {
         }
     }
 
-    /// Answers the parked pulls whose projects' checks are current now.
+    /// Answers the parked pulls whose projects' checks are current now (or, once a pull's patience ran out before the
+    /// compiler was known, current without it).
     fn answer_parked(&mut self) {
+        let now = Instant::now();
         let parked = std::mem::take(&mut self.parked);
-        for waiting in parked {
-            let answered = self.document_report(&waiting.uri, waiting.previous.as_deref());
+        for mut waiting in parked {
+            if waiting.patience.is_some_and(|end| end <= now) {
+                waiting.patience = None;
+            }
+            let files_only = waiting.patience.is_none() && !self.toolchain_ready;
+            let answered = self.document_report(&waiting.uri, waiting.previous.as_deref(), files_only);
             match answered {
                 Some(report) => self.respond(waiting.id, report),
                 None => self.parked.push(waiting),
@@ -1379,7 +1403,7 @@ impl<'a> Server<'a> {
 
     /// `textDocument/diagnostic`: the document's report, or None (parked) while its project is being checked.
     fn pull_document(&mut self, id: RequestId, uri: &str, previous: Option<String>) -> Option<Value> {
-        if let Some(report) = self.document_report(uri, previous.as_deref()) {
+        if let Some(report) = self.document_report(uri, previous.as_deref(), false) {
             return Some(report);
         }
 
@@ -1387,22 +1411,24 @@ impl<'a> Server<'a> {
             id,
             uri: uri.to_string(),
             previous,
+            patience: Some(Instant::now() + PROVISIONAL_WAIT),
         });
         None
     }
 
-    /// A document's diagnostic report when its project's check is current (and made with the compiler known).
-    fn document_report(&self, uri: &str, previous: Option<&str>) -> Option<Value> {
+    /// A document's diagnostic report when its project's check is current (and made with the compiler known, unless
+    /// `files_only` takes a check made without it).
+    fn document_report(&self, uri: &str, previous: Option<&str>, files_only: bool) -> Option<Value> {
         let Some(document) = self.documents.get(uri) else {
-            return self.closed_report(uri, previous);
+            return self.closed_report(uri, previous, files_only);
         };
 
         // A document of no project (a tests.toml of something else) has nothing to say
         let Some(root) = self.roots.get(&document.root) else {
             return Some(json!({ "kind": "full", "items": [] }));
         };
-        let current =
-            root.analysis.is_some() && !root.running && root.due.is_none() && !root.provisional && root.versions.get(uri) == Some(&document.version);
+        let settled = !root.provisional || (files_only && self.answers_files_only(root));
+        let current = root.analysis.is_some() && !root.running && root.due.is_none() && settled && root.versions.get(uri) == Some(&document.version);
         if !current {
             return None;
         }
@@ -1438,7 +1464,7 @@ impl<'a> Server<'a> {
 
     /// The report of a file the client has not opened (a member's manifest a check read), once the checks that read
     /// it are current.
-    fn closed_report(&self, uri: &str, previous: Option<&str>) -> Option<Value> {
+    fn closed_report(&self, uri: &str, previous: Option<&str>, files_only: bool) -> Option<Value> {
         let Some(path) = uri::to_path(uri) else {
             return Some(json!({ "kind": "full", "items": [] }));
         };
@@ -1448,7 +1474,8 @@ impl<'a> Server<'a> {
         let report = self.reports.get(&key);
         let pending = self.roots.iter().any(|(root_key, root)| {
             let concerned = report.is_some_and(|report| report.by_root.contains_key(root_key)) || util::strip_prefix_ci(&path, &root.path).is_some();
-            concerned && (root.running || root.due.is_some() || root.provisional)
+            let provisional = root.provisional && !(files_only && self.answers_files_only(root));
+            concerned && (root.running || root.due.is_some() || provisional)
         });
         if pending {
             return None;
@@ -1461,6 +1488,18 @@ impl<'a> Server<'a> {
         }
 
         Some(json!({ "kind": "full", "resultId": report.result_id, "items": report.sent }))
+    }
+
+    /// Whether a project's files-only check may answer a pull: the client is told to pull again when the whole check
+    /// differs (refresh), or the files-only check found errors (a client that is never told to pull again must not
+    /// take an empty answer for "no problems" when only the load, which needs the compiler, could find them).
+    fn answers_files_only(&self, root: &Root) -> bool {
+        let errors = root
+            .analysis
+            .as_ref()
+            .is_some_and(|analysis| analysis.problems.iter().any(|problem| problem.severity == Severity::Error));
+
+        self.refresh_support || errors
     }
 
     /// `workspace/diagnostic`: every file's report as it stands.

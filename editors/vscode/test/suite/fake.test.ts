@@ -220,7 +220,7 @@ suite("fake anvil", () => {
     assert.strictEqual(project.model?.toolchain.family, "msvc");
   });
 
-  test("Test Explorer lists the tests, grouped by package, at their declarations", async () => {
+  test("Test Explorer lists the tests, grouped by package (their places come from anvil lsp, which the fake has not)", async () => {
     const anvil = await api();
     const items = anvil.tests.controller.items;
     const top: string[] = [];
@@ -228,11 +228,7 @@ suite("fake anvil", () => {
     assert.deepStrictEqual(top.sort(), ["fails_on_purpose", "from_tests_file", "package:dep", "smoke"]);
     assert.ok(items.get("package:dep")!.children.get("dep/lint"));
 
-    const smoke = items.get("smoke")!;
-    assert.strictEqual(slash(smoke.uri!.fsPath).toLowerCase(), `${ROOT}/anvil.toml`.toLowerCase());
-    assert.strictEqual(smoke.range?.start.line, 15);
-    const fromFile = items.get("from_tests_file")!;
-    assert.ok(fromFile.uri!.fsPath.endsWith("tests.toml"));
+    assert.strictEqual(items.get("smoke")!.range, undefined);
   });
 
   test("running tests reports passes, failures with output, and runs only what was asked", async () => {

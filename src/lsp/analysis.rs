@@ -8,7 +8,7 @@ use super::scan::{self, Part};
 use super::schema_info::FileKind;
 use super::session::{self, Session, Walks};
 use crate::cond::CondContext;
-use crate::located::{Located, Place};
+use crate::located::{At, Located, Place, Scope};
 use crate::project::{self, Model, MANIFEST_NAME, TESTS_FILE_NAME};
 use crate::util;
 use regex::Regex;
@@ -123,6 +123,13 @@ pub fn analyze(
         None => {}
     }
     for error in &session.errors {
+        // Before the compiler is known, an unknown condition word may be another package's option
+        let condition_word = error
+            .downcast_ref::<Located>()
+            .is_some_and(|located| located.code == "unknown-condition-word");
+        if !complete && condition_word {
+            continue;
+        }
         load_errors(error, &files, texts, &mut problems);
     }
     for (message, place) in &session.warnings {
@@ -189,11 +196,15 @@ fn check(
     // Each open document: its syntax, keys and value types (reported for the project's own documents; the load
     // reads every one without what the parser refused)
     let mut parses = true;
+    let mut own_manifests = Vec::new();
     for (path, text) in texts.values() {
         let (found, repaired) = parse_problems(path, text);
         let owned = own.iter().any(|owned| util::path_key(owned) == util::path_key(path));
         if owned {
             problems.extend(found);
+        }
+        if owned && is_manifest(path) {
+            own_manifests.extend(repaired.clone().map(|repaired| (path.clone(), repaired)));
         }
         match repaired {
             Some(repaired) if repaired != *text => session::replace_text(path, repaired),
@@ -201,6 +212,9 @@ fn check(
             None if owned && is_manifest(path) => parses = false,
             None => {}
         }
+    }
+    if parses && !load_model {
+        check_tables(&own_manifests);
     }
     if !parses || !load_model {
         return (root, None);
@@ -218,6 +232,36 @@ fn check(
     });
 
     (root, Some(loaded))
+}
+
+/// Before the compiler is known: what the load checks of each of the project's own manifests that needs no compiler
+/// (its version, every table's keys and values, its profiles), as the session's errors.
+fn check_tables(manifests: &[(PathBuf, String)]) {
+    for (path, text) in manifests {
+        let Ok(mut manifest) = crate::manifest::parse_str(text) else { continue };
+        manifest.file = Some(path.clone());
+
+        // Conditions are not judged here (filtered out later): their words may be another package's options
+        let condition = CondContext {
+            family: crate::toolchain::Family::Msvc,
+            platform: crate::platform::Platform::host(),
+            profiles: vec!["debug".into()],
+            all_profiles: manifest.profile.keys().cloned().collect(),
+            options: crate::manifest::parse_options(&manifest.options).unwrap_or_default(),
+        };
+        let checked = || -> anyhow::Result<()> {
+            if let Some(version) = manifest.project.as_ref().and_then(|project| project.version.as_deref()) {
+                project::check_version(version)?;
+            }
+            crate::targets::check_package(&manifest, &condition)?;
+            crate::profile::Profile::check_all(&manifest.profile)
+        };
+        // The first error before the ones the check said after it
+        let before = session::error_count();
+        if let Err(error) = checked().at(Scope::file(path)) {
+            session::insert_error(before, error);
+        }
+    }
 }
 
 /// A manifest or tests.toml checked as TOML and against its tables: the problems, and the text with each unknown key
@@ -788,6 +832,26 @@ mod tests {
                 (problem.code, text_of(&problem.file, &problem.span), problem.severity, related)
             })
             .collect()
+    }
+
+    #[test]
+    fn before_the_compiler_the_tables_are_checked_but_not_condition_words() {
+        let manifest =
+            "[project]\nname = \"game\"\n\n[target.a]\nkind = \"lbi\"\nsources = []\n\n[target.game]\nstd = \"18\"\nwhen.withgl.defines = [\"GL\"]\n";
+        let root = project("files-only", manifest, None);
+        let path = root.join(MANIFEST_NAME);
+        let texts = HashMap::from([(util::path_key(&path), (path.clone(), manifest.to_string()))]);
+        let analysis = analyze(&root, &texts, &[path], &CheckSettings::default(), false, &mut Walks::default());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Each table's wrong value; `withgl` may be another package's option, so only the load judges it
+        let found: Vec<(&str, &str)> = analysis
+            .problems
+            .iter()
+            .map(|problem| (problem.code, &manifest[problem.span.clone()]))
+            .collect();
+        assert_eq!(found, vec![("invalid-value", "lbi"), ("invalid-value", "18")]);
+        assert!(!analysis.complete);
     }
 
     #[test]
