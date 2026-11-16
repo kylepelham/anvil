@@ -1925,6 +1925,8 @@ impl Model {
         }
 
         // Each vcpkg dependency gets the headers, libraries and DLLs of its package and what that depends on
+        let ports: Vec<&str> = self.targets.iter().filter_map(|target| Some(target.vcpkg.as_ref()?.0.as_str())).collect();
+        tree.read_packages(&ports, &build);
         for (index, target) in self.targets.iter_mut().enumerate() {
             let Some((port, only_libs)) = &target.vcpkg else { continue };
             if !tree.contains(port) {
