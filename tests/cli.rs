@@ -4669,7 +4669,7 @@ fn ide_vscode_merges_into_the_users_files_and_builds_refresh_them() {
         assert!(project.read(".vscode/settings.json").contains("\"--query-driver="));
         let launch = project.read(".vscode/launch.json");
         assert!(
-            launch.contains("\"MIMode\": \"gdb\"") && launch.contains("/out/debug-gcc/game.exe"),
+            launch.contains("\"MIMode\": \"gdb\"") && launch.contains(&format!("/out/debug-gcc/game{}", std::env::consts::EXE_SUFFIX)),
             "{launch}"
         );
         assert!(project.read(".anvil/ide.toml").contains("toolchain = \"gcc\""));

@@ -603,6 +603,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn reads_includes_definitions_and_standards() {
         let words = |text: &str| text.split(' ').map(str::to_string).collect::<Vec<_>>();
         let directory = Path::new("C:/p");
