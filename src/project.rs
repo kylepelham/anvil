@@ -2,7 +2,9 @@
 //! every dependency (local targets, vcpkg, pkg-config, path and git packages, prebuilt libraries) and installs vcpkg
 //! packages, giving the planner a complete list of targets.
 
+use crate::bail_at;
 use crate::cond::CondContext;
+use crate::located::{self, At, Errors, Located, Origins, Part, Place, Scope};
 use crate::lockfile::{Declared, LockFile, Refresh};
 use crate::manifest::{self, DepSpec, Manifest, StrOrList, TestSpec};
 use crate::platform::Platform;
@@ -27,6 +29,9 @@ const VERSION_REFUSED: &[char] = &['/', '\\', '"', ';'];
 
 // The keys whose items name dependencies, for the unused-dependency warning
 const DEP_LIST_KEYS: &[&str] = &["deps", "whole-archive", "header-deps", "needs"];
+
+// The same keys as a target's origins know them
+const DEP_KEYS: &[&[&str]] = &[&["deps"], &["public", "deps"], &["header-deps"], &["needs"], &["whole-archive"]];
 
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
@@ -143,7 +148,13 @@ impl Model {
 
         // The machine to build for: the command line's, the profile's, else this one (always this one for host tools)
         let platform = match options.target.as_deref().or(profile.target.as_deref()) {
-            Some(target) if options.host_tools_dir.is_none() => Platform::parse(target)?,
+            Some(target) if options.host_tools_dir.is_none() => {
+                let profile_scope = match options.target {
+                    None => Scope::keys(&["profile", &profile.name]),
+                    Some(_) => Scope::default(),
+                };
+                Platform::parse(target).at(profile_scope)?
+            }
             _ => Platform::host(),
         };
 
@@ -153,7 +164,11 @@ impl Model {
             .clone()
             .or(project.toolchain.clone())
             .or_else(|| Settings::load().toolchain);
-        let toolchain = Toolchain::find(requested.as_deref(), &platform)?;
+        let toolchain_scope = match options.toolchain.is_none() && project.toolchain.is_some() {
+            true => Scope::keys(&["project", "toolchain"]),
+            false => Scope::default(),
+        };
+        let toolchain = Toolchain::find(requested.as_deref(), &platform).at(toolchain_scope)?;
         toolchain.adapt_profile(&mut profile)?;
 
         // Output folders: a toolchain or a target machine picked on the command line gets its own
@@ -182,7 +197,9 @@ impl Model {
         for (member, member_manifest) in &member_manifests {
             check_member_project(&root, member, member_manifest)?;
             if util::strip_prefix_ci(member, &out_root).is_some() {
-                bail!(
+                bail_at!(
+                    Place::keys(&["project", "out"]).value(project.out.as_deref().unwrap_or("out")),
+                    "invalid-output-folder",
                     "{}: [project] out = \"{}\" holds the workspace member {}; name a folder of its own for the build output, such as \"out\"",
                     slash(&root.join(MANIFEST_NAME)),
                     project.out.as_deref().unwrap_or("out"),
@@ -246,7 +263,7 @@ impl Model {
         model.check_output_names()?;
         model.check_data_files()?;
         model.check_sources()?;
-        if options.host_tools_dir.is_none() {
+        if options.host_tools_dir.is_none() && !crate::lsp::session::has_errors() {
             model.warn_unused_deps();
         }
         model.find_cuda()?;
@@ -377,25 +394,46 @@ impl Model {
 
     fn add_package(&mut self, root: &Path, manifest: Manifest, member: bool) -> Result<usize> {
         let name = package_name(root, &manifest);
+        let file = manifest.file.clone();
         if let Some(other) = self.packages.iter().find(|package| package.name == name) {
-            bail!(
+            let message = format!(
                 "two packages are named `{name}`: {} and {}, so `{name}/<target>` and `{{target:...}}` could not tell them apart. \
                  Give one another [project] name in its anvil.toml (a folder without one is named by its [deps] key: rename that)",
                 slash(&other.root),
                 slash(root)
             );
+            let other_file = other.manifest.file.as_deref();
+            let label = format!("the other `{name}`: {}", slash(&other.root.join(MANIFEST_NAME)));
+            let error = Located::new(Place::keys(&["project", "name"]).file(file.as_deref()), "duplicate-package", message)
+                .related(Place::keys(&["project", "name"]).file(other_file), label);
+            return Err(error.into());
         }
         let index = self.packages.len();
         self.package_dirs.insert(package_key(root), index);
 
         if let Some(both) = manifest.dev_deps.keys().find(|dev_dep| manifest.deps.contains_key(*dev_dep)) {
-            bail!("`{both}` is under both [deps] and [dev-deps] of package `{name}`; keep it in one (tests see [deps] too)");
+            let error = Located::new(
+                Place::keys(&["dev-deps", both]).file(file.as_deref()),
+                "duplicate-dependency",
+                format!("`{both}` is under both [deps] and [dev-deps] of package `{name}`; keep it in one (tests see [deps] too)"),
+            )
+            .related(Place::keys(&["deps", both]).file(file.as_deref()), "under [deps] too");
+            return Err(error.into());
         }
 
+        // Errors of the package's manifest are in its file, after its name outside the root package
+        let package_scope = || {
+            let scope = match &file {
+                Some(file) => Scope::file(file),
+                None => Scope::default(),
+            };
+            scope.text(package_context(index, &name, root))
+        };
+
         // Options declared by members and dependencies join the root's, with the command line's values
-        let declared = manifest::parse_options(&manifest.options).with_context(|| package_context(index, &name, root))?;
+        let declared = manifest::parse_options(&manifest.options).at(package_scope())?;
         let option_names: Vec<String> = declared.keys().cloned().collect();
-        crate::cond::check_names(&self.condition.all_profiles, &option_names).with_context(|| package_context(index, &name, root))?;
+        crate::cond::check_names(&self.condition.all_profiles, &option_names).at(package_scope())?;
         for (option, default) in declared {
             let given = self
                 .options
@@ -416,7 +454,7 @@ impl Model {
             Profile::check_all(&manifest.profile)?;
             check_deps(&manifest, &self.condition)
         };
-        check().with_context(|| package_context(index, &name, root))?;
+        check().at(package_scope())?;
 
         // Members declare their own git dependencies (anvil.lock records whose a pin is)
         if member {
@@ -429,7 +467,11 @@ impl Model {
             manifest,
             member,
         });
-        self.create_targets(index)?;
+        let in_file = match &file {
+            Some(file) => Scope::file(file),
+            None => Scope::default(),
+        };
+        self.create_targets(index).at(in_file)?;
 
         Ok(index)
     }
@@ -452,6 +494,7 @@ impl Model {
             cxx: &self.toolchain.cxx,
             cc: &self.toolchain.cc,
             condition: &self.condition,
+            file: manifest.file.as_deref(),
         };
 
         // Explicit targets, or the layout conventions
@@ -720,20 +763,34 @@ impl Model {
         }
     }
 
-    /// Resolves the dependency names of one target.
+    /// Resolves the dependency names of one target. Under the language server a name that does not resolve is said
+    /// and left out, and the rest go on.
     fn link_target(&mut self, index: usize) -> Result<()> {
         let dep_names = self.targets[index].dep_names.clone();
         let package = self.targets[index].package;
+        let origins = self.targets[index].origins.clone();
+        let place = |keys: &[&[&str]], name: &str| origins.place(keys, name);
+        let mut errors = Errors::new(None);
 
         let mut deps = Vec::new();
         for (name, public) in dep_names {
             self.note_dev_dep_use(index, &name);
-            let resolved = self
-                .resolve_dep_of(package, &name, Some(index))
-                .with_context(|| format!("in target `{}`", self.qualified_name(index)))?;
+            let scope = Scope::place(place(&[&["deps"], &["public", "deps"]], &name)).text(format!("in target `{}`", self.qualified_name(index)));
+            let resolved = self.resolve_dep_of(package, &name, Some(index)).at(scope.clone());
+            let resolved = match resolved {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    errors.add(Err(error));
+                    if errors.stop() {
+                        return errors.finish();
+                    }
+                    continue;
+                }
+            };
             if let Some(dependency) = resolved {
                 if dependency == index {
-                    bail!("target `{name}` depends on itself");
+                    let error = Located::new(Place::default(), "dependency-cycle", format!("target `{name}` depends on itself"));
+                    return Err(Scope::place(place(&[&["deps"], &["public", "deps"]], &name)).wrap(error.into()));
                 }
                 deps.push((dependency, public));
             }
@@ -743,41 +800,61 @@ impl Model {
         let mut header_deps = Vec::new();
         for name in self.targets[index].header_dep_names.clone() {
             self.note_dev_dep_use(index, &name);
-            let resolved = self
-                .resolve_dep_of(package, &name, Some(index))
-                .with_context(|| format!("in target `{}` (header-deps)", self.qualified_name(index)))?;
-            if let Some(dependency) = resolved.filter(|dependency| *dependency != index) {
-                header_deps.push(dependency);
+            let scope = Scope::place(place(&[&["header-deps"]], &name)).text(format!("in target `{}` (header-deps)", self.qualified_name(index)));
+            let resolved = self.resolve_dep_of(package, &name, Some(index)).at(scope);
+            match resolved {
+                Ok(resolved) => header_deps.extend(resolved.filter(|dependency| *dependency != index)),
+                Err(error) => errors.add(Err(error)),
+            }
+            if errors.stop() {
+                return errors.finish();
             }
         }
 
         // Build-order-only dependencies
         let mut needs = Vec::new();
         for name in self.targets[index].need_names.clone() {
-            let resolved = self
-                .resolve_dep(package, &name)
-                .with_context(|| format!("in target `{}` (needs)", self.qualified_name(index)))?;
-            if let Some(dependency) = resolved.filter(|dependency| *dependency != index) {
-                needs.push(dependency);
+            let scope = Scope::place(place(&[&["needs"]], &name)).text(format!("in target `{}` (needs)", self.qualified_name(index)));
+            match self.resolve_dep(package, &name).at(scope) {
+                Ok(resolved) => needs.extend(resolved.filter(|dependency| *dependency != index)),
+                Err(error) => errors.add(Err(error)),
+            }
+            if errors.stop() {
+                return errors.finish();
             }
         }
 
         // Libraries linked whole
         let mut whole_archive = Vec::new();
         for name in self.targets[index].whole_archive_names.clone() {
+            let scope = Scope::place(place(&[&["whole-archive"]], &name));
             let resolved = self
                 .resolve_dep_of(package, &name, Some(index))
-                .with_context(|| format!("in target `{}` (whole-archive)", self.qualified_name(index)))?;
+                .at(scope.clone().text(format!("in target `{}` (whole-archive)", self.qualified_name(index))));
+            let resolved = match resolved {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    errors.add(Err(error));
+                    if errors.stop() {
+                        return errors.finish();
+                    }
+                    continue;
+                }
+            };
             if let Some(dependency) = resolved {
                 if !matches!(
                     self.targets[dependency].kind,
                     crate::targets::Kind::Static | crate::targets::Kind::External
                 ) {
-                    bail!("target `{}`: whole-archive `{name}` is not a static library", self.targets[index].name);
+                    let message = format!("target `{}`: whole-archive `{name}` is not a static library", self.targets[index].name);
+                    return Err(scope.wrap(Located::new(Place::default(), "invalid-whole-archive", message).into()));
                 }
                 whole_archive.push(dependency);
             }
         }
+
+        // Under the language server the errors so far are said, and the target links what resolved
+        errors.say()?;
 
         self.targets[index].deps = deps;
         self.targets[index].header_deps = header_deps;
@@ -813,12 +890,17 @@ impl Model {
                 continue;
             };
             let target = &self.targets[*index];
-            bail!(
+            let message = format!(
                 "target `{}` ({}) uses `{name}`, which is under [dev-deps]: only tests (kind = \"test\") use those, and libraries that only tests use; {reason}. Move `{name}` to [deps] if `{}` needs it.",
                 target.name,
                 target.kind.name(),
                 target.name
             );
+            let place = target.origins.place(&[&["deps"], &["public", "deps"], &["header-deps"]], name);
+            let declared = Place::keys(&["dev-deps", name.split('/').next().unwrap_or(name)]).file(target.origins.file());
+            return Err(Located::new(place, "dev-dep-outside-tests", message)
+                .related(declared, "declared under [dev-deps]")
+                .into());
         }
 
         Ok(())
@@ -919,7 +1001,11 @@ impl Model {
         known.extend(self.packages[package].manifest.deps.keys().cloned());
         known.extend(self.packages[package].manifest.dev_deps.keys().cloned());
         let hint = util::did_you_mean(name, known.iter().map(|known| known.as_str()));
-        bail!("unknown dependency `{name}`{hint}. Declare it under [deps] (e.g. `anvil add {name}`), or name one of this package's targets.")
+        bail_at!(
+            Place::default().value(name),
+            "unknown-dependency",
+            "unknown dependency `{name}`{hint}. Declare it under [deps] (e.g. `anvil add {name}`), or name one of this package's targets."
+        )
     }
 
     /// The package `package/target` names: a path or git [deps] entry of that key (loaded now), a loaded package of
@@ -955,7 +1041,11 @@ impl Model {
             .iter()
             .find_map(|(table, entries)| entries.contains_key(package_name).then_some(*table))
         {
-            bail!("`{package_name}/...`: {table} {package_name} is not a path or git package, so it has no targets to pick from");
+            bail_at!(
+                Place::default().value(package_name),
+                "unknown-package",
+                "`{package_name}/...`: {table} {package_name} is not a path or git package, so it has no targets to pick from"
+            );
         }
 
         // By package name: one loaded already, else one of this package's path dependencies, then its git ones in the
@@ -1009,7 +1099,11 @@ impl Model {
         }
 
         let hint = util::did_you_mean(package_name, source_deps.iter().map(|(key, _)| key.as_str()));
-        bail!("unknown package `{package_name}`{hint}. Name a path or git entry of [deps] (or its package's [project] name)")
+        bail_at!(
+            Place::default().value(package_name),
+            "unknown-package",
+            "unknown package `{package_name}`{hint}. Name a path or git entry of [deps] (or its package's [project] name)"
+        )
     }
 
     fn resolve_dep_spec(&mut self, package: usize, name: &str, spec: &DepSpec) -> Result<usize> {
@@ -1023,7 +1117,13 @@ impl Model {
 
         let resolved = if spec.path.is_some() || spec.git.is_some() {
             match self.load_dep_package(package, name, spec)? {
-                Some(loaded) => self.main_target(loaded, spec.target.as_deref())?,
+                Some(loaded) => {
+                    let target_key = match &spec.target {
+                        Some(target) => Scope::place(Place::absolute(located::keys(&["deps", name, "target"])).value(target)),
+                        None => Scope::default(),
+                    };
+                    self.main_target(loaded, spec.target.as_deref()).at(target_key)?
+                }
                 // Listing names it without fetching it
                 None => self.add_placeholder(package, name),
             }
@@ -1048,8 +1148,13 @@ impl Model {
     /// the cache yet.
     fn load_dep_package(&mut self, package: usize, name: &str, spec: &DepSpec) -> Result<Option<usize>> {
         let package_root = self.packages[package].root.clone();
+        let declared_in = self.packages[package].manifest.file.clone();
+        let path_key = Place::absolute(located::keys(&["deps", name, "path"])).file(declared_in.as_deref());
         let folder = match (&spec.path, &spec.git) {
-            (Some(path), _) => util::absolute(&package_root, Path::new(&util::expand_env(path)?)),
+            (Some(path), _) => {
+                let expanded = util::expand_env(path).located(path_key.clone().value(path), "invalid-dependency")?;
+                util::absolute(&package_root, Path::new(&expanded))
+            }
             (None, Some(url)) if self.options.list_only => match cached_git_checkout(name, url, spec, self.lock.as_ref().unwrap()) {
                 Some(folder) => folder,
                 None => return Ok(None),
@@ -1061,7 +1166,7 @@ impl Model {
             (None, None) => bail!("dependency `{name}` is not a path or git dependency"),
         };
 
-        self.load_source_folder(name, &folder, spec).map(Some)
+        self.load_source_folder(name, &folder, spec, declared_in.as_deref()).map(Some)
     }
 
     /// vcpkg, pkg-config and prebuilt dependencies become External targets carrying their usage.
@@ -1070,26 +1175,39 @@ impl Model {
         let mut target = Target::new(name, package, Kind::External, &package_root);
         target.default = false;
 
+        // Its errors are about its [deps] entry
+        let file = self.packages[package].manifest.file.clone();
+        let entry = Place::absolute(located::keys(&["deps", name])).file(file.as_deref());
+        let key = |key: &str| entry.clone().join(key);
+        target.origins = Origins::new(file.as_deref(), located::keys(&["deps", name]));
+        target
+            .origins
+            .note(&located::keys(&["deps", name]), &["include"], spec.include.iter().flatten());
+
         // Prebuilt parts and overrides, with environment variables (`$NAME`, `{env:NAME}`; in definitions and flags only
         // the latter)
         let key_context = |key: &str| format!("dependency `{name}`, `{key}`");
-        let expand = |key: &str, values: &Option<Vec<String>>| -> Result<Vec<PathBuf>> {
+        let expand = |name: &str, values: &Option<Vec<String>>| -> Result<Vec<PathBuf>> {
             values
                 .iter()
                 .flatten()
                 .map(|text| {
-                    Ok(util::absolute(
-                        &package_root,
-                        Path::new(&util::expand_env(text).with_context(|| key_context(key))?),
-                    ))
+                    let expanded = util::expand_env(text)
+                        .with_context(|| key_context(name))
+                        .located(key(name).value(text), "invalid-dependency")?;
+                    Ok(util::absolute(&package_root, Path::new(&expanded)))
                 })
                 .collect()
         };
-        let expand_words = |key: &str, values: &Option<Vec<String>>| -> Result<Vec<String>> {
+        let expand_words = |name: &str, values: &Option<Vec<String>>| -> Result<Vec<String>> {
             values
                 .iter()
                 .flatten()
-                .map(|text| util::expand_env_placeholders(text).with_context(|| key_context(key)))
+                .map(|text| {
+                    util::expand_env_placeholders(text)
+                        .with_context(|| key_context(name))
+                        .located(key(name).value(text), "invalid-dependency")
+                })
                 .collect()
         };
         target.public_system_include = expand("include", &spec.include)?;
@@ -1097,7 +1215,11 @@ impl Model {
         target.runtime_files = expand("runtime", &spec.runtime)?;
         let folders = spec.runtime.iter().flatten().zip(&target.runtime_files);
         if let Some((written, _)) = folders.into_iter().find(|(_, file)| file.is_dir() || file.file_name().is_none()) {
-            bail!("dependency `{name}`: runtime = [\"{written}\"] is a folder; `runtime` lists the files copied beside the programs, such as \"bin/{name}.dll\"");
+            bail_at!(
+                key("runtime").value(written),
+                "folder-not-file",
+                "dependency `{name}`: runtime = [\"{written}\"] is a folder; `runtime` lists the files copied beside the programs, such as \"bin/{name}.dll\""
+            );
         }
         target.public_defines = expand_words("defines", &spec.defines)?;
         target.public_flags = expand_words("flags", &spec.flags)?;
@@ -1109,7 +1231,9 @@ impl Model {
             spec.libs.as_deref() == Some(&[name.to_string()]) && spec.vcpkg.is_none() && spec.pkg_config.is_none() && spec.cmake.is_none();
         let system = system_form.then(|| crate::vcpkg_tree::system_dependency(name, &build)).flatten();
         if name == "vulkan" && system.as_ref().is_some_and(|usage| usage.libs.is_empty()) {
-            bail!(
+            bail_at!(
+                entry.clone(),
+                "invalid-dependency",
                 "dependency `vulkan`: the Vulkan SDK is not installed (VULKAN_SDK is not set); install it from https://vulkan.lunarg.com \
                  (its installer sets VULKAN_SDK), or describe it with `include` and `libs`"
             );
@@ -1125,7 +1249,9 @@ impl Model {
         } else if name == "cuda" && system_form {
             // The CUDA toolkit's headers and libraries, its static runtime and the driver's (CMake's CUDA::cudart_static
             // and CUDA::cuda_driver)
-            let cuda = crate::cuda::Cuda::find(&self.toolchain).context("dependency `cuda`")?;
+            let cuda = crate::cuda::Cuda::find(&self.toolchain)
+                .context("dependency `cuda`")
+                .located(entry.clone(), "invalid-dependency")?;
             target.public_system_include.push(cuda.include_dir.clone());
             target.lib_dirs.push(cuda.lib_dir.clone());
             target.libs.extend(cuda.runtime_libs(&self.toolchain));
@@ -1136,11 +1262,15 @@ impl Model {
             }
         } else if spec.vcpkg.is_none() {
             for lib in spec.libs.iter().flatten() {
-                let expanded = util::expand_env(lib).with_context(|| key_context("libs"))?;
+                let expanded = util::expand_env(lib)
+                    .with_context(|| key_context("libs"))
+                    .located(key("libs").value(lib), "invalid-dependency")?;
                 let is_path = expanded.contains('/') || expanded.contains('\\') || Path::new(&expanded).extension().is_some();
                 let path = util::absolute(&package_root, Path::new(&expanded));
                 if is_path && (path.is_dir() || path.file_name().is_none()) {
-                    bail!(
+                    bail_at!(
+                        key("libs").value(lib),
+                        "folder-not-file",
                         "dependency `{name}`: libs = [\"{lib}\"] is a folder; `libs` names libraries (\"lib/{name}.lib\", or \"{name}\" found in `lib-dirs`), and `lib-dirs` the folders"
                     );
                 }
@@ -1156,7 +1286,7 @@ impl Model {
 
         // pkg-config: ask it now
         if let Some(module) = &spec.pkg_config {
-            apply_pkg_config(&mut target, module, &self.toolchain.platform)?;
+            apply_pkg_config(&mut target, module, &self.toolchain.platform).located(entry.clone(), "pkg-config")?;
         }
 
         // An installed CMake package: found now, where find_package finds it
@@ -1170,7 +1300,8 @@ impl Model {
                 targets: spec.targets.as_deref(),
                 prefixes: &prefixes,
             };
-            let found = crate::cmake_package::find(&request, &self.toolchain, &self.profile)?;
+            let found =
+                crate::cmake_package::find(&request, &self.toolchain, &self.profile).located(key("cmake").value(package), "invalid-dependency")?;
             let usage = found.usage;
             target.public_system_include.extend(usage.includes);
             target.public_defines.extend(usage.defines);
@@ -1233,9 +1364,14 @@ impl Model {
     }
 
     /// A source package from a path or git checkout: its anvil.toml, or a library made from its layout.
-    fn load_source_folder(&mut self, name: &str, folder: &Path, spec: &DepSpec) -> Result<usize> {
+    fn load_source_folder(&mut self, name: &str, folder: &Path, spec: &DepSpec, declared_in: Option<&Path>) -> Result<usize> {
+        let entry = Place::absolute(located::keys(&["deps", name])).file(declared_in);
         if !folder.is_dir() {
-            bail!("dependency `{name}`: folder {} does not exist", slash(folder));
+            let place = match &spec.path {
+                Some(path) => entry.join("path").value(path),
+                None => entry,
+            };
+            bail_at!(place, "missing-path", "dependency `{name}`: folder {} does not exist", slash(folder));
         }
 
         // Already loaded (shared by several packages, or a workspace member)
@@ -1251,7 +1387,9 @@ impl Model {
                 ("defines", spec.defines.is_some()),
             ];
             if let Some((key, _)) = overrides.iter().find(|(_, given)| *given) {
-                bail!(
+                bail_at!(
+                    entry.join(key),
+                    "invalid-dependency",
                     "dependency `{name}`: `{key}` describes a folder without an anvil.toml, and {} has one; \
                      set it in that package's targets instead",
                     slash(folder)
@@ -1271,9 +1409,13 @@ impl Model {
                 true => "give its [deps] entry `include` and `sources` keys, or `anvil convert` a fork of it and depend on that".to_string(),
                 false => format!("`anvil convert {shown}` writes an {MANIFEST_NAME} that follows them"),
             };
-            crate::ui::warn(&format!(
-                "dependency `{name}`: {shown} has a CMakeLists.txt but no {MANIFEST_NAME}, so it builds by Anvil's layout (include/, src/), not by its CMake rules; {advice}"
-            ));
+            crate::ui::warn_at(
+                entry.clone(),
+                "cmake-only-path-dep",
+                &format!(
+                    "dependency `{name}`: {shown} has a CMakeLists.txt but no {MANIFEST_NAME}, so it builds by Anvil's layout (include/, src/), not by its CMake rules; {advice}"
+                ),
+            );
         }
         let synthetic = Manifest {
             project: Some(manifest::ProjectSpec {
@@ -1310,11 +1452,11 @@ impl Model {
             .collect();
 
         if let Some(wanted) = wanted {
-            return candidates
-                .iter()
-                .copied()
-                .find(|index| self.targets[*index].name == wanted)
-                .with_context(|| format!("package `{package_name}` has no target `{wanted}`"));
+            let found = candidates.iter().copied().find(|index| self.targets[*index].name == wanted);
+            let Some(found) = found else {
+                bail_at!(Place::default(), "unknown-target", "package `{package_name}` has no target `{wanted}`");
+            };
+            return Ok(found);
         }
 
         let libraries: Vec<usize> = candidates
@@ -1328,8 +1470,8 @@ impl Model {
 
         match libraries.as_slice() {
             [only] => Ok(*only),
-            [] => bail!("package `{package_name}` has no library target to depend on"),
-            _ => bail!("package `{package_name}` has several libraries; pick one with `target = \"...\"` in its [deps] entry or depend on \"{package_name}/<target>\""),
+            [] => bail_at!(Place::default(), "ambiguous-package-target", "package `{package_name}` has no library target to depend on"),
+            _ => bail_at!(Place::default(), "ambiguous-package-target", "package `{package_name}` has several libraries; pick one with `target = \"...\"` in its [deps] entry or depend on \"{package_name}/<target>\""),
         }
     }
 
@@ -1343,12 +1485,28 @@ impl Model {
                 2 => return Ok(()),
                 1 => {
                     let start = path.iter().position(|entry| *entry == index).unwrap_or(0);
-                    let cycle: Vec<&str> = path[start..]
-                        .iter()
-                        .chain(std::iter::once(&index))
-                        .map(|entry| model.targets[*entry].name.as_str())
-                        .collect();
-                    bail!("dependency cycle: {}", cycle.join(" -> "));
+                    let members: Vec<usize> = path[start..].iter().copied().chain(std::iter::once(index)).collect();
+                    let cycle: Vec<&str> = members.iter().map(|entry| model.targets[*entry].name.as_str()).collect();
+
+                    // At the first target's naming of the second, the other steps beside it
+                    let naming = |pair: &[usize]| {
+                        let user = &model.targets[pair[0]];
+                        let used = &model.targets[pair[1]].name;
+                        user.origins
+                            .find(DEP_KEYS, |written| written == used || written.ends_with(&format!("/{used}")))
+                    };
+                    let mut error = Located::new(
+                        naming(&members[..2]).unwrap_or_default(),
+                        "dependency-cycle",
+                        format!("dependency cycle: {}", cycle.join(" -> ")),
+                    );
+                    for pair in members.windows(2).skip(1) {
+                        if let Some(place) = naming(pair) {
+                            let label = format!("`{}` depends on `{}`", model.targets[pair[0]].name, model.targets[pair[1]].name);
+                            error = error.related(place, label);
+                        }
+                    }
+                    return Err(error.into());
                 }
                 _ => {}
             }
@@ -1385,7 +1543,9 @@ impl Model {
             let compiles = matches!(target.kind, Kind::Exe | Kind::Test | Kind::Static | Kind::Shared | Kind::Object);
             let takes_objects = target.deps.iter().any(|(dependency, _)| self.targets[*dependency].kind == Kind::Object);
             if compiles && target.sources.is_empty() && target.runs.is_empty() && !takes_objects {
-                bail!(
+                bail_at!(
+                    target.origins.key(&["sources"]),
+                    "nothing-to-compile",
                     "target `{}` has nothing to compile for this platform: its sources are all under `when` blocks that do not \
                      hold, or its patterns match no files. Give it sources here, or an `if` so it exists only where it has some",
                     self.qualified_name(index)
@@ -1419,12 +1579,15 @@ impl Model {
                 continue;
             };
             if let Some((other, _)) = files.insert(util::path_key(&file), (index, file.clone())) {
-                bail!(
+                let message = format!(
                     "targets `{}` and `{}` would both write {}; give one an `output-name` or an `output-dir`",
                     self.qualified_name(other),
                     self.qualified_name(index),
                     slash(&file)
                 );
+                let error = Located::new(self.output_place(index), "output-conflict", message)
+                    .related(self.output_place(other), format!("`{}`", self.qualified_name(other)));
+                return Err(error.into());
             }
         }
 
@@ -1433,12 +1596,15 @@ impl Model {
         for pair in folders.windows(2) {
             let ((first, folder, what, first_index), (second, _, _, second_index)) = (&pair[0], &pair[1]);
             if second.starts_with(first.as_str()) {
-                bail!(
+                let message = format!(
                     "targets `{}` and `{}` would share the {what} {}; rename one of them",
                     self.qualified_name(*first_index),
                     self.qualified_name(*second_index),
                     slash(folder)
                 );
+                let error = Located::new(self.table_place(*second_index), "output-conflict", message)
+                    .related(self.table_place(*first_index), format!("`{}`", self.qualified_name(*first_index)));
+                return Err(error.into());
             }
         }
 
@@ -1447,7 +1613,9 @@ impl Model {
             let inside = format!("{key}/");
             let after = folders.partition_point(|(folder_key, ..)| folder_key.as_str() < inside.as_str());
             if let Some((_, folder, what, other)) = folders.get(after).filter(|(folder_key, ..)| folder_key.starts_with(&inside)) {
-                bail!(
+                bail_at!(
+                    self.output_place(*index),
+                    "output-conflict",
                     "target `{}` would write {}, which the {what} of `{}` ({}) needs as a folder; rename one of them",
                     self.qualified_name(*index),
                     slash(file),
@@ -1458,6 +1626,21 @@ impl Model {
         }
 
         Ok(())
+    }
+
+    /// A target's own table, in its package's manifest.
+    fn table_place(&self, index: usize) -> Place {
+        let target = &self.targets[index];
+        Place::keys(&["target", &target.name]).file(target.origins.file())
+    }
+
+    /// Where a target names its file: its `output-name` when it sets one, else its table.
+    fn output_place(&self, index: usize) -> Place {
+        let target = &self.targets[index];
+        target
+            .origins
+            .find(&[&["output-name"]], |written| written == target.output_name)
+            .unwrap_or_else(|| self.table_place(index))
     }
 
     /// `[deps]` and `[dev-deps]` entries nothing of a package with [target] tables names (its targets, presets,
@@ -1489,10 +1672,14 @@ impl Model {
 
             for (table, entries, user) in [("deps", &manifest.deps, "target"), ("dev-deps", &manifest.dev_deps, "test")] {
                 for name in entries.keys().filter(|name| !used(&words, name)) {
-                    crate::ui::warn(&format!(
-                        "{}: `[{table}] {name}`: no {user} uses it; add it to a {user}'s `deps`, or remove it",
-                        slash(&manifest_file)
-                    ));
+                    crate::ui::warn_at(
+                        Place::keys(&[table, name]).file(Some(&manifest_file)),
+                        "unused-dep",
+                        &format!(
+                            "{}: `[{table}] {name}`: no {user} uses it; add it to a {user}'s `deps`, or remove it",
+                            slash(&manifest_file)
+                        ),
+                    );
                 }
             }
         }
@@ -1502,7 +1689,7 @@ impl Model {
     /// silently. Folders under the output folder ({gen}, {vcpkg}) are made by the build, and so may those of a
     /// package with build steps.
     fn warn_missing_include_folders(&self) {
-        let mut missing: indexmap::IndexMap<String, (PathBuf, Vec<String>)> = indexmap::IndexMap::new();
+        let mut missing: indexmap::IndexMap<String, (PathBuf, Vec<String>, Vec<usize>)> = indexmap::IndexMap::new();
         let with_steps: HashSet<usize> = self
             .targets
             .iter()
@@ -1525,17 +1712,38 @@ impl Model {
                 if folder.exists() || util::strip_prefix_ci(folder, &self.out_root).is_some() {
                     continue;
                 }
-                let users = &mut missing.entry(util::path_key(folder)).or_insert_with(|| (folder.clone(), Vec::new())).1;
-                users.push(format!("`{}`", self.qualified_name(index)));
+                let entry = missing
+                    .entry(util::path_key(folder))
+                    .or_insert_with(|| (folder.clone(), Vec::new(), Vec::new()));
+                entry.1.push(format!("`{}`", self.qualified_name(index)));
+                entry.2.push(index);
             }
         }
 
-        for (folder, users) in missing.values() {
-            crate::ui::warn(&format!(
-                "include folder {} does not exist (included by {})",
-                util::rel(folder, &self.root),
-                users.join(", ")
-            ));
+        // Each at the first user's key that names it
+        const INCLUDE_KEYS: &[&[&str]] = &[
+            &["include"],
+            &["public", "include"],
+            &["system-include"],
+            &["public", "system-include"],
+            &["interface", "include"],
+        ];
+        for (folder, users, indices) in missing.values() {
+            let target = &self.targets[indices[0]];
+            let names_folder = |written: &str| util::path_key(&util::absolute(&target.dir, Path::new(written))) == util::path_key(folder);
+            let place = target
+                .origins
+                .find(INCLUDE_KEYS, names_folder)
+                .unwrap_or_else(|| target.origins.key(&["include"]));
+            crate::ui::warn_at(
+                place,
+                "missing-include-folder",
+                &format!(
+                    "include folder {} does not exist (included by {})",
+                    util::rel(folder, &self.root),
+                    users.join(", ")
+                ),
+            );
         }
     }
 
@@ -1553,7 +1761,9 @@ impl Model {
                     continue;
                 };
                 if util::path_key(other_file) != util::path_key(file) {
-                    bail!(
+                    bail_at!(
+                        target.origins.key(&["data"]),
+                        "output-conflict",
                         "targets `{}` and `{}` both copy a data file to {}: {} and {}; rename one, or give one target an `output-dir`",
                         self.qualified_name(other),
                         self.qualified_name(index),
@@ -1729,9 +1939,11 @@ impl Model {
 
         let packages = self.packages.iter().enumerate().filter(|(index, package)| package.member || used[*index]);
         for (index, package) in packages {
-            for spec in &package.manifest.write {
+            for (item, spec) in package.manifest.write.iter().enumerate() {
+                let table = Place::absolute(vec![Part::Key("write".into()), Part::Index(item)]).file(package.manifest.file.as_deref());
                 if let Some(condition) = &spec.cond {
-                    if !self.condition.test(condition).with_context(|| format!("[[write]] {}", spec.path))? {
+                    let scope = Scope::place(table.clone()).text(format!("[[write]] {}", spec.path));
+                    if !self.condition.test(condition).at(Scope::key("if")).at(scope)? {
                         continue;
                     }
                 }
@@ -1746,7 +1958,9 @@ impl Model {
                 }
 
                 if util::strip_prefix_ci(&path, &git_cache).is_some() {
-                    bail!(
+                    bail_at!(
+                        table.join("path").value(&spec.path),
+                        "invalid-write",
                         "{}: [[write]] path = \"{}\" would write {}, inside a git checkout Anvil's cache shares between projects; write under the build folder instead (path = \"{{out}}/...\")",
                         package_context(index, &package.name, &package.root),
                         spec.path,
@@ -1755,7 +1969,9 @@ impl Model {
                 }
                 if let Some((other, other_text)) = written.insert(util::path_key(&path), (index, text.clone())) {
                     if other_text != text {
-                        bail!(
+                        bail_at!(
+                            table.join("path").value(&spec.path),
+                            "invalid-write",
                             "{} and {} both [[write]] {}, with different text; give one of them another path",
                             package_context(other, &self.packages[other].name, &self.packages[other].root),
                             package_context(index, &package.name, &package.root),
@@ -1796,6 +2012,7 @@ impl Model {
             origins.push(TestOrigin {
                 package: target.package,
                 place: format!("[target.{}] in {}", target.name, util::rel(&package.root.join(MANIFEST_NAME), &self.root)),
+                table: Place::keys(&["target", &target.name]).file(package.manifest.file.as_deref()),
             });
         }
         for package in self.packages.iter().filter(|package| package.member) {
@@ -1828,9 +2045,10 @@ impl Model {
             };
 
             for (spec, file) in &specs {
-                let context = || format!("in [[test]] `{}`", spec.name);
+                let table = Place::absolute(vec![Part::Key("test".into()), Part::Index(spec.table)]).file(Some(file));
+                let context = || Scope::place(table.clone()).text(format!("in [[test]] `{}`", spec.name));
                 if let Some(condition_text) = &spec.cond {
-                    if !self.condition.test(condition_text).with_context(context)? {
+                    if !self.condition.test(condition_text).at(Scope::key("if")).at(context())? {
                         switched_off.push(spec.name.clone());
                         continue;
                     }
@@ -1839,24 +2057,52 @@ impl Model {
                 let workdir = match &spec.workdir {
                     Some(workdir) => {
                         let filled = fill_test_text(workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name);
-                        util::absolute(&package.root, Path::new(&util::expand_env(&filled).with_context(context)?))
+                        let expanded = util::expand_env(&filled).located(Place::key("workdir").value(workdir), "invalid-value");
+                        util::absolute(&package.root, Path::new(&expanded.at(context())?))
                     }
                     None => package.root.clone(),
                 };
-                let mut test = test_case(spec, workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name).with_context(context)?;
+                let mut test = test_case(spec, workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name).at(context())?;
                 for word in &mut test.command {
                     *word = qualify_references(word, &package.name, &own);
                 }
+                self.check_test_references(&test, spec).at(context())?;
                 self.tests.push(test);
                 origins.push(TestOrigin {
                     package: package_index,
                     place: util::rel(file, &self.root),
+                    table,
                 });
             }
         }
 
         let package_names: Vec<&str> = self.packages.iter().map(|package| package.name.as_str()).collect();
         check_tests(&mut self.tests, &origins, &package_names, &switched_off)
+    }
+
+    /// `{target:X}` in a test's command names a target. One of a package not loaded may be a git dependency's that
+    /// listing does not fetch.
+    fn check_test_references(&self, test: &TestCase, spec: &TestSpec) -> Result<()> {
+        for name in crate::plan::target_references(&test.command) {
+            let loaded_package = name
+                .split_once('/')
+                .is_none_or(|(package, _)| self.packages.iter().any(|candidate| candidate.name == package));
+            if !loaded_package {
+                continue;
+            }
+            if let Err(error) = self.find_target(&name) {
+                let written = spec
+                    .command
+                    .to_command()
+                    .into_iter()
+                    .find(|word| word.contains("{target:"))
+                    .unwrap_or_default();
+                let place = Place::key("command").value(written);
+                return Err(Located::new(place, "unknown-target", format!("{{target:{name}}}: {error:#}")).into());
+            }
+        }
+
+        Ok(())
     }
 
     /// The test a `kind = "test"` target is: its program with its `args`, `env` and `workdir`.
@@ -1886,7 +2132,11 @@ impl Model {
 
         // Its workdir was resolved with its other paths, relative to its folder
         let workdir = target.workdir.clone().unwrap_or_else(|| package.root.clone());
-        test_case(&spec, workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name).with_context(|| format!("in [target.{}]", target.name))
+        let scope = Scope::target(&target.name);
+        let file = Scope::place(Place::default().file(package.manifest.file.as_deref()));
+        test_case(&spec, workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name)
+            .at(scope)
+            .at(file)
     }
 }
 
@@ -1899,6 +2149,7 @@ pub fn output_root(root: &Path, manifest: &Manifest) -> Result<PathBuf> {
     let out_root = util::absolute(root, Path::new(out));
     let key = format!("{}: [project] out = \"{out}\"", slash(&root.join(MANIFEST_NAME)));
     let instead = "name a folder of its own for the build output, such as \"out\"";
+    let place = || Place::keys(&["project", "out"]).value(out).file(Some(&root.join(MANIFEST_NAME)));
 
     // The project's folder, or one holding it
     if util::strip_prefix_ci(root, &out_root).is_some() {
@@ -1907,12 +2158,21 @@ pub fn output_root(root: &Path, manifest: &Manifest) -> Result<PathBuf> {
         } else {
             "a folder holding the project"
         };
-        bail!("{key} is {which}, which `anvil clean --all` would delete; {instead}");
+        bail_at!(
+            place(),
+            "invalid-output-folder",
+            "{key} is {which}, which `anvil clean --all` would delete; {instead}"
+        );
     }
 
     // A package's folder (a folder holding anything else, `anvil clean --all` refuses to delete)
     if out_root.join(MANIFEST_NAME).is_file() {
-        bail!("{key} holds a package ({}); {instead}", slash(&out_root.join(MANIFEST_NAME)));
+        bail_at!(
+            place(),
+            "invalid-output-folder",
+            "{key} holds a package ({}); {instead}",
+            slash(&out_root.join(MANIFEST_NAME))
+        );
     }
 
     Ok(out_root)
@@ -1940,10 +2200,14 @@ pub fn locate(start: &Path) -> Result<(PathBuf, Manifest)> {
         let manifest = match manifest::load(&candidate) {
             Ok(manifest) => manifest,
             Err(error) => {
-                crate::ui::warn(&format!(
-                    "not checking whether {} is a workspace holding this package, as it does not load: {error:#}",
-                    slash(&candidate)
-                ));
+                crate::ui::warn_at(
+                    Place::default().file(Some(&candidate)),
+                    "workspace-member",
+                    &format!(
+                        "not checking whether {} is a workspace holding this package, as it does not load: {error:#}",
+                        slash(&candidate)
+                    ),
+                );
                 continue;
             }
         };
@@ -1954,7 +2218,11 @@ pub fn locate(start: &Path) -> Result<(PathBuf, Manifest)> {
         let members = match workspace_members(ancestor, &manifest) {
             Ok(members) => members,
             Err(_) if !could_be_member(ancestor, &manifest, &nearest) => continue,
-            Err(error) => return Err(error.context(format!("in the workspace {}", slash(&candidate)))),
+            Err(error) => {
+                return Err(Scope::file(&candidate)
+                    .text(format!("in the workspace {}", slash(&candidate)))
+                    .wrap(error))
+            }
         };
         if members.iter().any(|member| util::path_key(member) == util::path_key(&nearest)) {
             return Ok((ancestor.to_path_buf(), manifest));
@@ -2036,7 +2304,11 @@ pub fn check_version(version: &str) -> Result<()> {
         return Ok(());
     }
 
-    bail!("[project] version = \"{version}\": write a version without spaces, `/`, `\\`, `\"` or `;` (\"2.1.0\", \"1.4.0-beta.2\")");
+    bail_at!(
+        Place::keys(&["project", "version"]).value(version),
+        "invalid-version",
+        "[project] version = \"{version}\": write a version without spaces, `/`, `\\`, `\"` or `;` (\"2.1.0\", \"1.4.0-beta.2\")"
+    );
 }
 
 /// Where a package's errors come from: its anvil.toml, and its name outside the root package.
@@ -2061,7 +2333,9 @@ fn check_member_project(root: &Path, member: &Path, manifest: &Manifest) -> Resu
     ];
 
     match root_only.iter().find(|(_, set)| *set) {
-        Some((key, _)) => bail!(
+        Some((key, _)) => bail_at!(
+            Place::keys(&["project", key]).file(Some(&member.join(MANIFEST_NAME))),
+            "root-only-key",
             "{}: [project] {key} is read only from the workspace root, for every member: set it in {} instead",
             slash(&member.join(MANIFEST_NAME)),
             slash(&root.join(MANIFEST_NAME))
@@ -2079,11 +2353,13 @@ pub fn workspace_members(root: &Path, manifest: &Manifest) -> Result<Vec<PathBuf
     let mut members = Vec::new();
 
     for pattern in &workspace.members {
+        let member = || Place::keys(&["workspace", "members"]).value(pattern);
+
         // A plain folder
         let (base, glob) = targets::split_pattern(root, pattern);
         let Some(glob) = glob else {
             if !base.join(MANIFEST_NAME).is_file() {
-                bail!("workspace member \"{pattern}\" has no {MANIFEST_NAME}");
+                bail_at!(member(), "workspace-member", "workspace member \"{pattern}\" has no {MANIFEST_NAME}");
             }
             members.push(base);
             continue;
@@ -2091,7 +2367,8 @@ pub fn workspace_members(root: &Path, manifest: &Manifest) -> Result<Vec<PathBuf
 
         // A glob over folders: walk from its literal part only as deep as it reaches
         let matcher = targets::compile_glob(&glob)
-            .with_context(|| format!("workspace member \"{pattern}\": bad pattern"))?
+            .with_context(|| format!("workspace member \"{pattern}\": bad pattern"))
+            .located(member(), "workspace-member")?
             .compile_matcher();
         let max_depth = if glob.contains("**") { usize::MAX } else { glob.split('/').count() };
         let walker = walkdir::WalkDir::new(&base)
@@ -2109,7 +2386,11 @@ pub fn workspace_members(root: &Path, manifest: &Manifest) -> Result<Vec<PathBuf
             }
         }
         if !found {
-            bail!("workspace member \"{pattern}\" matches no folder with an {MANIFEST_NAME}");
+            bail_at!(
+                member(),
+                "workspace-member",
+                "workspace member \"{pattern}\" matches no folder with an {MANIFEST_NAME}"
+            );
         }
     }
 
@@ -2127,7 +2408,8 @@ fn resolve_options<'a>(
 ) -> Result<indexmap::IndexMap<String, bool>> {
     let mut options = indexmap::IndexMap::new();
     for (root, declared) in package_options {
-        let parsed = manifest::parse_options(declared).with_context(|| slash(&root.join(MANIFEST_NAME)))?;
+        let file = root.join(MANIFEST_NAME);
+        let parsed = manifest::parse_options(declared).at(Scope::file(&file).text(slash(&file)))?;
         for (name, default) in parsed {
             options.entry(name).or_insert(default);
         }
@@ -2144,14 +2426,26 @@ fn resolve_options<'a>(
 
 /// Every [deps] and [dev-deps] entry, used or not: its form, its keys, its condition's words.
 fn check_deps(manifest: &Manifest, condition: &CondContext) -> Result<()> {
-    for (name, value) in manifest.deps.iter().chain(&manifest.dev_deps) {
-        let spec = manifest::parse_dep(name, value)?;
-        if let Some(text) = &spec.cond {
-            condition.check(text).with_context(|| format!("dependency `{name}`"))?;
+    let mut errors = Errors::new(manifest.file.as_deref());
+
+    for (table, entries) in [("deps", &manifest.deps), ("dev-deps", &manifest.dev_deps)] {
+        for (name, value) in entries {
+            let check = || -> Result<()> {
+                let spec = manifest::parse_dep(name, value)?;
+                if let Some(text) = &spec.cond {
+                    let entry = Scope::place(Place::absolute(located::keys(&[table, name]))).text(format!("dependency `{name}`"));
+                    condition.check(text).at(Scope::key("if")).at(entry)?;
+                }
+                Ok(())
+            };
+            errors.add(check());
+            if errors.stop() {
+                return errors.finish();
+            }
         }
     }
 
-    Ok(())
+    errors.finish()
 }
 
 /// The names in a [deps] or [dev-deps] table whose `if` holds (conventional targets use all of them).
@@ -2452,13 +2746,16 @@ fn check_shared_convention(targets: &[Target]) -> Result<()> {
             .iter()
             .find(|second| util::path_key(&second.dir) == util::path_key(&first.dir));
         if let Some(second) = same_folder {
-            bail!(
+            let message = format!(
                 "targets `{}` and `{}` both take the sources in {} by convention, so both would compile them; \
                  give one of them `sources = [...]` (or `sources = []` for none)",
                 first.name,
                 second.name,
                 slash(&first.dir)
             );
+            let table = |target: &Target| Place::keys(&["target", &target.name]).file(target.origins.file());
+            let error = Located::new(table(second), "shared-sources", message).related(table(first), format!("`{}`", first.name));
+            return Err(error.into());
         }
     }
 
@@ -2554,7 +2851,10 @@ fn tests_files_uncached(root: &Path, out_root: &Path) -> Vec<PathBuf> {
 /// One test from its keys, as [[test]] tables and test targets both give them, with its workdir resolved.
 fn test_case(spec: &TestSpec, workdir: PathBuf, package: &Package, out_dir: &Path, vcpkg_dir: &Path, profile: &str) -> Result<TestCase> {
     let fill = |text: &String| fill_test_text(text, package, out_dir, vcpkg_dir, profile);
-    let pattern = |key: &str, pattern: &Option<String>| compile_test_regex(key, &pattern.as_ref().map(fill));
+    let pattern = |key: &str, pattern: &Option<String>| {
+        let written = pattern.clone().unwrap_or_default();
+        compile_test_regex(key, &pattern.as_ref().map(fill)).located(Place::key(key).value(written), "invalid-regex")
+    };
 
     Ok(TestCase {
         name: spec.name.clone(),
@@ -2575,10 +2875,29 @@ fn test_case(spec: &TestSpec, workdir: PathBuf, package: &Package, out_dir: &Pat
     })
 }
 
-/// Where a test was declared: its package, and the file (or target) that declares it.
+/// Where a test was declared: its package, the file (or target) that declares it, and its table there.
 struct TestOrigin {
     package: usize,
     place: String,
+    table: Place,
+}
+
+impl TestOrigin {
+    /// Its table's key, with the value the message is about.
+    fn key(&self, key: &str, value: &str) -> Place {
+        match self.table.path.first() {
+            Some(Part::Key(first)) if first == "test" => self.table.clone().join(key).value(value),
+            _ => self.table.clone(),
+        }
+    }
+
+    /// The other of two duplicates, beside one at `other`.
+    fn label(&self, name: &str, other: &TestOrigin) -> String {
+        match (&self.table.file, &other.table.file) {
+            (Some(file), Some(other_file)) if file != other_file => format!("the other `{name}`: {}", slash(file)),
+            _ => format!("the other `{name}`"),
+        }
+    }
 }
 
 /// Test names are unique in a package, and the same name in two packages becomes `<package>/<name>` outside the
@@ -2592,16 +2911,19 @@ fn check_tests(tests: &mut [TestCase], origins: &[TestOrigin], package_names: &[
             continue;
         };
         let (first_place, second_place) = (&origins[first].place, &origins[index].place);
-        if first_place == second_place {
-            bail!(
+        let message = match first_place == second_place {
+            true => format!(
                 "two tests are named `{}` in {first_place}; test names must be unique in a package",
                 test.name
-            );
-        }
-        bail!(
-            "two tests are named `{}`, in {first_place} and in {second_place}; test names must be unique in a package: rename one",
-            test.name
-        );
+            ),
+            false => format!(
+                "two tests are named `{}`, in {first_place} and in {second_place}; test names must be unique in a package: rename one",
+                test.name
+            ),
+        };
+        let error = Located::new(origins[index].key("name", &test.name), "duplicate-test", message)
+            .related(origins[first].key("name", &test.name), origins[first].label(&test.name, &origins[index]));
+        return Err(error.into());
     }
 
     // The same name in several packages: those outside the root package get their package's name in front
@@ -2624,11 +2946,16 @@ fn check_tests(tests: &mut [TestCase], origins: &[TestOrigin], package_names: &[
     let mut by_final_name: HashMap<&str, usize> = HashMap::new();
     for (index, name) in final_names.iter().enumerate() {
         if let Some(first) = by_final_name.insert(name.as_str(), index) {
-            bail!(
+            let message = format!(
                 "two tests are named `{name}`, in {} and in {}; rename one",
-                origins[first].place,
-                origins[index].place
+                origins[first].place, origins[index].place
             );
+            let written = &tests[index].name;
+            let error = Located::new(origins[index].key("name", written), "duplicate-test", message).related(
+                origins[first].key("name", &tests[first].name),
+                origins[first].label(name, &origins[index]),
+            );
+            return Err(error.into());
         }
     }
 
@@ -2643,7 +2970,12 @@ fn check_tests(tests: &mut [TestCase], origins: &[TestOrigin], package_names: &[
                 None if switched_off.contains(name) => {}
                 None => {
                     let hint = util::did_you_mean(name, final_names.iter().map(String::as_str));
-                    bail!("test `{}`: after = [\"{name}\"] names no test{hint}", final_names[index]);
+                    bail_at!(
+                        origins[index].key("after", name),
+                        "unknown-test",
+                        "test `{}`: after = [\"{name}\"] names no test{hint}",
+                        final_names[index]
+                    );
                 }
             }
         }
@@ -2655,7 +2987,15 @@ fn check_tests(tests: &mut [TestCase], origins: &[TestOrigin], package_names: &[
     }
 
     if let Some(circle) = find_after_circle(tests) {
-        bail!("tests wait for each other in a circle: {} (each waits for the next)", circle.join(" -> "));
+        // At the first test's `after` naming the second
+        let first = tests.iter().position(|test| test.name == circle[0]).unwrap_or_default();
+        let second = circle[1].rsplit('/').next().unwrap_or(&circle[1]);
+        bail_at!(
+            origins[first].key("after", second),
+            "test-cycle",
+            "tests wait for each other in a circle: {} (each waits for the next)",
+            circle.join(" -> ")
+        );
     }
 
     Ok(())
@@ -2711,9 +3051,11 @@ pub fn fill_test_text(text: &str, package: &Package, out_dir: &Path, vcpkg_dir: 
 fn compile_test_regexes(key: &str, patterns: &[String], fill: &dyn Fn(&String) -> String) -> Result<Vec<regex::Regex>> {
     patterns
         .iter()
-        .map(|pattern| {
-            let pattern = fill(pattern);
-            regex::Regex::new(&pattern).with_context(|| format!("{key}: \"{pattern}\" is not a valid regex"))
+        .map(|written| {
+            let pattern = fill(written);
+            regex::Regex::new(&pattern)
+                .with_context(|| format!("{key}: \"{pattern}\" is not a valid regex"))
+                .located(Place::key(key).value(written), "invalid-regex")
         })
         .collect()
 }

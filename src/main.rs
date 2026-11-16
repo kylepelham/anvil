@@ -17,6 +17,7 @@ mod ide;
 mod install;
 mod job;
 mod lint;
+mod located;
 mod lockfile;
 mod lsp;
 mod manifest;

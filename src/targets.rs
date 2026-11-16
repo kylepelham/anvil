@@ -1,8 +1,10 @@
 //! Resolves one target: `[defaults]`, the target's table and its `when` blocks merged; layout conventions filled in;
 //! globs expanded; paths made absolute.
 
+use crate::bail_at;
 use crate::cond::CondContext;
 use crate::flags::{normalize_standard, Arch, Gui, Language, Warnings};
+use crate::located::{self, At, Errors, Located, Origins, Part, Place, Scope};
 use crate::manifest::{self, ExportHeaderSpec, FileRule, Manifest, RunSpec, StepSpec, TargetSpec};
 use crate::profile::Opt;
 use crate::util::{self, slash};
@@ -92,6 +94,9 @@ pub struct Target {
     pub whole_archive_names: Vec<String>,
     pub whole_archive: Vec<usize>,
 
+    /// Which table of its manifest set each of its values, for errors about them.
+    pub origins: Origins,
+
     // Code generation settings
     pub std: String,
     pub c_std: String,
@@ -175,6 +180,8 @@ pub struct PackageScope<'a> {
     pub cxx: &'a Path,
     pub cc: &'a Path,
     pub condition: &'a CondContext,
+    /// The package's manifest (none for a package made from a folder's layout).
+    pub file: Option<&'a Path>,
 }
 
 /// Every setting a target table can hold, accumulated over `[defaults]`, the table and its `when` blocks.
@@ -258,6 +265,9 @@ struct Accumulated {
     expect: Vec<String>,
     reject: Vec<String>,
     exit_code: Option<i32>,
+
+    /// Which table set each value.
+    origins: Origins,
 }
 
 /// Which table settings come from: some keys belong only to a target, `kind` also to its when blocks.
@@ -290,7 +300,11 @@ impl Kind {
             "object" => Kind::Object,
             "headers" | "header-only" | "interface" => Kind::Headers,
             "custom" => Kind::Custom,
-            other => bail!("kind = \"{other}\": expected exe, lib, shared, object, headers, test or custom"),
+            other => bail_at!(
+                Place::key("kind").value(other),
+                "invalid-value",
+                "kind = \"{other}\": expected exe, lib, shared, object, headers, test or custom"
+            ),
         })
     }
 
@@ -360,6 +374,7 @@ impl Target {
             needs: Vec::new(),
             whole_archive_names: Vec::new(),
             whole_archive: Vec::new(),
+            origins: Origins::default(),
             std: "c++20".into(),
             c_std: "gnu17".into(),
             warnings: Warnings::Default,
@@ -408,44 +423,65 @@ impl Target {
         presets: &IndexMap<String, TargetSpec>,
         scope: &PackageScope,
     ) -> Result<Option<Target>> {
-        let context = |error: anyhow::Error| error.context(format!("in [target.{name}]"));
+        let context = || Scope::target(name);
+        let table = located::keys(&["target", name]);
 
         if let Some(condition) = &spec.cond {
-            if !scope.condition.test(condition).map_err(context)? {
+            if !scope.condition.test(condition).at(Scope::key("if")).at(context())? {
                 return Ok(None);
             }
         }
 
         let dir = match &spec.dir {
-            Some(dir) => util::absolute(scope.root, Path::new(&expand_path_text(dir, scope, name)?)),
+            Some(dir) => {
+                let expanded = expand_path_text(dir, scope, name).located(Place::key("dir").value(dir), "invalid-value");
+                util::absolute(scope.root, Path::new(&expanded.at(Scope::keys(&["target", name]))?))
+            }
             None => scope.root.to_path_buf(),
         };
         if !dir.is_dir() {
-            return Err(context(anyhow::anyhow!("dir = \"{}\" does not exist", spec.dir.as_deref().unwrap_or(""))));
+            let written = spec.dir.as_deref().unwrap_or("");
+            let error = Located::new(
+                Place::key("dir").value(written),
+                "missing-path",
+                format!("dir = \"{written}\" does not exist"),
+            );
+            return Err(context().wrap(error.into()));
         }
 
         // Merge [defaults], the presets it names, then the target, each with its when blocks
-        let mut accumulated = Accumulated::default();
-        accumulated.apply(defaults, scope.condition, Table::Shared).map_err(context)?;
+        let mut accumulated = Accumulated {
+            origins: Origins::new(scope.file, table.clone()),
+            ..Default::default()
+        };
+        accumulated
+            .apply(defaults, scope.condition, Table::Shared, &located::keys(&["defaults"]))
+            .at(context())?;
         for preset_name in spec.preset.iter().flat_map(|names| names.to_vec()) {
             let Some(preset) = presets.get(&preset_name) else {
                 let hint = util::did_you_mean(&preset_name, presets.keys().map(String::as_str));
-                return Err(context(anyhow::anyhow!(
-                    "preset = \"{preset_name}\": there is no [preset.{preset_name}]{hint}"
-                )));
+                let error = Located::new(
+                    Place::key("preset").value(&preset_name),
+                    "unknown-preset",
+                    format!("preset = \"{preset_name}\": there is no [preset.{preset_name}]{hint}"),
+                );
+                return Err(context().wrap(error.into()));
             };
             accumulated
-                .apply(preset, scope.condition, Table::Shared)
-                .map_err(|error| context(error.context(format!("in [preset.{preset_name}]"))))?;
+                .apply(preset, scope.condition, Table::Shared, &located::keys(&["preset", &preset_name]))
+                .at(Scope::preset(&preset_name))
+                .at(context())?;
         }
-        accumulated.apply(spec, scope.condition, Table::Target).map_err(context)?;
+        accumulated.apply(spec, scope.condition, Table::Target, &table).at(context())?;
 
         // The kind, which a when block may change (lib or shared by an option)
-        let kind = Kind::parse(accumulated.kind.as_deref().unwrap_or("exe")).map_err(context)?;
+        let kind = Kind::parse(accumulated.kind.as_deref().unwrap_or("exe"))
+            .at(accumulated.origins.scope(&["kind"]))
+            .at(context())?;
 
         let mut target = Target::new(name, scope.index, kind, &dir);
         target.default = spec.default.unwrap_or(kind != Kind::Test);
-        target.fill(accumulated, scope).map_err(context)?;
+        target.fill(accumulated, scope).at(context())?;
 
         Ok(Some(target))
     }
@@ -473,8 +509,11 @@ impl Target {
             }
         };
 
-        let mut accumulated = Accumulated::default();
-        accumulated.apply(defaults, scope.condition, Table::Shared)?;
+        let mut accumulated = Accumulated {
+            origins: Origins::new(scope.file, located::keys(&["defaults"])),
+            ..Default::default()
+        };
+        accumulated.apply(defaults, scope.condition, Table::Shared, &located::keys(&["defaults"]))?;
         accumulated.deps.extend(all_deps.iter().map(|dep| (dep.clone(), true)));
 
         let mut target = Target::new(scope.name, scope.index, kind, root);
@@ -506,12 +545,12 @@ impl Target {
             return Ok(Vec::new());
         }
 
-        let files = expand_pattern_list(&tests_dir, &["*.{c,cc,cpp,cxx}".to_string()], scope.out_root, false, false)?;
+        let files = expand_pattern_list(&tests_dir, &["*.{c,cc,cpp,cxx}".to_string()], scope.out_root, false, false, None)?;
         let single_program = files.iter().any(|file| is_main_file(file));
 
         // One test program from all of tests/, or one per file
         let groups: Vec<(String, Vec<PathBuf>)> = if single_program {
-            let all = expand_pattern_list(&tests_dir, &[SOURCE_GLOB.to_string()], scope.out_root, false, false)?;
+            let all = expand_pattern_list(&tests_dir, &[SOURCE_GLOB.to_string()], scope.out_root, false, false, None)?;
             vec![("tests".to_string(), all)]
         } else {
             files
@@ -522,8 +561,11 @@ impl Target {
 
         let mut tests = Vec::new();
         for (name, sources) in groups {
-            let mut accumulated = Accumulated::default();
-            accumulated.apply(defaults, scope.condition, Table::Shared)?;
+            let mut accumulated = Accumulated {
+                origins: Origins::new(scope.file, located::keys(&["defaults"])),
+                ..Default::default()
+            };
+            accumulated.apply(defaults, scope.condition, Table::Shared, &located::keys(&["defaults"]))?;
             accumulated.sources = Some(sources.iter().map(|source| slash(source)).collect());
             accumulated.include.get_or_insert_with(Vec::new).push(slash(&tests_dir));
             accumulated.deps.extend(library.iter().chain(all_deps).map(|dep| (dep.clone(), true)));
@@ -537,13 +579,18 @@ impl Target {
     }
 
     /// Turns accumulated settings into the target's final fields.
-    fn fill(&mut self, settings: Accumulated, scope: &PackageScope) -> Result<()> {
+    fn fill(&mut self, mut settings: Accumulated, scope: &PackageScope) -> Result<()> {
         let dir = self.dir.clone();
-        let paths = |list: &[String]| -> Result<Vec<PathBuf>> {
+        let origins = std::mem::take(&mut settings.origins);
+        let paths = |key: &[&str], list: &[String]| -> Result<Vec<PathBuf>> {
             list.iter()
-                .map(|text| Ok(util::absolute(&dir, Path::new(&expand_path_text(text, scope, &self.name)?))))
+                .map(|text| {
+                    let expanded = expand_path_text(text, scope, &self.name).located(origins.place(&[key], text), "invalid-value")?;
+                    Ok(util::absolute(&dir, Path::new(&expanded)))
+                })
                 .collect()
         };
+        let sources_place = |pattern: &str| origins.place(&[&["sources"]], pattern);
 
         // Sources: given, or the layout convention for compiled kinds minus what when blocks claim (also when the
         // target lists only exclusions); then those of the when blocks that hold; then every `!` exclusion
@@ -554,19 +601,27 @@ impl Target {
         excludes.extend(when_excludes);
         self.conventional_sources = compiles && (settings.sources.is_none() || only_excludes);
 
-        let expand_text =
-            |patterns: &[String]| -> Result<Vec<String>> { patterns.iter().map(|pattern| expand_path_text(pattern, scope, &self.name)).collect() };
+        let expand_text = |patterns: &[String]| -> Result<Vec<String>> {
+            patterns
+                .iter()
+                .map(|pattern| expand_path_text(pattern, scope, &self.name).located(sources_place(pattern), "invalid-value"))
+                .collect()
+        };
         let expand = |patterns: &[String], given: bool| -> Result<Vec<PathBuf>> {
             let expanded = expand_text(patterns)?;
             if given {
                 for pattern in &expanded {
                     let (base, glob) = split_pattern(&dir, pattern);
                     if glob.is_none() && base.is_dir() {
-                        bail!("sources: \"{pattern}\" is a folder; list its files with a glob such as \"{pattern}/**/*.cpp\"");
+                        bail_at!(
+                            sources_place(pattern),
+                            "folder-not-file",
+                            "sources: \"{pattern}\" is a folder; list its files with a glob such as \"{pattern}/**/*.cpp\""
+                        );
                     }
                 }
             }
-            expand_pattern_list(&dir, &expanded, scope.out_root, given, given)
+            expand_pattern_list(&dir, &expanded, scope.out_root, given, given, Some(&origins))
         };
 
         let mut sources = if self.conventional_sources {
@@ -601,7 +656,8 @@ impl Target {
         if !excludes.is_empty() {
             let mut builder = GlobSetBuilder::new();
             for pattern in expand_text(&excludes)? {
-                builder.add(compile_glob(&absolute_glob(&dir, &pattern)).with_context(|| format!("bad pattern \"!{pattern}\""))?);
+                let glob = compile_glob(&absolute_glob(&dir, &pattern)).with_context(|| format!("bad pattern \"!{pattern}\""));
+                builder.add(glob.located(sources_place(&format!("!{pattern}")), "invalid-value")?);
             }
             let excluded = builder.build()?;
             sources.retain(|source| !excluded.is_match(slash(source)));
@@ -618,14 +674,20 @@ impl Target {
             }
         };
         let combine = |(before, after): (Vec<String>, Vec<String>), own: Vec<String>| [before, own, after].concat();
-        self.private_include = paths(&combine(settings.added_include, settings.include.unwrap_or_else(|| existing("src"))))?;
-        self.include = paths(&combine(
-            settings.added_public_include,
-            settings.public_include.unwrap_or_else(|| existing("include")),
-        ))?;
-        self.system_include = paths(&settings.system_include)?;
-        self.public_system_include = paths(&settings.public_system_include)?;
-        self.interface_include = paths(&settings.interface_include)?;
+        self.private_include = paths(
+            &["include"],
+            &combine(settings.added_include, settings.include.unwrap_or_else(|| existing("src"))),
+        )?;
+        self.include = paths(
+            &["public", "include"],
+            &combine(
+                settings.added_public_include,
+                settings.public_include.unwrap_or_else(|| existing("include")),
+            ),
+        )?;
+        self.system_include = paths(&["system-include"], &settings.system_include)?;
+        self.public_system_include = paths(&["public", "system-include"], &settings.public_system_include)?;
+        self.interface_include = paths(&["interface", "include"], &settings.interface_include)?;
 
         // Flags and linking
         // Definitions and flags may name folders: {root}, {out}, {gen}
@@ -641,10 +703,10 @@ impl Target {
         self.libs = settings
             .libs
             .iter()
-            .map(|lib| expand_lib(lib, &dir, scope, &self.name))
+            .map(|lib| expand_lib(lib, &dir, scope, &self.name).located(origins.place(&[&["libs"]], lib), "invalid-value"))
             .collect::<Result<_>>()?;
-        self.lib_dirs = paths(&settings.lib_dirs)?;
-        self.link_depends = paths(&settings.link_depends)?;
+        self.lib_dirs = paths(&["lib-dirs"], &settings.lib_dirs)?;
+        self.link_depends = paths(&["link-depends"], &settings.link_depends)?;
         self.cuda_arch = settings.cuda_arch.unwrap_or_default();
         self.cuda_flags = placeholders(settings.cuda_flags);
         self.dep_names = settings.deps;
@@ -662,52 +724,67 @@ impl Target {
         // DLLs loaded on first call: only a program or shared library has imports to delay
         let links = matches!(self.kind, Kind::Exe | Kind::Test | Kind::Shared);
         if !settings.delay_load.is_empty() && !links {
-            bail!(
+            bail_at!(
+                origins.key(&["delay-load"]),
+                "invalid-delay-load",
                 "delay-load: a {} target links no binary of its own; list the DLLs in the program or shared library that calls them",
                 self.kind.name()
             );
         }
         if links {
             self.delay_load = [settings.shared_delay_load, settings.delay_load].concat();
-            crate::delay_load::check_names(&self.delay_load)?;
+            crate::delay_load::check_names(&self.delay_load).at(origins.scope(&["delay-load"]))?;
         }
 
-        // Code generation
-        self.std = normalize_standard(settings.std.as_deref().unwrap_or(scope.std), Language::Cxx)?;
-        self.c_std = normalize_standard(settings.c_std.as_deref().unwrap_or(scope.c_std), Language::C)?;
+        // Code generation; a standard the target does not set is [project]'s
+        let project = || Scope::place(Place::absolute(located::keys(&["project"])).file(origins.file()));
+        let standard_scope = |key: &str, set: bool| if set { origins.scope(&[key]) } else { project() };
+        self.std =
+            normalize_standard(settings.std.as_deref().unwrap_or(scope.std), Language::Cxx).at(standard_scope("std", settings.std.is_some()))?;
+        self.c_std = normalize_standard(settings.c_std.as_deref().unwrap_or(scope.c_std), Language::C)
+            .at(standard_scope("c-std", settings.c_std.is_some()))?;
         self.warnings = settings
             .warnings
             .as_deref()
             .map(Warnings::parse)
-            .transpose()?
+            .transpose()
+            .at(origins.scope(&["warnings"]))?
             .unwrap_or(Warnings::Default);
         self.werror = settings.werror.unwrap_or(false);
-        self.arch = settings.arch.as_deref().map(Arch::parse).transpose()?;
+        self.arch = settings.arch.as_deref().map(Arch::parse).transpose().at(origins.scope(&["arch"]))?;
 
         // Output
-        self.gui = settings.gui.as_ref().map(Gui::parse).transpose()?.unwrap_or(Gui::Off);
+        self.gui = settings
+            .gui
+            .as_ref()
+            .map(Gui::parse)
+            .transpose()
+            .at(origins.scope(&["gui"]))?
+            .unwrap_or(Gui::Off);
         self.exports = settings.exports.unwrap_or(false);
         self.output_prefix = settings.output_prefix;
         self.output_name = settings.output_name.unwrap_or_else(|| self.name.clone());
         self.output_suffix = settings.output_suffix;
         self.output_dir = settings
             .output_dir
-            .map(|folder| paths(&[folder]).map(|mut list| list.remove(0)))
+            .map(|folder| paths(&["output-dir"], &[folder]).map(|mut list| list.remove(0)))
             .transpose()?;
         self.version = settings
             .version
             .map(|text| library_version(&text, "version", scope, &self.name))
-            .transpose()?;
+            .transpose()
+            .at(origins.scope(&["version"]))?;
         self.soversion = settings
             .soversion
             .map(|text| library_version(&text, "soversion", scope, &self.name))
-            .transpose()?;
+            .transpose()
+            .at(origins.scope(&["soversion"]))?;
         self.export_header = settings.export_header.map(|spec| self.resolve_export_header(spec));
         let mut data = settings.data;
         if copies_data(self.kind) {
             data.splice(0..0, settings.shared_data);
         }
-        self.data = resolve_data(&data, &dir, scope, &self.name, self.kind)?;
+        self.data = resolve_data(&data, &dir, scope, &self.name, self.kind, &origins)?;
         self.install = settings.install;
         self.qt = settings.qt.unwrap_or(true);
 
@@ -723,18 +800,31 @@ impl Target {
         }
 
         // Unity batches and the precompiled header
-        self.unity = settings.unity.as_ref().map(manifest::parse_unity).transpose()?.flatten();
+        self.unity = settings
+            .unity
+            .as_ref()
+            .map(manifest::parse_unity)
+            .transpose()
+            .at(origins.scope(&["unity"]))?
+            .flatten();
 
-        self.pch = settings.pch.map(|pch| paths(&[pch]).map(|mut list| list.remove(0))).transpose()?;
+        let written_pch = settings.pch.clone().unwrap_or_default();
+        self.pch = settings
+            .pch
+            .map(|pch| paths(&["pch"], &[pch]).map(|mut list| list.remove(0)))
+            .transpose()?;
         if let Some(pch) = &self.pch {
+            let place = || origins.place(&[&["pch"]], &written_pch);
             if pch.is_dir() {
-                bail!(
+                bail_at!(
+                    place(),
+                    "folder-not-file",
                     "pch = \"{}\" is a folder; pch names a header, such as \"src/pch.h\"",
                     util::rel(pch, &dir)
                 );
             }
             if !pch.is_file() {
-                bail!("pch = \"{}\" does not exist", util::rel(pch, &dir));
+                bail_at!(place(), "missing-path", "pch = \"{}\" does not exist", util::rel(pch, &dir));
             }
         }
 
@@ -743,7 +833,8 @@ impl Target {
             .file_rules
             .iter()
             .filter_map(|rule| resolve_file_rule(rule, &dir, scope, &self.name).transpose())
-            .collect::<Result<_>>()?;
+            .collect::<Result<_>>()
+            .at(Scope::key("file"))?;
         self.runs = settings.runs;
         self.pre_build = settings.pre_build;
         self.post_build = settings.post_build;
@@ -752,7 +843,7 @@ impl Target {
         self.args = settings.args;
         self.workdir = settings
             .workdir
-            .map(|workdir| paths(&[workdir]).map(|mut list| list.remove(0)))
+            .map(|workdir| paths(&["workdir"], &[workdir]).map(|mut list| list.remove(0)))
             .transpose()?;
         self.timeout = settings.timeout;
         self.env = settings.env;
@@ -766,6 +857,7 @@ impl Target {
         self.expect = settings.expect;
         self.reject = settings.reject;
         self.exit_code = settings.exit_code;
+        self.origins = origins;
 
         Ok(())
     }
@@ -787,61 +879,103 @@ pub fn default_export_macro(target_name: &str) -> String {
 }
 
 /// Checks every target, `[defaults]` and preset table of a package once, whether or not it applies here: each
-/// condition's words, the values, which table a key belongs in, and the presets targets name.
+/// condition's words, the values, which table a key belongs in, and the presets targets name. Each table's first
+/// error is the package's error (under the language server every table's is reported).
 pub fn check_package(manifest: &Manifest, condition: &CondContext) -> Result<()> {
-    check_spec(&manifest.defaults, Table::Shared, condition).context("in [defaults]")?;
+    let mut errors = Errors::new(manifest.file.as_deref());
+
+    errors.add(check_spec(&manifest.defaults, Table::Shared, condition).at(Scope::defaults()));
     for (name, preset) in &manifest.preset {
-        check_spec(preset, Table::Shared, condition).with_context(|| format!("in [preset.{name}]"))?;
+        errors.add(check_spec(preset, Table::Shared, condition).at(Scope::preset(name)));
     }
-
     for (name, spec) in &manifest.target {
-        let context = || format!("in [target.{name}]");
-        if let Some(text) = &spec.cond {
-            condition.check(text).with_context(context)?;
+        if errors.stop() {
+            break;
         }
-        for preset_name in spec.preset.iter().flat_map(|names| names.to_vec()) {
-            if !manifest.preset.contains_key(&preset_name) {
-                let hint = util::did_you_mean(&preset_name, manifest.preset.keys().map(String::as_str));
-                return Err(anyhow::anyhow!("preset = \"{preset_name}\": there is no [preset.{preset_name}]{hint}")).with_context(context);
-            }
-        }
-        check_spec(spec, Table::Target, condition).with_context(context)?;
-
-        // Test settings on a target that is never a test would be ignored
-        if !can_be_test(spec) {
-            if let Some(key) = test_key(spec) {
-                return Err(anyhow::anyhow!(
-                    "`{key}` is a test setting, and this target is not kind = \"test\"; for a test that runs a program, \
-                     write a [[test]] table with command = [\"{{target:{name}}}\"]"
-                ))
-                .with_context(context);
-            }
-        }
+        errors.add(check_target(name, spec, manifest, condition).at(Scope::target(name)));
     }
 
-    for spec in &manifest.write {
+    for (index, spec) in manifest.write.iter().enumerate() {
         if let Some(text) = &spec.cond {
-            condition.check(text).with_context(|| format!("in [[write]] {}", spec.path))?;
+            let scope = Scope::item("write", index).text(format!("in [[write]] {}", spec.path));
+            errors.add(condition.check(text).at(Scope::key("if")).at(scope));
         }
     }
-    // A test's condition may take matrix parameters (`{backend}`), filled in per test
+    // A test's condition may take matrix parameters (`{backend}`), filled in per test; a table's tests share theirs
+    let mut checked_tables = HashSet::new();
     for spec in &manifest.test {
-        if let Some(text) = spec.cond.as_ref().filter(|text| !text.contains('{')) {
-            condition.check(text).with_context(|| format!("in [[test]] `{}`", spec.name))?;
+        if let Some(text) = spec.cond.as_ref().filter(|text| !text.contains('{') && checked_tables.insert(spec.table)) {
+            let scope = Scope::item("test", spec.table).text(format!("in [[test]] `{}`", spec.name));
+            errors.add(condition.check(text).at(Scope::key("if")).at(scope));
+        }
+    }
+
+    errors.finish()
+}
+
+/// One target table: its condition, the presets it names, its keys and values.
+fn check_target(name: &str, spec: &TargetSpec, manifest: &Manifest, condition: &CondContext) -> Result<()> {
+    if let Some(text) = &spec.cond {
+        condition.check(text).at(Scope::key("if"))?;
+    }
+    for preset_name in spec.preset.iter().flat_map(|names| names.to_vec()) {
+        if !manifest.preset.contains_key(&preset_name) {
+            let hint = util::did_you_mean(&preset_name, manifest.preset.keys().map(String::as_str));
+            bail_at!(
+                Place::key("preset").value(&preset_name),
+                "unknown-preset",
+                "preset = \"{preset_name}\": there is no [preset.{preset_name}]{hint}"
+            );
+        }
+    }
+    check_spec(spec, Table::Target, condition)?;
+
+    // Test settings on a target that is never a test would be ignored
+    if !can_be_test(spec) {
+        if let Some(path) = test_key(spec) {
+            let key = match path.last() {
+                Some(Part::Key(key)) => key.clone(),
+                _ => String::new(),
+            };
+            bail_at!(
+                Place { path, ..Default::default() },
+                "test-setting-on-non-test",
+                "`{key}` is a test setting, and this target is not kind = \"test\"; for a test that runs a program, \
+                 write a [[test]] table with command = [\"{{target:{name}}}\"]"
+            );
         }
     }
 
     Ok(())
 }
 
+/// The first of the keys that belong only to a target table that a table sets.
+fn target_only_key(spec: &TargetSpec) -> Option<&'static str> {
+    let keys = [
+        ("dir", spec.dir.is_some()),
+        ("if", spec.cond.is_some()),
+        ("default", spec.default.is_some()),
+        ("preset", spec.preset.is_some()),
+    ];
+
+    keys.iter().find(|(_, given)| *given).map(|(key, _)| *key)
+}
+
 /// One table's keys and values, and those of its when blocks.
 fn check_spec(spec: &TargetSpec, table: Table, condition: &CondContext) -> Result<()> {
-    let target_only = spec.dir.is_some() || spec.cond.is_some() || spec.default.is_some() || spec.preset.is_some();
-    if table != Table::Target && target_only {
-        bail!("dir, if, default and preset belong to a [target] table, not to [defaults], a preset or a when block");
+    if let Some(key) = target_only_key(spec).filter(|_| table != Table::Target) {
+        bail_at!(
+            Place::key(key),
+            "misplaced-key",
+            "dir, if, default and preset belong to a [target] table, not to [defaults], a preset or a when block"
+        );
     }
     if matches!(table, Table::Shared | Table::SharedWhen) && spec.kind.is_some() {
-        bail!("kind belongs to a [target] table or its when blocks, not to [defaults], a preset or their when blocks");
+        bail_at!(
+            Place::key("kind"),
+            "misplaced-key",
+            "kind belongs to a [target] table or its when blocks, not to [defaults], a preset or their when blocks"
+        );
     }
 
     // Values
@@ -868,27 +1002,34 @@ fn check_spec(spec: &TargetSpec, table: Table, condition: &CondContext) -> Resul
     }
 
     // Per-file settings and build steps
-    for rule in &spec.file {
-        if let Some(text) = &rule.cond {
-            condition.check(text)?;
-        }
-        rule.warnings.as_deref().map(Warnings::parse).transpose()?;
-        rule.arch.as_deref().map(Arch::parse).transpose()?;
-        rule.opt.as_ref().map(Opt::parse).transpose()?;
+    for (index, rule) in spec.file.iter().enumerate() {
+        let check_rule = || -> Result<()> {
+            if let Some(text) = &rule.cond {
+                condition.check(text).at(Scope::key("if"))?;
+            }
+            rule.warnings.as_deref().map(Warnings::parse).transpose()?;
+            rule.arch.as_deref().map(Arch::parse).transpose()?;
+            rule.opt.as_ref().map(Opt::parse).transpose()?;
+            Ok(())
+        };
+        check_rule().at(Scope::item("file", index))?;
     }
-    let step_conditions = spec
-        .run
-        .iter()
-        .map(|run| &run.cond)
-        .chain(spec.pre_build.iter().chain(&spec.post_build).map(|step| &step.cond));
-    for text in step_conditions.flatten() {
-        condition.check(text)?;
+    let steps = [
+        ("run", spec.run.iter().map(|run| &run.cond).collect::<Vec<_>>()),
+        ("pre-build", spec.pre_build.iter().map(|step| &step.cond).collect()),
+        ("post-build", spec.post_build.iter().map(|step| &step.cond).collect()),
+    ];
+    for (key, conditions) in steps {
+        for (index, text) in conditions.into_iter().enumerate() {
+            if let Some(text) = text {
+                condition.check(text).at(Scope::key("if")).at(Scope::item(key, index))?;
+            }
+        }
     }
 
     for (text, block) in &spec.when {
-        let context = || format!("in when.\"{text}\"");
-        condition.check(text).with_context(context)?;
-        check_spec(block, table.when(), condition).with_context(context)?;
+        condition.check(text).at(Scope::when(text))?;
+        check_spec(block, table.when(), condition).at(Scope::when(text))?;
     }
 
     Ok(())
@@ -899,8 +1040,8 @@ fn can_be_test(spec: &TargetSpec) -> bool {
     spec.kind.as_deref() == Some("test") || spec.when.values().any(can_be_test)
 }
 
-/// The first test-only key a table or its when blocks set.
-fn test_key(spec: &TargetSpec) -> Option<&'static str> {
+/// The first test-only key a table or its when blocks set: its path under the table.
+fn test_key(spec: &TargetSpec) -> Option<Vec<Part>> {
     let keys = [
         ("args", spec.args.is_some()),
         ("workdir", spec.workdir.is_some()),
@@ -918,22 +1059,35 @@ fn test_key(spec: &TargetSpec) -> Option<&'static str> {
         ("exit-code", spec.exit_code.is_some()),
     ];
 
-    keys.iter()
-        .find(|(_, given)| *given)
-        .map(|(key, _)| *key)
-        .or_else(|| spec.when.values().find_map(test_key))
+    let own = keys.iter().find(|(_, given)| *given).map(|(key, _)| located::keys(&[key]));
+    own.or_else(|| {
+        spec.when.iter().find_map(|(condition, block)| {
+            let inner = test_key(block)?;
+            Some([located::keys(&["when", condition]), inner].concat())
+        })
+    })
 }
 
 impl Accumulated {
     /// Adds one table's settings (lists append, single values replace), then its true `when` blocks, recursively.
-    fn apply(&mut self, spec: &TargetSpec, condition: &CondContext, table: Table) -> Result<()> {
-        let target_only = spec.dir.is_some() || spec.cond.is_some() || spec.default.is_some() || spec.preset.is_some();
-        if table != Table::Target && target_only {
-            bail!("dir, if, default and preset belong to a [target] table, not to [defaults], a preset or a when block");
+    /// `path` is the table's key path.
+    fn apply(&mut self, spec: &TargetSpec, condition: &CondContext, table: Table, path: &[Part]) -> Result<()> {
+        let at = |key: &str| Place::absolute([path.to_vec(), located::keys(&[key])].concat());
+        if let Some(key) = target_only_key(spec).filter(|_| table != Table::Target) {
+            bail_at!(
+                at(key),
+                "misplaced-key",
+                "dir, if, default and preset belong to a [target] table, not to [defaults], a preset or a when block"
+            );
         }
         if matches!(table, Table::Shared | Table::SharedWhen) && spec.kind.is_some() {
-            bail!("kind belongs to a [target] table or its when blocks, not to [defaults], a preset or their when blocks");
+            bail_at!(
+                at("kind"),
+                "misplaced-key",
+                "kind belongs to a [target] table or its when blocks, not to [defaults], a preset or their when blocks"
+            );
         }
+        self.note_origins(spec, path);
 
         // Sources: a when block's belong to its condition
         if matches!(table, Table::When | Table::SharedWhen) {
@@ -1033,14 +1187,72 @@ impl Accumulated {
         // Conditional blocks; the sources of every one, holding or not, leave the convention
         for (condition_text, block) in &spec.when {
             collect_sources(block, &mut self.claimed_sources);
-            let holds = condition.test(condition_text).with_context(|| format!("in when.\"{condition_text}\""))?;
+            let block_path = [path.to_vec(), located::keys(&["when", condition_text])].concat();
+            let context = || Scope::place(Place::absolute(block_path.clone())).text(format!("in when.\"{condition_text}\""));
+            let holds = condition.test(condition_text).at(context())?;
             if holds {
-                self.apply(block, condition, table.when())
-                    .with_context(|| format!("in when.\"{condition_text}\""))?;
+                self.apply(block, condition, table.when(), &block_path).at(context())?;
             }
         }
 
         Ok(())
+    }
+
+    /// Remembers which table set the values errors can be about.
+    fn note_origins(&mut self, spec: &TargetSpec, path: &[Part]) {
+        let origins = &mut self.origins;
+        let public = spec.public.clone().unwrap_or_default();
+        let interface = spec.interface.clone().unwrap_or_default();
+        let lists: [(&[&str], &Option<Vec<String>>); 14] = [
+            (&["sources"], &spec.sources),
+            (&["include"], &spec.include),
+            (&["system-include"], &spec.system_include),
+            (&["libs"], &spec.libs),
+            (&["lib-dirs"], &spec.lib_dirs),
+            (&["deps"], &spec.deps),
+            (&["header-deps"], &spec.header_deps),
+            (&["needs"], &spec.needs),
+            (&["link-depends"], &spec.link_depends),
+            (&["whole-archive"], &spec.whole_archive),
+            (&["delay-load"], &spec.delay_load),
+            (&["data"], &spec.data),
+            (&["expect"], &spec.expect),
+            (&["reject"], &spec.reject),
+        ];
+        for (key, values) in lists {
+            origins.note(path, key, values.iter().flatten());
+        }
+        let nested: [(&[&str], &Option<Vec<String>>); 4] = [
+            (&["public", "include"], &public.include),
+            (&["public", "system-include"], &public.system_include),
+            (&["public", "deps"], &public.deps),
+            (&["interface", "include"], &interface.include),
+        ];
+        for (key, values) in nested {
+            origins.note(path, key, values.iter().flatten());
+        }
+
+        let single = [
+            ("kind", spec.kind.clone()),
+            ("pch", spec.pch.clone()),
+            ("warnings", spec.warnings.clone()),
+            ("arch", spec.arch.clone()),
+            ("std", spec.std.clone()),
+            ("c-std", spec.c_std.clone()),
+            ("output-name", spec.output_name.clone()),
+            ("output-dir", spec.output_dir.clone()),
+            ("version", spec.version.clone()),
+            ("soversion", spec.soversion.clone()),
+            ("workdir", spec.workdir.clone()),
+            ("pass-regex", spec.pass_regex.clone()),
+            ("fail-regex", spec.fail_regex.clone()),
+            ("skip-regex", spec.skip_regex.clone()),
+            ("unity", spec.unity.as_ref().and_then(located::value_text)),
+            ("gui", spec.gui.as_ref().and_then(located::value_text)),
+        ];
+        for (key, value) in single {
+            origins.note(path, &[key], value.iter());
+        }
     }
 }
 
@@ -1052,7 +1264,11 @@ fn library_version(text: &str, key: &str, scope: &PackageScope, target_name: &st
             .split('.')
             .all(|part| !part.is_empty() && part.chars().all(|character| character.is_ascii_alphanumeric()));
     if !valid {
-        bail!("{key} = \"{text}\": a library version is numbers joined by dots, such as \"1.2.3\" (or \"{{version}}\", the project's)");
+        bail_at!(
+            Place::key(key).value(text),
+            "invalid-value",
+            "{key} = \"{text}\": a library version is numbers joined by dots, such as \"1.2.3\" (or \"{{version}}\", the project's)"
+        );
     }
 
     Ok(version)
@@ -1070,18 +1286,28 @@ fn collect_sources(spec: &TargetSpec, patterns: &mut Vec<String>) {
 /// plain path must exist unless it lies in the output folder (generated). Results keep the list's order (a glob's
 /// files sorted), without duplicates.
 pub fn expand_patterns(dir: &Path, patterns: &[String], out_root: &Path, check_literals: bool) -> Result<Vec<PathBuf>> {
-    expand_pattern_list(dir, patterns, out_root, check_literals, true)
+    expand_pattern_list(dir, patterns, out_root, check_literals, true, None)
 }
 
 /// `expand_patterns`, saying so when a glob matches nothing only when `warn_empty` (not for the layout convention).
-fn expand_pattern_list(dir: &Path, patterns: &[String], out_root: &Path, check_literals: bool, warn_empty: bool) -> Result<Vec<PathBuf>> {
+/// `origins`: where a target's `sources` were written, for its errors and warnings.
+fn expand_pattern_list(
+    dir: &Path,
+    patterns: &[String],
+    out_root: &Path,
+    check_literals: bool,
+    warn_empty: bool,
+    origins: Option<&Origins>,
+) -> Result<Vec<PathBuf>> {
     let mut included: Vec<PathBuf> = Vec::new();
     let mut excludes = GlobSetBuilder::new();
     let mut has_excludes = false;
+    let place = |pattern: &str| origins.map(|origins| origins.place(&[&["sources"]], pattern)).unwrap_or_default();
 
     for pattern in patterns {
         if let Some(excluded) = pattern.strip_prefix('!') {
-            excludes.add(compile_glob(&absolute_glob(dir, excluded)).with_context(|| format!("bad pattern \"{pattern}\""))?);
+            let glob = compile_glob(&absolute_glob(dir, excluded)).with_context(|| format!("bad pattern \"{pattern}\""));
+            excludes.add(glob.located(place(pattern), "invalid-value")?);
             has_excludes = true;
             continue;
         }
@@ -1091,16 +1317,20 @@ fn expand_pattern_list(dir: &Path, patterns: &[String], out_root: &Path, check_l
         if glob.is_none() {
             let generated = util::strip_prefix_ci(&file, out_root).is_some();
             if check_literals && !generated && !file.exists() {
-                bail!("file not found: {}", slash(&file));
+                bail_at!(place(pattern), "missing-path", "file not found: {}", slash(&file));
             }
             included.push(file);
             continue;
         }
 
         // One glob's files sorted (the walk's order differs between systems)
-        let mut found = walk_glob(dir, pattern, out_root)?;
+        let mut found = walk_glob(dir, pattern, out_root).located(place(pattern), "invalid-value")?;
         if found.is_empty() && warn_empty {
-            crate::ui::warn(&format!("\"{pattern}\" matches no files (in {})", slash(dir)));
+            let message = format!("\"{pattern}\" matches no files (in {})", slash(dir));
+            match origins {
+                Some(_) => crate::ui::warn_at(place(pattern), "glob-matches-nothing", &message),
+                None => crate::ui::warn(&message),
+            }
         }
         found.sort_by_cached_key(|file| util::path_key(file));
         included.extend(found);
@@ -1365,7 +1595,11 @@ fn expand_lib(lib: &str, dir: &Path, scope: &PackageScope, target_name: &str) ->
     if is_path && !expanded.starts_with('-') {
         let path = util::absolute(dir, Path::new(&expanded));
         if (path.is_dir() || path.file_name().is_none()) && !expanded.ends_with(".framework") {
-            bail!("libs = [\"{lib}\"] is a folder; `libs` names libraries (a file, or a name found in `lib-dirs`), and `lib-dirs` the folders");
+            bail_at!(
+                Place::key("libs").value(lib),
+                "folder-not-file",
+                "libs = [\"{lib}\"] is a folder; `libs` names libraries (a file, or a name found in `lib-dirs`), and `lib-dirs` the folders"
+            );
         }
         Ok(slash(&path))
     } else {
@@ -1380,49 +1614,75 @@ fn copies_data(kind: Kind) -> bool {
 
 /// `data` patterns: each file they match, with its path under `dir` (where it goes beside the target's file). A
 /// folder stands for everything in it; a pattern that matches nothing is an error.
-fn resolve_data(patterns: &[String], dir: &Path, scope: &PackageScope, target_name: &str, kind: Kind) -> Result<Vec<(PathBuf, PathBuf)>> {
+fn resolve_data(
+    patterns: &[String],
+    dir: &Path,
+    scope: &PackageScope,
+    target_name: &str,
+    kind: Kind,
+    origins: &Origins,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
     if patterns.is_empty() {
         return Ok(Vec::new());
     }
     if !copies_data(kind) {
-        bail!("data: a {} target makes no program or shared library to copy files beside", kind.name());
+        bail_at!(
+            origins.key(&["data"]),
+            "invalid-data",
+            "data: a {} target makes no program or shared library to copy files beside",
+            kind.name()
+        );
     }
     if patterns.iter().all(|pattern| pattern.starts_with('!')) {
-        bail!("data: only `!` patterns, which exclude files; name the files to copy too (data = [\"assets\", \"!assets/raw\"])");
+        bail_at!(
+            origins.key(&["data"]),
+            "invalid-data",
+            "data: only `!` patterns, which exclude files; name the files to copy too (data = [\"assets\", \"!assets/raw\"])"
+        );
     }
 
-    // Each pattern's files, then the `!` exclusions
+    // Each pattern's files (with the pattern), then the `!` exclusions
     let mut files = Vec::new();
     let mut excludes = GlobSetBuilder::new();
-    for pattern in patterns {
-        let pattern = expand_path_text(pattern, scope, target_name)?;
+    for written in patterns {
+        let place = || origins.place(&[&["data"]], written);
+        let pattern = expand_path_text(written, scope, target_name).located(place(), "invalid-data")?;
         if let Some(excluded) = pattern.strip_prefix('!') {
-            excludes.add(compile_glob(&absolute_glob(dir, excluded)).with_context(|| format!("data: bad pattern \"{pattern}\""))?);
+            let glob = compile_glob(&absolute_glob(dir, excluded)).with_context(|| format!("data: bad pattern \"{pattern}\""));
+            excludes.add(glob.located(place(), "invalid-data")?);
             continue;
         }
 
         let (base, glob) = split_pattern(dir, &pattern);
         let found = match glob {
-            None if base.is_dir() => walk_glob(&base, "**", scope.out_root)?,
-            _ => walk_glob(dir, &pattern, scope.out_root)?,
+            None if base.is_dir() => walk_glob(&base, "**", scope.out_root),
+            _ => walk_glob(dir, &pattern, scope.out_root),
         };
+        let found = found.located(place(), "invalid-data")?;
         if found.is_empty() {
-            bail!("data: \"{pattern}\" matches no files (in {})", util::rel(dir, scope.root));
+            bail_at!(
+                place(),
+                "glob-matches-nothing",
+                "data: \"{pattern}\" matches no files (in {})",
+                util::rel(dir, scope.root)
+            );
         }
-        files.extend(found);
+        files.extend(found.into_iter().map(|file| (file, written)));
     }
     let excludes = excludes.build()?;
-    files.retain(|file| !excludes.is_match(slash(file)));
+    files.retain(|(file, _)| !excludes.is_match(slash(file)));
 
     // Each file once, at its path under the target's folder
     let mut seen = HashSet::new();
     let mut data = Vec::new();
-    for file in files {
+    for (file, written) in files {
         if !seen.insert(util::path_key(&file)) {
             continue;
         }
         let Some(relative) = util::strip_prefix_ci(&file, dir) else {
-            bail!(
+            bail_at!(
+                origins.place(&[&["data"]], written),
+                "invalid-data",
                 "data: {} is outside the target's folder ({}); data files keep their path under it, so give the target a `dir` that holds them",
                 util::rel(&file, scope.root),
                 util::rel(dir, scope.root)
@@ -1444,7 +1704,8 @@ fn resolve_file_rule(rule: &FileRule, dir: &Path, scope: &PackageScope, target_n
     // Patterns match absolute source paths
     let mut builder = GlobSetBuilder::new();
     for pattern in rule.patterns.to_vec() {
-        builder.add(compile_glob(&absolute_glob(dir, &pattern)).with_context(|| format!("bad file pattern \"{pattern}\""))?);
+        let glob = compile_glob(&absolute_glob(dir, &pattern)).with_context(|| format!("bad file pattern \"{pattern}\""));
+        builder.add(glob.located(Place::default().value(&pattern), "invalid-value")?);
     }
 
     // Definitions and flags may name folders, as the target's do

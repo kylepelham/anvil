@@ -8,6 +8,7 @@ use super::scan::{self, Part};
 use super::schema_info::FileKind;
 use super::session::{self, Session, Walks};
 use crate::cond::CondContext;
+use crate::located::{Located, Place};
 use crate::project::{self, Model, MANIFEST_NAME, TESTS_FILE_NAME};
 use crate::util;
 use regex::Regex;
@@ -118,19 +119,20 @@ pub fn analyze(
     let complete = loaded.is_some();
     match loaded {
         Some(Ok(loaded)) => model = Some(summarize(&loaded)),
-        Some(Err(error)) => {
-            let layers: Vec<String> = error.chain().map(|layer| layer.to_string()).collect();
-            if !is_parse_error(&layers) {
-                problems.push(problem(&layers, &files, Severity::Error));
-            } else if !problems.iter().any(|problem| problem.severity == Severity::Error) {
-                // A file the editor does not have open: parse it for the span
-                problems.extend(parse_named_file(&layers, &files));
-            }
-        }
+        Some(Err(error)) => load_errors(&error, &files, texts, &mut problems),
         None => {}
     }
-    for warning in &session.warnings {
-        problems.push(problem(std::slice::from_ref(warning), &files, Severity::Warning));
+    for error in &session.errors {
+        load_errors(error, &files, texts, &mut problems);
+    }
+    for (message, place) in &session.warnings {
+        let layers = std::slice::from_ref(message);
+        problems.push(match place {
+            Some((place, code)) => {
+                placed(layers, place, code, &[], &files, Severity::Warning).unwrap_or_else(|| problem(layers, &files, Severity::Warning))
+            }
+            None => problem(layers, &files, Severity::Warning),
+        });
     }
     dedup(&mut problems);
 
@@ -238,24 +240,35 @@ pub fn parse_problems(path: &Path, text: &str) -> (Vec<Problem>, Option<String>)
         return (problems, None);
     }
 
-    // Then the tables, each error blanked out in turn so the next shows
+    // Then the tables, each error blanked out in turn so the next shows; a table with an error says nothing more of
+    // what the blanking left missing in it
     let mut repaired = text.to_string();
+    let mut reported: Vec<Range<usize>> = Vec::new();
     for _ in 0..MAX_PARSE_ERRORS {
-        let Some((message, span)) = deserialize(path, &repaired) else {
+        let Some((message, span, code)) = deserialize(path, &repaired) else {
             return (problems, Some(repaired));
         };
         let span = widen(text, span.unwrap_or(0..0));
         let message = shorten(&crate::manifest::explain_unknown_key(&message));
         let replacement = suggestion(&message).map(|word| (key_word(text, &span), word));
-        problems.push(Problem {
-            file: path.to_path_buf(),
-            span: span.clone(),
-            severity: Severity::Error,
-            code: parse_code(&message),
-            message,
-            related: Vec::new(),
-            replacement,
-        });
+
+        // A key the blanking left missing, or a check of the whole table, says again what the table's error said
+        let code = code.unwrap_or_else(|| parse_code(&message));
+        let of_one_key = matches!(code, "unknown-key" | "wrong-type" | "invalid-value" | "duplicate-key");
+        let table = table_of(text, &span);
+        let repeated = !of_one_key && reported.iter().any(|earlier| overlaps(earlier, &table));
+        reported.push(table);
+        if !repeated {
+            problems.push(Problem {
+                file: path.to_path_buf(),
+                span: span.clone(),
+                severity: Severity::Error,
+                code,
+                message,
+                related: Vec::new(),
+                replacement,
+            });
+        }
 
         // Blank out what the error is about; one that cannot be blanked out ends the parse
         let Some(blanked) = blank_out(&repaired, &span) else {
@@ -267,26 +280,39 @@ pub fn parse_problems(path: &Path, text: &str) -> (Vec<Problem>, Option<String>)
     (problems, None)
 }
 
-/// The deserialize error of a manifest's or tests.toml's text: its message and span.
-fn deserialize(path: &Path, text: &str) -> Option<(String, Option<Range<usize>>)> {
-    if !is_manifest(path) {
-        let error = crate::manifest::parse_tests(text).err()?;
-        let span = error.downcast_ref::<toml::de::Error>().and_then(|toml_error| toml_error.span());
-        let message = match error.downcast_ref::<toml::de::Error>() {
-            Some(toml_error) => toml_error.message().to_string(),
-            None => format!("{error:#}"),
-        };
-        return Some((message, span));
-    }
+/// A parse error: its message, its span when it has one, its code when it says.
+type ParseError = (String, Option<Range<usize>>, Option<&'static str>);
 
-    // The manifest's own checks after the tables (the project name, empty commands) have no span
-    match toml::from_str::<crate::manifest::Manifest>(text) {
-        Ok(_) => match crate::manifest::parse_str(text) {
-            Ok(_) => None,
-            Err(error) => Some((format!("{error:#}"), None)),
+/// The deserialize error of a manifest's or tests.toml's text.
+fn deserialize(path: &Path, text: &str) -> Option<ParseError> {
+    let error = match is_manifest(path) {
+        true => match toml::from_str::<crate::manifest::Manifest>(text) {
+            Ok(manifest) => crate::manifest::finish(manifest).err()?,
+            Err(error) => return Some((error.message().to_string(), error.span(), None)),
         },
-        Err(error) => Some((error.message().to_string(), error.span())),
+        false => crate::manifest::parse_tests(text).err()?,
+    };
+
+    // A TOML error has its span; the checks after the tables say their place
+    if let Some(toml_error) = error.downcast_ref::<toml::de::Error>() {
+        return Some((toml_error.message().to_string(), toml_error.span(), None));
     }
+    let Some(located) = error.downcast_ref::<Located>() else {
+        return Some((format!("{error:#}"), None, None));
+    };
+    let file = SourceFile::new(path.to_path_buf(), text.to_string(), String::new());
+    let span = locate::place_span(&file, &located.place).map(|(span, _)| span);
+
+    Some((format!("{error:#}"), span, Some(located.code)))
+}
+
+/// The span of the table a span is in (its header to the next), or the span itself outside any.
+fn table_of(text: &str, span: &Range<usize>) -> Range<usize> {
+    let scan = scan::scan(text);
+    scan.headers
+        .iter()
+        .rfind(|header| header.span.start <= span.start && span.start < header.end)
+        .map_or(span.clone(), |header| header.span.start..header.end)
 }
 
 /// The text with the entry or table at `span` replaced by spaces (line breaks kept, so offsets stay the same).
@@ -357,7 +383,7 @@ fn first_paragraph(message: &str) -> String {
 /// offers the keys).
 fn shorten(message: &str) -> String {
     match message.find(", expected one of") {
-        Some(cut) if message.starts_with("unknown field") => {
+        Some(cut) if message.contains("unknown field") => {
             let rest = &message[cut..];
             let hint = rest.find("\nhint:").map_or("", |start| &rest[start..]);
             format!("{}{hint}", &message[..cut])
@@ -385,58 +411,20 @@ fn parse_code(message: &str) -> &'static str {
     }
 }
 
-// Message patterns and their diagnostic codes, the first match wins
+// Codes of the messages that do not say their place (and code), the first match wins
 const CODES: &[(&str, &str)] = &[
     (r"unknown field", "unknown-key"),
     (r"unknown condition", "unknown-condition-word"),
     (r#"condition "|empty condition"#, "bad-condition"),
-    (r"unknown dependency", "unknown-dependency"),
-    (r"unknown package|is not a path or git package", "unknown-package"),
-    (r"has no target `|no target named", "unknown-target"),
-    (r"has several libraries|has no library target", "ambiguous-package-target"),
-    (r"there is no \[preset\.", "unknown-preset"),
-    (r"unknown profile", "unknown-profile"),
-    (r"inherits from itself", "profile-cycle"),
-    (r"is already a condition word|has the name of a profile", "reserved-name"),
     (r"unknown option|no package loaded here declares the option", "unknown-option"),
-    (r"^option `", "bad-option"),
-    (r"dependency cycle|depends on itself", "dependency-cycle"),
-    (r"would both write|would share|needs as a folder|both copy a data file", "output-conflict"),
-    (r"both take the sources", "shared-sources"),
-    (r"whole-archive", "invalid-whole-archive"),
-    (r"delay-load", "invalid-delay-load"),
-    (r"\[\[write\]\]", "invalid-write"),
-    (r"two packages are named", "duplicate-package"),
-    (r"two tests are named|would both be the test", "duplicate-test"),
-    (r"names no test", "unknown-test"),
-    (r"wait for each other in a circle", "test-cycle"),
-    (r"under both \[deps\] and \[dev-deps\]", "duplicate-dependency"),
-    (r"which is under \[dev-deps\]", "dev-dep-outside-tests"),
-    (r"has nothing to compile|^nothing to build", "nothing-to-compile"),
-    (r"is a test setting", "test-setting-on-non-test"),
-    (r"belongs? to a \[target\] table", "misplaced-key"),
-    (r"is read only from the workspace root", "root-only-key"),
-    (r"workspace member|in the workspace", "workspace-member"),
-    (r"\[project\] version", "invalid-version"),
-    (r"\[project\] name", "invalid-name"),
-    (
-        r"\[project\] out|`anvil clean --all` would delete|holds a package \(",
-        "invalid-output-folder",
-    ),
-    (r"`command` is empty", "empty-command"),
-    (r"is not a valid regex", "invalid-regex"),
-    (r"no (?:target|test) uses it", "unused-dep"),
-    (r"include folder .* does not exist", "missing-include-folder"),
-    (r"has a CMakeLists\.txt but no", "cmake-only-path-dep"),
+    (r"would both be the test", "duplicate-test"),
+    (r"^nothing to build", "nothing-to-compile"),
+    (r"in the workspace", "workspace-member"),
     (r"matches no files", "glob-matches-nothing"),
-    (r"^data: |: data: ", "invalid-data"),
-    (r"pkg-config|does not know `", "pkg-config"),
     (r"file not found|does not exist", "missing-path"),
-    (r"is a folder", "folder-not-file"),
-    (r"matrix", "invalid-matrix"),
     (r"^dependency `|: dependency `", "invalid-dependency"),
     (r"toolchain|compiler", "toolchain"),
-    (r"expected|unknown sanitizer|bad (?:file )?pattern|a batch holds", "invalid-value"),
+    (r"expected", "invalid-value"),
 ];
 
 /// The stable code of a message.
@@ -454,26 +442,14 @@ pub fn code(message: &str) -> &'static str {
 fn problem(layers: &[String], files: &[SourceFile], severity: Severity) -> Problem {
     let location = locate::locate(layers, files, 0);
     let file = &files[location.file];
-
-    // The message without the file it is in (the editor shows that)
-    let written = util::slash(&file.path);
-    let parts: Vec<&str> = layers
-        .iter()
-        .map(|layer| layer.strip_prefix(&format!("{written}: ")).unwrap_or(layer))
-        .filter(|layer| !layer.eq_ignore_ascii_case(&written))
-        .collect();
-    let message = parts.join(": ");
+    let message = without_file(layers, file);
     let code = code(&message);
     let replacement = suggestion(&message).and_then(|word| location.word.clone().map(|span| (span, word)));
-    let severity = match (severity, code) {
-        (Severity::Warning, "toolchain") => Severity::Information,
-        (severity, _) => severity,
-    };
 
     Problem {
         file: file.path.clone(),
         span: location.span,
-        severity,
+        severity: problem_severity(severity, code),
         code,
         message,
         related: location
@@ -482,6 +458,109 @@ fn problem(layers: &[String], files: &[SourceFile], severity: Severity) -> Probl
             .map(|(index, span, label)| (files[index].path.clone(), span, label))
             .collect(),
         replacement,
+    }
+}
+
+/// An error of the load. A TOML error of a file the editor does not have open: that file parsed for its span, unless
+/// an open file has an error already.
+fn load_errors(error: &anyhow::Error, files: &[SourceFile], texts: &HashMap<String, (PathBuf, String)>, problems: &mut Vec<Problem>) {
+    let layers: Vec<String> = error.chain().map(|layer| layer.to_string()).collect();
+    if !is_parse_error(&layers) {
+        problems.extend(load_error(error, files, texts));
+    } else if !problems.iter().any(|problem| problem.severity == Severity::Error) {
+        problems.extend(parse_named_file(&layers, files));
+    }
+}
+
+/// The load's error. One in a file the editor does not have open that its parse finds: every problem of that parse.
+fn load_error(error: &anyhow::Error, files: &[SourceFile], texts: &HashMap<String, (PathBuf, String)>) -> Vec<Problem> {
+    let closed_file = error
+        .downcast_ref::<Located>()
+        .and_then(|located| located.place.file.as_ref())
+        .filter(|file| !texts.contains_key(&util::path_key(file)))
+        .and_then(|file| locate::file_index(files, file));
+    if let Some(index) = closed_file {
+        let (found, _) = parse_problems(&files[index].path, &files[index].text);
+        if !found.is_empty() {
+            return found;
+        }
+    }
+
+    vec![error_problem(error, files, Severity::Error)]
+}
+
+/// An error's problem: at its place when it has one, else where its message says.
+fn error_problem(error: &anyhow::Error, files: &[SourceFile], severity: Severity) -> Problem {
+    let layers: Vec<String> = error.chain().map(|layer| layer.to_string()).collect();
+    let located = error.downcast_ref::<Located>();
+
+    located
+        .and_then(|located| placed(&layers, &located.place, located.code, &located.related, files, severity))
+        .unwrap_or_else(|| problem(&layers, files, severity))
+}
+
+/// A problem at a place of crate::located (None when the check did not read its file): its value, else its key or
+/// table, else the first line of its file.
+fn placed(
+    layers: &[String],
+    place: &Place,
+    code: &'static str,
+    related: &[(Place, String)],
+    files: &[SourceFile],
+    severity: Severity,
+) -> Option<Problem> {
+    let index = match &place.file {
+        Some(file) => locate::file_index(files, file)?,
+        None => locate::find_file(layers, files).unwrap_or(0),
+    };
+    let file = &files[index];
+    let (span, word) = locate::place_span(file, place).unwrap_or_else(|| (locate::first_line(&file.text), None));
+    let message = without_file(layers, file);
+    let replacement = word.zip(suggestion(&message));
+
+    // Other places it names, in their files (the same file when they do not say)
+    let related = related
+        .iter()
+        .filter_map(|(other, label)| {
+            let other_index = match &other.file {
+                Some(other_file) => locate::file_index(files, other_file)?,
+                None => index,
+            };
+            // Only where the file has it: a nearer table would mislead
+            files[other_index].scan.key_span(&other.path)?;
+            let (other_span, _) = locate::place_span(&files[other_index], other)?;
+            Some((files[other_index].path.clone(), other_span, label.clone()))
+        })
+        .collect();
+
+    Some(Problem {
+        file: file.path.clone(),
+        span,
+        severity: problem_severity(severity, code),
+        code,
+        message,
+        related,
+        replacement,
+    })
+}
+
+/// A message without the file it is in (the editor shows that).
+fn without_file(layers: &[String], file: &SourceFile) -> String {
+    let written = util::slash(&file.path);
+    let parts: Vec<&str> = layers
+        .iter()
+        .map(|layer| layer.strip_prefix(&format!("{written}: ")).unwrap_or(layer))
+        .filter(|layer| !layer.eq_ignore_ascii_case(&written))
+        .collect();
+
+    parts.join(": ")
+}
+
+/// A compiler's warning is information: the check goes on without it.
+fn problem_severity(severity: Severity, code: &str) -> Severity {
+    match (severity, code) {
+        (Severity::Warning, "toolchain") => Severity::Information,
+        (severity, _) => severity,
     }
 }
 
@@ -626,6 +705,26 @@ mod tests {
     }
 
     #[test]
+    fn test_tables_say_each_error_once() {
+        let marked = |text: &str| {
+            let (mut problems, _) = parse_problems(Path::new("C:/p/tests.toml"), text);
+            problems.sort_by_key(|problem| problem.span.start);
+            problems
+                .iter()
+                .map(|problem| (problem.code, text[problem.span.clone()].to_string()))
+                .collect::<Vec<_>>()
+        };
+
+        // Each test's own keys, both of one table
+        let keys = "[[test]]\nname = \"a\"\ncommand = \"x\"\n\n[[test]]\nname = \"b\"\ncommand = \"x\"\ntimout = 3\nretires = 1\n";
+        assert_eq!(marked(keys), vec![("unknown-key", "timout".into()), ("unknown-key", "retires".into())]);
+
+        // A matrix's error once, not again for what blanking it out leaves
+        let matrix = "[[test]]\nname = \"a\"\ncommand = \"x {v}\"\nmatrix.v = [\"p\", \"q\"]\n";
+        assert_eq!(marked(matrix), vec![("invalid-matrix", "a".into())]);
+    }
+
+    #[test]
     fn syntax_errors_stop_the_parse() {
         let text = "[project\nname = \"x\"\n";
         let (problems, repaired) = parse_problems(Path::new("C:/p/anvil.toml"), text);
@@ -640,10 +739,11 @@ mod tests {
     #[test]
     fn codes() {
         assert_eq!(code("unknown condition `lnux` (did you mean `linux`?)"), "unknown-condition-word");
-        assert_eq!(code("in target `app`: unknown dependency `fmtt`"), "unknown-dependency");
-        assert_eq!(code("`[deps] zlib`: no target uses it"), "unused-dep");
-        assert_eq!(code("include folder inc does not exist (included by `app`)"), "missing-include-folder");
+        assert_eq!(code("in target `app`: dependency `zlib`: vcpkg install failed"), "invalid-dependency");
         assert_eq!(code("\"src/*.c\" matches no files (in C:/p)"), "glob-matches-nothing");
+
+        // Only a message that is about it: one that names pkg-config in passing is not
+        assert_eq!(code("std = \"19\": C++ standards are 11, 14, 17, 20, 23 and 26"), "load-error");
         assert_eq!(code("something new"), "load-error");
         assert_eq!(suggestion("unknown dependency `fmtt` (did you mean `fmt`?)").unwrap(), "fmt");
     }
@@ -688,6 +788,23 @@ mod tests {
                 (problem.code, text_of(&problem.file, &problem.span), problem.severity, related)
             })
             .collect()
+    }
+
+    #[test]
+    fn checks_say_every_error() {
+        let marked = |manifest: &str| {
+            let found = checked("every", manifest, None);
+            found.into_iter().map(|(code, text, ..)| (code, text)).collect::<Vec<_>>()
+        };
+
+        // One per table, and every name that does not resolve
+        let tables = "[project]\nname = \"game\"\n\n[target.a]\nkind = \"lib\"\nsources = []\nstd = \"19\"\n\n[target.game]\nstd = \"18\"\n";
+        assert_eq!(marked(tables), vec![("invalid-value", "19".into()), ("invalid-value", "18".into())]);
+        let names = "[project]\nname = \"game\"\n\n[target.game]\ndeps = [\"fmtt\", \"zlibb\"]\n";
+        assert_eq!(
+            marked(names),
+            vec![("unknown-dependency", "fmtt".into()), ("unknown-dependency", "zlibb".into())]
+        );
     }
 
     #[test]
@@ -760,16 +877,16 @@ mod tests {
                 format!("{BASE}\n[target.tool]\n"),
                 None,
                 "shared-sources",
-                "[target.tool]",
+                "tool",
                 error,
-                vec!["[target.app]"],
+                vec!["app"],
             ),
             (
                 "option",
                 format!("{BASE}\n[options]\nfast = \"yes\"\n"),
                 None,
                 "bad-option",
-                "fast",
+                "yes",
                 error,
                 vec![],
             ),
@@ -826,6 +943,92 @@ mod tests {
                 "smoke",
                 error,
                 vec!["smoke"],
+            ),
+            // [deps]: the short form's value, an inline table's key; one merged from [defaults] where it is written
+            (
+                "short-form",
+                BASE.replace("fmt = \"vcpkg\"", "fmt = \"vcpkgg\""),
+                None,
+                "invalid-dependency",
+                "vcpkgg",
+                error,
+                vec![],
+            ),
+            (
+                "inline-key",
+                BASE.replace("fmt = \"vcpkg\"", "fmt = { vcpkg = \"fmt\", tg = \"v1\" }"),
+                None,
+                "unknown-key",
+                "tg",
+                error,
+                vec![],
+            ),
+            (
+                "defaults-dep",
+                format!("{BASE}\n[defaults]\ndeps = [\"fmtt\"]\n"),
+                None,
+                "unknown-dependency",
+                "fmtt",
+                error,
+                vec![],
+            ),
+            // The manifest's own checks: its name, values that are not text
+            (
+                "project-name",
+                BASE.replace("name = \"game\"", "name = \"a/b\""),
+                None,
+                "invalid-name",
+                "a/b",
+                error,
+                vec![],
+            ),
+            ("unity", format!("{BASE}unity = 1\n"), None, "invalid-value", "1", error, vec![]),
+            ("std", format!("{BASE}std = \"19\"\n"), None, "invalid-value", "19", error, vec![]),
+            (
+                "profile-opt",
+                format!("{BASE}\n[profile.release]\nopt = 7\n"),
+                None,
+                "invalid-value",
+                "7",
+                error,
+                vec![],
+            ),
+            (
+                "when-if",
+                format!("{BASE}when.windows.if = \"linux\"\n"),
+                None,
+                "misplaced-key",
+                "if",
+                error,
+                vec![],
+            ),
+            // tests.toml: each test's own key, a target its command names
+            (
+                "test-key",
+                BASE.to_string(),
+                Some("[[test]]\nname = \"a\"\ncommand = \"x\"\n\n[[test]]\nname = \"b\"\ncommand = \"x\"\ntimout = 3\n"),
+                "unknown-key",
+                "timout",
+                error,
+                vec![],
+            ),
+            (
+                "test-command",
+                BASE.to_string(),
+                Some("[[test]]\nname = \"a\"\ncommand = \"x\"\n\n[[test]]\nname = \"b\"\ncommand = []\n"),
+                "empty-command",
+                "command",
+                error,
+                vec![],
+            ),
+            (
+                "test-target",
+                BASE.to_string(),
+                Some("[[test]]\nname = \"a\"\ncommand = \"{target:nope}\"\n"),
+                "unknown-target",
+                "{target:nope}",
+                error,
+                vec![],
             ),
         ];
 

@@ -1,7 +1,9 @@
 //! The machine a build produces programs for: a processor and an operating system, the host's unless a cross build
 //! asks for another (`--target arm64`, `--target aarch64-linux-gnu`, or a profile's `target`).
 
-use anyhow::{bail, Result};
+use crate::bail_at;
+use crate::located::Place;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,7 +107,11 @@ impl Platform {
         let mut parts = text.split('-');
         let first = parts.next().unwrap_or_default();
         let Some(cpu) = Cpu::parse(first) else {
-            bail!("target `{text}`: expected x64, x86, arm64, arm, or a triple such as aarch64-linux-gnu");
+            bail_at!(
+                Place::key("target").value(text),
+                "invalid-value",
+                "target `{text}`: expected x64, x86, arm64, arm, or a triple such as aarch64-linux-gnu"
+            );
         };
 
         let rest = text.to_ascii_lowercase();
@@ -116,7 +122,11 @@ impl Platform {
         } else if rest.contains("darwin") || rest.contains("apple") || rest.contains("macos") {
             Os::Macos
         } else {
-            bail!("target `{text}`: cannot tell its operating system (expected windows, mingw, linux or darwin in it)");
+            bail_at!(
+                Place::key("target").value(text),
+                "invalid-value",
+                "target `{text}`: cannot tell its operating system (expected windows, mingw, linux or darwin in it)"
+            );
         };
 
         Ok(Platform {

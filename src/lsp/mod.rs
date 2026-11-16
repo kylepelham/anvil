@@ -228,7 +228,9 @@ impl<'a> Server<'a> {
         let ready_events = events_sender.clone();
         std::thread::Builder::new().name("anvil-lsp-toolchain".into()).spawn(move || {
             let requested = requested.or_else(|| crate::settings::Settings::load().toolchain);
-            let found = crate::toolchain::Toolchain::find(requested.as_deref(), &crate::platform::Platform::host());
+            // In a session of its own: its warnings (an unusable CXX) are the checks' to report
+            let find = || crate::toolchain::Toolchain::find(requested.as_deref(), &crate::platform::Platform::host());
+            let (found, _) = session::run(session::Session::default(), find);
             if let Err(error) = &found {
                 eprintln!("anvil lsp: no compiler found ({error:#}); checks that need one are skipped");
             }

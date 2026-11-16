@@ -1,6 +1,8 @@
 //! Condition expressions: `windows`, `!windows`, `msvc & debug`, `linux | macos`, `(a | b) & !c`.
 //! Used by `if = "..."` keys and `[when.<cond>]` tables.
 
+use crate::bail_at;
+use crate::located::Place;
 use crate::platform::{Cpu, Os, Platform};
 use crate::toolchain::Family;
 use anyhow::{bail, Result};
@@ -48,17 +50,29 @@ pub const BUILTIN_WORDS: &[&str] = &[
 pub fn check_names(profiles: &[String], options: &[String]) -> Result<()> {
     for profile in profiles {
         if BUILTIN_WORDS.contains(&profile.as_str()) {
-            bail!("profile `{profile}`: `{profile}` is already a condition word (platform, processor or compiler); rename the profile");
+            bail_at!(
+                Place::keys(&["profile", profile]),
+                "reserved-name",
+                "profile `{profile}`: `{profile}` is already a condition word (platform, processor or compiler); rename the profile"
+            );
         }
     }
 
     for option in options {
         if BUILTIN_WORDS.contains(&option.as_str()) {
-            bail!("option `{option}`: `{option}` is already a condition word (platform, processor or compiler); rename the option");
+            bail_at!(
+                Place::keys(&["options", option]),
+                "reserved-name",
+                "option `{option}`: `{option}` is already a condition word (platform, processor or compiler); rename the option"
+            );
         }
         let is_profile = matches!(option.as_str(), "debug" | "release") || profiles.contains(option);
         if is_profile {
-            bail!("option `{option}` has the name of a profile, so `when.{option}` could not tell them apart; rename the option");
+            bail_at!(
+                Place::keys(&["options", option]),
+                "reserved-name",
+                "option `{option}` has the name of a profile, so `when.{option}` could not tell them apart; rename the option"
+            );
         }
     }
 
@@ -75,7 +89,12 @@ pub fn parse(source: &str) -> Result<Cond> {
 
     let condition = parser.parse_or()?;
     if parser.position != tokens.len() {
-        bail!("condition \"{source}\": unexpected `{}`", tokens[parser.position]);
+        bail_at!(
+            Place::default().value(source),
+            "bad-condition",
+            "condition \"{source}\": unexpected `{}`",
+            tokens[parser.position]
+        );
     }
 
     Ok(condition)
@@ -181,7 +200,9 @@ impl CondContext {
                 .chain(self.all_profiles.iter().map(String::as_str))
                 .chain(self.options.keys().map(String::as_str));
             let hint = crate::util::did_you_mean(name, known);
-            bail!(
+            bail_at!(
+                Place::default().value(name),
+                "unknown-condition-word",
                 "unknown condition `{name}`{hint}. Known: windows, linux, macos, unix, x64, x86, arm64, arm, cross, msvc, gnu, \
                  cl, clang-cl, clang, gcc, mingw, debug, release, any profile name, any [options] name, true, false"
             );
@@ -243,7 +264,12 @@ impl<'a> Parser<'a> {
                 let inner = self.parse_or()?;
 
                 if self.peek() != Some(")") {
-                    bail!("condition \"{}\": missing `)`", self.source);
+                    bail_at!(
+                        Place::default().value(self.source),
+                        "bad-condition",
+                        "condition \"{}\": missing `)`",
+                        self.source
+                    );
                 }
                 self.position += 1;
 
@@ -253,8 +279,18 @@ impl<'a> Parser<'a> {
                 self.position += 1;
                 Ok(Cond::Atom(word.to_string()))
             }
-            Some(word) => bail!("condition \"{}\": unexpected `{word}`", self.source),
-            None => bail!("condition \"{}\": ends too early", self.source),
+            Some(word) => bail_at!(
+                Place::default().value(self.source),
+                "bad-condition",
+                "condition \"{}\": unexpected `{word}`",
+                self.source
+            ),
+            None => bail_at!(
+                Place::default().value(self.source),
+                "bad-condition",
+                "condition \"{}\": ends too early",
+                self.source
+            ),
         }
     }
 }
@@ -286,7 +322,11 @@ fn tokenize(source: &str) -> Result<Vec<String>> {
         }
 
         if !is_word_character(character) {
-            bail!("condition \"{source}\": unexpected character `{character}`");
+            bail_at!(
+                Place::default().value(source),
+                "bad-condition",
+                "condition \"{source}\": unexpected character `{character}`"
+            );
         }
 
         // A name, or one of the word operators
@@ -309,7 +349,11 @@ fn tokenize(source: &str) -> Result<Vec<String>> {
     }
 
     if tokens.is_empty() {
-        bail!("empty condition: write one, such as \"windows\" or \"debug & !msvc\", or leave it out");
+        bail_at!(
+            Place::default().value(source),
+            "bad-condition",
+            "empty condition: write one, such as \"windows\" or \"debug & !msvc\", or leave it out"
+        );
     }
 
     Ok(tokens)

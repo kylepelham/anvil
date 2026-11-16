@@ -2,6 +2,7 @@
 //! unsaved text, warnings are collected instead of printed, [[write]] files are not written, and every file read is
 //! remembered (an edit to one of them checks the project again). Outside the language server nothing changes.
 
+use crate::located::Place;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,8 +16,11 @@ pub struct Session {
     /// The editor's text of open files, by `util::path_key`.
     pub texts: HashMap<String, String>,
 
-    /// What `ui::warn` would have printed.
-    pub warnings: Vec<String>,
+    /// What `ui::warn` would have printed, with where it is when the warning says.
+    pub warnings: Vec<(String, Option<(Place, &'static str)>)>,
+
+    /// Errors of checks that go on past their first (the load's own error is the first).
+    pub errors: Vec<anyhow::Error>,
 
     /// Manifests and tests.toml files the load read.
     pub read: Vec<PathBuf>,
@@ -117,13 +121,42 @@ pub fn walk<E>(kind: &str, parts: &[&Path], walk: impl FnOnce() -> Result<Vec<Pa
     Ok(files)
 }
 
-/// Keeps a warning for the language server instead of printing it; false outside one.
-pub fn capture_warning(message: &str) -> bool {
+/// Keeps a warning for the language server instead of printing it, with its place and code when it has them; false
+/// outside one.
+pub fn capture_warning(message: &str, place: Option<(Place, &'static str)>) -> bool {
     CURRENT.with(|current| match current.borrow_mut().as_mut() {
         Some(session) => {
-            session.warnings.push(message.to_string());
+            session.warnings.push((message.to_string(), place));
             true
         }
         None => false,
     })
+}
+
+/// Keeps an error a check found after its first, for the language server (outside one nothing asks for it).
+pub fn add_error(error: anyhow::Error) {
+    CURRENT.with(|current| {
+        if let Some(session) = current.borrow_mut().as_mut() {
+            session.errors.push(error);
+        }
+    });
+}
+
+/// How many errors were said so far.
+pub fn error_count() -> usize {
+    CURRENT.with(|current| current.borrow().as_ref().map_or(0, |session| session.errors.len()))
+}
+
+/// An error said before the ones at and after `index`.
+pub fn insert_error(index: usize, error: anyhow::Error) {
+    CURRENT.with(|current| {
+        if let Some(session) = current.borrow_mut().as_mut() {
+            session.errors.insert(index.min(session.errors.len()), error);
+        }
+    });
+}
+
+/// Whether errors were said and left behind: what was checked after them may miss what they left out.
+pub fn has_errors() -> bool {
+    CURRENT.with(|current| current.borrow().as_ref().is_some_and(|session| !session.errors.is_empty()))
 }

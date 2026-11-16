@@ -956,12 +956,11 @@ pub(crate) fn module_target(name: &str, build: &BuildContext) -> Option<Imported
     Some(target)
 }
 
-/// A warning about the OpenMP runtime, once per run however many packages and targets use OpenMP.
+/// A warning about the OpenMP runtime, once per run however many packages and targets use OpenMP (under the language
+/// server, in every check).
 fn warn_once(message: &str) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        crate::ui::warn(message);
-    }
+    crate::ui::warn_once(&WARNED, message);
 }
 
 /// The imported targets CMake package files define, with what each gives its users for `build`. One target's

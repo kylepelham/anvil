@@ -1,5 +1,7 @@
 //! Turns Anvil's compiler-neutral settings into each toolchain's command lines and file names.
 
+use crate::bail_at;
+use crate::located::Place;
 use crate::platform::{Cpu, Os};
 use crate::profile::{Opt, Profile};
 use crate::toolchain::{Family, Toolchain};
@@ -126,7 +128,11 @@ impl Warnings {
             "default" => Warnings::Default,
             "high" | "extra" => Warnings::High,
             "all" | "pedantic" => Warnings::All,
-            other => bail!("warnings = \"{other}\": expected off, default, high or all"),
+            other => bail_at!(
+                Place::key("warnings").value(other),
+                "invalid-value",
+                "warnings = \"{other}\": expected off, default, high or all"
+            ),
         })
     }
 }
@@ -138,7 +144,11 @@ impl Arch {
             "avx2" => Arch::Avx2,
             "avx512" => Arch::Avx512,
             "native" => Arch::Native,
-            other => bail!("arch = \"{other}\": expected avx, avx2, avx512 or native"),
+            other => bail_at!(
+                Place::key("arch").value(other),
+                "invalid-value",
+                "arch = \"{other}\": expected avx, avx2, avx512 or native"
+            ),
         })
     }
 }
@@ -149,7 +159,11 @@ impl Gui {
             toml::Value::Boolean(false) => Gui::Off,
             toml::Value::Boolean(true) => Gui::WinMain,
             toml::Value::String(text) if text == "main" => Gui::Main,
-            other => bail!("gui = {other}: expected true (a GUI program with WinMain), \"main\" (a GUI program with main()) or false"),
+            other => bail_at!(
+                Place::key("gui").value(crate::located::value_text(other).unwrap_or_default()),
+                "invalid-value",
+                "gui = {other}: expected true (a GUI program with WinMain), \"main\" (a GUI program with main()) or false"
+            ),
         })
     }
 }
@@ -175,9 +189,17 @@ pub fn normalize_standard(text: &str, language: Language) -> Result<String> {
     };
     if !valid {
         if cxx {
-            bail!("std = \"{text}\": C++ standards are 11, 14, 17, 20, 23 and 26 (\"c++20\", \"20\", or \"gnu++20\" with GNU extensions)");
+            bail_at!(
+                Place::key("std").value(text),
+                "invalid-value",
+                "std = \"{text}\": C++ standards are 11, 14, 17, 20, 23 and 26 (\"c++20\", \"20\", or \"gnu++20\" with GNU extensions)"
+            );
         }
-        bail!("c-std = \"{text}\": C standards are 89, 90, 99, 11, 17, 18 and 23 (\"c17\", \"17\", or \"gnu17\" with GNU extensions)");
+        bail_at!(
+            Place::key("c-std").value(text),
+            "invalid-value",
+            "c-std = \"{text}\": C standards are 89, 90, 99, 11, 17, 18 and 23 (\"c17\", \"17\", or \"gnu17\" with GNU extensions)"
+        );
     }
 
     Ok(if !cxx && lowered.starts_with("gnu") {
@@ -501,9 +523,12 @@ impl Toolchain {
         if profile.sanitize.is_empty() {
             return Ok(());
         }
+        let key = |key: &str| Place::keys(&["profile", &profile.name, key]);
 
         if self.family == Family::Gcc && self.targets_windows() {
-            bail!(
+            bail_at!(
+                key("sanitize"),
+                "toolchain",
                 "profile `{}`: sanitize needs a sanitizer runtime, which MinGW gcc does not have; build it with --toolchain msvc, clang-cl or clang",
                 profile.name
             );
@@ -512,7 +537,9 @@ impl Toolchain {
             // clang's AddressSanitizer runtime, where the compiler said it is when it was detected
             let address = profile.sanitize.iter().any(|sanitizer| sanitizer == "address");
             if address && self.sanitizer_runtime_dir.is_none() {
-                bail!(
+                bail_at!(
+                    key("sanitize").value("address"),
+                    "toolchain",
                     "profile `{}`: sanitize = [\"address\"] needs clang's AddressSanitizer runtime (clang_rt.asan_dynamic-{}.lib), which {} does not find; \
                      install LLVM's compiler-rt libraries (the LLVM installer and Visual Studio's \"C++ Clang tools\" have them) and run \
                      `anvil toolchains --refresh`, or build it with --toolchain msvc",
@@ -523,7 +550,7 @@ impl Toolchain {
             }
 
             if profile.debug_runtime_requested {
-                crate::ui::warn(&format!(
+                crate::ui::warn_at(key("debug-runtime"), "toolchain", &format!(
                     "profile `{}`: debug-runtime = true is not used with sanitize on {}: clang's sanitizers on Windows have no debug C runtime, so it links the release one",
                     profile.name,
                     self.family.name()

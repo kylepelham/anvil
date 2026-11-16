@@ -5,12 +5,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-/// One step of a key path: a key, or an item of an array (also an array of tables, `[[test]]`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Part {
-    Key(String),
-    Index(usize),
-}
+pub use crate::located::Part;
 
 pub type KeyPath = Vec<Part>;
 
