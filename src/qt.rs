@@ -15,16 +15,19 @@ use crate::util::{self, slash};
 use crate::vcpkg_tree::{self, BuildContext, CmakePackage, ImportPrefix, Usage};
 use anyhow::{bail, Context, Result};
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, OnceLock};
 
-// The macros that make moc write code, as AUTOMOC looks for them
-const MOC_MACROS: &str = r"(?m)^[ \t]*(?:Q_OBJECT|Q_GADGET|Q_GADGET_EXPORT|Q_NAMESPACE|Q_NAMESPACE_EXPORT)\b";
+// The macros that make moc write code, as AUTOMOC looks for them (at a line's start, after a `{` too)
+const MOC_MACROS: &str = r"(?m)^[ \t]*\{?[ \t]*(?:Q_OBJECT|Q_GADGET|Q_GADGET_EXPORT|Q_NAMESPACE|Q_NAMESPACE_EXPORT)\b";
 
 // Header extensions AUTOMOC tries beside a source, and the C++ sources moc reads
 const HEADER_EXTENSIONS: &[&str] = &["h", "hh", "h++", "hm", "hpp", "hxx"];
 const SOURCE_EXTENSIONS: &[&str] = &["cpp", "cc", "cxx", "c++", "cp", "mm"];
+
+// The first line of a target's scan cache: a file without it (another version's) is read again
+const SCAN_CACHE_HEADER: &str = "# anvil qt scans 2: time, moc macro, generated includes, path";
 
 // Folders under a Qt prefix that hold its tools ({major}: 5 or 6), most specific first: distributions' lib/qt6/libexec,
 // vcpkg's tools/Qt6/bin, Homebrew's share/qt/libexec, then bin/ (Qt's own installs; on Linux /usr/bin/moc may be
@@ -88,12 +91,15 @@ struct Scan {
     includes: Vec<String>,
 }
 
-/// Scans of the files a target's moc may read, kept beside its generated files with each file's size and time, so a
-/// build reads only the files that changed.
+/// Scans of the files a target's moc may read, kept beside its generated files with each file's time, so a build
+/// reads only the files that changed.
 struct ScanCache {
     file: PathBuf,
-    entries: HashMap<String, (u64, i64, Scan)>,
-    lines: Vec<String>,
+    entries: HashMap<String, (i64, Scan)>,
+    /// The times of each folder's files, from one listing (Windows; elsewhere a file's own stat is cheap).
+    folder_times: HashMap<PathBuf, Option<HashMap<String, i64>>>,
+    /// This build's files' lines, by path.
+    lines: BTreeMap<String, String>,
 }
 
 impl Qt {
@@ -537,25 +543,47 @@ pub fn plan(model: &Model, index: usize, qt: &Qt, settings: &CompileSettings) ->
     }
 
     // Headers moc may read: those listed, those beside a source with its name (`x.h`, `x_p.h`), and those of the
-    // target's own include folders with a source's name
-    headers.extend(candidate_headers(model, target, &sources)?);
+    // target's own include folders with a source's name; with the layout convention, any other header of its own
+    // folders with a moc macro, unless the convention dropped the sources beside it
+    let (named, others) = candidate_headers(model, target, &sources)?;
+    headers.extend(named);
     let mut seen = HashSet::new();
     headers.retain(|header| seen.insert(util::path_key(header)));
-    let moc_headers: Vec<PathBuf> = headers.into_iter().filter(|header| cache.scan(header).has_macro).collect();
+    let mut moc_headers: Vec<PathBuf> = headers.into_iter().filter(|header| cache.scan(header).has_macro).collect();
+    let compiled: HashSet<String> = target.sources.iter().map(|source| util::path_key(source)).collect();
+    let mut dropped_folders: HashMap<PathBuf, bool> = HashMap::new();
+    for header in others {
+        if !seen.insert(util::path_key(&header)) || !cache.scan(&header).has_macro {
+            continue;
+        }
+        let folder = header.parent().unwrap_or(Path::new("")).to_path_buf();
+        let dropped = *dropped_folders
+            .entry(folder)
+            .or_insert_with_key(|folder| has_dropped_sources(folder, &compiled));
+        if !dropped {
+            moc_headers.push(header);
+        }
+    }
     cache.save()?;
 
-    // Sources: one with a moc macro includes `<name>.moc`, which moc writes from it; `moc_<name>.cpp` a source
-    // includes is a header's, written beside the forms' headers instead of compiled alone
+    // Sources: one with a moc macro includes `<name>.moc`, which moc writes from it (into include/, or the include's
+    // folder there: "sub/<name>.moc"); `moc_<name>.cpp` a source includes is a header's, written beside the forms'
+    // headers instead of compiled alone
     let mut source_mocs = Vec::new();
+    let mut moc_writers: HashMap<String, &Path> = HashMap::new();
     let mut included_header_mocs = HashSet::new();
     for (source, scan) in &source_scans {
         let own = format!("{}.moc", stem(source));
+        let mut own_include = None;
         for name in &scan.includes {
-            if name.ends_with(".moc") && *name != own {
-                bail!(
-                    "{}: includes \"{name}\", which would be moc's output for another file; a source includes only its own, \"{own}\"",
-                    slash(source)
-                );
+            if name.ends_with(".moc") {
+                if file_name(Path::new(name)) != own {
+                    bail!(
+                        "{}: includes \"{name}\", which would be moc's output for another file; a source includes only its own, \"{own}\"",
+                        slash(source)
+                    );
+                }
+                own_include.get_or_insert(name);
             }
             if let Some(header) = name.strip_prefix("moc_").and_then(|rest| rest.strip_suffix(".cpp")) {
                 if !moc_headers.iter().any(|known| stem(known) == header) {
@@ -569,14 +597,17 @@ pub fn plan(model: &Model, index: usize, qt: &Qt, settings: &CompileSettings) ->
             }
         }
 
-        match (scan.has_macro, scan.includes.contains(&own)) {
-            (_, true) => source_mocs.push((source.to_path_buf(), include.join(&own))),
-            (true, false) => bail!(
+        match (scan.has_macro, own_include) {
+            (_, Some(name)) => {
+                let output = source_moc_output(source, name, &include, &mut moc_writers)?;
+                source_mocs.push((source.to_path_buf(), output));
+            }
+            (true, None) => bail!(
                 "{}: a class with Q_OBJECT (or Q_GADGET, Q_NAMESPACE) in a source file needs `#include \"{own}\"` at the end of the file, \
                  which moc writes; or move the class to a header",
                 slash(source)
             ),
-            (false, false) => {}
+            (false, None) => {}
         }
     }
 
@@ -801,10 +832,11 @@ fn moc_step(qt: &Qt, moc: &Path, settings: &CompileSettings, predefs: Option<&Pa
         args.extend(["--include".to_string(), path_text(predefs)]);
     }
 
-    // What it read, from Qt 5.15 on
-    let depfile = qt
-        .moc_writes_depfile()
-        .then(|| folder.join("deps").join(format!("{}.d", file_name(output))));
+    // What it read, from Qt 5.15 on (named for the output's place, as two outputs may share a name)
+    let depfile = qt.moc_writes_depfile().then(|| {
+        let relative = util::strip_prefix_ci(output, folder).map_or_else(|| file_name(output), |relative| slash(&relative));
+        folder.join("deps").join(format!("{relative}.d"))
+    });
     if let Some(depfile) = &depfile {
         args.extend(["--output-dep-file".to_string(), "--dep-file-path".to_string(), path_text(depfile)]);
     }
@@ -903,11 +935,42 @@ fn check_unique_names(files: &[PathBuf], what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where moc writes a source's `.moc`: in the generated include folder, as the source includes it ("x.moc",
+/// "sub/x.moc"). Two sources whose includes name one file are an error, as in CMake: one include must say more.
+fn source_moc_output<'a>(source: &'a Path, name: &str, include: &Path, writers: &mut HashMap<String, &'a Path>) -> Result<PathBuf> {
+    let relative = Path::new(name);
+    let file = file_name(relative);
+    if !relative.components().all(|component| matches!(component, Component::Normal(_))) {
+        bail!(
+            "{}: includes \"{name}\"; moc writes it on the include path, so include it as \"{file}\" or \"<folder>/{file}\"",
+            slash(source)
+        );
+    }
+
+    let output = include.join(relative);
+    if let Some(other) = writers.insert(util::path_key(&output), source) {
+        let folder = |path: &Path| path.parent().map(file_name).unwrap_or_default();
+        bail!(
+            "{} and {} both include \"{name}\", and moc would write that one file from both; tell them apart with a folder \
+             (`#include \"{}/{file}\"` in one, `#include \"{}/{file}\"` in the other), or rename one",
+            slash(other),
+            slash(source),
+            folder(other),
+            folder(source)
+        );
+    }
+
+    Ok(output)
+}
+
 /// The headers AUTOMOC would read for these sources: `<name>.h` and `<name>_p.h` beside each (any header extension),
-/// and the headers of the target's own include folders (in its package, not generated) with a source's name.
-fn candidate_headers(model: &Model, target: &Target, sources: &[PathBuf]) -> Result<Vec<PathBuf>> {
+/// and the headers of the target's own include folders (in its package, not generated) with a source's name. With
+/// the layout convention, where no headers are listed, also the other headers of those folders and of the folder its
+/// sources come from (src/, else the target's folder itself): (headers named for a source, others).
+fn candidate_headers(model: &Model, target: &Target, sources: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let names: HashSet<String> = sources.iter().map(|source| stem(source).to_lowercase()).collect();
     let mut headers = Vec::new();
+    let mut others = Vec::new();
 
     // Beside the sources
     for source in sources {
@@ -921,24 +984,54 @@ fn candidate_headers(model: &Model, target: &Target, sources: &[PathBuf]) -> Res
         }
     }
 
-    // In its own include folders
+    // Its own folders: include folders, and the convention's source folder
     let root = &model.packages[target.package].root;
-    let pattern = format!("**/*.{{{}}}", HEADER_EXTENSIONS.join(","));
+    let extensions = HEADER_EXTENSIONS.join(",");
+    let below = format!("**/*.{{{extensions}}}");
+    let mut folders: Vec<(&Path, String)> = Vec::new();
     for folder in target.include.iter().chain(&target.private_include) {
         let own = util::strip_prefix_ci(folder, root).is_some() && util::strip_prefix_ci(folder, &model.out_root).is_none();
-        if !own || !folder.is_dir() {
+        if own && folder.is_dir() {
+            folders.push((folder, below.clone()));
+        }
+    }
+    let source_folder = target.dir.join("src");
+    if target.conventional_sources {
+        match source_folder.is_dir() {
+            true => folders.push((&source_folder, below.clone())),
+            false => folders.push((&target.dir, format!("*.{{{extensions}}}"))),
+        }
+    }
+
+    // Their headers, each folder once
+    let mut walked = HashSet::new();
+    for (folder, pattern) in folders {
+        if !walked.insert((util::path_key(folder), pattern.clone())) {
             continue;
         }
-        for header in targets::expand_patterns(folder, std::slice::from_ref(&pattern), &model.out_root, false)? {
+        for header in targets::expand_pattern_list(folder, &[pattern], &model.out_root, false, false)? {
             let name = stem(&header).to_lowercase();
             let base = name.strip_suffix("_p").unwrap_or(&name);
             if names.contains(base) {
                 headers.push(header);
+            } else if target.conventional_sources {
+                others.push(header);
             }
         }
     }
 
-    Ok(headers)
+    Ok((headers, others))
+}
+
+/// Whether a folder holds C or C++ files the target does not compile: the convention's files a `when` block or `!`
+/// pattern took out (src/win/ elsewhere than on Windows), whose headers are not the target's either.
+fn has_dropped_sources(folder: &Path, compiled: &HashSet<String>) -> bool {
+    std::fs::read_dir(folder).into_iter().flatten().flatten().any(|entry| {
+        let path = entry.path();
+        let source = matches!(extension(&path).as_str(), "c" | "cc" | "cpp" | "cxx" | "c++");
+
+        source && !compiled.contains(&util::path_key(&path))
+    })
 }
 
 /// With the layout convention, the `.ui` and `.qrc` files where the convention finds sources.
@@ -951,7 +1044,7 @@ fn conventional_files(model: &Model, target: &Target) -> Result<Vec<PathBuf>> {
         true => "src/**/*.{ui,qrc}",
         false => "*.{ui,qrc}",
     };
-    let found = targets::expand_patterns(&target.dir, &[pattern.to_string()], &model.out_root, false)?;
+    let found = targets::expand_pattern_list(&target.dir, &[pattern.to_string()], &model.out_root, false, false)?;
     Ok(found
         .into_iter()
         .filter(|file| !target.sources.iter().any(|source| util::path_key(source) == util::path_key(file)))
@@ -1168,50 +1261,63 @@ fn imported_dlls(file: &Path) -> Option<Vec<String>> {
 
 impl ScanCache {
     fn load(file: PathBuf) -> ScanCache {
+        // Another version's scans are read again
         let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let text = text.strip_prefix(&format!("{SCAN_CACHE_HEADER}\n")).unwrap_or_default();
         let mut entries = HashMap::new();
         for line in text.lines() {
-            let fields: Vec<&str> = line.splitn(5, '\t').collect();
-            let [size, time, has_macro, includes, path] = fields[..] else { continue };
-            let (Ok(size), Ok(time)) = (size.parse(), time.parse()) else { continue };
+            let fields: Vec<&str> = line.splitn(4, '\t').collect();
+            let [time, has_macro, includes, path] = fields[..] else { continue };
+            let Ok(time) = time.parse() else { continue };
             let scan = Scan {
                 has_macro: has_macro == "1",
                 includes: includes.split('|').filter(|name| !name.is_empty()).map(String::from).collect(),
             };
-            entries.insert(path.to_string(), (size, time, scan));
+            entries.insert(path.to_string(), (time, scan));
         }
 
         ScanCache {
             file,
             entries,
-            lines: Vec::new(),
+            folder_times: HashMap::new(),
+            lines: BTreeMap::new(),
         }
     }
 
-    /// A file's scan: the cached one while its size and time stay, else read now.
+    /// A file's scan: the cached one while its time stays, else read now.
     fn scan(&mut self, path: &Path) -> Scan {
         let key = slash(path);
-        let metadata = std::fs::metadata(path).ok();
-        let size = metadata.as_ref().map_or(0, |metadata| metadata.len());
-        let time = util::mtime(path).unwrap_or(0);
+        let time = self.modified(path);
 
         let scan = match self.entries.get(&key) {
-            Some((cached_size, cached_time, scan)) if *cached_size == size && *cached_time == time => scan.clone(),
+            Some((cached_time, scan)) if *cached_time == time => scan.clone(),
             _ => scan_text(&String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default())),
         };
-        let line = format!("{size}\t{time}\t{}\t{}\t{key}", scan.has_macro as u8, scan.includes.join("|"));
-        if !self.lines.contains(&line) {
-            self.lines.push(line);
-        }
+        let line = format!("{time}\t{}\t{}\t{key}", scan.has_macro as u8, scan.includes.join("|"));
+        self.lines.insert(key, line);
 
         scan
     }
 
+    /// A file's modification time: from its folder's listing where there is one (a stat per file costs on Windows).
+    fn modified(&mut self, path: &Path) -> i64 {
+        let folder = path.parent().unwrap_or(Path::new(""));
+        let times = self
+            .folder_times
+            .entry(folder.to_path_buf())
+            .or_insert_with(|| util::folder_mtimes(folder));
+        let listed = times.as_ref().and_then(|times| times.get(&util::path_key(Path::new(&file_name(path)))));
+
+        listed.copied().or_else(|| util::mtime(path)).unwrap_or(0)
+    }
+
     /// Keeps the scans of this build's files, written only when they changed.
     fn save(&self) -> Result<()> {
-        let mut lines = self.lines.clone();
-        lines.sort();
-        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        let mut text = format!("{SCAN_CACHE_HEADER}\n");
+        for line in self.lines.values() {
+            text.push_str(line);
+            text.push('\n');
+        }
 
         util::write_if_changed(&self.file, text.as_bytes()).with_context(|| format!("writing {}", slash(&self.file)))?;
         Ok(())
@@ -1225,9 +1331,16 @@ fn scan_text(text: &str) -> Scan {
 
     let mut includes = Vec::new();
     for captures in INCLUDE.captures_iter(text) {
-        let name = captures[1].rsplit('/').next().unwrap_or_default().to_string();
+        let written = captures[1].replace('\\', "/");
+        let name = written.rsplit('/').next().unwrap_or_default().to_string();
         let generated =
             name.ends_with(".moc") || (name.starts_with("moc_") && name.ends_with(".cpp")) || (name.starts_with("ui_") && name.ends_with(".h"));
+
+        // A `.moc` keeps its folder ("sub/x.moc"), where moc writes it
+        let name = match name.ends_with(".moc") {
+            true => written.trim_start_matches("./").to_string(),
+            false => name,
+        };
         if generated && !includes.contains(&name) {
             includes.push(name);
         }
@@ -1329,15 +1442,83 @@ mod tests {
                     class A : public QObject {\n    Q_OBJECT\n};\n";
         let scan = scan_text(text);
         assert!(scan.has_macro);
-        assert_eq!(scan.includes, ["ui_form.h", "moc_window.cpp", "main.moc"]);
+        assert_eq!(scan.includes, ["ui_form.h", "moc_window.cpp", "sub/main.moc"]);
 
         // Only a macro that starts a line counts: not one in a comment or a longer name
         for text in ["// Q_OBJECT\n", "#define X Q_OBJECT\n", "  Q_OBJECTS\n"] {
             assert!(!scan_text(text).has_macro, "{text}");
         }
-        for text in ["Q_GADGET\n", "\tQ_NAMESPACE_EXPORT(API)\n", "  Q_GADGET_EXPORT(API)\n", "Q_NAMESPACE\n"] {
+        for text in [
+            "Q_GADGET\n",
+            "\tQ_NAMESPACE_EXPORT(API)\n",
+            "  Q_GADGET_EXPORT(API)\n",
+            "Q_NAMESPACE\n",
+            "{ Q_OBJECT\n",
+            "  {Q_OBJECT\n",
+        ] {
             assert!(scan_text(text).has_macro, "{text}");
         }
+    }
+
+    #[test]
+    fn writes_each_source_moc_where_its_include_finds_it() {
+        let include = PathBuf::from("/out/qt/app/include");
+        let (first, second) = (PathBuf::from("/p/src/a/item.cpp"), PathBuf::from("/p/src/b/item.cpp"));
+        let mut writers = HashMap::new();
+
+        // "item.moc" in include/, "b/item.moc" in include/b/
+        let output = source_moc_output(&first, "item.moc", &include, &mut writers).unwrap();
+        assert_eq!(output, include.join("item.moc"));
+        let output = source_moc_output(&second, "b/item.moc", &include, &mut writers).unwrap();
+        assert_eq!(output, include.join("b/item.moc"));
+
+        // Two sources whose includes name one file, and an include that leaves the include folder
+        let error = source_moc_output(&second, "item.moc", &include, &mut writers).unwrap_err().to_string();
+        assert!(
+            error.contains("/p/src/a/item.cpp and /p/src/b/item.cpp both include \"item.moc\"")
+                && error.contains("`#include \"a/item.moc\"` in one, `#include \"b/item.moc\"` in the other"),
+            "{error}"
+        );
+        let error = source_moc_output(&second, "../item.moc", &include, &mut writers).unwrap_err().to_string();
+        assert!(error.contains("include it as \"item.moc\" or \"<folder>/item.moc\""), "{error}");
+    }
+
+    #[test]
+    fn scan_cache_keeps_scans_until_a_file_changes() {
+        let folder = scratch("scancache");
+        let header = folder.join("window.h");
+        write(&header, "class Window {\n    Q_OBJECT\n};\n");
+        let file = folder.join("scan.txt");
+
+        // Scanned, kept, and read back
+        let mut cache = ScanCache::load(file.clone());
+        assert!(cache.scan(&header).has_macro);
+        cache.save().unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with(&format!("{SCAN_CACHE_HEADER}\n")), "{text}");
+        assert_eq!(ScanCache::load(file.clone()).entries.len(), 1);
+
+        // Another version's cache is read again
+        write(&file, text.trim_start_matches(&format!("{SCAN_CACHE_HEADER}\n")));
+        assert!(ScanCache::load(file).entries.is_empty());
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn folders_with_dropped_sources() {
+        let folder = scratch("dropped");
+        write(&folder.join("win/native.cpp"), "");
+        write(&folder.join("win/native.h"), "");
+        write(&folder.join("extra/orphan.h"), "");
+        write(&folder.join("main.cpp"), "");
+        let compiled: HashSet<String> = [util::path_key(&folder.join("main.cpp"))].into_iter().collect();
+
+        assert!(has_dropped_sources(&folder.join("win"), &compiled));
+        assert!(!has_dropped_sources(&folder.join("extra"), &compiled));
+        assert!(!has_dropped_sources(&folder, &compiled));
+
+        std::fs::remove_dir_all(&folder).ok();
     }
 
     #[test]

@@ -14,7 +14,6 @@ const IGNORED_COMMANDS: &[&str] = &[
     "qt_finalize_executable",
     "qt_policy",
     "qt_import_plugins",
-    "qt_disable_unicode_defines",
     "qt_allow_non_utf8_sources",
     "qt_generate_deploy_app_script",
     "qt_generate_deploy_qml_app_script",
@@ -34,6 +33,7 @@ const HANDLED_COMMANDS: &[&str] = &[
     "qt_wrap_ui",
     "qt_wrap_cpp",
     "qt_add_qml_module",
+    "qt_disable_unicode_defines",
 ];
 
 /// A Qt command's versionless name: `qt6_add_resources` and `qt5_wrap_ui` as `qt_add_resources` and `qt_wrap_ui`.
@@ -91,6 +91,7 @@ impl Interpreter {
             "qt_wrap_ui" | "qt_wrap_cpp" => self.qt_list_files(&args, &["OPTIONS", "TARGET", "DEPENDS"]),
             "qt_add_resources" | "qt_add_big_resources" => self.qt_add_resources(command, &args),
             "qt_add_qml_module" => self.qt_add_qml_module(command, &args),
+            "qt_disable_unicode_defines" => self.qt_disable_unicode_defines(command, &args),
             _ => {}
         }
     }
@@ -222,6 +223,20 @@ impl Interpreter {
             shown.join(", ")
         );
         self.targets.get_mut(&target).unwrap().notes.push(note);
+    }
+
+    /// qt_disable_unicode_defines(target): Qt 6 defines UNICODE and _UNICODE on Windows for every target that uses it
+    /// unless the target sets QT_NO_UNICODE_DEFINES, which Anvil has no key for; a note says how to undefine them.
+    fn qt_disable_unicode_defines(&mut self, command: &Command, args: &[String]) {
+        let Some(first) = args.first() else { return };
+        let name = self.aliases.get(first).cloned().unwrap_or_else(|| first.clone());
+        let Some(target) = self.targets.get_mut(&name) else { return };
+
+        target.notes.push(format!(
+            "{}({first}) is not converted: Qt still defines UNICODE and _UNICODE for it on Windows; to undefine them add \
+             `flags = [\"-UUNICODE\", \"-U_UNICODE\"]` to its `when.windows` block",
+            command.name
+        ));
     }
 
     /// AUTOMOC, AUTOUIC or AUTORCC on a target: on is what Anvil does anyway; off becomes `qt = false`, which turns

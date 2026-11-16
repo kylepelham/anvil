@@ -5053,6 +5053,62 @@ fn qt_widgets_build_and_rebuild_what_changed() {
     project.anvil(&["build"]).success().up_to_date();
 }
 
+const QT_MOC_ITEM: &str = "#include <QObject>\nnamespace NAME {\nclass Item : public QObject {\n    Q_OBJECT\n};\n\
+     QString make() { Item item; return item.metaObject()->className(); }\n}\n#include \"INCLUDE\"\n";
+
+#[test]
+fn qt_moc_finds_headers_and_sources_as_cmake_does() {
+    require!("default", "qt");
+
+    // The layout convention without forms or resources (and an include/ without headers): no warnings. Two sources
+    // of one name include their `.moc` with a folder; a header no source is named for has `{ Q_OBJECT`; a folder whose
+    // sources a `!` pattern drops keeps its header out of moc too
+    let project = Project::empty("qt_moc_finds");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"mocs\"\n\n[deps]\nqt = { cmake = \"Qt6\", components = [\"Core\"] }\n\n\
+         [target.mocs]\nkind = \"exe\"\nsources = [\"!src/native/**\"]\ndeps = [\"qt\"]\n",
+    );
+    project.write("include/README.txt", "no headers here\n");
+    project.write("src/a/item.cpp", &QT_MOC_ITEM.replace("NAME", "a").replace("INCLUDE", "a/item.moc"));
+    project.write("src/b/item.cpp", &QT_MOC_ITEM.replace("NAME", "b").replace("INCLUDE", "b/item.moc"));
+    project.write(
+        "src/extra/orphan.h",
+        "#pragma once\n#include <QObject>\nclass Orphan : public QObject\n{ Q_OBJECT\npublic:\n    int value() const { return 7; }\n};\n",
+    );
+    project.write(
+        "src/native/native.h",
+        "#pragma once\n#include <QObject>\n#include <not_on_this_system.h>\nclass Native : public QObject {\n    Q_OBJECT\n};\n",
+    );
+    project.write("src/native/native.cpp", "#include \"native.h\"\n");
+    project.write(
+        "src/main.cpp",
+        "#include <cstdio>\n#include \"extra/orphan.h\"\nnamespace a { QString make(); }\nnamespace b { QString make(); }\n\
+         int main() { Orphan orphan; std::printf(\"%s %s %s %d\\n\", qPrintable(a::make()), qPrintable(b::make()), \
+         orphan.metaObject()->className(), orphan.value()); return 0; }\n",
+    );
+    let run = project.anvil(&["run"]);
+    run.success().lacks("matches no files").lacks("native.h");
+    assert_eq!(program_output(&run), "a::Item b::Item Orphan 7");
+    project.anvil(&["build"]).success().up_to_date().lacks("warning");
+
+    // The orphan header changed: moc runs again
+    project.edit("src/extra/orphan.h", "return 7;", "return 8;");
+    let run = project.anvil(&["run"]);
+    run.success();
+    assert_eq!(program_output(&run), "a::Item b::Item Orphan 8");
+    assert!(run.actions().iter().any(|action| action == "Running moc orphan.h"), "{:?}", run.actions());
+
+    // Both including "item.moc" would write one file: an error naming both
+    project.edit("src/a/item.cpp", "a/item.moc", "item.moc");
+    project.edit("src/b/item.cpp", "b/item.moc", "item.moc");
+    let run = project.anvil(&["build"]);
+    assert_ne!(run.code, 0, "{}", run.output());
+    run.contains("src/a/item.cpp and ")
+        .contains("src/b/item.cpp both include \"item.moc\"")
+        .contains("`#include \"a/item.moc\"` in one");
+}
+
 #[test]
 fn qt_files_need_qt() {
     require!("default");

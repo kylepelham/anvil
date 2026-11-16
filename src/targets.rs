@@ -1074,7 +1074,7 @@ pub fn expand_patterns(dir: &Path, patterns: &[String], out_root: &Path, check_l
 }
 
 /// `expand_patterns`, saying so when a glob matches nothing only when `warn_empty` (not for the layout convention).
-fn expand_pattern_list(dir: &Path, patterns: &[String], out_root: &Path, check_literals: bool, warn_empty: bool) -> Result<Vec<PathBuf>> {
+pub fn expand_pattern_list(dir: &Path, patterns: &[String], out_root: &Path, check_literals: bool, warn_empty: bool) -> Result<Vec<PathBuf>> {
     let mut included: Vec<PathBuf> = Vec::new();
     let mut excludes = GlobSetBuilder::new();
     let mut has_excludes = false;
