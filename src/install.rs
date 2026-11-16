@@ -874,15 +874,21 @@ fn same_as_installed(content: &Content, destination: &Path) -> bool {
     }
 }
 
-/// Removes a file an earlier install wrote, and the folders it leaves empty up to the prefix; never one a link in the
-/// prefix leads to (the project's own files, through a linked folder).
+/// Removes a file (or link) an earlier install wrote, and the folders it leaves empty up to the prefix; never one a link
+/// in the prefix leads to (the project's own files, through a linked folder). A link is removed itself, also when what
+/// it named is gone (libfoo.so.2 after libfoo.so.1.3.0 was replaced).
 fn remove_installed(prefix: &Path, relative: &str) -> Result<bool> {
     let path = prefix.join(relative);
-    let inside = match (path.canonicalize(), prefix.canonicalize()) {
-        (Ok(file), Ok(prefix)) => file.starts_with(prefix),
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return Ok(false);
+    };
+    let inside = match (path.parent().map(Path::canonicalize), prefix.canonicalize()) {
+        (Some(Ok(folder)), Ok(prefix)) => folder.starts_with(prefix),
         _ => false,
     };
-    if !path.is_file() || !inside {
+    // A file, or a link to one or to nothing (not a folder's link: Windows removes those as folders)
+    let removable = metadata.is_file() || (metadata.file_type().is_symlink() && !path.is_dir());
+    if !removable || !inside {
         return Ok(false);
     }
     std::fs::remove_file(&path).with_context(|| format!("removing {} (no longer installed)", slash(&path)))?;
@@ -1768,5 +1774,32 @@ mod tests {
             ]
         );
         assert_eq!(by_configuration("INTERFACE_LINK_OPTIONS", &[], "RELEASE", &other), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removes_a_link_whose_file_is_gone() {
+        let prefix = std::env::temp_dir().join(format!("anvil-install-test-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(prefix.join("lib")).unwrap();
+
+        // libfoo.so.2 -> libfoo.so.1.3.0, removed first
+        std::fs::write(prefix.join("lib/libfoo.so.1.3.0"), "").unwrap();
+        std::os::unix::fs::symlink("libfoo.so.1.3.0", prefix.join("lib/libfoo.so.2")).unwrap();
+        assert!(remove_installed(&prefix, "lib/libfoo.so.1.3.0").unwrap());
+        assert!(remove_installed(&prefix, "lib/libfoo.so.2").unwrap());
+        assert!(std::fs::symlink_metadata(prefix.join("lib/libfoo.so.2")).is_err());
+        assert!(!prefix.join("lib").exists());
+
+        // Never through a linked folder that leads out of the prefix
+        let outside = prefix.with_extension("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("own.h"), "").unwrap();
+        std::os::unix::fs::symlink(&outside, prefix.join("include")).unwrap();
+        assert!(!remove_installed(&prefix, "include/own.h").unwrap());
+        assert!(outside.join("own.h").is_file());
+
+        let _ = std::fs::remove_dir_all(&prefix);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

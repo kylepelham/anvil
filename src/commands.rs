@@ -70,7 +70,7 @@ pub fn run(start_dir: &Path, build: &BuildArgs, name: Option<&str>, args: &[Stri
     let mut command = std::process::Command::new(&setup.program);
     command.args(&setup.args).current_dir(&setup.workdir).envs(setup.env.iter().cloned());
     crate::job::end_with_anvil(&mut command);
-    let status = command.status();
+    let status = crate::job::run_program(&mut command);
     crate::job::FOREGROUND_PROGRAM.store(false, std::sync::atomic::Ordering::Relaxed);
     let status = status.with_context(|| format!("starting {}", setup.program.display()))?;
     drop(model);

@@ -1130,6 +1130,21 @@ impl Interpreter {
                     }
                 }
             }
+            // The driver a program or shared library links through (a C program on a prebuilt C++ library)
+            "LINKER_LANGUAGE" if self.targets[target].kind == TargetKind::Exe || self.targets[target].kind == TargetKind::Shared => {
+                for (condition, value) in self.conditional_values(Some(target), &items) {
+                    let language = match value.as_str() {
+                        "CXX" => "c++",
+                        "C" => "c",
+                        _ => continue,
+                    };
+                    self.targets.get_mut(target).unwrap().settings.push(Item {
+                        condition,
+                        public: false,
+                        value: ("link-language", language.to_string()),
+                    });
+                }
+            }
 
             // What a shared build defines in place of <target>_EXPORTS ("" for nothing)
             "DEFINE_SYMBOL" => self.targets.get_mut(target).unwrap().define_symbol = Some(items.join(";")),

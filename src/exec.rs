@@ -5,7 +5,7 @@
 use crate::db::{Database, Record, Stamp, NO_TIME_STAMP};
 use crate::depfile;
 use crate::flags::DepsFormat;
-use crate::plan::{Action, ActionKind, Plan, ResponseStyle};
+use crate::plan::{Action, ActionKind, LibraryNames, Plan, ResponseStyle};
 use crate::timings::{self, Timing};
 use crate::toolchain::Toolchain;
 use crate::ui;
@@ -415,6 +415,9 @@ impl Executor<'_> {
                             // Should it fail or stop halfway, nothing it leaves behind may pass for up to date
                             let known = self.known_inputs(index);
                             self.database.forget(self.output_ids[index][0]);
+                            if let Some(library) = &action.library_names {
+                                self.remove_other_versions(library);
+                            }
 
                             let lane = lanes_busy.iter().position(|busy| !busy).expect("a lane is free below the job limit");
                             lanes_busy[lane] = true;
@@ -561,6 +564,26 @@ impl Executor<'_> {
         }
 
         None
+    }
+
+    /// Removes the versions of a shared library an earlier build made under other numbers (libfoo.so.1.2.0 and its
+    /// links, before `version` changed): only files of its folder the build database says Anvil wrote.
+    fn remove_other_versions(&mut self, library: &LibraryNames) {
+        let Some(folder) = library.unversioned.parent() else { return };
+        let Ok(entries) = std::fs::read_dir(folder) else { return };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !library.is_other_version(&name) {
+                continue;
+            }
+
+            let path = folder.join(&name);
+            let Some(id) = self.database.id(&path) else { continue };
+            if self.database.record(id).is_some() && std::fs::remove_file(&path).is_ok() {
+                self.database.forget(id);
+            }
+        }
     }
 
     /// Stores what a successful action read and wrote, so the next build can tell whether it is stale.

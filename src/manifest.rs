@@ -202,6 +202,9 @@ pub struct TargetSpec {
     pub whole_archive: Option<Vec<String>>,
     /// DLLs a Windows binary loads on its first call into them instead of at start ("nvml.dll"); ignored elsewhere.
     pub delay_load: Option<Vec<String>>,
+    /// "c++" or "c": the compiler driver that links it, as CMake's LINKER_LANGUAGE (default: by the languages compiled
+    /// into it and its static libraries). On a static or object library: what the binaries linking it count it as.
+    pub link_language: Option<String>,
     /// Files (globs relative to `dir`) copied beside the program or shared library, keeping their path under `dir`.
     pub data: Option<Vec<String>>,
     /// `anvil install` installs it (default: whether it is a default target; tests never).
