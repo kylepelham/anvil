@@ -18,6 +18,7 @@ mod schema_info;
 pub mod session;
 mod symbols;
 mod text;
+mod transport;
 mod uri;
 mod view;
 
@@ -42,6 +43,7 @@ use crate::util;
 const DEBOUNCE: Duration = Duration::from_millis(200);
 
 // LSP error codes lsp-server does not name
+const SERVER_NOT_INITIALIZED: i32 = -32002;
 const REQUEST_CANCELLED: i32 = -32800;
 const REQUEST_FAILED: i32 = -32803;
 
@@ -50,14 +52,16 @@ const SOURCE_GLOB: &str = "**/*.{c,cc,cpp,cxx,c++,cu,h,hh,hpp,hxx,inl,ipp,rc,asm
 
 /// Runs the server until the client says `exit`: 0 after a `shutdown`, 1 otherwise.
 pub fn run(verbose: bool) -> anyhow::Result<i32> {
-    let (connection, io_threads) = Connection::stdio();
+    let (connection, io_threads) = transport::stdio();
 
     let code = match Server::start(&connection, verbose) {
-        Ok(mut server) => {
+        Ok(Some(mut server)) => {
             let code = server.serve();
             drop(server);
             code
         }
+        // `exit` or the end of the input before `initialize`
+        Ok(None) => 1,
         Err(error) => {
             eprintln!("anvil lsp: {error}");
             return Ok(1);
@@ -66,7 +70,7 @@ pub fn run(verbose: bool) -> anyhow::Result<i32> {
 
     // The reader has stopped (exit, or the client went away): let the writer send what is left
     drop(connection);
-    let _ = io_threads.join();
+    io_threads.join();
     Ok(code)
 }
 
@@ -93,6 +97,8 @@ struct Root {
     from_folder: bool,
     /// Whether the next check walks folders again (else it reuses the last check's walks: only text changed).
     walk_again: bool,
+    /// The analysis was made before the compiler was known (files only): a pull waits for the next one.
+    provisional: bool,
 }
 
 /// What was last reported for one file: each project's diagnostics of it, merged.
@@ -125,6 +131,7 @@ enum Event {
         root: String,
         analysis: Box<Analysis>,
         versions: HashMap<String, i32>,
+        with_compiler: bool,
     },
     ToolchainReady,
     Ports(Vec<String>),
@@ -141,7 +148,12 @@ struct Server<'a> {
     refresh_support: bool,
     hierarchical_symbols: bool,
     snippets: bool,
+    hover_markdown: bool,
+    documentation_markdown: bool,
+    watch_files: bool,
     workspace_folders: Vec<PathBuf>,
+    /// How the client writes drives in URIs, for the files it did not name.
+    uri_style: Option<uri::Style>,
 
     settings: CheckSettings,
     documents: HashMap<String, Document>,
@@ -149,7 +161,9 @@ struct Server<'a> {
     reports: HashMap<String, Report>,
     parked: Vec<Parked>,
     queue: VecDeque<Message>,
+    initialized: bool,
     shutdown: bool,
+    toolchain_ready: bool,
 
     jobs: Sender<Job>,
     events: Receiver<Event>,
@@ -159,9 +173,22 @@ struct Server<'a> {
 }
 
 impl<'a> Server<'a> {
-    /// Answers `initialize` and waits for `initialized`.
-    fn start(connection: &'a Connection, verbose: bool) -> anyhow::Result<Server<'a>> {
-        let (id, params) = connection.initialize_start()?;
+    /// Waits for `initialize` and answers it; None when the client exits first. What comes between the answer and
+    /// `initialized` is handled as usual by the message loop.
+    fn start(connection: &'a Connection, verbose: bool) -> anyhow::Result<Option<Server<'a>>> {
+        // Before `initialize`: requests are refused, notifications dropped, `exit` ends the server
+        let (id, params) = loop {
+            let Ok(message) = connection.receiver.recv() else { return Ok(None) };
+            match message {
+                Message::Request(request) if request.method == "initialize" => break (request.id, request.params),
+                Message::Request(request) => {
+                    let refused = Response::new_err(request.id, SERVER_NOT_INITIALIZED, "the server is not initialized yet".into());
+                    let _ = connection.sender.send(Message::Response(refused));
+                }
+                Message::Notification(notification) if notification.method == "exit" => return Ok(None),
+                _ => {}
+            }
+        };
         let capabilities = &params["capabilities"];
 
         // UTF-8 positions when the client offers them, else UTF-16 (the protocol's default)
@@ -173,29 +200,36 @@ impl<'a> Server<'a> {
 
         let options = &params["initializationOptions"];
         let mut settings = CheckSettings::default();
-        let trace = read_settings(options, &mut settings).unwrap_or(false) || params["trace"] == "verbose";
+        let trace = read_settings(options, true, &mut settings).unwrap_or(false) || params["trace"] == "verbose";
 
         // Workspace folders, else the root URI
-        let mut workspace_folders: Vec<PathBuf> = params["workspaceFolders"]
+        let mut folder_uris: Vec<&str> = params["workspaceFolders"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|folder| folder["uri"].as_str().and_then(uri::to_path))
+            .filter_map(|folder| folder["uri"].as_str())
             .collect();
-        if workspace_folders.is_empty() {
-            workspace_folders.extend(params["rootUri"].as_str().and_then(uri::to_path));
+        if folder_uris.is_empty() {
+            folder_uris.extend(params["rootUri"].as_str());
         }
+        let workspace_folders: Vec<PathBuf> = folder_uris.iter().filter_map(|folder| uri::to_path(folder)).collect();
+        let uri_style = folder_uris.iter().find_map(|folder| uri::Style::of(folder));
 
         let result = json!({
             "capabilities": capabilities_json(encoding),
             "serverInfo": { "name": "anvil", "version": env!("CARGO_PKG_VERSION") },
         });
-        connection.initialize_finish(id, result)?;
+        connection.sender.send(Message::Response(Response::new_ok(id, result)))?;
 
         let (jobs, job_receiver) = crossbeam_channel::unbounded::<Job>();
         let (events_sender, events) = crossbeam_channel::unbounded::<Event>();
         let toolchain_ready = Arc::new(AtomicBool::new(false));
 
+        let offers_markdown = |formats: &Value| {
+            formats
+                .as_array()
+                .is_some_and(|formats| formats.iter().any(|format| format == "markdown"))
+        };
         let mut server = Server {
             connection,
             encoding,
@@ -205,14 +239,20 @@ impl<'a> Server<'a> {
             refresh_support: capabilities["workspace"]["diagnostics"]["refreshSupport"] == true,
             hierarchical_symbols: capabilities["textDocument"]["documentSymbol"]["hierarchicalDocumentSymbolSupport"] == true,
             snippets: capabilities["textDocument"]["completion"]["completionItem"]["snippetSupport"] == true,
-            workspace_folders,
+            hover_markdown: offers_markdown(&capabilities["textDocument"]["hover"]["contentFormat"]),
+            documentation_markdown: offers_markdown(&capabilities["textDocument"]["completion"]["completionItem"]["documentationFormat"]),
+            watch_files: capabilities["workspace"]["didChangeWatchedFiles"]["dynamicRegistration"] == true,
+            workspace_folders: Vec::new(),
+            uri_style,
             settings,
             documents: HashMap::new(),
             roots: HashMap::new(),
             reports: HashMap::new(),
             parked: Vec::new(),
             queue: VecDeque::new(),
+            initialized: false,
             shutdown: false,
+            toolchain_ready: false,
             jobs,
             events,
             ports: Arc::new(Vec::new()),
@@ -230,9 +270,22 @@ impl<'a> Server<'a> {
         let ready_events = events_sender.clone();
         std::thread::Builder::new().name("anvil-lsp-toolchain".into()).spawn(move || {
             let requested = requested.or_else(|| crate::settings::Settings::load().toolchain);
-            let found = crate::toolchain::Toolchain::find(requested.as_deref(), &crate::platform::Platform::host());
-            if let Err(error) = &found {
-                eprintln!("anvil lsp: no compiler found ({error:#}); checks that need one are skipped");
+
+            // For the tests: a slow first detection (a cold vcvarsall.bat)
+            #[cfg(debug_assertions)]
+            if let Some(delay) = std::env::var("ANVIL_LSP_TEST_TOOLCHAIN_DELAY_MS")
+                .ok()
+                .and_then(|delay| delay.parse().ok())
+            {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+
+            // Reported whatever happens: pulls wait for it
+            let found = std::panic::catch_unwind(|| crate::toolchain::Toolchain::find(requested.as_deref(), &crate::platform::Platform::host()));
+            match found {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("anvil lsp: no compiler found ({error:#}); checks that need one are skipped"),
+                Err(panic) => eprintln!("anvil lsp: finding the compiler failed: {}", panic_message(&panic)),
             }
             toolchain_ready.store(true, Ordering::SeqCst);
             let _ = ready_events.send(Event::ToolchainReady);
@@ -241,32 +294,8 @@ impl<'a> Server<'a> {
             let _ = events_sender.send(Event::Ports(vcpkg_ports()));
         })?;
 
-        // Watch manifests, tests.toml files and the sources globs match
-        if capabilities["workspace"]["didChangeWatchedFiles"]["dynamicRegistration"] == true {
-            let watchers = json!([
-                { "globPattern": "**/anvil.toml" },
-                { "globPattern": "**/tests.toml" },
-                { "globPattern": SOURCE_GLOB, "kind": 5 },
-            ]);
-            server.request(
-                "client/registerCapability",
-                json!({ "registrations": [{
-                    "id": "anvil-watch",
-                    "method": "workspace/didChangeWatchedFiles",
-                    "registerOptions": { "watchers": watchers },
-                }]}),
-            );
-        }
-
         // The workspace folders' projects, checked right away (their diagnostics, their targets as symbols)
-        for folder in server.workspace_folders.clone() {
-            if folder.join(MANIFEST_NAME).is_file() {
-                let root = server.find_root(&folder);
-                let key = util::path_key(&root);
-                server.root_entry(&key, &root).from_folder = true;
-                server.mark_due(&key, Duration::ZERO);
-            }
-        }
+        server.add_folders(workspace_folders);
 
         server.log(&format!(
             "anvil lsp {} started ({} positions, {} diagnostics)",
@@ -274,7 +303,7 @@ impl<'a> Server<'a> {
             if encoding == Encoding::Utf8 { "UTF-8" } else { "UTF-16" },
             if server.pull { "pull" } else { "push" }
         ));
-        Ok(server)
+        Ok(Some(server))
     }
 
     /// The message loop; returns the exit code.
@@ -288,7 +317,6 @@ impl<'a> Server<'a> {
                 self.on_event(event);
             }
             self.apply_cancellations();
-            self.schedule();
 
             if let Some(message) = self.queue.pop_front() {
                 if let Some(code) = self.handle(message) {
@@ -296,6 +324,9 @@ impl<'a> Server<'a> {
                 }
                 continue;
             }
+
+            // Checks start once what has arrived is handled (a close and a reopen are one change, not two checks)
+            self.schedule();
 
             // Wait for a message, a finished check, or the next check to be due
             let timeout = self
@@ -388,6 +419,7 @@ impl<'a> Server<'a> {
                 Ok(self.pull_document(request.id.clone(), &uri, previous))
             }
             "workspace/diagnostic" => Ok(Some(self.pull_workspace(&params["previousResultIds"]))),
+            "initialize" => Err((ErrorCode::InvalidRequest as i32, "the server is initialized already".to_string())),
             // For the tests: a handler that panics must leave the server running
             #[cfg(debug_assertions)]
             "anvil/debugPanic" => panic!("a panic on request"),
@@ -399,6 +431,11 @@ impl<'a> Server<'a> {
         let params = &notification.params;
 
         match notification.method.as_str() {
+            "initialized" => {
+                if !std::mem::replace(&mut self.initialized, true) {
+                    self.register_watchers();
+                }
+            }
             "textDocument/didOpen" => {
                 let document = &params["textDocument"];
                 let uri = document["uri"].as_str().unwrap_or_default().to_string();
@@ -442,6 +479,9 @@ impl<'a> Server<'a> {
                 if let Some(document) = self.documents.remove(uri) {
                     self.mark_due(&document.root, Duration::ZERO);
                 }
+
+                // A project outside the workspace folders goes with its last document, and its diagnostics with it
+                self.drop_unused_roots();
             }
             "workspace/didChangeWatchedFiles" => {
                 let paths: Vec<PathBuf> = params["changes"]
@@ -454,7 +494,7 @@ impl<'a> Server<'a> {
             }
             "workspace/didChangeConfiguration" => {
                 let settings = &params["settings"];
-                if let Some(trace) = read_settings(settings, &mut self.settings) {
+                if let Some(trace) = read_settings(settings, false, &mut self.settings) {
                     self.trace = trace;
                 }
                 let keys: Vec<String> = self.roots.keys().cloned().collect();
@@ -463,11 +503,15 @@ impl<'a> Server<'a> {
                 }
             }
             "workspace/didChangeWorkspaceFolders" => {
-                for added in params["event"]["added"].as_array().into_iter().flatten() {
-                    if let Some(folder) = added["uri"].as_str().and_then(uri::to_path) {
-                        self.workspace_folders.push(folder);
-                    }
-                }
+                let folders = |list: &Value| -> Vec<PathBuf> {
+                    list.as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|folder| folder["uri"].as_str().and_then(uri::to_path))
+                        .collect()
+                };
+                self.remove_folders(&folders(&params["event"]["removed"]));
+                self.add_folders(folders(&params["event"]["added"]));
             }
             "$/setTrace" => self.trace = params["value"] == "verbose" || params["value"] == "messages",
             // Cancellations were applied before; anything else is not ours to act on
@@ -477,7 +521,74 @@ impl<'a> Server<'a> {
 
     // Documents and projects
 
+    /// Watches manifests, tests.toml files and the sources globs match (once the client is initialized).
+    fn register_watchers(&mut self) {
+        if !self.watch_files {
+            return;
+        }
+
+        let watchers = json!([
+            { "globPattern": "**/anvil.toml" },
+            { "globPattern": "**/tests.toml" },
+            { "globPattern": SOURCE_GLOB, "kind": 5 },
+        ]);
+        self.request(
+            "client/registerCapability",
+            json!({ "registrations": [{
+                "id": "anvil-watch",
+                "method": "workspace/didChangeWatchedFiles",
+                "registerOptions": { "watchers": watchers },
+            }]}),
+        );
+    }
+
+    /// Workspace folders opened: their projects are checked right away (their diagnostics, their targets as symbols).
+    fn add_folders(&mut self, folders: Vec<PathBuf>) {
+        for folder in folders {
+            if self
+                .workspace_folders
+                .iter()
+                .any(|known| util::path_key(known) == util::path_key(&folder))
+            {
+                continue;
+            }
+            self.workspace_folders.push(folder.clone());
+
+            if folder.join(MANIFEST_NAME).is_file() {
+                let root = self.find_root(&folder);
+                let key = util::path_key(&root);
+                self.root_entry(&key, &root).from_folder = true;
+                self.mark_due(&key, Duration::ZERO);
+            }
+        }
+    }
+
+    /// Workspace folders closed: their projects go, with their diagnostics, unless an open document holds them.
+    fn remove_folders(&mut self, folders: &[PathBuf]) {
+        if folders.is_empty() {
+            return;
+        }
+        let removed: HashSet<String> = folders.iter().map(|folder| util::path_key(folder)).collect();
+        self.workspace_folders.retain(|folder| !removed.contains(&util::path_key(folder)));
+
+        // The projects the remaining folders hold
+        let mut kept = HashSet::new();
+        for folder in self.workspace_folders.clone() {
+            if folder.join(MANIFEST_NAME).is_file() {
+                kept.insert(util::path_key(&self.find_root(&folder)));
+            }
+        }
+        for (key, root) in self.roots.iter_mut() {
+            root.from_folder = kept.contains(key);
+        }
+
+        self.relocate_documents();
+    }
+
     fn open(&mut self, uri: String, text: String, version: i32) {
+        if self.uri_style.is_none() {
+            self.uri_style = uri::Style::of(&uri);
+        }
         let Some(path) = uri::to_path(&uri) else { return };
         let Some(name) = path.file_name().map(|name| name.to_string_lossy().to_lowercase()) else {
             return;
@@ -513,14 +624,9 @@ impl<'a> Server<'a> {
             document.root = key.clone();
         }
 
-        // Diagnostics right away when the project's check is current; else check it
-        let fresh = self
-            .roots
-            .get(&key)
-            .is_some_and(|root| root.analysis.is_some() && root.versions.get(&uri) == Some(&version));
-        if !fresh {
-            self.mark_due(&key, Duration::ZERO);
-        }
+        // Checked again even at the version last checked: a close and a reopen at version 1 (as VS Code does) may
+        // have been checked without it in between
+        self.mark_due(&key, Duration::ZERO);
     }
 
     fn is_open(&self, path: &Path) -> bool {
@@ -552,6 +658,7 @@ impl<'a> Server<'a> {
             running: false,
             from_folder: false,
             walk_again: true,
+            provisional: false,
         })
     }
 
@@ -584,18 +691,30 @@ impl<'a> Server<'a> {
             }
         }
 
-        // Projects no document and no workspace folder holds any more: their diagnostics go
-        let used: HashSet<String> = self.documents.values().map(|document| document.root.clone()).collect();
+        self.drop_unused_roots();
+    }
+
+    /// Projects no document and no workspace folder holds any more: their diagnostics go (a running one's when its
+    /// check ends).
+    fn drop_unused_roots(&mut self) {
         let unused: Vec<String> = self
             .roots
             .iter()
-            .filter(|(key, root)| !used.contains(*key) && !root.from_folder && !root.running)
+            .filter(|(key, root)| !root.running && !self.holds(key, root))
             .map(|(key, _)| key.clone())
             .collect();
         for key in unused {
             self.roots.remove(&key);
             self.clear_root_reports(&key);
         }
+        if !self.parked.is_empty() {
+            self.answer_parked();
+        }
+    }
+
+    /// Whether a workspace folder or an open document keeps a project.
+    fn holds(&self, key: &str, root: &Root) -> bool {
+        root.from_folder || self.documents.values().any(|document| document.root == key)
     }
 
     /// Files changed on disk: the projects that read them, or hold them, are checked again.
@@ -698,15 +817,22 @@ impl<'a> Server<'a> {
 
     fn on_event(&mut self, event: Event) {
         match event {
-            Event::Analyzed { root, analysis, versions } => self.on_analysis(root, *analysis, versions),
+            Event::Analyzed {
+                root,
+                analysis,
+                versions,
+                with_compiler,
+            } => self.on_analysis(root, *analysis, versions, with_compiler),
             Event::ToolchainReady => {
-                let incomplete: Vec<String> = self
+                // Projects checked without the compiler (a running one is checked again when it ends)
+                self.toolchain_ready = true;
+                let provisional: Vec<String> = self
                     .roots
                     .iter()
-                    .filter(|(_, root)| root.analysis.as_ref().is_some_and(|analysis| !analysis.complete))
+                    .filter(|(_, root)| root.provisional && !root.running)
                     .map(|(key, _)| key.clone())
                     .collect();
-                for key in incomplete {
+                for key in provisional {
                     self.mark_due(&key, Duration::ZERO);
                 }
             }
@@ -717,7 +843,7 @@ impl<'a> Server<'a> {
         }
     }
 
-    fn on_analysis(&mut self, key: String, mut analysis: Analysis, versions: HashMap<String, i32>) {
+    fn on_analysis(&mut self, key: String, mut analysis: Analysis, versions: HashMap<String, i32>, with_compiler: bool) {
         // A project forgotten while it was checked has nothing to report
         let Some(root) = self.roots.get_mut(&key) else { return };
         root.running = false;
@@ -728,12 +854,37 @@ impl<'a> Server<'a> {
         let analysis = Arc::new(analysis);
         root.analysis = Some(analysis.clone());
         root.versions = versions.clone();
+        root.provisional = !with_compiler;
+
+        // Nothing holds it any more (its folder closed, its last document too, while it ran)
+        if let Some(root) = self.roots.get(&key) {
+            if !self.holds(&key, root) {
+                self.drop_unused_roots();
+                return;
+            }
+        }
+
+        // Checked again when the compiler became known meanwhile, or when an open document changed and nothing is due
+        // to check it (a document reopened while its close was being checked)
+        let stale = self
+            .documents
+            .values()
+            .any(|document| document.root == key && versions.get(&document.uri) != Some(&document.version));
+        let due = self.roots.get(&key).is_some_and(|root| root.due.is_some());
+        if (!with_compiler && self.toolchain_ready) || (stale && !due) {
+            self.mark_due(&key, Duration::ZERO);
+        }
+
         self.log(&format!(
             "checked {} in {} ms: {} problems{}",
             util::slash(&analysis.root),
             elapsed.as_millis(),
             analysis.problems.len(),
-            if analysis.complete { "" } else { " (files only: no compiler yet)" }
+            match (with_compiler, analysis.complete) {
+                (false, _) => " (files only: no compiler yet)",
+                (true, false) => " (files only: they do not parse)",
+                (true, true) => "",
+            }
         ));
 
         // Each file's diagnostics from this project, for files whose text is the one checked
@@ -774,7 +925,15 @@ impl<'a> Server<'a> {
             changed |= self.update_report(&file_key, &path, &key, diagnostics);
         }
 
-        // Parked pulls of this project
+        self.answer_parked();
+
+        if changed && self.pull && self.refresh_support {
+            self.request("workspace/diagnostic/refresh", Value::Null);
+        }
+    }
+
+    /// Answers the parked pulls whose projects' checks are current now.
+    fn answer_parked(&mut self) {
         let parked = std::mem::take(&mut self.parked);
         for waiting in parked {
             let answered = self.document_report(&waiting.uri, waiting.previous.as_deref());
@@ -782,10 +941,6 @@ impl<'a> Server<'a> {
                 Some(report) => self.respond(waiting.id, report),
                 None => self.parked.push(waiting),
             }
-        }
-
-        if changed && self.pull && self.refresh_support {
-            self.request("workspace/diagnostic/refresh", Value::Null);
         }
     }
 
@@ -807,7 +962,19 @@ impl<'a> Server<'a> {
             sent: Vec::new(),
             result_id: "0".into(),
         });
-        report.uri = uri;
+
+        // Known to the client by another spelling now (the document opened as file:///c%3A/...): the old one clears
+        let renamed = report.uri != uri;
+        let old_uri = std::mem::replace(&mut report.uri, uri);
+        let mut cleared = false;
+        if renamed && !report.sent.is_empty() {
+            cleared = true;
+            report.sent.clear();
+            if !self.pull {
+                self.notify("textDocument/publishDiagnostics", json!({ "uri": old_uri, "diagnostics": [] }));
+            }
+        }
+        let Some(report) = self.reports.get_mut(file_key) else { return cleared };
         report.by_root.insert(root.to_string(), diagnostics);
 
         // The same diagnostic from two projects (a shared dependency) once
@@ -821,7 +988,7 @@ impl<'a> Server<'a> {
                 }
             }
         }
-        if merged == report.sent && report.result_id != "0" {
+        if merged == report.sent && report.result_id != "0" && !cleared {
             return false;
         }
 
@@ -864,7 +1031,7 @@ impl<'a> Server<'a> {
             .find(|document| util::path_key(&document.path) == key)
             .map(|document| document.uri.clone())
             .or_else(|| self.reports.get(&key).map(|report| report.uri.clone()))
-            .unwrap_or_else(|| uri::from_path(path))
+            .unwrap_or_else(|| uri::from_path(path, self.uri_style.unwrap_or_default()))
     }
 
     fn diagnostic_json(&self, problem: &Problem, text: &Text, texts: &HashMap<String, Text>) -> Value {
@@ -878,7 +1045,7 @@ impl<'a> Server<'a> {
             "severity": severity,
             "code": problem.code,
             "source": "anvil",
-            "message": problem.message,
+            "message": presented_message(&problem.message, &problem.file),
         });
 
         let related: Vec<Value> = problem
@@ -967,7 +1134,10 @@ impl<'a> Server<'a> {
                         json["detail"] = json!(detail);
                     }
                     if let Some(documentation) = item.documentation {
-                        json["documentation"] = json!({ "kind": "markdown", "value": documentation });
+                        json["documentation"] = match self.documentation_markdown {
+                            true => json!({ "kind": "markdown", "value": documentation }),
+                            false => json!(plain_text(&documentation)),
+                        };
                     }
                     json
                 })
@@ -981,10 +1151,11 @@ impl<'a> Server<'a> {
         let found = self.with_view(uri, |view, document| {
             let offset = self.offset(document, position);
             hover::hover(view, offset).map(|(markdown, span)| {
-                json!({
-                    "contents": { "kind": "markdown", "value": markdown },
-                    "range": document.text.range(&span, self.encoding),
-                })
+                let contents = match self.hover_markdown {
+                    true => json!({ "kind": "markdown", "value": markdown }),
+                    false => json!({ "kind": "plaintext", "value": plain_text(&markdown) }),
+                };
+                json!({ "contents": contents, "range": document.text.range(&span, self.encoding) })
             })
         });
 
@@ -1073,12 +1244,15 @@ impl<'a> Server<'a> {
                 false => {
                     let mut flat = Vec::new();
                     flatten_symbols(&symbols, None, &mut |symbol, container| {
-                        flat.push(json!({
+                        let mut json = json!({
                             "name": symbol.name,
                             "kind": symbol.kind,
                             "location": { "uri": document.uri, "range": document.text.range(&symbol.range, self.encoding) },
-                            "containerName": container,
-                        }));
+                        });
+                        if let Some(container) = container {
+                            json["containerName"] = json!(container);
+                        }
+                        flat.push(json);
                     });
                     json!(flat)
                 }
@@ -1115,12 +1289,15 @@ impl<'a> Server<'a> {
                     continue;
                 }
                 let text = Text::new(file.text.clone());
-                found.push(json!({
+                let mut json = json!({
                     "name": symbol.name,
                     "kind": symbol.kind,
                     "location": { "uri": self.uri_of(&file.path), "range": text.range(&symbol.selection, self.encoding) },
-                    "containerName": symbol.detail,
-                }));
+                });
+                if let Some(container) = &symbol.detail {
+                    json["containerName"] = json!(container);
+                }
+                found.push(json);
             }
         }
 
@@ -1142,11 +1319,18 @@ impl<'a> Server<'a> {
 
             let mut actions_json = Vec::new();
             for diagnostic in diagnostics {
+                let span = range(&diagnostic["range"]).unwrap_or(0..0);
+
+                // The did-you-mean from the data sent with it; from its message and range for a client that drops data
+                let sent = range(&diagnostic["data"]["replace"]["range"]).zip(diagnostic["data"]["replace"]["text"].as_str().map(str::to_string));
+                let replacement = sent.or_else(|| {
+                    let word = analysis::suggestion(diagnostic["message"].as_str().unwrap_or_default())?;
+                    Some((misspelled_word(&document.text.text, &span)?, word))
+                });
                 let reported = actions::Reported {
-                    span: range(&diagnostic["range"]).unwrap_or(0..0),
+                    span,
                     code: diagnostic["code"].as_str().unwrap_or_default().to_string(),
-                    replacement: range(&diagnostic["data"]["replace"]["range"])
-                        .zip(diagnostic["data"]["replace"]["text"].as_str().map(str::to_string)),
+                    replacement,
                 };
                 for action in actions::actions(view.document(), std::slice::from_ref(&reported), view.ports) {
                     let edits: Vec<Value> = action
@@ -1205,17 +1389,18 @@ impl<'a> Server<'a> {
         None
     }
 
-    /// A document's diagnostic report when its project's check is current.
+    /// A document's diagnostic report when its project's check is current (and made with the compiler known).
     fn document_report(&self, uri: &str, previous: Option<&str>) -> Option<Value> {
         let Some(document) = self.documents.get(uri) else {
-            return Some(json!({ "kind": "full", "items": [] }));
+            return self.closed_report(uri, previous);
         };
 
         // A document of no project (a tests.toml of something else) has nothing to say
         let Some(root) = self.roots.get(&document.root) else {
             return Some(json!({ "kind": "full", "items": [] }));
         };
-        let current = root.analysis.is_some() && !root.running && root.due.is_none() && root.versions.get(uri) == Some(&document.version);
+        let current =
+            root.analysis.is_some() && !root.running && root.due.is_none() && !root.provisional && root.versions.get(uri) == Some(&document.version);
         if !current {
             return None;
         }
@@ -1247,6 +1432,33 @@ impl<'a> Server<'a> {
         }
 
         Some(json)
+    }
+
+    /// The report of a file the client has not opened (a member's manifest a check read), once the checks that read
+    /// it are current.
+    fn closed_report(&self, uri: &str, previous: Option<&str>) -> Option<Value> {
+        let Some(path) = uri::to_path(uri) else {
+            return Some(json!({ "kind": "full", "items": [] }));
+        };
+
+        // Waits while a project that read it, or holds it, is being checked
+        let key = util::path_key(&path);
+        let report = self.reports.get(&key);
+        let pending = self.roots.iter().any(|(root_key, root)| {
+            let concerned = report.is_some_and(|report| report.by_root.contains_key(root_key)) || util::strip_prefix_ci(&path, &root.path).is_some();
+            concerned && (root.running || root.due.is_some() || root.provisional)
+        });
+        if pending {
+            return None;
+        }
+        let Some(report) = report else {
+            return Some(json!({ "kind": "full", "items": [] }));
+        };
+        if previous == Some(report.result_id.as_str()) {
+            return Some(json!({ "kind": "unchanged", "resultId": report.result_id }));
+        }
+
+        Some(json!({ "kind": "full", "resultId": report.result_id, "items": report.sent }))
     }
 
     /// `workspace/diagnostic`: every file's report as it stands.
@@ -1376,6 +1588,7 @@ fn check_jobs(jobs: Receiver<Job>, events: Sender<Event>, toolchain_ready: Arc<A
             root: job.root,
             analysis: Box::new(analysis),
             versions: job.versions,
+            with_compiler: load_model,
         };
         if events.send(event).is_err() {
             return;
@@ -1432,19 +1645,65 @@ fn capabilities_json(encoding: Encoding) -> Value {
     })
 }
 
-/// Reads `profile`, `toolchain` and `trace` from settings (`{ "anvil": { ... } }` or the object itself); returns the
-/// trace setting when given.
-fn read_settings(value: &Value, settings: &mut CheckSettings) -> Option<bool> {
-    let value = if value["anvil"].is_object() { &value["anvil"] } else { value };
-    if !value.is_object() {
-        return None;
-    }
+/// Reads `profile`, `toolchain` and `trace` from settings: `{ "anvil": { ... } }`, or (`bare`, the initialization
+/// options) the object itself. Only the keys given change (null or "" clears one); no `anvil` object changes nothing
+/// (Neovim sends `{ "settings": {} }` after `initialized`). Returns the trace setting when given.
+fn read_settings(value: &Value, bare: bool, settings: &mut CheckSettings) -> Option<bool> {
+    let value = match value["anvil"].is_object() {
+        true => &value["anvil"],
+        false if bare => value,
+        false => return None,
+    };
+    let object = value.as_object()?;
 
     let text = |key: &str| value[key].as_str().filter(|text| !text.is_empty()).map(str::to_string);
-    settings.profile = text("profile");
-    settings.toolchain = text("toolchain");
+    if object.contains_key("profile") {
+        settings.profile = text("profile");
+    }
+    if object.contains_key("toolchain") {
+        settings.toolchain = text("toolchain");
+    }
 
     value["trace"].as_bool()
+}
+
+/// A message as the editor shows it, beside the file: without the `package `x` (<this file>): ` the CLI puts first,
+/// and without trailing line breaks.
+fn presented_message(message: &str, file: &Path) -> String {
+    static PREFIX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let prefix = PREFIX.get_or_init(|| regex::Regex::new(r"^package `[^`]*` \((.+?)\): ").unwrap());
+
+    let message = message.trim_end();
+    if let Some(captures) = prefix.captures(message) {
+        if util::path_key(Path::new(&captures[1])) == util::path_key(file) {
+            return message[captures[0].len()..].to_string();
+        }
+    }
+
+    message.to_string()
+}
+
+/// Markdown as plain text, for a client that shows no markdown: no `**`, backticks or `---` rules.
+fn plain_text(markdown: &str) -> String {
+    markdown
+        .lines()
+        .filter(|line| line.trim() != "---")
+        .map(|line| line.replace("**", "").replace('`', ""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The misspelled word a diagnostic's range covers (a key, or a quoted value without its quotes); None when the range
+/// holds more than one word.
+fn misspelled_word(text: &str, span: &std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+    let written = text.get(span.clone())?;
+    let quoted = written.len() >= 2 && (written.starts_with('"') || written.starts_with('\''));
+    let word = if quoted { span.start + 1..span.end - 1 } else { span.clone() };
+
+    let one_word = text[word.clone()]
+        .chars()
+        .all(|character| character.is_alphanumeric() || "_-+".contains(character));
+    (!word.is_empty() && one_word).then_some(word)
 }
 
 /// A file's package: a manifest's own, a tests.toml's nearest manifest's.
@@ -1492,4 +1751,56 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
         .cloned()
         .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()))
         .unwrap_or_else(|| "a panic".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_change_only_where_given() {
+        let mut settings = CheckSettings {
+            profile: Some("release".into()),
+            toolchain: Some("gcc".into()),
+        };
+
+        // No `anvil` object: nothing changes (the initialization options may be the object itself)
+        read_settings(&json!({}), false, &mut settings);
+        read_settings(&json!({ "profile": "debug" }), false, &mut settings);
+        assert_eq!(settings.profile.as_deref(), Some("release"));
+        read_settings(&json!({ "toolchain": "msvc" }), true, &mut settings);
+        assert_eq!(settings.toolchain.as_deref(), Some("msvc"));
+
+        // The keys given: a null or an empty one clears
+        let trace = read_settings(&json!({ "anvil": { "profile": null, "trace": true } }), false, &mut settings);
+        assert_eq!(trace, Some(true));
+        assert_eq!(settings.profile, None);
+        assert_eq!(settings.toolchain.as_deref(), Some("msvc"));
+        read_settings(&json!({ "anvil": { "toolchain": "" } }), false, &mut settings);
+        assert_eq!(settings.toolchain, None);
+    }
+
+    #[test]
+    fn messages_as_the_editor_shows_them() {
+        let file = Path::new("C:/ws/lib/anvil.toml");
+        assert_eq!(
+            presented_message("package `lib` (C:/ws/lib/anvil.toml): in [target.lib]: kind = \"lbi\"\n", file),
+            "in [target.lib]: kind = \"lbi\""
+        );
+        let elsewhere = "package `lib` (C:/ws/other/anvil.toml): in [target.lib]: oops";
+        assert_eq!(presented_message(elsewhere, file), elsewhere);
+
+        assert_eq!(
+            plain_text("**app** — exe target\n\n---\nfile: `out/app.exe`"),
+            "app — exe target\n\nfile: out/app.exe"
+        );
+    }
+
+    #[test]
+    fn misspelled_words_from_a_range() {
+        let text = "verison = \"1\"\nkind = \"exx\"\nwhen.lnux.x = 1\n";
+        assert_eq!(misspelled_word(text, &(0..7)), Some(0..7));
+        assert_eq!(misspelled_word(text, &(21..26)), Some(22..25));
+        assert_eq!(misspelled_word(text, &(28..37)), None);
+    }
 }

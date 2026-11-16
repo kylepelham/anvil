@@ -30,6 +30,8 @@ pub struct Session {
 #[derive(Default)]
 pub struct Walks {
     found: HashMap<String, (Instant, Vec<PathBuf>)>,
+    /// Programs' answers (pkg-config's flags), kept as the walks are.
+    answers: HashMap<String, (Instant, Result<Vec<String>, String>)>,
     pub reuse: bool,
 }
 
@@ -60,6 +62,16 @@ pub fn run<T>(session: Session, work: impl FnOnce() -> T) -> (T, Session) {
 /// Whether a language server load runs on this thread (nothing is written then).
 pub fn active() -> bool {
     CURRENT.with(|current| current.borrow().is_some())
+}
+
+/// Whether a manifest is there: on disk, or open in the editor (a new one, not saved yet).
+pub fn is_file(path: &Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+
+    let key = crate::util::path_key(path);
+    CURRENT.with(|current| current.borrow().as_ref().is_some_and(|session| session.texts.contains_key(&key)))
 }
 
 /// A manifest's or tests.toml's text: the editor's when it has the file open, else the file's.
@@ -117,6 +129,31 @@ pub fn walk<E>(kind: &str, parts: &[&Path], walk: impl FnOnce() -> Result<Vec<Pa
     Ok(files)
 }
 
+/// A program's answer (pkg-config's flags), remembered under the language server as folder walks are: reused while
+/// only manifests are edited, asked again after a save, a file event or WALK_LIFETIME. `key` names the question whole.
+pub fn ask(key: &str, run: impl FnOnce() -> anyhow::Result<Vec<String>>) -> anyhow::Result<Vec<String>> {
+    // An answer this check may reuse
+    let remembered = CURRENT.with(|current| {
+        let current = current.borrow();
+        let walks = &current.as_ref()?.walks;
+        let (when, answer) = walks.answers.get(key)?;
+        (walks.reuse && when.elapsed() < WALK_LIFETIME).then(|| answer.clone())
+    });
+    if let Some(answer) = remembered {
+        return answer.map_err(|message| anyhow::anyhow!(message));
+    }
+
+    // Else ask, and remember the answer (a refusal too) when a check runs
+    let answer = run().map_err(|error| format!("{error:#}"));
+    CURRENT.with(|current| {
+        if let Some(session) = current.borrow_mut().as_mut() {
+            session.walks.answers.insert(key.to_string(), (Instant::now(), answer.clone()));
+        }
+    });
+
+    answer.map_err(|message| anyhow::anyhow!(message))
+}
+
 /// Keeps a warning for the language server instead of printing it; false outside one.
 pub fn capture_warning(message: &str) -> bool {
     CURRENT.with(|current| match current.borrow_mut().as_mut() {
@@ -126,4 +163,33 @@ pub fn capture_warning(message: &str) -> bool {
         }
         None => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn answers_are_kept_while_walks_are_reused() {
+        let mut walks = Walks::default();
+        let mut asked = 0;
+        for reuse in [false, true, true, false] {
+            walks.reuse = reuse;
+            let session = Session {
+                walks: std::mem::take(&mut walks),
+                ..Default::default()
+            };
+            let (answer, session) = run(session, || {
+                ask("pkg-config|zlib", || {
+                    asked += 1;
+                    anyhow::bail!("pkg-config does not know `zlib`")
+                })
+            });
+            assert_eq!(answer.unwrap_err().to_string(), "pkg-config does not know `zlib`");
+            walks = session.walks;
+        }
+
+        // Asked at the first check and again when walks are not reused; a refusal is remembered too
+        assert_eq!(asked, 2);
+    }
 }

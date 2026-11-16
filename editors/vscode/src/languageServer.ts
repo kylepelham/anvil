@@ -75,7 +75,7 @@ export class LanguageServer implements vscode.Disposable {
       return;
     }
     this.sentSettings = settings;
-    await this.client.sendNotification(DidChangeConfigurationNotification.type, { settings: { anvil: settings } });
+    await this.client.sendNotification(DidChangeConfigurationNotification.type, { settings: { anvil: wireSettings(settings) } });
   }
 
   private async startNow(anvil: string | undefined, folder: string | undefined, force: boolean): Promise<void> {
@@ -106,7 +106,7 @@ export class LanguageServer implements vscode.Disposable {
         { scheme: "file", pattern: "**/anvil.toml" },
         { scheme: "file", pattern: "**/tests.toml" },
       ],
-      initializationOptions: { anvil: settings },
+      initializationOptions: { anvil: wireSettings(settings) },
       outputChannel: this.output,
       initializationFailedHandler: () => false,
       errorHandler: {
@@ -167,6 +167,11 @@ export class LanguageServer implements vscode.Disposable {
       }
     });
   }
+}
+
+/** The settings as sent: an unset one as null, since the server changes only the keys it is given. */
+function wireSettings(settings: ServerSettings): { profile: string | null; toolchain: string | null } {
+  return { profile: settings.profile ?? null, toolchain: settings.toolchain ?? null };
 }
 
 /** A client that logs its errors to the output only: LanguageServer reports failures itself, once. */

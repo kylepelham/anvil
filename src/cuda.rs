@@ -256,6 +256,20 @@ fn choose_host_compiler(nvcc: &Path, toolchain: &Toolchain) -> Result<(PathBuf, 
         return Ok((toolchain.cxx.clone(), toolchain.env.clone()));
     }
 
+    // Refused by every one before: asked again only when nvcc, the build's compiler or the installations change
+    let visual_studios = crate::vcpkg::all_visual_studios();
+    let refused_file = util::user_data_dir().join(format!("cuda-{}-refused.txt", toolchain.family.name()));
+    let refused_key = format!(
+        "{CACHE_VERSION}|{}|{}|{}|{}",
+        slash(nvcc),
+        util::mtime(nvcc).unwrap_or(0),
+        toolchain.identity(),
+        visual_studios.iter().map(|folder| slash(folder)).collect::<Vec<_>>().join(";")
+    );
+    if std::fs::read_to_string(&refused_file).ok().as_deref() == Some(refused_key.as_str()) {
+        bail!(refused_message(nvcc));
+    }
+
     // A kernel to try each compiler on
     let probe_folder = util::user_data_dir().join("cuda-probe");
     std::fs::create_dir_all(&probe_folder)?;
@@ -270,9 +284,7 @@ fn choose_host_compiler(nvcc: &Path, toolchain: &Toolchain) -> Result<(PathBuf, 
 
     // Other Visual Studios (capturing each one's environment takes a second)
     let own = toolchain.visual_studio.as_deref().map(util::path_key);
-    let others = crate::vcpkg::all_visual_studios()
-        .into_iter()
-        .filter(|folder| Some(util::path_key(folder)) != own);
+    let others = visual_studios.into_iter().filter(|folder| Some(util::path_key(folder)) != own);
     for folder in others {
         let Ok(env) = toolchain::visual_studio_environment(&folder, toolchain.platform.cpu) else {
             continue;
@@ -285,7 +297,12 @@ fn choose_host_compiler(nvcc: &Path, toolchain: &Toolchain) -> Result<(PathBuf, 
         }
     }
 
-    bail!(
+    let _ = util::write_atomic(&refused_file, refused_key.as_bytes());
+    bail!(refused_message(nvcc))
+}
+
+fn refused_message(nvcc: &Path) -> String {
+    format!(
         "nvcc ({}) accepts none of the installed Visual Studio compilers; install the Visual Studio version its CUDA release supports (CUDA 12 and 13: Visual Studio 2022) or a newer CUDA toolkit",
         slash(nvcc)
     )

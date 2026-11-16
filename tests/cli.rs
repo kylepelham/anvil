@@ -5201,3 +5201,25 @@ fn delay_load_names_dlls_of_linked_binaries() {
     assert_ne!(run.code, 0, "{}", run.output());
     run.contains("delay-load: a lib target links no binary of its own");
 }
+
+// 67. Listing writes nothing: `anvil targets` (and `--json`) leave [[write]] files to the build
+#[test]
+fn listing_targets_writes_no_files() {
+    require!("default");
+    let project = Project::empty("listing_writes_nothing");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"listed\"\n\n[[write]]\npath = \"{out}/gen/config.h\"\ntext = \"#define LISTED 1\\n\"\n\n\
+         [[write]]\npath = \"generated.h\"\ntext = \"#pragma once\\n\"\n\n[target.app]\nkind = \"exe\"\nsources = [\"src/main.c\"]\n",
+    );
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+
+    project.anvil(&["targets"]).success().contains("app");
+    project.anvil(&["targets", "--json"]).success();
+    assert!(!project.path("generated.h").exists(), "anvil targets wrote a [[write]] file");
+    assert!(!project.path("out/debug/gen/config.h").exists(), "anvil targets wrote a [[write]] file");
+
+    // The build writes them
+    project.anvil(&["build"]).success();
+    assert_eq!(project.read("generated.h"), "#pragma once\n");
+}
