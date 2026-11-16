@@ -18,18 +18,23 @@ use crate::toolchain::Family;
 use crate::ui;
 use crate::util::{self, slash};
 use crate::BuildArgs;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 // Anvil's folder in the project: what `anvil ide` set up, the refresh stamps, Visual Studio's projects
 pub const STATE_FOLDER: &str = ".anvil";
 const RECORD_FILE: &str = "ide.toml";
+const LOCK_FILE: &str = "ide.lock";
 const RECORD_HEADER: &str = "# Written by `anvil ide`: the IDE files every anvil build refreshes, and the options their builds use.\n";
 
-// The start of the name of every entry Anvil owns in a file the user edits too (tasks, launch configurations)
+// The start of the name of every entry Anvil writes in a file the user edits too (tasks, launch configurations)
 pub const OWNED_PREFIX: &str = "anvil: ";
+
+// The byte-order mark some editors start UTF-8 files with
+const UTF8_BOM: &str = "\u{feff}";
 
 // The version of `anvil targets --json`'s shape: fields may be added, never renamed
 const TARGETS_VERSION: u32 = 1;
@@ -65,6 +70,10 @@ pub struct Record {
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
+    /// The entries Anvil wrote into files the user edits too, by file (relative to the root): the only ones it
+    /// replaces or removes there.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub entries: BTreeMap<String, Vec<String>>,
 }
 
 /// What the IDE files describe, gathered from the model without building.
@@ -105,8 +114,6 @@ pub enum Debugger {
 
 #[derive(Debug)]
 pub struct TargetInfo {
-    /// Its index in the model.
-    pub index: usize,
     pub name: String,
     pub package: String,
     pub qualified: String,
@@ -131,6 +138,20 @@ pub struct TargetInfo {
 pub struct Writer {
     pub written: Vec<PathBuf>,
     pub removed: Vec<PathBuf>,
+
+    /// The entries it wrote into files the user edits too, by file, for the record.
+    pub entries: Vec<(PathBuf, Vec<String>)>,
+    /// Files besides its own whose change means the IDE's files must be made again (manifests, compile commands).
+    pub watched: Vec<PathBuf>,
+}
+
+/// A file the user edits too, as Anvil merges into it: its text without a byte-order mark and with LF line endings,
+/// and how to write it back as it was.
+#[derive(Debug)]
+pub struct UserText {
+    pub text: String,
+    bom: bool,
+    crlf: bool,
 }
 
 impl Ide {
@@ -167,6 +188,29 @@ impl Record {
         let text = format!("{RECORD_HEADER}{}", toml::to_string(self)?);
         write_file(&root.join(STATE_FOLDER).join(RECORD_FILE), &text)?;
         Ok(())
+    }
+
+    /// The entries a writer wrote into the user's files, kept for the next refresh (saved when they changed).
+    fn note_entries(&mut self, root: &Path, writer: &Writer) -> Result<()> {
+        let mut changed = false;
+        for (file, entries) in &writer.entries {
+            let key = util::rel(file, root);
+            if self.entries.get(&key) != Some(entries) {
+                self.entries.insert(key, entries.clone());
+                changed = true;
+            }
+        }
+
+        match changed {
+            true => self.save(root),
+            false => Ok(()),
+        }
+    }
+
+    /// The entries Anvil wrote into `file` (relative to the root, in forward slashes) last time; None when no anvil
+    /// listed them (an anvil before the lists wrote the file).
+    pub fn entries_of(&self, file: &str) -> Option<&[String]> {
+        self.entries.get(file).map(Vec::as_slice)
     }
 
     /// The arguments of an anvil command an IDE runs: the command's words, then `-p` (for `profile`), `--toolchain`,
@@ -221,7 +265,6 @@ impl Project {
                 });
 
             targets.push(TargetInfo {
-                index,
                 name: target.name.clone(),
                 package: package.name.clone(),
                 qualified: model.qualified_name(index),
@@ -307,19 +350,43 @@ impl Writer {
         Ok(())
     }
 
-    /// Writes Anvil's entries merged into a file the user edits too; a file it could not read stays as it is, with a
-    /// warning (the next build after it is fixed merges them).
-    pub fn merge(&mut self, path: &Path, merged: Result<String>) -> Result<()> {
+    /// Writes Anvil's entries merged into a file the user edits too: `merge` gets its text, `new` makes it when there
+    /// is no such file. `entries` names them, for the record. A file that cannot be read (another program holds it, not
+    /// UTF-8) or merged stays as it is, with a warning saying what Anvil would add (the next build after it is fixed
+    /// adds it).
+    pub fn merge(
+        &mut self,
+        path: &Path,
+        entries: Option<Vec<String>>,
+        new: impl FnOnce() -> String,
+        merge: impl FnOnce(&str) -> Result<String>,
+    ) -> Result<()> {
+        let merged = match UserText::read(path) {
+            Ok(None) => Ok(new()),
+            Ok(Some(user)) => merge(&user.text).map(|text| user.restore(&text)),
+            Err(error) => Err(error),
+        };
+
         match merged {
-            Ok(text) => self.write(path, &text),
+            Ok(text) => {
+                self.write(path, &text)?;
+                if let Some(entries) = entries {
+                    self.entries.push((path.to_path_buf(), entries));
+                }
+            }
             Err(error) => {
+                let adds = match &entries {
+                    Some(entries) => entries.iter().map(|entry| format!("\"{entry}\"")).collect::<Vec<_>>().join(", "),
+                    None => "its settings".to_string(),
+                };
                 ui::warn(&format!(
-                    "{} left as it is ({error:#}): once it reads as JSON with comments again, the next build adds Anvil's entries to it",
+                    "{} left as it is ({error:#}); once it is fixed, the next build adds Anvil's entries to it ({adds})",
                     slash(path)
                 ));
-                Ok(())
             }
         }
+
+        Ok(())
     }
 
     /// Says what it wrote and deleted, relative to `base`.
@@ -341,6 +408,63 @@ impl Writer {
         }
         Ok(())
     }
+}
+
+impl UserText {
+    /// The file's text; None when there is no such file. A file that cannot be read, or is not UTF-8, is an error.
+    pub fn read(path: &Path) -> Result<Option<UserText>> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(anyhow!("cannot read it: {error}")),
+        };
+        if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+            bail!("it is UTF-16 text; save it as UTF-8");
+        }
+        let text = String::from_utf8(bytes).map_err(|_| anyhow!("it is not UTF-8 text; save it as UTF-8"))?;
+
+        // Merged without the mark and with LF; a file with CRLF throughout gets it back
+        let bom = text.starts_with(UTF8_BOM);
+        let text = text.strip_prefix(UTF8_BOM).unwrap_or(&text).to_string();
+        let crlf = text.contains("\r\n") && text.matches('\n').count() == text.matches("\r\n").count();
+        let text = if crlf { text.replace("\r\n", "\n") } else { text };
+
+        Ok(Some(UserText { text, bom, crlf }))
+    }
+
+    /// Merged text as the file had it: its byte-order mark and line endings.
+    pub fn restore(&self, text: &str) -> String {
+        let text = match self.crlf {
+            true => text.replace('\n', "\r\n"),
+            false => text.to_string(),
+        };
+        match self.bom {
+            true => format!("{UTF8_BOM}{text}"),
+            false => text,
+        }
+    }
+}
+
+/// The project as `anvil targets --json -p <profile>` with the record's toolchain, machine and options describes it,
+/// and the manifests that load read. Nothing is fetched, installed or written, and the load's warnings stay quiet (the
+/// build prints its own).
+pub fn gather_profile(root: &Path, record: &Record, profile: &str) -> (Result<Project>, Vec<PathBuf>) {
+    let build = BuildArgs {
+        profile: Some(profile.to_string()),
+        toolchain: record.toolchain.clone(),
+        platform: record.target.clone(),
+        options: record.options.clone(),
+        ..Default::default()
+    };
+    let (project, session) = crate::lsp::session::run(Default::default(), || {
+        let model = commands::load_model_for_listing(root, &build)?;
+        Project::gather(&model, root)
+    });
+
+    let mut read = session.read;
+    read.sort();
+    read.dedup();
+    (project, read)
 }
 
 /// `anvil targets --json`: the project's targets and tests, as an editor extension reads them. Plans nothing, builds
@@ -386,26 +510,39 @@ pub fn setup(start_dir: &Path, build: &BuildArgs, requested: &[Ide]) -> Result<(
         bail!("no IDE files here to refresh; say which IDE: `anvil ide vs`, `vscode`, `clion`, `zed` or `all`");
     }
 
-    let record = Record {
+    // One refresh at a time
+    let _lock = lock_state(&root)?;
+    let mut record = Record {
         ides,
         anvil: anvil_command(),
         profile: model.profile.name.clone(),
         toolchain: build.toolchain.clone(),
         target: build.platform.clone(),
         options: build.options.clone(),
+        entries: previous.map(|record| record.entries).unwrap_or_default(),
     };
     record.save(&root)?;
 
     // compile_commands.json at the root, where clangd and cpptools find it; every build refreshes it from now on
-    let mut writer = Writer::default();
     copy_compile_commands(&model)?;
 
     // Each IDE's files
     let project = Project::gather(&model, &root)?;
-    for ide in &record.ides {
-        generate(*ide, &model, &project, &record, &mut writer)?;
-        save_stamp(*ide, &model, &project, &record);
+    let mut written = Vec::new();
+    let mut removed = Vec::new();
+    for ide in record.ides.clone() {
+        let mut writer = Writer::default();
+        generate(ide, &model, &project, &record, &mut writer)?;
+        record.note_entries(&root, &writer)?;
+        save_stamp(ide, &model, &project, &record, &writer.watched);
+        written.extend(writer.written);
+        removed.extend(writer.removed);
     }
+    let writer = Writer {
+        written,
+        removed,
+        ..Default::default()
+    };
     writer.report("Wrote", &std::env::current_dir()?);
     if writer.written.is_empty() && writer.removed.is_empty() {
         ui::status("Fresh", "the IDE files are up to date");
@@ -434,21 +571,49 @@ pub fn refresh(model: &Model, build: &BuildArgs) {
     if model.options.host_tools_dir.is_some() {
         return;
     }
-    refresh_compile_commands(model);
 
-    // Set up for builds like this one
-    let Some(record) = Record::load(&model.root) else {
+    // Without IDE files, the root's compile_commands.json follows every build
+    if !model.root.join(STATE_FOLDER).join(RECORD_FILE).is_file() {
+        refresh_compile_commands(model);
+        return;
+    }
+
+    // One refresh at a time: an IDE builds several projects at once (MSBuild's /m), each refreshing
+    let _lock = match lock_state(&model.root) {
+        Ok(lock) => lock,
+        Err(error) => {
+            ui::warn(&format!("IDE files not refreshed: {error:#}"));
+            return;
+        }
+    };
+    let Some(mut record) = Record::load(&model.root) else {
+        refresh_compile_commands(model);
         return;
     };
+
+    // Set up for builds like this one; with IDE files, the root's compile_commands.json is that of their builds
     if record.toolchain != build.toolchain || record.target != build.platform || record.options != build.options {
         return;
+    }
+    if model.profile.name == record.profile {
+        refresh_compile_commands(model);
+    }
+
+    // The anvil the IDEs run: this one once theirs is gone, or when this one is on PATH
+    let anvil = anvil_command();
+    if record.anvil != anvil && (anvil == "anvil" || !anvil_exists(&record.anvil)) {
+        record.anvil = anvil;
+        if let Err(error) = record.save(&model.root) {
+            ui::warn(&format!("IDE files not refreshed: {error:#}"));
+            return;
+        }
     }
 
     let name = &model.packages[0].name;
     let mut project = None;
-    for ide in &record.ides {
+    for ide in record.ides.clone() {
         // Deleting an IDE's files stops their refreshes; only Visual Studio builds other profiles
-        if !ide.anchor(&model.root, name).exists() || (*ide != Ide::Vs && model.profile.name != record.profile) {
+        if !ide.anchor(&model.root, name).exists() || (ide != Ide::Vs && model.profile.name != record.profile) {
             continue;
         }
 
@@ -460,14 +625,14 @@ pub fn refresh(model: &Model, build: &BuildArgs) {
                 return;
             }
         };
-        let stamp_file = stamp_path(*ide, model);
-        if std::fs::read_to_string(&stamp_file).ok() == Some(fingerprint(*ide, model, project, &record)) {
+        if stamp_matches(ide, model, project, &record) {
             continue;
         }
 
         let mut writer = Writer::default();
-        match generate(*ide, model, project, &record, &mut writer) {
-            Ok(()) => save_stamp(*ide, model, project, &record),
+        let generated = generate(ide, model, project, &record, &mut writer).and_then(|()| record.note_entries(&model.root, &writer));
+        match generated {
+            Ok(()) => save_stamp(ide, model, project, &record, &writer.watched),
             Err(error) => ui::warn(&format!("{} files not refreshed: {error:#}", ide.name())),
         }
         writer.report("Updated", &model.root);
@@ -571,9 +736,14 @@ fn generate(ide: Ide, model: &Model, project: &Project, record: &Record, writer:
     }
 }
 
-/// What an IDE's files are made from, hashed: the project, how its builds run, the anvil writing them, and the files
-/// themselves as they are on disk (one the user deleted or edited is written again).
-fn fingerprint(ide: Ide, model: &Model, project: &Project, record: &Record) -> String {
+/// What an IDE's files are made from, hashed: the project, how its builds run, the anvil writing them, the files
+/// themselves as they are on disk (one the user deleted or edited is written again), and the `watched` files the last
+/// writing read (the manifests and compile commands of Visual Studio's configurations).
+fn fingerprint(ide: Ide, project: &Project, record: &Record, watched: &[PathBuf]) -> String {
+    let record = Record {
+        entries: BTreeMap::new(),
+        ..record.clone()
+    };
     let mut text = format!(
         "{ide:?}\n{record:?}\n{:?}\n",
         (
@@ -589,7 +759,6 @@ fn fingerprint(ide: Ide, model: &Model, project: &Project, record: &Record) -> S
     let mut sources = Vec::new();
     for target in &project.targets {
         let TargetInfo {
-            index: _,
             name: _,
             package: _,
             qualified,
@@ -618,24 +787,17 @@ fn fingerprint(ide: Ide, model: &Model, project: &Project, record: &Record) -> S
         text.push_str(&format!("{}:{:?}\n", slash(&exe), util::mtime(&exe)));
     }
 
-    // Visual Studio's IntelliSense comes from each profile's compile commands
     let outputs = match ide {
-        Ide::Vs => {
-            for out_dir in vs::configuration_out_dirs(model, project, record) {
-                let stamp = std::fs::read_to_string(out_dir.join(".anvil").join("compile_commands.stamp")).unwrap_or_default();
-                text.push_str(&format!("{}={stamp}\n", slash(&out_dir)));
-            }
-            vs::outputs(project)
-        }
+        Ide::Vs => vs::outputs(&project.root, &project.name),
         Ide::Vscode => vscode::outputs(&project.root),
         Ide::Clion => clion::outputs(&project.root),
         Ide::Zed => zed::outputs(&project.root),
         Ide::All => Vec::new(),
     };
-    for output in outputs {
-        let metadata = std::fs::metadata(&output).ok();
+    for output in outputs.iter().chain(watched) {
+        let metadata = std::fs::metadata(output).ok();
         let state = metadata.map(|metadata| (metadata.len(), metadata.modified().ok()));
-        text.push_str(&format!("{}:{state:?}\n", slash(&output)));
+        text.push_str(&format!("{}:{state:?}\n", slash(output)));
     }
 
     format!("{:016x}", util::hash_bytes(text.as_bytes()))
@@ -645,8 +807,41 @@ fn stamp_path(ide: Ide, model: &Model) -> PathBuf {
     model.root.join(STATE_FOLDER).join(format!("{}-{}.stamp", ide.name(), model.profile.name))
 }
 
-fn save_stamp(ide: Ide, model: &Model, project: &Project, record: &Record) {
-    let _ = write_file(&stamp_path(ide, model), &fingerprint(ide, model, project, record));
+/// Whether an IDE's files are as the last refresh left them: the stamp's fingerprint, then the files it watched.
+fn stamp_matches(ide: Ide, model: &Model, project: &Project, record: &Record) -> bool {
+    let Ok(stamp) = std::fs::read_to_string(stamp_path(ide, model)) else {
+        return false;
+    };
+
+    let mut lines = stamp.lines();
+    let saved = lines.next().unwrap_or_default();
+    let watched: Vec<PathBuf> = lines.map(PathBuf::from).collect();
+    saved == fingerprint(ide, project, record, &watched)
+}
+
+fn save_stamp(ide: Ide, model: &Model, project: &Project, record: &Record, watched: &[PathBuf]) {
+    let mut text = fingerprint(ide, project, record, watched);
+    for file in watched {
+        text.push_str(&format!("\n{}", slash(file)));
+    }
+    let _ = write_file(&stamp_path(ide, model), &text);
+}
+
+/// Holds the lock of Anvil's folder in the project while IDE files are written: one anvil at a time writes them.
+fn lock_state(root: &Path) -> Result<std::fs::File> {
+    let folder = root.join(STATE_FOLDER);
+    std::fs::create_dir_all(&folder).with_context(|| format!("creating {}", slash(&folder)))?;
+
+    let file = folder.join(LOCK_FILE);
+    let lock = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&file)
+        .with_context(|| format!("opening {}", slash(&file)))?;
+    lock.lock().with_context(|| format!("locking {}", slash(&file)))?;
+
+    Ok(lock)
 }
 
 /// The root's compile_commands.json, once `anvil compdb` or `anvil ide` wrote it: kept the same as this build's, for
@@ -692,6 +887,14 @@ pub fn write_file(path: &Path, text: &str) -> Result<bool> {
 
     util::write_atomic(path, text.as_bytes()).with_context(|| format!("writing {}", slash(path)))?;
     Ok(true)
+}
+
+/// Whether the anvil the IDE files run is there: `anvil` on PATH, or the file.
+fn anvil_exists(anvil: &str) -> bool {
+    match anvil {
+        "anvil" => util::which("anvil").is_some(),
+        path => Path::new(path).is_file(),
+    }
 }
 
 /// The anvil an IDE runs: `anvil` when that is this one, else this one's path.
@@ -740,6 +943,33 @@ fn platform_name(platform: &Platform) -> String {
     format!("{}-{os}", platform.cpu.name())
 }
 
+/// Whether an entry of a list is Anvil's: named as one it wrote last time (`previous`) or writes now (`names`). With no
+/// list of what it wrote, an entry named `anvil: ...` that runs this anvil, or builds first through an `anvil: ` task.
+pub fn owned_entry(node: &jsonc::Node, name_key: &str, previous: Option<&[String]>, names: &[String], anvil: &str) -> bool {
+    let Some(name) = node.member(name_key).and_then(jsonc::Node::text) else {
+        return false;
+    };
+    if names.iter().any(|owned| owned == name) {
+        return true;
+    }
+
+    match previous {
+        Some(previous) => previous.iter().any(|owned| owned == name),
+        None => {
+            let runs_anvil = |command: Option<&jsonc::Node>| command.and_then(jsonc::Node::text) == Some(anvil);
+            let build = node.member("build").and_then(|build| build.member("command"));
+            let pre_launch = node.member("preLaunchTask").and_then(jsonc::Node::text);
+            name.starts_with(OWNED_PREFIX)
+                && (runs_anvil(node.member("command")) || runs_anvil(build) || pre_launch.is_some_and(|task| task.starts_with(OWNED_PREFIX)))
+        }
+    }
+}
+
+/// The names of entries Anvil writes into a list (their `name_key`).
+fn entry_names(entries: &[Value], name_key: &str) -> Vec<String> {
+    entries.iter().filter_map(|entry| entry[name_key].as_str().map(str::to_string)).collect()
+}
+
 fn environment_object(env: &[(String, String)]) -> Value {
     Value::Object(env.iter().map(|(name, value)| (name.clone(), Value::String(value.clone()))).collect())
 }
@@ -777,7 +1007,6 @@ fn warn_unignored(root: &Path, name: &str, record: &Record) {
 #[cfg(test)]
 pub fn sample_project(root: &Path, debugger: Debugger) -> Project {
     let program = |name: &str, kind: Kind| TargetInfo {
-        index: 0,
         name: name.into(),
         package: "game".into(),
         qualified: name.into(),
@@ -833,6 +1062,7 @@ mod tests {
             toolchain: Some("clang-cl".into()),
             target: None,
             options: vec!["tracy=true".into()],
+            entries: BTreeMap::from([(".vscode/tasks.json".to_string(), vec!["anvil: build".to_string()])]),
         };
         let text = toml::to_string(&record).unwrap();
         assert_eq!(toml::from_str::<Record>(&text).unwrap(), record);
@@ -842,6 +1072,60 @@ mod tests {
             record.args(&["build", "game"], Some("release")),
             ["build", "game", "-p", "release", "--toolchain", "clang-cl", "-o", "tracy=true"]
         );
+    }
+
+    #[test]
+    fn user_files_keep_their_mark_and_line_endings_and_odd_ones_are_left_alone() {
+        let folder = std::env::temp_dir().join(format!("anvil_user_text_{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("tasks.json");
+
+        // A byte-order mark and CRLF: merged without them, written back with them
+        std::fs::write(&file, "\u{feff}{\r\n    \"tasks\": []\r\n}\r\n").unwrap();
+        let user = UserText::read(&file).unwrap().unwrap();
+        assert_eq!(user.text, "{\n    \"tasks\": []\n}\n");
+        assert_eq!(user.restore("{\n    \"a\": 1\n}\n"), "\u{feff}{\r\n    \"a\": 1\r\n}\r\n");
+
+        // Mixed line endings stay as they are; Anvil's lines get LF
+        std::fs::write(&file, "{\r\n}\n").unwrap();
+        let user = UserText::read(&file).unwrap().unwrap();
+        assert_eq!(user.restore(&user.text), "{\r\n}\n");
+
+        // Latin-1 and UTF-16 are not merged, and no file is not an error
+        std::fs::write(&file, b"{ \"name\": \"caf\xe9\" }").unwrap();
+        assert!(UserText::read(&file).unwrap_err().to_string().contains("not UTF-8"));
+        std::fs::write(&file, [0xFF, 0xFE, b'{', 0, b'}', 0]).unwrap();
+        assert!(UserText::read(&file).unwrap_err().to_string().contains("UTF-16"));
+        assert!(UserText::read(&folder.join("none.json")).unwrap().is_none());
+
+        // Such a file stays as it is through a merge
+        std::fs::write(&file, b"{ \"name\": \"caf\xe9\" }").unwrap();
+        let mut writer = Writer::default();
+        writer
+            .merge(&file, Some(vec!["anvil: build".into()]), || "new".into(), |text| Ok(text.into()))
+            .unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"{ \"name\": \"caf\xe9\" }");
+        assert!(writer.written.is_empty() && writer.entries.is_empty());
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn entries_are_anvils_when_it_wrote_them() {
+        let task = |label: &str, command: &str| jsonc::parse(&format!("{{ \"label\": \"{label}\", \"command\": \"{command}\" }}")).unwrap();
+        let names = ["anvil: build".to_string()];
+        let previous = ["anvil: build old".to_string()];
+
+        // Listed: what it writes now and wrote last time, not a task of the user's named like them
+        assert!(owned_entry(&task("anvil: build", "make"), "label", Some(&previous), &names, "anvil"));
+        assert!(owned_entry(&task("anvil: build old", "anvil"), "label", Some(&previous), &names, "anvil"));
+        assert!(!owned_entry(&task("anvil: mine", "anvil"), "label", Some(&previous), &names, "anvil"));
+
+        // Not listed (an older anvil's file): `anvil: ` entries that run it, or build through its tasks
+        assert!(owned_entry(&task("anvil: build old", "anvil"), "label", None, &names, "anvil"));
+        assert!(!owned_entry(&task("anvil: mine", "make"), "label", None, &names, "anvil"));
+        let launch = jsonc::parse("{ \"name\": \"anvil: game\", \"preLaunchTask\": \"anvil: build game\" }").unwrap();
+        assert!(owned_entry(&launch, "name", None, &names, "anvil"));
     }
 
     #[test]

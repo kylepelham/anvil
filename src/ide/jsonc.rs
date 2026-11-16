@@ -7,6 +7,9 @@ use serde_json::Value;
 // The indent of what Anvil writes, as VS Code writes its own files
 const INDENT: &str = "    ";
 
+// How deep objects and arrays may nest (as serde_json allows): deeper is refused, not a stack overflow
+const MAX_DEPTH: usize = 128;
+
 /// A value's place in the text, and for objects and arrays, what it holds.
 #[derive(Debug)]
 pub struct Node {
@@ -29,13 +32,14 @@ struct Parser<'a> {
     text: &'a str,
     bytes: &'a [u8],
     position: usize,
+    depth: usize,
 }
 
 impl Node {
-    /// The member `key` of an object.
+    /// The member `key` of an object: its last, when the key is there twice, as JSON parsers (VS Code's too) read it.
     pub fn member(&self, key: &str) -> Option<&Node> {
         match &self.kind {
-            NodeKind::Object(members) => members.iter().find(|(name, _)| name == key).map(|(_, value)| value),
+            NodeKind::Object(members) => members.iter().rev().find(|(name, _)| name == key).map(|(_, value)| value),
             _ => None,
         }
     }
@@ -55,6 +59,7 @@ pub fn parse(text: &str) -> Result<Node> {
         text,
         bytes: text.as_bytes(),
         position: 0,
+        depth: 0,
     };
 
     let node = parser.value()?;
@@ -168,9 +173,9 @@ pub fn set_member(text: &str, path: &[&str], key: &str, value: &Value) -> Result
         None => (key, value.clone()),
     };
 
-    // Replace it in place
+    // Replace it in place (the last of a key that is there twice, the one that counts)
     let object_indent = line_indent(text, node.start);
-    if let Some((_, existing)) = members.iter().find(|(name, _)| name == key) {
+    if let Some((_, existing)) = members.iter().rev().find(|(name, _)| name == key) {
         let indent = line_indent(text, existing.start);
         let replacement = indented(&pretty(&value), &indent);
         return Ok(format!("{}{replacement}{}", &text[..existing.start], &text[existing.end..]));
@@ -247,8 +252,9 @@ impl Parser<'_> {
         let start = self.position;
 
         let kind = match self.bytes.get(start) {
-            Some(b'{') => self.object()?,
-            Some(b'[') => self.array()?,
+            Some(b'{' | b'[') if self.depth == MAX_DEPTH => bail!("objects and lists nest deeper than {MAX_DEPTH} levels at {}", self.place()),
+            Some(b'{') => self.nested(Self::object)?,
+            Some(b'[') => self.nested(Self::array)?,
             Some(b'"') => NodeKind::String(self.string()?),
             Some(b'-' | b'0'..=b'9' | b't' | b'f' | b'n') => {
                 while self
@@ -273,6 +279,14 @@ impl Parser<'_> {
             end: self.position,
             kind,
         })
+    }
+
+    /// An object or array, one level deeper.
+    fn nested(&mut self, parse: fn(&mut Self) -> Result<NodeKind>) -> Result<NodeKind> {
+        self.depth += 1;
+        let kind = parse(self);
+        self.depth -= 1;
+        kind
     }
 
     fn object(&mut self) -> Result<NodeKind> {
@@ -404,6 +418,31 @@ mod tests {
         assert!(parse("{ \"a\": }").is_err());
         assert!(parse("{ \"a\": 1 } x").is_err());
         assert!(parse("{ /* open").is_err());
+    }
+
+    #[test]
+    fn refuses_deep_nesting_instead_of_overflowing() {
+        let deep = format!("{}{}", "[".repeat(3000), "]".repeat(3000));
+        let error = parse(&deep).unwrap_err().to_string();
+        assert!(error.contains("deeper than 128 levels"), "{error}");
+
+        let allowed = format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+        assert!(parse(&allowed).is_ok());
+    }
+
+    #[test]
+    fn a_key_given_twice_counts_as_its_last() {
+        let text = "{ \"tasks\": [], \"tasks\": [ { \"label\": \"mine\" } ] }";
+        let node = parse(text).unwrap();
+        assert!(matches!(&node.member("tasks").unwrap().kind, NodeKind::Array(elements) if elements.len() == 1));
+
+        // Anvil's entries go into the list VS Code reads, and a setting is replaced where it counts
+        let merged = replace_entries(text, &["tasks"], &ours, &[json!({ "label": "anvil: build" })]).unwrap();
+        assert!(merged.starts_with("{ \"tasks\": [], \"tasks\": [ { \"label\": \"mine\" },"));
+        assert_eq!(
+            set_member("{ \"a\": 1, \"a\": 2 }", &[], "a", &json!(3)).unwrap(),
+            "{ \"a\": 1, \"a\": 3 }"
+        );
     }
 
     #[test]

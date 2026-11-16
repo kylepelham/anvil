@@ -1,8 +1,10 @@
 //! Zed: `.zed/tasks.json` (build, test) and `.zed/debug.json` (a debug configuration per program, built first). Both
-//! are lists; Anvil's entries are those labelled `anvil: ...`, and every other entry and comment stays.
+//! are lists; Anvil's entries are those it wrote (labelled `anvil: ...`, listed in .anvil/ide.toml), and every other
+//! entry and comment stays.
 
 use super::jsonc::{self, Node};
-use super::{project_path, Debugger, Project, Record, Writer, OWNED_PREFIX};
+use super::{entry_names, owned_entry, project_path, Debugger, Project, Record, Writer, OWNED_PREFIX};
+use crate::util;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -16,8 +18,10 @@ pub fn outputs(root: &Path) -> Vec<PathBuf> {
 pub fn generate(project: &Project, record: &Record, writer: &mut Writer) -> Result<()> {
     let [tasks_file, debug_file] = <[PathBuf; 2]>::try_from(outputs(&project.root)).unwrap();
 
-    merge_list(&tasks_file, &tasks(record), writer)?;
-    merge_list(&debug_file, &debug_configurations(project, record), writer)?;
+    for (file, entries) in [(&tasks_file, tasks(record)), (&debug_file, debug_configurations(project, record))] {
+        let previous = record.entries_of(&util::rel(file, &project.root));
+        merge_list(file, &entries, previous, &record.anvil, writer)?;
+    }
 
     Ok(())
 }
@@ -67,21 +71,18 @@ fn debug_configurations(project: &Project, record: &Record) -> Vec<Value> {
     configurations
 }
 
-/// Replaces Anvil's entries of a list file, or writes it.
-fn merge_list(file: &Path, entries: &[Value], writer: &mut Writer) -> Result<()> {
-    let text = match std::fs::read_to_string(file) {
-        Ok(text) => {
-            let owned = |node: &Node| {
-                node.member("label")
-                    .and_then(Node::text)
-                    .is_some_and(|label| label.starts_with(OWNED_PREFIX))
-            };
-            jsonc::replace_entries(&text, &[], &owned, entries)
-        }
-        Err(_) => Ok(jsonc::document(&Value::Array(entries.to_vec()))),
-    };
+/// Replaces Anvil's entries of a list file (those it wrote last time, `previous`, and those of the same labels), or
+/// writes it.
+fn merge_list(file: &Path, entries: &[Value], previous: Option<&[String]>, anvil: &str, writer: &mut Writer) -> Result<()> {
+    let labels = entry_names(entries, "label");
+    let owned = |node: &Node| owned_entry(node, "label", previous, &labels, anvil);
 
-    writer.merge(file, text)
+    writer.merge(
+        file,
+        Some(labels.clone()),
+        || jsonc::document(&Value::Array(entries.to_vec())),
+        |text| jsonc::replace_entries(text, &[], &owned, entries),
+    )
 }
 
 #[cfg(test)]

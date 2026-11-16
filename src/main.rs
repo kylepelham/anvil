@@ -132,6 +132,9 @@ enum CommandLine {
 
     /// Delete build output (the profile's folder, or everything with --all).
     Clean {
+        /// Only these targets' objects, program or library (what an IDE's Clean and Rebuild of a project delete).
+        targets: Vec<String>,
+
         /// The release profile's folders.
         #[arg(short, long, conflicts_with = "profile")]
         release: bool,
@@ -140,8 +143,20 @@ enum CommandLine {
         #[arg(short, long, value_name = "NAME")]
         profile: Option<String>,
 
+        /// Only the folder of builds with this toolchain.
+        #[arg(long, value_name = "NAME")]
+        toolchain: Option<String>,
+
+        /// Only the folder of builds for this machine.
+        #[arg(long = "target", id = "platform", value_name = "PLATFORM")]
+        platform: Option<String>,
+
+        /// An option the builds set (-o name=true|false), for finding their targets and folder.
+        #[arg(short = 'o', long = "option", value_name = "NAME=VALUE")]
+        options: Vec<String>,
+
         /// The whole output folder, vcpkg packages included.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["targets", "toolchain", "platform"])]
         all: bool,
     },
 
@@ -520,7 +535,25 @@ fn main() {
         CommandLine::Install { targets, prefix, plan, run } => {
             install::install(&start_dir, &BuildArgs::new(plan, run), &targets, prefix.as_deref()).map(|_| 0)
         }
-        CommandLine::Clean { release, profile, all } => commands::clean(&start_dir, release, profile.as_deref(), all).map(|_| 0),
+        CommandLine::Clean {
+            targets,
+            release,
+            profile,
+            toolchain,
+            platform,
+            options,
+            all,
+        } => {
+            let plan = PlanArgs {
+                release,
+                profile,
+                toolchain,
+                platform,
+                options,
+                ..Default::default()
+            };
+            commands::clean(&start_dir, &BuildArgs::planning(plan), &targets, all).map(|_| 0)
+        }
         CommandLine::New { name, lib } => scaffold::new_project(&start_dir, &name, lib, &shell_dir).map(|_| 0),
         CommandLine::Init => scaffold::init(&start_dir).map(|_| 0),
         CommandLine::Add(args) => scaffold::add(&start_dir, &args).map(|_| 0),

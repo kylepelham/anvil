@@ -2069,17 +2069,22 @@ impl<'a> Planner<'a> {
         util::rel(path, &self.model.root)
     }
 
-    /// The project's own targets this build does not make (tests, targets not asked for): compile_commands.json
-    /// covers their files too.
+    /// The targets of the whole project (its own and those of dependencies they use) this build does not make (tests,
+    /// targets not asked for): compile_commands.json covers their files too, whatever a build makes.
     fn unplanned_targets(&self, planned: &[usize]) -> Vec<usize> {
         let model = self.model;
         let planned: HashSet<usize> = planned.iter().copied().collect();
+        let own: Vec<usize> = (0..model.targets.len())
+            .filter(|index| model.packages[model.targets[*index].package].member)
+            .collect();
 
-        (0..model.targets.len())
+        model
+            .closure(&own)
+            .into_iter()
             .filter(|index| {
                 let target = &model.targets[*index];
                 let compiles = !matches!(target.kind, Kind::External | Kind::Headers | Kind::Custom);
-                compiles && !planned.contains(index) && model.packages[target.package].member
+                compiles && !planned.contains(index)
             })
             .collect()
     }
@@ -2191,7 +2196,7 @@ impl<'a> Planner<'a> {
         };
 
         self.add_unplanned_compile_commands(&unplanned);
-        let entries: Vec<serde_json::Value> = self
+        let mut entries: Vec<serde_json::Value> = self
             .compile_commands
             .iter()
             .map(|entry| {
@@ -2219,6 +2224,10 @@ impl<'a> Planner<'a> {
                 })
             })
             .collect();
+
+        // In one order whatever the build makes, so the file changes only when a command does
+        let key = |entry: &serde_json::Value| (entry["file"].to_string(), entry["output"].to_string());
+        entries.sort_by_cached_key(key);
         let text = serde_json::to_string_pretty(&entries)? + "\n";
         for file in &files {
             util::write_if_changed(file, text.as_bytes())?;
