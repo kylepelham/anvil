@@ -1230,6 +1230,32 @@ impl Interpreter {
         ] {
             self.set_variable(name, &format!("{SYMBOL_PREFIX}{name}"));
         }
+
+        // File names' prefixes and suffixes as Anvil writes them on each platform, for steps and tests that name files
+        let file_affixes: [(&str, &[(&str, &str)]); 9] = [
+            ("CMAKE_EXECUTABLE_SUFFIX", &[("windows", ".exe")]),
+            ("CMAKE_SHARED_LIBRARY_PREFIX", &[("!windows", "lib")]),
+            (
+                "CMAKE_SHARED_LIBRARY_SUFFIX",
+                &[("windows", ".dll"), ("macos", ".dylib"), ("!windows & !macos", ".so")],
+            ),
+            ("CMAKE_SHARED_MODULE_PREFIX", &[("!windows", "lib")]),
+            (
+                "CMAKE_SHARED_MODULE_SUFFIX",
+                &[("windows", ".dll"), ("macos", ".dylib"), ("!windows & !macos", ".so")],
+            ),
+            ("CMAKE_STATIC_LIBRARY_PREFIX", &[("!windows | mingw", "lib")]),
+            ("CMAKE_STATIC_LIBRARY_SUFFIX", &[("windows & !mingw", ".lib"), ("!windows | mingw", ".a")]),
+            ("CMAKE_IMPORT_LIBRARY_PREFIX", &[("mingw", "lib")]),
+            ("CMAKE_IMPORT_LIBRARY_SUFFIX", &[("windows & !mingw", ".lib"), ("mingw", ".dll.a")]),
+        ];
+        for (name, alternatives) in file_affixes {
+            let items: Vec<String> = alternatives
+                .iter()
+                .map(|(condition, text)| model::conditional_item(condition, text))
+                .collect();
+            self.set_variable(name, &items.join(";"));
+        }
     }
 
     // Execution

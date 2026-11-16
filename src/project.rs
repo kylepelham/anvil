@@ -2150,7 +2150,7 @@ impl Model {
                     .command
                     .to_command()
                     .into_iter()
-                    .find(|word| word.contains("{target:"))
+                    .find(|word| !crate::plan::target_placeholders(word).is_empty())
                     .unwrap_or_default();
                 let place = Place::key("command").value(written);
                 return Err(Located::new(place, "unknown-target", format!("{{target:{name}}}: {error:#}")).into());
@@ -2853,13 +2853,13 @@ fn qualify_target_references(target: &mut Target, package: &str, own: &[String])
     }
 }
 
-/// `text` with each `{target:X}` whose X is one of `own` written `{target:package/X}`.
+/// `text` with each `{target:X}` (and the like) whose X is one of `own` written `{target:package/X}`.
 fn qualify_references(text: &str, package: &str, own: &[String]) -> String {
     let mut qualified = text.to_string();
 
-    for name in crate::plan::target_references(&[text.to_string()]) {
+    for (kind, name) in crate::plan::target_placeholders(text) {
         if !name.contains('/') && own.contains(&name) {
-            qualified = qualified.replace(&format!("{{target:{name}}}"), &format!("{{target:{package}/{name}}}"));
+            qualified = qualified.replace(&format!("{{{kind}:{name}}}"), &format!("{{{kind}:{package}/{name}}}"));
         }
     }
 

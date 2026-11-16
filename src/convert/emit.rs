@@ -366,6 +366,8 @@ struct Emitter {
     cmake: Interpreter,
     root: PathBuf,
     root_text: String,
+    /// CMAKE_RUNTIME_OUTPUT_DIRECTORY when it is a folder of the build folder (`{out}/bin`).
+    runtime_dir: Option<String>,
 
     // Every file under the project, and every target's sources, for turning file lists back into patterns
     all_files: Vec<(String, PathBuf)>,
@@ -400,6 +402,7 @@ pub fn emit(interpreter: Interpreter) -> Result<Conversion> {
     emitter.convert_targets();
     emitter.convert_custom_commands();
     emitter.convert_tests();
+    emitter.check_made_folders();
     emitter.drop_empty_custom_targets();
     emitter.factor_shared_settings();
     emitter.separate_dependency_names();
@@ -531,6 +534,10 @@ impl Emitter {
     fn new(cmake: Interpreter) -> Emitter {
         let root = cmake.root.clone();
         let root_text = slash(&root);
+        let runtime_dir = cmake
+            .get_variable("CMAKE_RUNTIME_OUTPUT_DIRECTORY")
+            .map(|folder| slash(Path::new(&folder)).trim_end_matches("/$<CONFIG>").trim_end_matches('/').to_string())
+            .filter(|folder| folder.starts_with("{out}/"));
 
         // The project's vcpkg.json ports
         let manifest_ports = std::fs::read_to_string(root.join("vcpkg.json"))
@@ -562,6 +569,7 @@ impl Emitter {
             cmake,
             root,
             root_text,
+            runtime_dir,
             manifest_ports,
             dependencies: IndexMap::new(),
             link_cache: HashMap::new(),
@@ -1818,11 +1826,12 @@ impl Emitter {
             ..Default::default()
         };
 
-        // Input files (not targets) the step reads; headers find_file() looked for are vcpkg's
+        // Input files (not targets) the step reads; headers find_file() looked for are vcpkg's, and those in a
+        // target's include folders ({header-dep:X}/x.h) are found in each folder
         let input_files: Vec<PathBuf> = command
             .depends
             .iter()
-            .filter(|depend| !self.cmake.target_exists(depend) && !depend.contains("{found-header:"))
+            .filter(|depend| !self.cmake.target_exists(depend) && !depend.contains("{found-header:") && !depend.contains("{header-dep:"))
             .map(PathBuf::from)
             .collect();
         run.inputs = self.source_patterns(&dir, &input_files, &HashSet::new(), None);
@@ -1831,7 +1840,20 @@ impl Emitter {
                 run.inputs.push(format!("{{vcpkg}}/include/{header}"));
             }
         }
-        run.outputs = command.outputs.iter().map(|output| self.path_text(output, &dir)).collect();
+        for depend in command.depends.iter().filter(|depend| depend.contains("{header-dep:")) {
+            let Some(name) = header_dep_name(depend) else { continue };
+            let marker = format!("{{header-dep:{name}}}");
+            // The folder is a whole path: what came before it is the step's folder, which resolving the name added
+            let Some((_, after)) = depend.split_once(&marker) else { continue };
+            let folders = self.header_dep_text(&marker, &dir);
+            run.inputs
+                .extend(super::model::split_list(&folders).iter().map(|folder| format!("{folder}{after}")));
+        }
+        run.outputs = command
+            .outputs
+            .iter()
+            .map(|output| self.path_text(output, &dir).replace("$<CONFIG>", "{config}"))
+            .collect();
 
         // The command: one runs directly, several through the shell
         let mut lines: Vec<Vec<String>> = command
@@ -1841,7 +1863,11 @@ impl Emitter {
             .collect();
 
         // Anvil creates output folders itself
-        let output_texts: Vec<String> = command.outputs.iter().map(|output| self.command_word(&slash(output))).collect();
+        let output_texts: Vec<String> = command
+            .outputs
+            .iter()
+            .map(|output| self.command_word(&slash(output)).replace("$<CONFIG>", "{config}"))
+            .collect();
         lines.retain(|words| !is_output_folder_creation(words, &output_texts));
 
         if let Some(depfile) = &command.depfile {
@@ -1902,11 +1928,15 @@ impl Emitter {
                 continue;
             };
 
-            // The run with its input written as {input} and {stem}
+            // The run with its input written as {input}, {filename} (a copy's) and {stem}
             let input_text = self.path_text(&input, &dir);
             let stem = input.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
+            let file_name = input.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
             let template_word = |word: &String| -> String {
                 let replaced = replace_whole_path(&word.replace(&self.command_word(&slash(&input)), "{input}"), &input_text, "{input}");
+                if let Some(folder) = replaced.strip_suffix(&format!("/{file_name}")) {
+                    return format!("{folder}/{{filename}}");
+                }
 
                 // The stem only as a whole file name part (`shade` must not touch `shaders`)
                 let with_stem = replaced.replace(&format!("/{stem}."), "/{stem}.");
@@ -1969,6 +1999,39 @@ impl Emitter {
         merged.extend(unmerged.map(|(run, _)| run));
 
         merged
+    }
+
+    /// Folders file(MAKE_DIRECTORY) made at configure time that nothing in anvil.toml makes (a file written or made
+    /// in them, a test's workdir, which `anvil test` makes): a warning, since a step or test may expect them.
+    fn check_made_folders(&mut self) {
+        let mut made: Vec<String> = self
+            .cmake
+            .configure_writes
+            .iter()
+            .map(|write| self.command_word(&slash(&write.path)))
+            .collect();
+        for target in self.targets.values() {
+            let runs = target.runs.iter().chain(&target.pre_build).chain(&target.post_build);
+            made.extend(runs.flat_map(|run| run.outputs.iter().chain(&run.workdir)).cloned());
+            made.extend(target.workdir.iter().cloned());
+        }
+        made.extend(self.tests.iter().filter_map(|test| test.workdir.clone()));
+
+        let mut unmade: IndexMap<String, Vec<String>> = IndexMap::new();
+        for (location, folder) in self.cmake.builtin.made_folders.clone() {
+            let folder = self.command_word(&slash(&folder));
+            let folder = folder.trim_end_matches('/');
+            let is_made = made.iter().any(|path| path == folder || path.starts_with(&format!("{folder}/")));
+            if !is_made {
+                unmade.entry(location).or_default().push(folder.to_string());
+            }
+        }
+        for (location, folders) in unmade {
+            self.warnings.push(format!(
+                "{location}: file(MAKE_DIRECTORY {}) at configure time is not converted; a build step or test that expects the folder must make it",
+                folders.join(" ")
+            ));
+        }
     }
 
     // Tests
@@ -2722,16 +2785,40 @@ impl Emitter {
             tests_files.push((dir.join(crate::project::TESTS_FILE_NAME), text));
         }
 
-        // [[write]]: files CMake writes at configure time, when their text is known now
+        // [[write]]: files CMake writes at configure time, when their text is known now; the others are TODOs
         let mut unconverted_writes = Vec::new();
+        let not_found = regex::Regex::new(r"[\w.:-]*-NOTFOUND").unwrap();
         for write in self.cmake.configure_writes.clone() {
+            let path = self.command_word(&slash(&write.path));
             let Some(text) = write.text.as_ref().and_then(|text| self.found_header_text(text)) else {
+                let _ = writeln!(
+                    output,
+                    "\n# TODO: {}",
+                    comment_text(&format!(
+                        "{}: CMake writes {path} at configure time from what only that run knows (a process's output, the build's \
+                         generator expressions, a file it made); not converted: write it with a [[write]] or a build step",
+                        write.location
+                    ))
+                );
+                todo_count += 1;
                 unconverted_writes.push(write.location.clone());
                 continue;
             };
             let text = self.header_dep_text(&text, &write.path);
 
-            let path = self.command_word(&slash(&write.path));
+            // A value CMake found at configure time (find_*, get_target_property) that the converter did not
+            if let Some(value) = not_found.find(&text) {
+                let _ = writeln!(
+                    output,
+                    "\n# TODO: {}",
+                    comment_text(&format!(
+                        "the text holds `{}`, something CMake finds at configure time and the converter could not: write what it is",
+                        value.as_str()
+                    ))
+                );
+                todo_count += 1;
+            }
+
             let _ = writeln!(output, "\n[[write]]\npath = {}", quote(&path));
             if let Some(condition) = &write.condition {
                 let _ = writeln!(output, "if = {}", quote(condition));
@@ -2761,9 +2848,10 @@ impl Emitter {
         }
 
         let unknown_genex: IndexSet<&String> = self.cmake.unknown_genex.iter().collect();
-        for expression in unknown_genex {
-            warnings.push(format!("generator expression kept as text: {expression}"));
-        }
+        let genex_warnings: Vec<String> = unknown_genex
+            .into_iter()
+            .map(|expression| format!("generator expression kept as text: {expression}"))
+            .collect();
 
         // The same warning from a function called many times is shown once, with a count
         let mut counted: IndexMap<String, usize> = IndexMap::new();
@@ -2774,7 +2862,27 @@ impl Emitter {
             .into_iter()
             .map(|(warning, count)| if count > 1 { format!("{warning} (x{count})") } else { warning })
             .collect();
-        let warnings = aggregate_warnings(warnings);
+        let mut warnings = aggregate_warnings(warnings);
+
+        // Each is a TODO at the end of anvil.toml too; generator expressions get theirs where they were kept
+        if !warnings.is_empty() {
+            let _ = writeln!(
+                output,
+                "\n# What `anvil convert` did not convert, or converted with a guess (its warnings):"
+            );
+        }
+        for warning in &warnings {
+            let _ = writeln!(output, "# TODO: {}", comment_text(warning));
+            todo_count += 1;
+        }
+        let (output, genex_todo_count) = mark_kept_genex(&output);
+        todo_count += genex_todo_count;
+        for (_, text) in &mut tests_files {
+            let (marked, count) = mark_kept_genex(text);
+            *text = marked;
+            todo_count += count;
+        }
+        warnings.extend(aggregate_warnings(genex_warnings));
 
         Conversion {
             toml: output,
@@ -3111,7 +3219,13 @@ impl Emitter {
             true => slash(&util::normalize(Path::new(word))),
             false => word.to_string(),
         };
-        collapse_parent_segments(&word.replace(&self.root_text, "{root}"))
+        let word = collapse_parent_segments(&word.replace(&self.root_text, "{root}"));
+
+        // CMake's folder for programs is Anvil's {out}, where it puts them
+        match &self.runtime_dir {
+            Some(runtime_dir) => replace_folder(&word, runtime_dir, "{out}"),
+            None => word,
+        }
     }
 
     /// A definition with {root}, and the project's version as {version} so it follows [project] version.
@@ -3122,6 +3236,23 @@ impl Emitter {
             _ => text,
         }
     }
+}
+
+/// `text` with `folder` replaced where it is a whole folder: not followed by more of its last name (`{out}/bin` is not
+/// in `{out}/binaries`).
+fn replace_folder(text: &str, folder: &str, replacement: &str) -> String {
+    let mut result = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(folder) {
+        let after = &rest[start + folder.len()..];
+        let whole = !after.starts_with(|character: char| character.is_alphanumeric() || "._-".contains(character));
+        result.push_str(&rest[..start]);
+        result.push_str(if whole { replacement } else { folder });
+        rest = after;
+    }
+    result.push_str(rest);
+
+    result
 }
 
 /// `text` with each `path` in it replaced, but not where it ends a longer path (`{out}/tests/data/x.txt` holds the
@@ -3546,6 +3677,100 @@ fn make_private(blocks: &mut Blocks) {
             }
         }
     }
+}
+
+/// A converted file with a TODO above each line that keeps a generator expression as text, naming them (above the
+/// start of a multiline string holding one, which a comment cannot go inside); returns the file and its new TODOs. A
+/// [[write]]'s text is left alone: CMake writes configured files' generator expressions as they are too.
+fn mark_kept_genex(text: &str) -> (String, usize) {
+    let mut output: Vec<String> = Vec::new();
+    let mut todo_count = 0;
+
+    // A line, or a multiline string from the line it starts on, with the expressions in it
+    let mut start = 0;
+    let mut expressions: Vec<String> = Vec::new();
+    let mut multiline: Option<&str> = None;
+    let mut in_write = false;
+    let mut written_text = false;
+    for line in text.lines() {
+        if multiline.is_none() {
+            start = output.len();
+            expressions.clear();
+            if line.starts_with('[') {
+                in_write = line == "[[write]]";
+            }
+            written_text = in_write && line.starts_with("text = ");
+        }
+        output.push(line.to_string());
+        if (!line.trim_start().starts_with('#') || multiline.is_some()) && !written_text {
+            for expression in kept_genex(line) {
+                if !expressions.contains(&expression) {
+                    expressions.push(expression);
+                }
+            }
+        }
+
+        // A multiline string opens or closes on this line
+        let delimiters = match multiline {
+            Some(delimiter) => vec![delimiter],
+            None => vec!["'''", "\"\"\""],
+        };
+        if let Some(delimiter) = delimiters.into_iter().find(|delimiter| line.matches(delimiter).count() % 2 == 1) {
+            multiline = if multiline.is_some() { None } else { Some(delimiter) };
+        }
+        if multiline.is_some() || expressions.is_empty() {
+            continue;
+        }
+
+        let note = format!(
+            "# TODO: {}",
+            comment_text(&format!(
+                "generator expression kept as text, which Anvil does not read: {}; write what it stands for",
+                expressions.join(", ")
+            ))
+        );
+        output.insert(start, note);
+        expressions.clear();
+        todo_count += 1;
+    }
+
+    let mut marked = output.join("\n");
+    if text.ends_with('\n') {
+        marked.push('\n');
+    }
+    (marked, todo_count)
+}
+
+/// The outermost generator expressions (`$<...>`) in a text.
+fn kept_genex(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = text;
+
+    while let Some(start) = rest.find("$<") {
+        let mut depth = 0;
+        let mut end = rest.len();
+        let bytes = rest.as_bytes();
+        let mut index = start;
+        while index < bytes.len() {
+            if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'<') {
+                depth += 1;
+                index += 2;
+                continue;
+            }
+            if bytes[index] == b'>' {
+                depth -= 1;
+                if depth == 0 {
+                    end = index + 1;
+                    break;
+                }
+            }
+            index += 1;
+        }
+        found.push(rest[start..end].to_string());
+        rest = &rest[end..];
+    }
+
+    found
 }
 
 /// A note as one comment line: option markers as the option's name, line breaks as spaces, other control

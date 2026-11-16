@@ -1006,15 +1006,27 @@ impl GenexParser<'_> {
                     value
                 }
             }
-            "TARGET_FILE" | "TARGET_LINKER_FILE" => {
+            // A target's files: Anvil's placeholders for them (crate::plan::TARGET_PLACEHOLDERS)
+            "TARGET_FILE"
+            | "TARGET_FILE_NAME"
+            | "TARGET_FILE_DIR"
+            | "TARGET_LINKER_FILE"
+            | "TARGET_LINKER_FILE_NAME"
+            | "TARGET_LINKER_FILE_DIR"
+            | "TARGET_PDB_FILE"
+            | "TARGET_PDB_FILE_DIR" => {
                 let name = self.text_until(&['>']);
                 self.expect_close();
-                vec![(Truth::Known(true), format!("{{target:{name}}}"))]
-            }
-            "TARGET_FILE_DIR" => {
-                self.text_until(&['>']);
-                self.expect_close();
-                vec![(Truth::Known(true), "{out}".into())]
+                let kind = match head.as_str() {
+                    "TARGET_FILE" => "target",
+                    "TARGET_FILE_NAME" => "target-filename",
+                    "TARGET_FILE_DIR" | "TARGET_PDB_FILE_DIR" => "target-dir",
+                    "TARGET_LINKER_FILE" => "lib",
+                    "TARGET_LINKER_FILE_NAME" => "lib-filename",
+                    "TARGET_LINKER_FILE_DIR" => "lib-dir",
+                    _ => "pdb",
+                };
+                vec![(Truth::Known(true), format!("{{{kind}:{name}}}"))]
             }
 
             // An object library's objects: a dependency on it
@@ -1759,6 +1771,32 @@ mod tests {
         assert!(unknown.is_empty(), "{unknown:?}");
         expand_genex("$<$<TARGET_EXISTS:real>:real>", &mut unknown, None);
         assert_eq!(unknown, vec!["$<$<TARGET_EXISTS:real>:real>"]);
+    }
+
+    #[test]
+    fn genex_target_files_are_anvil_placeholders() {
+        let mut unknown = Vec::new();
+        let plain = |text: &str| vec![(Truth::Known(true), text.to_string())];
+
+        let copy = "$<TARGET_FILE:app> $<TARGET_FILE_DIR:app>/copy_$<TARGET_FILE_NAME:app>";
+        assert_eq!(
+            expand_genex(copy, &mut unknown, None),
+            plain("{target:app} {target-dir:app}/copy_{target-filename:app}")
+        );
+        let linked = "$<TARGET_LINKER_FILE:png> $<TARGET_LINKER_FILE_DIR:png>/$<TARGET_LINKER_FILE_NAME:png>";
+        assert_eq!(
+            expand_genex(linked, &mut unknown, None),
+            plain("{lib:png} {lib-dir:png}/{lib-filename:png}")
+        );
+        assert_eq!(
+            expand_genex("$<TARGET_PDB_FILE:app> $<TARGET_PDB_FILE_DIR:app>", &mut unknown, None),
+            plain("{pdb:app} {target-dir:app}")
+        );
+        assert!(unknown.is_empty(), "{unknown:?}");
+
+        // No placeholder for a debug file's name alone
+        expand_genex("$<TARGET_PDB_FILE_NAME:app>", &mut unknown, None);
+        assert_eq!(unknown, vec!["$<TARGET_PDB_FILE_NAME:app>"]);
     }
 
     #[test]
