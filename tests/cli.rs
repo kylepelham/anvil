@@ -2570,20 +2570,16 @@ fn openmp_system_dependency_runs_clang_cl() {
     openmp_program(Some("clang-cl"), "openmp_clang_cl");
 }
 
-// 33. A port's language-specific definitions reach only that language's files; $<CONFIG:Debug> holds exactly when
-//     its debug libraries are linked; its OpenMP::OpenMP_CXX gives C++ files OpenMP
+// 33. A port's language-specific definitions reach only that language's files; $<CONFIG:Debug> holds in debug builds
+//     (whichever libraries they link, as CMake's Debug configuration); its OpenMP::OpenMP_CXX gives C++ files OpenMP
 
-fn vcpkg_port_usage(toolchain: Option<&str>, test: &str, debug_libraries: bool) {
+fn vcpkg_port_usage(toolchain: Option<&str>, test: &str) {
     let project = Project::fixture("vcpkg_overlay", test);
-    let debug = if debug_libraries { " OPT_DEBUG" } else { "" };
 
     // The program's line comes last (vcpkg's install prints on stdout too)
     let run = project.anvil(&with_toolchain(toolchain, &["run"]));
     run.success();
-    assert_eq!(
-        program_output(&run).lines().last(),
-        Some(format!("c=1 OPT_CXX_DEF{debug} openmp").as_str())
-    );
+    assert_eq!(program_output(&run).lines().last(), Some("c=1 OPT_CXX_DEF OPT_DEBUG openmp"));
 
     let run = project.anvil(&with_toolchain(toolchain, &["run", "--release"]));
     run.success();
@@ -2593,19 +2589,19 @@ fn vcpkg_port_usage(toolchain: Option<&str>, test: &str, debug_libraries: bool) 
 #[test]
 fn vcpkg_port_usage_follows_language_and_libraries() {
     require!("msvc", "vcpkg");
-    vcpkg_port_usage(Some("msvc"), "vcpkg_usage", true);
+    vcpkg_port_usage(Some("msvc"), "vcpkg_usage");
 }
 
 #[test]
 fn vcpkg_port_usage_follows_language_and_libraries_clang() {
     require!("clang", "windows", "vcpkg");
-    vcpkg_port_usage(Some("clang"), "vcpkg_usage_clang", true);
+    vcpkg_port_usage(Some("clang"), "vcpkg_usage_clang");
 }
 
 #[test]
 fn vcpkg_port_usage_follows_language_and_libraries_gcc() {
     require!("gcc", "vcpkg");
-    vcpkg_port_usage(Some("gcc"), "vcpkg_usage_gcc", false);
+    vcpkg_port_usage(Some("gcc"), "vcpkg_usage_gcc");
 }
 
 // 34. A resource script sees _DEBUG with the debug C runtime, as the sources do, and not in release
@@ -4452,6 +4448,100 @@ fn cmake_package_from_a_vcpkg_tree() {
     let run = user.anvil(&with_toolchain(toolchain, &["run"]));
     run.success();
     assert_eq!(program_output(&run), expected);
+}
+
+/// A hand-written CMake package as CMake runs it: a prefix computed from its folder, a macro, set_property() appends,
+/// the user target's properties (unset), compile features. Its users print what they got.
+const HAND_WRITTEN_CONFIG: &str = r#"macro(set_and_check _var _file)
+  set(${_var} "${_file}")
+  if(NOT EXISTS "${_file}")
+    message(FATAL_ERROR "missing ${_file}")
+  endif()
+endmacro()
+get_filename_component(_hand_prefix "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+set_and_check(HAND_INCLUDE_DIR "${_hand_prefix}/include")
+unset(_hand_prefix)
+if(NOT TARGET Hand::hand)
+  add_library(Hand::hand INTERFACE IMPORTED)
+  set_target_properties(Hand::hand PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${HAND_INCLUDE_DIR}")
+endif()
+set_property(TARGET Hand::hand APPEND PROPERTY INTERFACE_COMPILE_DEFINITIONS $<$<NOT:$<CONFIG:Debug>>:HAND_RELEASE>)
+set_property(TARGET Hand::hand APPEND PROPERTY INTERFACE_COMPILE_DEFINITIONS
+  "$<$<NOT:$<BOOL:$<TARGET_PROPERTY:HAND_NO_WIDE>>>:HAND_WIDE>")
+target_compile_features(Hand::hand INTERFACE cxx_std_20)
+"#;
+
+#[test]
+fn cmake_package_files_run_as_cmake_runs_them() {
+    require!("default");
+    let project = Project::empty("cmake_hand_written");
+    project.write("prefix/include/hand.h", "#define HAND_HEADER 1\n");
+    project.write("prefix/lib/cmake/Hand/HandConfig.cmake", HAND_WRITTEN_CONFIG);
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"user\"\nstd = \"c++17\"\n\n[deps]\nhand = { cmake = \"Hand\", prefix = \"prefix\" }\n",
+    );
+    project.write(
+        "src/main.cpp",
+        "#include <hand.h>\n#include <cstdio>\n#ifndef HAND_RELEASE\n#define HAND_RELEASE 0\n#endif\n#ifndef HAND_WIDE\n#define HAND_WIDE 0\n#endif\n\
+         int main() { std::printf(\"release %d wide %d cxx20 %d\\n\", HAND_RELEASE + 0, HAND_WIDE + 0, int(__cplusplus >= 202002L)); }\n",
+    );
+
+    // Debug, then release: the package's generator expressions test the profile's configuration, and its
+    // cxx_std_20 raises the project's C++17
+    let run = project.anvil(&["run"]);
+    run.success();
+    assert_eq!(program_output(&run), "release 0 wide 1 cxx20 1");
+    let run = project.anvil(&["run", "--release"]);
+    run.success();
+    assert_eq!(program_output(&run), "release 1 wide 1 cxx20 1");
+
+    // A value made from a variable no command Anvil runs sets is an error naming it, not a library left out
+    project.edit(
+        "prefix/lib/cmake/Hand/HandConfig.cmake",
+        "target_compile_features",
+        "find_library(HAND_LIBRARY hand)\nset_property(TARGET Hand::hand APPEND PROPERTY INTERFACE_LINK_LIBRARIES \"${HAND_LIBRARY}\")\ntarget_compile_features",
+    );
+    project
+        .anvil(&["build"])
+        .code(1)
+        .contains("dependency `hand`: ")
+        .contains("HandConfig.cmake: INTERFACE_LINK_LIBRARIES of target Hand::hand uses ${HAND_LIBRARY}")
+        .contains("pkg-config");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn cmake_packages_with_variables_linux() {
+    require!("default");
+    let installed = |folder: &str| Path::new("/usr/lib/x86_64-linux-gnu/cmake").join(folder).is_dir();
+    if !installed("boost_filesystem-1.83.0") || !installed("boost_program_options-1.83.0") || !installed("SDL2") {
+        eprintln!("skipped: libboost-filesystem1.83-dev, libboost-program-options1.83-dev and libsdl2-dev are not installed");
+        return;
+    }
+
+    // Boost's files compute their folders and include a variant file each; SDL2's hand-written one computes its
+    // libraries with string(REGEX)
+    let project = Project::empty("cmake_boost_sdl2");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"user\"\n\n[deps]\nboost = { cmake = \"Boost\", components = [\"filesystem\", \"program_options\"] }\n\
+         sdl2 = { cmake = \"SDL2\", targets = [\"SDL2::SDL2\"] }\n",
+    );
+    project.write(
+        "src/main.cpp",
+        "#include <boost/filesystem.hpp>\n#include <boost/program_options.hpp>\n#include <SDL.h>\n#include <cstdio>\n\
+         int main(int, char**) { boost::program_options::options_description options(\"o\"); SDL_version version; SDL_GetVersion(&version);\n\
+         std::printf(\"%s sdl %d\\n\", boost::filesystem::path(\"/a/b.txt\").filename().string().c_str(), version.major); }\n",
+    );
+    let run = project.anvil(&["run"]);
+    run.success();
+    assert_eq!(program_output(&run), "b.txt sdl 2");
+    let commands = project.read("out/compile_commands.json");
+    assert!(
+        commands.contains("BOOST_FILESYSTEM_DYN_LINK") && commands.contains("/usr/include/SDL2"),
+        "{commands}"
+    );
 }
 
 #[test]

@@ -1180,6 +1180,8 @@ impl Model {
             target.link_flags.extend(usage.link_flags);
             target.runtime_files.extend(usage.runtime);
             target.cxx_libraries = usage.cxx_libraries;
+            target.required_std = usage.cxx_standard;
+            target.required_c_std = usage.c_standard;
             target.cmake_package = Some(found.package);
         }
 
@@ -1710,6 +1712,8 @@ impl Model {
             target.link_flags.extend(usage.link_flags);
             target.runtime_files.extend(usage.runtime);
             target.cxx_libraries = usage.cxx_libraries;
+            target.required_std = usage.cxx_standard;
+            target.required_c_std = usage.c_standard;
         }
 
         self.vcpkg = Some(instance);
