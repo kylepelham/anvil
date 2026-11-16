@@ -139,6 +139,7 @@ const KEY_ORDER: &[&str] = &[
     "lib-dirs",
     "deps",
     "whole-archive",
+    "delay-load",
     "header-deps",
     "needs",
     "std",
@@ -804,6 +805,11 @@ impl Emitter {
                     Link::Flag(flag) => self.convert_link_flag(&flag, condition, &mut converted.blocks),
                 }
             }
+        }
+
+        // A program's or shared library's /DELAYLOAD options are delay-load, which links the helper library itself
+        if matches!(target.kind, TargetKind::Exe | TargetKind::Shared) {
+            move_delay_loads(&mut converted.blocks);
         }
 
         // A dependency it links needs no header-only entry as well (a find module's include folder and libraries)
@@ -3307,6 +3313,70 @@ fn aggregate_warnings(warnings: Vec<String>) -> Vec<String> {
     }
 
     aggregated
+}
+
+/// Moves the delay-load link options of each block (/DELAYLOAD:x, lld's -delayload) to its `delay-load`, then drops
+/// the delay-load helper (delayimp) from the libraries, which the key links itself.
+fn move_delay_loads(blocks: &mut Blocks) {
+    let mut moved = false;
+    for block in blocks.blocks.values_mut() {
+        let Some(Value::List(flags)) = block.get_mut("link-flags") else {
+            continue;
+        };
+
+        let mut names = Vec::new();
+        flags.retain(|flag| match delay_load_name(flag) {
+            Some(name) => {
+                names.push(name);
+                false
+            }
+            None => true,
+        });
+        if names.is_empty() {
+            continue;
+        }
+
+        moved = true;
+        if let Some(Value::List(list)) = block.get_mut("delay-load") {
+            names.retain(|name| !list.contains(name));
+            list.extend(names);
+        } else {
+            block.insert("delay-load", Value::List(names));
+        }
+    }
+    if !moved {
+        return;
+    }
+
+    // The helper, as a library or a raw flag; a list left empty goes
+    let is_helper = |item: &String| {
+        let lowered = item.to_ascii_lowercase();
+        matches!(lowered.as_str(), "delayimp" | "delayimp.lib" | "-ldelayimp")
+    };
+    for block in blocks.blocks.values_mut() {
+        for key in ["libs", "link-flags"] {
+            if let Some(Value::List(items)) = block.get_mut(key) {
+                items.retain(|item| !is_helper(item));
+                if items.is_empty() {
+                    block.shift_remove(key);
+                }
+            }
+        }
+    }
+}
+
+/// The DLL a delay-load link option names: /DELAYLOAD:x (or -DELAYLOAD:, through -Wl,), lld's MinGW -delayload x.
+fn delay_load_name(flag: &str) -> Option<String> {
+    let option = flag.strip_prefix("-Wl,").unwrap_or(flag);
+    let upper = option.to_ascii_uppercase();
+    let prefix = ["/DELAYLOAD:", "-DELAYLOAD:", "-DELAYLOAD,", "-DELAYLOAD=", "--DELAYLOAD,", "--DELAYLOAD="]
+        .iter()
+        .find(|prefix| upper.starts_with(*prefix))?;
+    let name = option[prefix.len()..].trim_matches('"').to_string();
+
+    // Only a name the key takes; anything else stays a raw flag
+    crate::delay_load::check_names(std::slice::from_ref(&name)).ok()?;
+    Some(name)
 }
 
 /// `/ENTRY:mainCRTStartup` (or wmain, or through the GNU linker): main() as the entry of a windows program.

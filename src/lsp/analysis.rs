@@ -404,6 +404,7 @@ const CODES: &[(&str, &str)] = &[
     (r"would both write|would share|needs as a folder|both copy a data file", "output-conflict"),
     (r"both take the sources", "shared-sources"),
     (r"whole-archive", "invalid-whole-archive"),
+    (r"delay-load", "invalid-delay-load"),
     (r"\[\[write\]\]", "invalid-write"),
     (r"two packages are named", "duplicate-package"),
     (r"two tests are named|would both be the test", "duplicate-test"),

@@ -992,4 +992,47 @@ target_compile_definitions(app PRIVATE "PLUGINS=${PLUGINS}" "KINDS=${kinds}" "FR
         assert!(toml.contains(r#""KINDS=a", "b""#), "{toml}");
         assert!(toml.contains(r#""FROM_BLOCK=yes", "INSIDE=""#), "{toml}");
     }
+
+    #[test]
+    fn delay_load_options_become_the_key() {
+        let root = r#"cmake_minimum_required(VERSION 3.20)
+project(gpu C)
+add_library(helper SHARED helper.c)
+add_library(core STATIC core.c)
+target_link_options(core INTERFACE /DELAYLOAD:core.dll)
+add_executable(app main.c)
+target_link_libraries(app PRIVATE helper core delayimp)
+target_link_options(app PRIVATE "LINKER:/DELAYLOAD:helper.dll")
+if(MSVC)
+  target_link_options(app PRIVATE /DELAYLOAD:nvml.dll)
+  set_property(TARGET app APPEND_STRING PROPERTY LINK_FLAGS " /DELAYLOAD:cudart.dll")
+endif()
+add_executable(tool tool.c)
+target_link_options(tool PRIVATE -Wl,-delayload,dbghelp.dll /DELAYLOAD:not-a-dll)
+target_link_libraries(tool PRIVATE delayimp.lib)
+"#;
+        let files = [
+            ("CMakeLists.txt", root),
+            ("helper.c", "__declspec(dllexport) int helper(void) { return 1; }\n"),
+            ("core.c", "int core(void) { return 1; }\n"),
+            ("main.c", "int main(void) { return 0; }\n"),
+            ("tool.c", "int main(void) { return 0; }\n"),
+        ];
+        let toml = convert_files("delay-load", &files).toml;
+
+        // Each under its condition; the helper library goes, since the key links it
+        assert!(toml.contains("delay-load = [\"helper.dll\"]"), "{toml}");
+        assert!(
+            toml.contains("[target.app.when.msvc]\ndelay-load = [\"nvml.dll\", \"cudart.dll\"]"),
+            "{toml}"
+        );
+        assert!(!toml.contains("delayimp\""), "{toml}");
+
+        // lld's MinGW spelling too; a name the key does not take stays a raw flag
+        assert!(toml.contains("delay-load = [\"dbghelp.dll\"]"), "{toml}");
+        assert!(toml.contains("\"/DELAYLOAD:not-a-dll\""), "{toml}");
+
+        // A static library's options pass on to whatever links it: they stay raw flags
+        assert!(toml.contains("\"/DELAYLOAD:core.dll\""), "{toml}");
+    }
 }

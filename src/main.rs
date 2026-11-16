@@ -8,6 +8,7 @@ mod convert;
 mod convert_check;
 mod cuda;
 mod db;
+mod delay_load;
 mod depfile;
 mod exec;
 mod export_header;

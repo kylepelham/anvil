@@ -5074,3 +5074,130 @@ fn qt_files_need_qt() {
     assert_ne!(run.code, 0, "{}", run.output());
     run.contains("which `qt = false` turns off for `noqt`");
 }
+
+// 66. `delay-load`: a program loads a DLL on its first call into it (MSVC ABI): not loaded before the call, loaded
+// after, and the program starts without the DLL when it never calls in; changing the list relinks; a misspelt entry
+// is an error naming it. MinGW cannot delay-load: an error, unless the key is under a condition that leaves it out
+
+const DELAY_LOAD_MANIFEST: &str = "[project]\nname = \"delayed\"\n\n[target.helper]\nkind = \"shared\"\nsources = [\"helper/helper.c\"]\n\n\
+     [target.app]\nkind = \"exe\"\nsources = [\"app/main.c\"]\ndeps = [\"helper\"]\ndelay-load = [\"helper.dll\"]\n";
+
+const DELAY_LOAD_PROGRAM: &str = r#"#include <stdio.h>
+#include <string.h>
+#include <windows.h>
+
+__declspec(dllimport) int helper_answer(void);
+
+static const char* state(void) { return GetModuleHandleA("helper.dll") ? "loaded" : "not loaded"; }
+
+int main(int argc, char** argv) {
+    printf("before: %s\n", state());
+    if (argc > 1 && strcmp(argv[1], "skip") == 0) {
+        printf("never called\n");
+        return 0;
+    }
+    int answer = helper_answer();
+    printf("answer %d\nafter: %s\n", answer, state());
+    return 0;
+}
+"#;
+
+fn delay_load_project(test: &str) -> Project {
+    let project = Project::empty(test);
+    project.write("anvil.toml", DELAY_LOAD_MANIFEST);
+    project.write("helper/helper.c", "__declspec(dllexport) int helper_answer(void) { return 42; }\n");
+    project.write("app/main.c", DELAY_LOAD_PROGRAM);
+    project
+}
+
+#[cfg(windows)]
+fn delay_load(toolchain: &str, test: &str) {
+    let project = delay_load_project(test);
+
+    // Loaded on the first call
+    let run = project.anvil(&["run", "app", "--toolchain", toolchain]);
+    run.success();
+    assert_eq!(program_output(&run), "before: not loaded\nanswer 42\nafter: loaded");
+    project.anvil(&["build", "--toolchain", toolchain]).success().up_to_date();
+
+    // Without the DLL, a run that never calls in still starts
+    let program = project.root.join(run.program());
+    let folder = program.parent().unwrap().to_path_buf();
+    std::fs::rename(folder.join("helper.dll"), folder.join("helper.dll.away")).unwrap();
+    let output = Command::new(&program).arg("skip").output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n").trim(),
+        "before: not loaded\nnever called"
+    );
+    std::fs::rename(folder.join("helper.dll.away"), folder.join("helper.dll")).unwrap();
+
+    // A misspelt entry: the linker ignores it, Anvil does not, build after build
+    project.edit("anvil.toml", "\"helper.dll\"", "\"helpr.dll\"");
+    for _ in 0..2 {
+        let build = project.anvil(&["build", "--toolchain", toolchain]);
+        assert_ne!(build.code, 0, "{}", build.output());
+        build.contains("target `app`: delay-load = [\"helpr.dll\"], but app.exe imports nothing from helpr.dll");
+    }
+
+    // Fixed, it relinks; without the key the DLL loads at start
+    project.edit("anvil.toml", "\"helpr.dll\"", "\"helper.dll\"");
+    assert_eq!(project.anvil(&["build", "--toolchain", toolchain]).success().linked(), 1);
+    project.edit("anvil.toml", "delay-load = [\"helper.dll\"]\n", "");
+    let run = project.anvil(&["run", "app", "--toolchain", toolchain]);
+    run.success();
+    assert!(program_output(&run).starts_with("before: loaded"), "{}", run.output());
+}
+
+#[test]
+#[cfg(windows)]
+fn delay_load_msvc() {
+    require!("msvc");
+    delay_load("msvc", "delay_load_msvc");
+}
+
+#[test]
+#[cfg(windows)]
+fn delay_load_clang_cl() {
+    require!("clang-cl");
+    delay_load("clang-cl", "delay_load_clang_cl");
+}
+
+#[test]
+#[cfg(windows)]
+fn delay_load_mingw_is_refused_unless_left_out() {
+    require!("gcc");
+    let project = delay_load_project("delay_load_mingw");
+
+    let build = project.anvil(&["build", "--toolchain", "gcc"]);
+    assert_ne!(build.code, 0, "{}", build.output());
+    build.contains("planning target `app`: delay-load needs the MSVC linker (link.exe or lld-link)");
+
+    // Under `when.msvc` MinGW links the DLL as usual, loaded at start
+    project.edit(
+        "anvil.toml",
+        "delay-load = [\"helper.dll\"]\n",
+        "\n[target.app.when.msvc]\ndelay-load = [\"helper.dll\"]\n",
+    );
+    let run = project.anvil(&["run", "app", "--toolchain", "gcc"]);
+    run.success();
+    assert_eq!(program_output(&run), "before: loaded\nanswer 42\nafter: loaded");
+}
+
+#[test]
+fn delay_load_names_dlls_of_linked_binaries() {
+    require!("default");
+    let project = delay_load_project("delay_load_names");
+
+    // A name that is no DLL's file
+    project.edit("anvil.toml", "\"helper.dll\"", "\"bin/helper.dll\"");
+    let run = project.anvil(&["build"]);
+    assert_ne!(run.code, 0, "{}", run.output());
+    run.contains("delay-load = [\"bin/helper.dll\"]: name the DLL's file without a folder (\"helper.dll\")");
+
+    // On a target that links no binary of its own
+    project.write("anvil.toml", &DELAY_LOAD_MANIFEST.replace("kind = \"exe\"", "kind = \"lib\""));
+    let run = project.anvil(&["build"]);
+    assert_ne!(run.code, 0, "{}", run.output());
+    run.contains("delay-load: a lib target links no binary of its own");
+}

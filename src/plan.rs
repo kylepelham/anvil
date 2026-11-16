@@ -78,6 +78,9 @@ pub struct Action {
     /// Files the action must create, with the error to show when it does not.
     pub must_create: Vec<(PathBuf, String)>,
 
+    /// DLLs the linked binary (the first output) must delay-load, with the error to show when it does not.
+    pub must_delay_load: Vec<(String, String)>,
+
     /// The outputs are stamps the action does not make itself: written once it succeeds.
     pub stamp: bool,
 
@@ -224,6 +227,7 @@ impl Action {
             copy_from: None,
             symlink: false,
             must_create: Vec::new(),
+            must_delay_load: Vec::new(),
             stamp: false,
             incremental_state: None,
             raw_args: false,
@@ -1272,6 +1276,16 @@ impl<'a> Planner<'a> {
             .as_ref()
             .map_or(output.clone(), |version| output.with_file_name(&version.file));
 
+        // Delay-loading is the MSVC linkers' (link.exe, lld-link); MinGW's GNU ld has no such thing
+        let windows = self.toolchain.targets_windows();
+        if !target.delay_load.is_empty() && windows && !self.toolchain.is_msvc_abi() {
+            bail!(
+                "delay-load needs the MSVC linker (link.exe or lld-link), and MinGW's cannot delay-load a DLL; build with \
+                 --toolchain msvc or clang-cl, or move the key under [target.{}.when.msvc]",
+                target.name
+            );
+        }
+
         let spec = LinkSpec {
             profile: &self.model.profile,
             shared,
@@ -1287,6 +1301,7 @@ impl<'a> Planner<'a> {
             import_lib: import_lib.as_deref(),
             cxx,
             library_version: library_version.as_ref(),
+            delay_load: &target.delay_load,
         };
 
         // Binaries without C++ code link through the C compiler, as CMake links by the languages linked
@@ -1319,6 +1334,19 @@ impl<'a> Planner<'a> {
                 target.name
             );
             action.must_create.push((import_lib.clone(), message));
+        }
+
+        // The linker drops a delay-load entry the binary imports nothing from (link.exe warns, lld-link does not)
+        if windows {
+            for dll in &target.delay_load {
+                let message = format!(
+                    "target `{}`: delay-load = [\"{dll}\"], but {} imports nothing from {dll}, so the linker ignored it: check the \
+                     name, and that the DLL's import library is linked (`deps`, or `libs` for a prebuilt one)",
+                    target.name,
+                    written.file_name().unwrap().to_string_lossy()
+                );
+                action.must_delay_load.push((dll.clone(), message));
+            }
         }
 
         let mut action = self.push(action);

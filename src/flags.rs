@@ -105,6 +105,8 @@ pub struct LinkSpec<'a> {
     pub cxx: bool,
     /// A shared library's versioned names (`version`, `soversion`).
     pub library_version: Option<&'a LibraryVersion>,
+    /// DLLs loaded on the first call into them (`delay-load`): MSVC ABI only, other Windows toolchains are refused.
+    pub delay_load: &'a [String],
 }
 
 /// A versioned shared library's names and numbers: libfoo.so.1.2.3 (`file`, what the link writes) known as
@@ -788,6 +790,10 @@ impl Toolchain {
         for lib in spec.libs {
             args.push(msvc_lib_name(lib));
         }
+        if !spec.delay_load.is_empty() {
+            args.extend(spec.delay_load.iter().map(|dll| format!("/DELAYLOAD:{dll}")));
+            args.push("delayimp.lib".into());
+        }
         args.extend(WINDOWS_DEFAULT_LIBS.iter().map(|lib| format!("{lib}.lib")));
 
         args.extend(spec.flags.iter().cloned());
@@ -935,6 +941,10 @@ impl Toolchain {
                 args.extend(gnu_lib_arguments(lib));
             }
             flag_value = takes_value(lib);
+        }
+        if windows_clang && !spec.delay_load.is_empty() {
+            args.extend(spec.delay_load.iter().map(|dll| format!("-Wl,/DELAYLOAD:{dll}")));
+            args.push("-ldelayimp".into());
         }
         if self.targets_windows() {
             args.extend(WINDOWS_DEFAULT_LIBS.iter().map(|lib| format!("-l{lib}")));
@@ -1290,6 +1300,7 @@ mod tests {
             import_lib: None,
             cxx: true,
             library_version: None,
+            delay_load: &[],
         };
         toolchain.link_args(&spec)
     }
@@ -1314,6 +1325,43 @@ mod tests {
         assert!(link_failure_hint(error).is_some());
         assert!(link_failure_hint("lld-link: error: undefined symbol: WinMain\n>>> msvcrtd.lib(exe_winmain.obj)").is_some());
         assert!(link_failure_hint("error LNK2019: unresolved external symbol foo").is_none());
+    }
+
+    #[test]
+    fn delay_loaded_dlls_link_through_the_helper() {
+        let profile = Profile::resolve("debug", &Default::default()).unwrap();
+        let delay_load = ["nvml.dll".to_string(), "helper.dll".to_string()];
+        let spec = LinkSpec {
+            profile: &profile,
+            shared: false,
+            gui: Gui::Off,
+            exports: false,
+            uses_program_exports: false,
+            objects: &[PathBuf::from("main.obj")],
+            libs: &["helper".to_string()],
+            whole: &[],
+            lib_dirs: &[],
+            flags: &[],
+            output: Path::new("app.exe"),
+            import_lib: None,
+            cxx: true,
+            library_version: None,
+            delay_load: &delay_load,
+        };
+        let delayed = |toolchain: &Toolchain| -> Vec<String> {
+            let args = toolchain.link_args(&spec);
+            args.into_iter().filter(|arg| arg.to_lowercase().contains("delay")).collect()
+        };
+
+        // link.exe and lld-link, directly or through clang's driver; one helper library for every DLL
+        let msvc = Toolchain::for_tests(Family::Msvc, platform(Cpu::X64, Os::Windows), true);
+        assert_eq!(delayed(&msvc), ["/DELAYLOAD:nvml.dll", "/DELAYLOAD:helper.dll", "delayimp.lib"]);
+        let clang = Toolchain::for_tests(Family::Clang, platform(Cpu::X64, Os::Windows), true);
+        assert_eq!(delayed(&clang), ["-Wl,/DELAYLOAD:nvml.dll", "-Wl,/DELAYLOAD:helper.dll", "-ldelayimp"]);
+
+        // Other systems load shared libraries their own way
+        let linux = Toolchain::for_tests(Family::Gcc, platform(Cpu::X64, Os::Linux), false);
+        assert!(delayed(&linux).is_empty());
     }
 
     #[test]
@@ -1377,6 +1425,7 @@ mod tests {
             import_lib: None,
             cxx: true,
             library_version: None,
+            delay_load: &[],
         };
 
         let linux = Toolchain::for_tests(Family::Gcc, platform(Cpu::X64, Os::Linux), false);
@@ -1451,6 +1500,7 @@ mod tests {
             import_lib: None,
             cxx: true,
             library_version: None,
+            delay_load: &[],
         };
         let args = linux.link_args(&spec);
         let position = |wanted: &str| args.iter().position(|arg| arg == wanted).unwrap();

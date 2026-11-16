@@ -37,6 +37,9 @@ const CXX_STANDARDS: &[&str] = &[
 ];
 const C_STANDARDS: &[&str] = &["c17", "c11", "c23", "c99", "c89", "c90", "c18", "gnu17", "gnu11", "gnu23", "gnu99"];
 
+// What crate::delay_load::check_names takes: a DLL's file name, without a folder
+const DLL_NAME_PATTERN: &str = r"^[^/\\:\s][^/\\:]*\.[dD][lL][lL]$";
+
 // What crate::project::check_version takes
 const VERSION_PATTERN: &str = r#"^[^\s/\\";]+$"#;
 
@@ -431,6 +434,14 @@ fn target_table(kind: Table) -> Value {
         (
             "whole-archive",
             texts("Static libraries linked whole, every object in them, even those nothing here calls."),
+        ),
+        (
+            "delay-load",
+            array(
+                "DLLs a Windows program or shared library loads on its first call into them instead of at start (\"nvml.dll\"): \
+                 /DELAYLOAD with delayimp.lib (MSVC and clang-cl; MinGW cannot). Other systems ignore it.",
+                json!({ "type": "string", "pattern": DLL_NAME_PATTERN, "examples": ["nvml.dll"] }),
+            ),
         ),
         (
             "data",

@@ -831,6 +831,15 @@ fn run_action(index: usize, action: &Action, low_priority: bool) -> Outcome {
         }
     }
 
+    // DLLs the binary must delay-load (the linker drops an entry nothing imports from)
+    if let Some(binary) = action.outputs.first() {
+        if let Err(error) = crate::delay_load::check_linked(binary, &action.must_delay_load) {
+            outcome.success = false;
+            outcome.error = Some(format!("{error:#}"));
+            return outcome;
+        }
+    }
+
     // Headers it read
     match &action.deps {
         DepsFormat::Make(depfile_path) => {

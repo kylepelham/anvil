@@ -200,6 +200,8 @@ pub struct TargetSpec {
     /// Static libraries linked whole, every object in them, even those nothing here calls (a program that loads
     /// plugins and exports the engine to them).
     pub whole_archive: Option<Vec<String>>,
+    /// DLLs a Windows binary loads on its first call into them instead of at start ("nvml.dll"); ignored elsewhere.
+    pub delay_load: Option<Vec<String>>,
     /// Files (globs relative to `dir`) copied beside the program or shared library, keeping their path under `dir`.
     pub data: Option<Vec<String>>,
     /// `anvil install` installs it (default: whether it is a default target; tests never).

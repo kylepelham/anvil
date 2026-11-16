@@ -103,6 +103,8 @@ pub struct Target {
     pub gui: Gui,
     pub exports: bool,
     pub link_depends: Vec<PathBuf>,
+    /// DLLs loaded on the first call into them (programs and shared libraries; Windows only).
+    pub delay_load: Vec<String>,
 
     // The output file: prefix, name and extension (None: the platform's)
     pub output_prefix: Option<String>,
@@ -212,6 +214,9 @@ struct Accumulated {
     needs: Vec<String>,
     link_depends: Vec<String>,
     whole_archive: Vec<String>,
+    delay_load: Vec<String>,
+    /// `delay-load` from [defaults] and presets, which only targets that link a binary take.
+    shared_delay_load: Vec<String>,
     pch: Option<String>,
     unity: Option<toml::Value>,
     warnings: Option<String>,
@@ -365,6 +370,7 @@ impl Target {
             gui: Gui::Off,
             exports: false,
             link_depends: Vec::new(),
+            delay_load: Vec::new(),
             output_prefix: None,
             output_name: name.to_string(),
             output_suffix: None,
@@ -653,6 +659,19 @@ impl Target {
         }
         self.whole_archive_names = settings.whole_archive;
 
+        // DLLs loaded on first call: only a program or shared library has imports to delay
+        let links = matches!(self.kind, Kind::Exe | Kind::Test | Kind::Shared);
+        if !settings.delay_load.is_empty() && !links {
+            bail!(
+                "delay-load: a {} target links no binary of its own; list the DLLs in the program or shared library that calls them",
+                self.kind.name()
+            );
+        }
+        if links {
+            self.delay_load = [settings.shared_delay_load, settings.delay_load].concat();
+            crate::delay_load::check_names(&self.delay_load)?;
+        }
+
         // Code generation
         self.std = normalize_standard(settings.std.as_deref().unwrap_or(scope.std), Language::Cxx)?;
         self.c_std = normalize_standard(settings.c_std.as_deref().unwrap_or(scope.c_std), Language::C)?;
@@ -844,6 +863,9 @@ fn check_spec(spec: &TargetSpec, table: Table, condition: &CondContext) -> Resul
     if let Some(unity) = &spec.unity {
         manifest::parse_unity(unity)?;
     }
+    if let Some(names) = &spec.delay_load {
+        crate::delay_load::check_names(names)?;
+    }
 
     // Per-file settings and build steps
     for rule in &spec.file {
@@ -958,6 +980,10 @@ impl Accumulated {
         match table {
             Table::Shared | Table::SharedWhen => self.shared_data.extend(spec.data.iter().flatten().cloned()),
             _ => self.data.extend(spec.data.iter().flatten().cloned()),
+        }
+        match table {
+            Table::Shared | Table::SharedWhen => self.shared_delay_load.extend(spec.delay_load.iter().flatten().cloned()),
+            _ => self.delay_load.extend(spec.delay_load.iter().flatten().cloned()),
         }
         self.cuda_flags.extend(spec.cuda_flags.iter().flatten().cloned());
         if let Some(cuda_arch) = &spec.cuda_arch {
