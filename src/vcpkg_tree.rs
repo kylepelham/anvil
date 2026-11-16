@@ -9,8 +9,10 @@ use crate::profile::Profile;
 use crate::toolchain::{Family, Toolchain};
 use crate::util::{self, slash};
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 // The languages compile options are evaluated for, with CMake's names for them
 const LANGUAGES: [(Language, &str); 4] = [
@@ -28,7 +30,14 @@ pub struct InstalledTree {
     pub root: PathBuf,
     pub triplet: String,
     packages: HashMap<String, Package>,
+
+    /// Each package's imported targets, read once per build: running its CMake files is the slow part of a load, and
+    /// the packages most dependencies share (zlib, vcpkg-cmake) would otherwise run once per user.
+    imported: Mutex<HashMap<String, ReadFor>>,
 }
+
+/// A package's imported targets and the build they were read for.
+type ReadFor = (BuildContext, Arc<Vec<ImportedTarget>>);
 
 #[derive(Debug, Default)]
 struct Package {
@@ -41,7 +50,7 @@ struct Package {
 }
 
 /// An imported target from a package's CMake files.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ImportedTarget {
     pub(crate) name: String,
     pub(crate) has_library: bool,
@@ -261,7 +270,7 @@ pub struct CmakePackage {
 
 /// The build a package's generator expressions are evaluated for, in CMake's names (configuration, compiler and
 /// platform), and while evaluating, the language of the file compiled and whether it is for linking.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BuildContext {
     family: Family,
     os: Os,
@@ -452,6 +461,7 @@ impl InstalledTree {
             root: install_root.to_path_buf(),
             triplet: triplet.to_string(),
             packages: HashMap::new(),
+            imported: Mutex::default(),
         };
         tree.read_status(&status.replace("\r\n", "\n"));
         tree.read_file_lists()?;
@@ -471,6 +481,20 @@ impl InstalledTree {
             .collect()
     }
 
+    /// Reads the CMake files of `ports` and of every package they depend on, several packages at once, for the `usage`
+    /// calls that follow with the same `build`: running them is most of a load's time, and mostly waiting on files.
+    pub fn read_packages(&self, ports: &[&str], build: &BuildContext) {
+        let mut names: Vec<String> = ports.iter().flat_map(|port| self.closure(port)).collect();
+        names.sort();
+        names.dedup();
+
+        names.par_iter().for_each(|name| {
+            if let Some(package) = self.packages.get(name) {
+                self.imported_targets(name, package, build);
+            }
+        });
+    }
+
     /// Headers, libraries and DLLs of `name` and its dependencies, dependents before dependencies (link order), and
     /// what their CMake packages require of users, evaluated for `build`. `debug` picks the debug libraries where the
     /// package has them. `only_libs` keeps libraries whose file stem matches one of the names.
@@ -486,12 +510,13 @@ impl InstalledTree {
 
         // Every package's imported targets (host-only tools like vcpkg-cmake are not installed for the triplet).
         // A linked name that is none of them is a system library
-        let packages: Vec<(String, &Package, Vec<ImportedTarget>)> = self
+        let packages: Vec<(String, &Package, Arc<Vec<ImportedTarget>>)> = self
             .closure(name)
             .into_iter()
             .filter_map(|package_name| {
                 let package = self.packages.get(&package_name)?;
-                Some((package_name, package, self.imported_targets(package, build)))
+                let imported = self.imported_targets(&package_name, package, build);
+                Some((package_name, package, imported))
             })
             .collect();
         let known: HashSet<&str> = packages
@@ -591,7 +616,7 @@ impl InstalledTree {
                 .or_else(|| file_name.strip_suffix("-config.cmake"))
                 .map(str::to_string)
         })?;
-        let imported = self.imported_targets(package, build);
+        let imported = self.imported_targets(name, package, build);
         let has_library = imported.iter().any(|target| target.has_library);
         let targets: Vec<String> = imported
             .iter()
@@ -610,8 +635,15 @@ impl InstalledTree {
         })
     }
 
-    /// The imported targets a package's CMake files define, with what each gives its users for `build`.
-    fn imported_targets(&self, package: &Package, build: &BuildContext) -> Vec<ImportedTarget> {
+    /// The imported targets a package's CMake files define, with what each gives its users for `build`; read once per
+    /// build.
+    fn imported_targets(&self, package_name: &str, package: &Package, build: &BuildContext) -> Arc<Vec<ImportedTarget>> {
+        if let Some((read_for, imported)) = self.imported.lock().unwrap().get(package_name) {
+            if read_for == build {
+                return imported.clone();
+            }
+        }
+
         let prefix = ImportPrefix::Fixed(slash(&self.root.join(&self.triplet)));
         let share = format!("{}/share/", self.triplet);
         let mut cmake_files: Vec<PathBuf> = package
@@ -627,7 +659,12 @@ impl InstalledTree {
             !(name.ends_with("Config.cmake") || name.ends_with("-config.cmake"))
         });
 
-        read_imported_targets(&cmake_files, &prefix, build)
+        let imported = Arc::new(read_imported_targets(&cmake_files, &prefix, build));
+        self.imported
+            .lock()
+            .unwrap()
+            .insert(package_name.to_string(), (build.clone(), imported.clone()));
+        imported
     }
 
     /// Whether the triplet's library folder holds a library named `name` (a target of a package outside the closure).
@@ -1749,6 +1786,14 @@ set_target_properties(SDL3::SDL3 PROPERTIES IMPORTED_IMPLIB_RELEASE "${_IMPORT_P
         );
         assert_eq!(usage.link_flags, vec!["/LTCG", "-ignore:4221"]);
         assert!(tree.usage("missing", false, None, &build(Family::Msvc, Os::Windows, "Release")).is_err());
+
+        // The packages read ahead give the same usage; another build reads them again
+        tree.read_packages(&["sdl3", "missing"], &build(Family::Msvc, Os::Windows, "Release"));
+        let again = tree.usage("sdl3", false, None, &build(Family::Msvc, Os::Windows, "Release")).unwrap();
+        assert_eq!((again.libs, again.flags, again.link_flags), (usage.libs, usage.flags, usage.link_flags));
+        let debug = tree.usage("sdl3", false, None, &build(Family::Msvc, Os::Windows, "Debug")).unwrap();
+        assert_eq!(debug.flags, vec!["/Zc:preprocessor"]);
+        assert_eq!(debug.link_flags, vec!["-ignore:4221"]);
 
         std::fs::remove_dir_all(&root).ok();
     }
