@@ -2,6 +2,7 @@
 //! depends on) and the per-package file lists, to give each package's headers, libraries and DLLs without running
 //! CMake.
 
+use crate::cmake_script::{self, Script};
 use crate::flags::Language;
 use crate::platform::{Cpu, Os};
 use crate::profile::Profile;
@@ -54,13 +55,17 @@ pub(crate) struct ImportedTarget {
     pub(crate) links: Vec<String>,
     /// Everything its users link, $<LINK_ONLY:...> too: targets, system libraries and linker flags.
     pub(crate) link_items: Vec<String>,
-    /// INTERFACE_COMPILE_OPTIONS as written: evaluated per language.
+    /// INTERFACE_COMPILE_OPTIONS and INTERFACE_COMPILE_FEATURES as written: evaluated per language, and for the
+    /// standards they ask for (cxx_std_17).
     compile_options: Vec<String>,
+    compile_features: Vec<String>,
     link_options: Vec<String>,
     /// Files its users' programs need beside them (LLVM's libomp.dll).
     pub(crate) runtime: Vec<PathBuf>,
     /// Its files per configuration (IMPORTED_LOCATION_<CONFIG>, IMPORTED_IMPLIB_<CONFIG>; "" for the unsuffixed ones).
     pub(crate) files: Vec<ImportedFiles>,
+    /// Files whose path holds a variable Anvil could not evaluate: configuration, property and value.
+    unresolved_files: Vec<(String, String, String)>,
 }
 
 /// One configuration's files of an imported target: the library (a DLL for a shared one on Windows) and its import
@@ -236,6 +241,10 @@ pub struct Usage {
     /// A static library among the libraries may hold C++ code (its package says so, or says nothing), so programs
     /// linking it link as C++.
     pub cxx_libraries: bool,
+    /// The lowest C++ and C standards users must compile with (INTERFACE_COMPILE_FEATURES cxx_std_17, c_std_11), as
+    /// years (2017).
+    pub cxx_standard: Option<u32>,
+    pub c_standard: Option<u32>,
 }
 
 /// How CMake users find and link an installed port: `find_package(<name> [CONFIG])`, then its targets.
@@ -258,7 +267,10 @@ pub struct BuildContext {
     os: Os,
     cpu: Cpu,
     msvc_abi: bool,
-    configuration: String,
+    /// The configuration generator expressions test ($<CONFIG:Debug>), as CMake builds the profile; and the one
+    /// packages' files are picked for, which must match MSVC's runtime (`Debug` only with its debug runtime).
+    cmake_configuration: String,
+    library_configuration: String,
     compiler_id: &'static str,
     frontend: &'static str,
     language: Option<&'static str>,
@@ -279,9 +291,18 @@ impl BuildContext {
             (Family::Clang | Family::ClangCl, _) => "Clang",
         };
 
-        // The configuration CMake builds for the profile: Debug exactly when the packages' debug libraries are linked,
-        // else the first built-in release one along its chain
-        let configuration = if uses_debug_libraries(toolchain, profile) {
+        // The configuration CMake builds for the profile: the first built-in one along its chain (a profile
+        // inheriting `debug` is Debug)
+        let configuration = profile
+            .chain
+            .iter()
+            .map(String::as_str)
+            .find(|name| matches!(*name, "debug" | "release" | "relwithdebinfo" | "minsizerel"))
+            .unwrap_or("release");
+
+        // The packages' files: Debug exactly when their debug libraries are linked, else the first built-in release
+        // configuration along the chain
+        let library_configuration = if uses_debug_libraries(toolchain, profile) {
             "debug"
         } else {
             profile
@@ -297,7 +318,8 @@ impl BuildContext {
             os,
             cpu: toolchain.platform.cpu,
             msvc_abi: toolchain.is_msvc_abi(),
-            configuration: crate::targets::config_name(configuration),
+            cmake_configuration: crate::targets::config_name(configuration),
+            library_configuration: crate::targets::config_name(library_configuration),
             compiler_id,
             frontend: if toolchain.family.is_msvc_style() { "MSVC" } else { "GNU" },
             language: None,
@@ -327,7 +349,7 @@ impl BuildContext {
 
     /// The configuration packages' files are picked for, in CMake's spelling (`Debug`, `Release`).
     pub(crate) fn configuration(&self) -> &str {
-        &self.configuration
+        &self.library_configuration
     }
 
     pub(crate) fn os(&self) -> Os {
@@ -336,6 +358,88 @@ impl BuildContext {
 
     pub(crate) fn is_msvc_abi(&self) -> bool {
         self.msvc_abi
+    }
+
+    /// The variables CMake sets for package files to read when it builds this (WIN32, CMAKE_SIZEOF_VOID_P, the
+    /// library file names), and those it leaves unset.
+    fn script_variables(&self) -> (Vec<(String, String)>, &'static [&'static str]) {
+        let windows = self.os == Os::Windows;
+        let pointer_size = if matches!(self.cpu, Cpu::X64 | Cpu::Arm64) { "8" } else { "4" };
+        let processor = match (self.os, self.cpu) {
+            (Os::Windows, Cpu::X64) => "AMD64",
+            (Os::Windows, Cpu::X86) => "x86",
+            (Os::Windows, Cpu::Arm64) => "ARM64",
+            (Os::Windows, Cpu::Arm) => "ARM",
+            (Os::Macos, Cpu::Arm64) => "arm64",
+            (_, Cpu::X64) => "x86_64",
+            (_, Cpu::X86) => "i686",
+            (_, Cpu::Arm64) => "aarch64",
+            (_, Cpu::Arm) => "armv7l",
+        };
+        let mut variables: Vec<(&str, String)> = vec![
+            ("CMAKE_SIZEOF_VOID_P", pointer_size.into()),
+            ("CMAKE_SYSTEM_NAME", self.platform_id().into()),
+            ("CMAKE_SYSTEM_PROCESSOR", processor.into()),
+            ("CMAKE_CXX_COMPILER_ID", self.compiler_id.into()),
+            ("CMAKE_C_COMPILER_ID", self.compiler_id.into()),
+            ("CMAKE_CXX_COMPILER_FRONTEND_VARIANT", self.frontend.into()),
+            ("CMAKE_BUILD_TYPE", self.cmake_configuration.clone()),
+            ("CMAKE_VERSION", "3.31.6".into()),
+            ("CMAKE_MAJOR_VERSION", "3".into()),
+            ("CMAKE_MINOR_VERSION", "31".into()),
+            ("CMAKE_PATCH_VERSION", "6".into()),
+            ("CMAKE_CROSSCOMPILING", "FALSE".into()),
+        ];
+
+        // The platform's switches
+        let switches: &[&str] = match self.os {
+            Os::Windows if self.msvc_abi && matches!(self.family, Family::Msvc | Family::ClangCl) => &["WIN32", "MSVC"],
+            Os::Windows if self.msvc_abi => &["WIN32"],
+            Os::Windows => &["WIN32", "MINGW"],
+            Os::Linux => &["UNIX", "LINUX"],
+            Os::Macos => &["UNIX", "APPLE"],
+        };
+        variables.extend(switches.iter().map(|name| (*name, "1".to_string())));
+        if self.os == Os::Linux {
+            let architecture = match self.cpu {
+                Cpu::X64 => "x86_64-linux-gnu",
+                Cpu::X86 => "i386-linux-gnu",
+                Cpu::Arm64 => "aarch64-linux-gnu",
+                Cpu::Arm => "arm-linux-gnueabihf",
+            };
+            variables.push(("CMAKE_LIBRARY_ARCHITECTURE", architecture.into()));
+        }
+
+        // Library file names: prefix and suffix of static, shared, import and module libraries, and programs
+        let names: [(&str, &str); 5] = match (self.os, self.msvc_abi) {
+            (Os::Windows, true) => [("", ".lib"), ("", ".dll"), ("", ".lib"), ("", ".dll"), ("", ".exe")],
+            (Os::Windows, false) => [("lib", ".a"), ("lib", ".dll"), ("lib", ".dll.a"), ("lib", ".dll"), ("", ".exe")],
+            (Os::Linux, _) => [("lib", ".a"), ("lib", ".so"), ("", ""), ("lib", ".so"), ("", "")],
+            (Os::Macos, _) => [("lib", ".a"), ("lib", ".dylib"), ("", ""), ("lib", ".so"), ("", "")],
+        };
+        let mut variables: Vec<(String, String)> = variables.into_iter().map(|(name, value)| (name.to_string(), value)).collect();
+        let kinds = ["STATIC_LIBRARY", "SHARED_LIBRARY", "IMPORT_LIBRARY", "SHARED_MODULE", "EXECUTABLE"];
+        for (kind, (prefix, suffix)) in kinds.iter().zip(names) {
+            if *kind == "IMPORT_LIBRARY" && !windows {
+                continue;
+            }
+            variables.push((format!("CMAKE_{kind}_PREFIX"), prefix.to_string()));
+            variables.push((format!("CMAKE_{kind}_SUFFIX"), suffix.to_string()));
+        }
+
+        let unset: &'static [&'static str] = if windows {
+            &["CMAKE_CONFIGURATION_TYPES", "CMAKE_MODULE_PATH", "CMAKE_PREFIX_PATH"]
+        } else {
+            &[
+                "CMAKE_CONFIGURATION_TYPES",
+                "CMAKE_MODULE_PATH",
+                "CMAKE_PREFIX_PATH",
+                "CMAKE_IMPORT_LIBRARY_PREFIX",
+                "CMAKE_IMPORT_LIBRARY_SUFFIX",
+            ]
+        };
+
+        (variables, unset)
     }
 }
 
@@ -510,12 +614,18 @@ impl InstalledTree {
     fn imported_targets(&self, package: &Package, build: &BuildContext) -> Vec<ImportedTarget> {
         let prefix = ImportPrefix::Fixed(slash(&self.root.join(&self.triplet)));
         let share = format!("{}/share/", self.triplet);
-        let cmake_files: Vec<PathBuf> = package
+        let mut cmake_files: Vec<PathBuf> = package
             .files
             .iter()
             .filter(|file| file.starts_with(&share) && file.ends_with(".cmake"))
             .map(|file| self.root.join(file))
             .collect();
+
+        // Config files first: they include the others as CMake would
+        cmake_files.sort_by_key(|file| {
+            let name = file.file_name().unwrap_or_default().to_string_lossy();
+            !(name.ends_with("Config.cmake") || name.ends_with("-config.cmake"))
+        });
 
         read_imported_targets(&cmake_files, &prefix, build)
     }
@@ -717,6 +827,14 @@ pub(crate) struct Requirements {
     options: [Vec<String>; 4],
     link_options: Vec<String>,
     system_libs: Vec<PathBuf>,
+    /// The standards the features ask for, as years: C++, then C.
+    cxx_standard: Option<u32>,
+    c_standard: Option<u32>,
+
+    /// Values of the targets used made from variables Anvil could not evaluate, as messages; and those of their files,
+    /// with the configuration and whether the target has other files to use.
+    unresolved: Vec<String>,
+    unresolved_files: Vec<(String, String, bool)>,
 }
 
 impl Requirements {
@@ -725,36 +843,61 @@ impl Requirements {
         for (index, (_, language)) in LANGUAGES.iter().enumerate() {
             let build = build.for_language(language);
             for value in &target.include_values {
-                let folders: Vec<PathBuf> = evaluate_list(value, &build)
+                let entries = self.resolved(target, "INTERFACE_INCLUDE_DIRECTORIES", evaluate_list(value, &build));
+                let folders: Vec<PathBuf> = entries
                     .into_iter()
-                    .filter(|entry| !entry.contains("${"))
                     .map(|entry| util::normalize(Path::new(&entry)))
                     .filter(|folder| folder.is_dir())
                     .collect();
                 push_new(&mut self.includes[index], &folders);
             }
             for value in &target.define_values {
-                let defines: Vec<String> = evaluate_list(value, &build).into_iter().filter(|define| !define.contains("${")).collect();
+                let defines = self.resolved(target, "INTERFACE_COMPILE_DEFINITIONS", evaluate_list(value, &build));
                 push_new(&mut self.defines[index], &defines);
             }
             for value in &target.compile_options {
-                let options = evaluate_list(value, &build);
-                push_new(
-                    &mut self.options[index],
-                    &options.into_iter().filter(|option| !option.contains("${")).collect::<Vec<_>>(),
-                );
+                let options = self.resolved(target, "INTERFACE_COMPILE_OPTIONS", evaluate_list(value, &build));
+                push_new(&mut self.options[index], &options);
             }
         }
 
-        self.visible.extend(target.links.iter().cloned());
+        // The standards its features ask for: the highest of all
+        for value in &target.compile_features {
+            for feature in self.resolved(target, "INTERFACE_COMPILE_FEATURES", evaluate_list(value, build)) {
+                let (standard, number) = match (feature.strip_prefix("cxx_std_"), feature.strip_prefix("c_std_")) {
+                    (Some(number), _) => (&mut self.cxx_standard, number),
+                    (_, Some(number)) => (&mut self.c_standard, number),
+                    _ => continue,
+                };
+                if let Ok(number) = number.parse::<u32>() {
+                    let year = if number >= 50 { 1900 + number } else { 2000 + number };
+                    *standard = Some(standard.map_or(year, |known| known.max(year)));
+                }
+            }
+        }
+
+        let links = self.resolved(target, "INTERFACE_LINK_LIBRARIES", target.links.clone());
+        self.visible.extend(links);
     }
 
     /// Adds what users link with from `target`: its link options, the flags and system libraries among what it links
     /// (packages' own library files, in `tree`, are linked from their file lists), and the targets it names.
     pub(crate) fn add_link(&mut self, target: &ImportedTarget, known: &HashSet<&str>, tree: Option<&InstalledTree>) {
-        push_new(&mut self.link_options, &target.link_options);
+        let link_options = self.resolved(target, "INTERFACE_LINK_OPTIONS", target.link_options.clone());
+        push_new(&mut self.link_options, &link_options);
 
-        for item in &target.link_items {
+        // Its files whose paths could not be evaluated: whether that matters depends on the configuration linked
+        let present = |file: &Option<PathBuf>| file.as_ref().is_some_and(|file| file.is_file());
+        let other_files = target
+            .files
+            .iter()
+            .any(|files| present(&files.location) || present(&files.import_library));
+        for (configuration, property, value) in &target.unresolved_files {
+            let message = unresolved_message(&target.name, property, value);
+            self.unresolved_files.push((configuration.clone(), message, other_files));
+        }
+
+        for item in &self.resolved(target, "INTERFACE_LINK_LIBRARIES", target.link_items.clone()) {
             let path = Path::new(item);
             if item.starts_with('-') {
                 push_new(&mut self.link_options, std::slice::from_ref(item));
@@ -769,6 +912,24 @@ impl Requirements {
             } else if !tree.is_some_and(|tree| tree.has_library_named(item)) {
                 push_new(&mut self.system_libs, &[path.to_path_buf()]);
             }
+        }
+    }
+
+    /// An error naming every value of the targets used that holds a variable Anvil could not evaluate (their files'
+    /// only for the configuration linked, or when they have no other files).
+    pub(crate) fn check_resolved(&self, build: &BuildContext) -> Result<(), String> {
+        let mut messages: Vec<&String> = self.unresolved.iter().collect();
+        for (configuration, message, other_files) in &self.unresolved_files {
+            if configuration.is_empty() || configuration.eq_ignore_ascii_case(&build.library_configuration) || !other_files {
+                messages.push(message);
+            }
+        }
+        let mut seen = HashSet::new();
+        messages.retain(|message| seen.insert(*message));
+
+        match messages.is_empty() {
+            true => Ok(()),
+            false => Err(messages.iter().map(|message| message.as_str()).collect::<Vec<_>>().join("\n")),
         }
     }
 
@@ -802,7 +963,37 @@ impl Requirements {
 
         usage.link_flags = self.link_options.iter().flat_map(|option| option_words(option, build)).collect();
         usage.libs.extend(self.system_libs);
+        usage.cxx_standard = self.cxx_standard;
+        usage.c_standard = self.c_standard;
     }
+
+    /// The values of a target's property Anvil could evaluate; those holding a variable it could not are noted.
+    fn resolved(&mut self, target: &ImportedTarget, property: &str, values: Vec<String>) -> Vec<String> {
+        let (unknown, known): (Vec<String>, Vec<String>) = values.into_iter().partition(|value| cmake_script::is_unknown(value));
+        for value in unknown {
+            let message = unresolved_message(&target.name, property, &value);
+            if !self.unresolved.contains(&message) {
+                self.unresolved.push(message);
+            }
+        }
+
+        known
+    }
+}
+
+/// Why a value of an imported target's property cannot be used: the variable it is made from, and what to do instead.
+fn unresolved_message(target: &str, property: &str, value: &str) -> String {
+    let unknown = cmake_script::unknown_variables(value);
+    let (variable, file) = unknown
+        .first()
+        .map(|(variable, file)| (variable.as_str(), file.as_str()))
+        .unwrap_or_default();
+
+    format!(
+        "{file}: {property} of target {target} uses ${{{variable}}}, which no command Anvil runs sets (Anvil runs package files' \
+         set(), if(), include() and the like, not find_library() or what other packages set); describe the package with \
+         `pkg-config = \"<module>\"` instead, or with `include` and `libs`"
+    )
 }
 
 /// What every language's list holds, and the rest by language.
@@ -964,113 +1155,121 @@ fn warn_once(message: &str) {
     }
 }
 
-/// The imported targets CMake package files define, with what each gives its users for `build`. One target's
-/// properties may be spread over several files (its configurations' files hold the libraries).
+/// The imported targets CMake package files define, with what each gives its users for `build`. The files run as
+/// CMake runs them (crate::cmake_script): the first (the config file) with what it includes, then each one it did not
+/// reach. One target's properties may be spread over several files (its configurations' files hold the libraries).
 pub(crate) fn read_imported_targets(files: &[PathBuf], prefix: &ImportPrefix, build: &BuildContext) -> Vec<ImportedTarget> {
     let link = build.for_link();
-    let mut targets: Vec<ImportedTarget> = Vec::new();
+    let (variables, unset) = build.script_variables();
+    let mut script = Script::new(variables, unset);
 
+    // What find_package sets for the package its config file is
+    if let Some(first) = files.first() {
+        let file_name = first.file_name().unwrap_or_default().to_string_lossy();
+        let name = file_name.strip_suffix("Config.cmake").or_else(|| file_name.strip_suffix("-config.cmake"));
+        if let Some(name) = name {
+            script.set("CMAKE_FIND_PACKAGE_NAME", name);
+            script.set(&format!("{name}_DIR"), &first.parent().map(slash).unwrap_or_default());
+        }
+    }
+
+    // Each file not run yet, with the install prefix of files that compute none
+    let prefix = match prefix {
+        ImportPrefix::Fixed(prefix) => prefix,
+        ImportPrefix::PerFile { fallback } => fallback,
+    };
     for path in files {
-        let Ok(text) = std::fs::read_to_string(path) else { continue };
-        let list_dir = slash(path.parent().unwrap());
-        let prefix = match prefix {
-            ImportPrefix::Fixed(prefix) => prefix.clone(),
-            ImportPrefix::PerFile { fallback } => file_import_prefix(&text, path).map_or_else(|| fallback.clone(), |found| slash(&found)),
+        if script.has_run(path) {
+            continue;
+        }
+        for name in ["_IMPORT_PREFIX", "VCPKG_IMPORT_PREFIX", "PACKAGE_PREFIX_DIR"] {
+            script.set(name, prefix);
+        }
+        script.run_file(path);
+    }
+
+    let mut targets: Vec<ImportedTarget> = Vec::new();
+    for defined in script.into_targets() {
+        let mut target = ImportedTarget {
+            name: defined.name,
+            kind: defined.kind,
+            ..Default::default()
         };
 
-        // Declarations: add_library(<name> <kind> IMPORTED), and aliases, which pass on what they name
-        for (name, kind, aliased) in imported_declarations(&text) {
-            let target = target_named(&mut targets, &name);
-            target.kind = kind;
-            if let Some(aliased) = aliased {
-                target.links.push(aliased.clone());
-                target.link_items.push(aliased);
-            }
+        // An alias passes on what it names
+        if let Some(aliased) = defined.aliased {
+            target.links.push(aliased.clone());
+            target.link_items.push(aliased);
         }
 
-        for (name, properties) in target_property_blocks(&text) {
-            if name.contains('$') {
-                continue;
-            }
-            let target = target_named(&mut targets, &name);
-            target.has_library |= properties.contains("IMPORTED_LOCATION") || properties.contains("IMPORTED_IMPLIB");
+        for (property, value) in defined.properties {
+            target.has_library |= property.starts_with("IMPORTED_LOCATION") || property.starts_with("IMPORTED_IMPLIB");
+            match property.as_str() {
+                // Evaluated per language when used
+                "INTERFACE_INCLUDE_DIRECTORIES" => target.include_values.push(value),
+                "INTERFACE_COMPILE_DEFINITIONS" => target.define_values.push(value),
+                "INTERFACE_COMPILE_OPTIONS" => target.compile_options.push(value),
+                "INTERFACE_COMPILE_FEATURES" => target.compile_features.push(value),
 
-            // Include folders and definitions may depend on the file's language too: evaluated for each
-            if let Some(value) = property_value(&properties, "INTERFACE_INCLUDE_DIRECTORIES") {
-                target.include_values.push(expand_import_prefixes(&value, &prefix, &list_dir));
-            }
-            target.define_values.extend(property_value(&properties, "INTERFACE_COMPILE_DEFINITIONS"));
-            target.links.extend(property_values(&properties, "INTERFACE_LINK_LIBRARIES", build));
-
-            // What linking needs: every linked item, and the link options
-            for item in property_values(&properties, "INTERFACE_LINK_LIBRARIES", &link) {
-                let item = expand_import_prefixes(&item, &prefix, &list_dir);
-                if !item.contains("${") {
-                    target.link_items.push(item);
+                // What compiling and linking need: the targets named, every linked item, the link options
+                "INTERFACE_LINK_LIBRARIES" => {
+                    target.links.extend(evaluate_list(&value, build));
+                    target.link_items.extend(evaluate_list(&value, &link));
                 }
-            }
-            let link_options = property_values(&properties, "INTERFACE_LINK_OPTIONS", &link);
-            target
-                .link_options
-                .extend(link_options.into_iter().filter(|option| !option.contains("${")));
-
-            // Compile options depend on the file's language: evaluated for each
-            target.compile_options.extend(property_value(&properties, "INTERFACE_COMPILE_OPTIONS"));
-
-            // Its files, per configuration
-            for (property, value) in property_pairs(&properties) {
-                let value = expand_import_prefixes(&value, &prefix, &list_dir);
-                if value.contains("${") || value.contains("$<") {
-                    continue;
-                }
-                let found = [
-                    "IMPORTED_LOCATION",
-                    "IMPORTED_IMPLIB",
-                    "IMPORTED_LINK_DEPENDENT_LIBRARIES",
-                    "IMPORTED_LINK_INTERFACE_LANGUAGES",
-                ]
-                .into_iter()
-                .find_map(|key| Some((key, configuration_suffix(&property, key)?)));
-                let Some((key, configuration)) = found else { continue };
-                let files = match target.files.iter().position(|files| files.configuration == configuration) {
-                    Some(index) => &mut target.files[index],
-                    None => {
-                        target.files.push(ImportedFiles {
-                            configuration,
-                            ..Default::default()
-                        });
-                        target.files.last_mut().unwrap()
-                    }
-                };
-                match key {
-                    "IMPORTED_LOCATION" => files.location = Some(util::normalize(Path::new(&value))),
-                    "IMPORTED_IMPLIB" => files.import_library = Some(util::normalize(Path::new(&value))),
-                    "IMPORTED_LINK_INTERFACE_LANGUAGES" => {
-                        files.languages = Some(value.split(';').filter(|item| !item.is_empty()).map(String::from).collect())
-                    }
-                    _ => files.dependent_libraries = value.split(';').filter(|item| !item.is_empty()).map(String::from).collect(),
-                }
+                "INTERFACE_LINK_OPTIONS" => target.link_options.extend(evaluate_list(&value, &link)),
+                _ => add_imported_file(&mut target, &property, &value),
             }
         }
+        targets.push(target);
     }
 
     targets
 }
 
-/// The target of this name in `targets`, added when it is not there yet.
-fn target_named<'a>(targets: &'a mut Vec<ImportedTarget>, name: &str) -> &'a mut ImportedTarget {
-    let index = match targets.iter().position(|target| target.name == name) {
-        Some(index) => index,
+/// One of a target's per-configuration file properties (IMPORTED_LOCATION_RELEASE, ...), when `property` is one.
+fn add_imported_file(target: &mut ImportedTarget, property: &str, value: &str) {
+    let found = [
+        "IMPORTED_LOCATION",
+        "IMPORTED_IMPLIB",
+        "IMPORTED_LINK_DEPENDENT_LIBRARIES",
+        "IMPORTED_LINK_INTERFACE_LANGUAGES",
+    ]
+    .into_iter()
+    .find_map(|key| Some((key, configuration_suffix(property, key)?)));
+    let Some((key, configuration)) = found else { return };
+    if value.contains("$<") {
+        return;
+    }
+
+    // A path made from a variable that could not be evaluated is no path
+    let is_file = matches!(key, "IMPORTED_LOCATION" | "IMPORTED_IMPLIB");
+    if is_file && cmake_script::is_unknown(value) {
+        target.unresolved_files.push((configuration, property.to_string(), value.to_string()));
+        return;
+    }
+
+    let files = match target.files.iter().position(|files| files.configuration == configuration) {
+        Some(index) => &mut target.files[index],
         None => {
-            targets.push(ImportedTarget {
-                name: name.to_string(),
+            target.files.push(ImportedFiles {
+                configuration,
                 ..Default::default()
             });
-            targets.len() - 1
+            target.files.last_mut().unwrap()
         }
     };
-
-    &mut targets[index]
+    let items = || {
+        value
+            .split(';')
+            .filter(|item| !item.is_empty() && !cmake_script::is_unknown(item))
+            .map(String::from)
+    };
+    match key {
+        "IMPORTED_LOCATION" => files.location = Some(util::normalize(Path::new(value))),
+        "IMPORTED_IMPLIB" => files.import_library = Some(util::normalize(Path::new(value))),
+        "IMPORTED_LINK_INTERFACE_LANGUAGES" => files.languages = Some(items().collect()),
+        _ => files.dependent_libraries = items().collect(),
+    }
 }
 
 /// A static library file (libz.a, z.lib), not a shared one or a MinGW import library (libz.dll.a).
@@ -1087,28 +1286,6 @@ fn configuration_suffix(property: &str, key: &str) -> Option<String> {
         None if rest.is_empty() => Some(String::new()),
         None => None,
     }
-}
-
-/// Each `add_library(<name> <kind> IMPORTED)` (kind SHARED, STATIC, ...) and `add_library(<name> ALIAS <target>)` of a
-/// package file: the name, the kind, and the target an alias names.
-fn imported_declarations(text: &str) -> Vec<(String, String, Option<String>)> {
-    static IMPORTED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"add_library\(\s*([^\s)$]+)\s+(SHARED|STATIC|MODULE|UNKNOWN|INTERFACE|OBJECT)\s+IMPORTED").unwrap()
-    });
-    static ALIAS: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"add_library\(\s*([^\s)$]+)\s+ALIAS\s+([^\s)$]+)\s*\)").unwrap());
-
-    let mut declarations: Vec<(String, String, Option<String>)> = IMPORTED
-        .captures_iter(text)
-        .map(|captures| (captures[1].to_string(), captures[2].to_string(), None))
-        .collect();
-    declarations.extend(
-        ALIAS
-            .captures_iter(text)
-            .map(|captures| (captures[1].to_string(), "INTERFACE".to_string(), Some(captures[2].to_string()))),
-    );
-
-    declarations
 }
 
 /// The install prefix a package file computes for `${_IMPORT_PREFIX}` or `${PACKAGE_PREFIX_DIR}`: its own folder, up as
@@ -1135,105 +1312,6 @@ pub(crate) fn file_import_prefix(text: &str, file: &Path) -> Option<PathBuf> {
     };
 
     folder.ancestors().nth(levels).map(Path::to_path_buf)
-}
-
-/// A set_target_properties body's `PROPERTY value` pairs after `PROPERTIES`, values unquoted.
-fn property_pairs(properties: &str) -> Vec<(String, String)> {
-    let Some(start) = properties.find("PROPERTIES") else { return Vec::new() };
-    let mut words = Vec::new();
-    let mut characters = properties[start + "PROPERTIES".len()..].chars().peekable();
-
-    // Words: quoted (with \" and \$ escapes) or bare
-    while let Some(character) = characters.next() {
-        if character.is_whitespace() {
-            continue;
-        }
-        let mut word = String::new();
-        if character == '"' {
-            while let Some(character) = characters.next() {
-                match character {
-                    '\\' => word.extend(characters.next()),
-                    '"' => break,
-                    _ => word.push(character),
-                }
-            }
-        } else {
-            word.push(character);
-            while let Some(character) = characters.next_if(|character| !character.is_whitespace()) {
-                word.push(character);
-            }
-        }
-        words.push(word);
-    }
-
-    words
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|[property, value]| (property.clone(), value.clone()))
-        .collect()
-}
-
-/// An imported target's path with the variables package files write for the install prefix and their own folder.
-fn expand_import_prefixes(entry: &str, prefix: &str, list_dir: &str) -> String {
-    entry
-        .replace("${_IMPORT_PREFIX}", prefix)
-        .replace("${VCPKG_IMPORT_PREFIX}", prefix)
-        .replace("${PACKAGE_PREFIX_DIR}", prefix)
-        .replace("${CMAKE_CURRENT_LIST_DIR}", list_dir)
-}
-
-/// Each `set_target_properties(NAME PROPERTIES ...)` call: the target name and the text of its properties.
-fn target_property_blocks(text: &str) -> Vec<(String, String)> {
-    let mut blocks = Vec::new();
-    let mut rest = text;
-
-    while let Some(start) = rest.find("set_target_properties(") {
-        let after = &rest[start + "set_target_properties(".len()..];
-
-        // The closing parenthesis outside quoted values (__declspec(dllimport) is inside one)
-        let mut quoted = false;
-        let mut end = after.len();
-        for (index, character) in after.char_indices() {
-            match character {
-                '"' => quoted = !quoted,
-                ')' if !quoted => {
-                    end = index;
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        let body = &after[..end];
-        if let Some(name) = body.split_whitespace().next() {
-            blocks.push((name.to_string(), body.to_string()));
-        }
-        rest = &after[end..];
-    }
-
-    blocks
-}
-
-/// A property's quoted value in a set_target_properties body, as a list with its generator expressions evaluated for
-/// `build` (items with one that cannot be are left out).
-fn property_values(properties: &str, property: &str, build: &BuildContext) -> Vec<String> {
-    match property_value(properties, property) {
-        Some(value) => evaluate_list(&value, build),
-        None => Vec::new(),
-    }
-}
-
-/// A property's quoted value in a set_target_properties body, as written.
-fn property_value(properties: &str, property: &str) -> Option<String> {
-    let found = properties
-        .match_indices(property)
-        .find(|(index, _)| properties[index + property.len()..].starts_with(char::is_whitespace));
-    let (start, _) = found?;
-    let value = properties[start + property.len()..].split('"').nth(1)?;
-
-    // Generator expressions written inside the file's own quoted strings come escaped (\$<...>)
-    Some(value.replace("\\$", "$"))
 }
 
 /// A ;-list whose items may hold generator expressions, evaluated for `build`. An item holding one Anvil cannot
@@ -1278,7 +1356,7 @@ fn evaluate_expression(inner: &str, build: &BuildContext) -> Option<String> {
     // Without arguments: the values conditions test
     let Some(arguments) = arguments else {
         return match head.as_str() {
-            "CONFIG" => Some(build.configuration.clone()),
+            "CONFIG" => Some(build.cmake_configuration.clone()),
             "CXX_COMPILER_ID" | "C_COMPILER_ID" => Some(build.compiler_id.to_string()),
             "CXX_COMPILER_FRONTEND_VARIANT" | "C_COMPILER_FRONTEND_VARIANT" => Some(build.frontend.to_string()),
             "PLATFORM_ID" => Some(build.platform_id().to_string()),
@@ -1341,13 +1419,21 @@ fn evaluate_expression(inner: &str, build: &BuildContext) -> Option<String> {
         },
 
         // What the build is
-        "CONFIG" => truth(values()?.iter().any(|name| name.eq_ignore_ascii_case(&build.configuration))),
+        "CONFIG" => truth(values()?.iter().any(|name| name.eq_ignore_ascii_case(&build.cmake_configuration))),
         "CXX_COMPILER_ID" | "C_COMPILER_ID" => truth(values()?.iter().any(|id| id == build.compiler_id)),
         "CXX_COMPILER_FRONTEND_VARIANT" | "C_COMPILER_FRONTEND_VARIANT" => truth(values()?.iter().any(|variant| variant == build.frontend)),
         "PLATFORM_ID" => truth(values()?.iter().any(|id| id == build.platform_id())),
         "COMPILE_LANGUAGE" => {
             let language = build.language?;
             truth(values()?.iter().any(|name| name == language))
+        }
+        // The consuming target's property: unknown for those Anvil's targets have, else unset
+        "TARGET_PROPERTY" if !arguments.contains(',') => {
+            let property = expand(arguments, build)?;
+            match cmake_script::CONSUMER_PROPERTIES.contains(&property.as_str()) {
+                true => None,
+                false => Some(String::new()),
+            }
         }
         "COMPILE_LANG_AND_ID" => {
             let language = build.language?;
@@ -1434,7 +1520,8 @@ mod tests {
             os,
             cpu: Cpu::X64,
             msvc_abi: os == Os::Windows && family != Family::Gcc,
-            configuration: configuration.into(),
+            cmake_configuration: configuration.into(),
+            library_configuration: configuration.into(),
             compiler_id: match family {
                 Family::Msvc => "MSVC",
                 Family::Gcc => "GNU",
@@ -1468,9 +1555,13 @@ mod tests {
             vec!["C"]
         );
 
-        let blocks = target_property_blocks("set_target_properties(a::b PROPERTIES\n  INTERFACE_COMPILE_DEFINITIONS \"X=f(1)\"\n)\nset_target_properties(a::c PROPERTIES IMPORTED_IMPLIB \"x.lib\")");
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(property_values(&blocks[0].1, "INTERFACE_COMPILE_DEFINITIONS", &debug), vec!["X=f(1)"]);
+        let folder = scratch("blocks");
+        let file = folder.join("aConfig.cmake");
+        std::fs::write(&file, "set_target_properties(a::b PROPERTIES\n  INTERFACE_COMPILE_DEFINITIONS \"X=f(1)\"\n)\nset_target_properties(a::c PROPERTIES IMPORTED_IMPLIB \"x.lib\")").unwrap();
+        let targets = read_imported_targets(&[file], &ImportPrefix::Fixed(String::new()), &debug);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(evaluate_list(&targets[0].define_values[0], &debug), vec!["X=f(1)"]);
+        std::fs::remove_dir_all(&folder).ok();
     }
 
     #[test]
@@ -1651,5 +1742,238 @@ set_target_properties(SDL3::SDL3 PROPERTIES IMPORTED_IMPLIB_RELEASE "${_IMPORT_P
         assert!(tree.usage("missing", false, None, &build(Family::Msvc, Os::Windows, "Release")).is_err());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A fresh folder for one test.
+    fn scratch(test: &str) -> PathBuf {
+        let folder = std::env::temp_dir().join(format!("anvil-cmake-files-{test}-{}", std::process::id()));
+        std::fs::remove_dir_all(&folder).ok();
+        std::fs::create_dir_all(&folder).unwrap();
+        folder
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// What a package's targets give users who link `wanted`, for `build`, or why that cannot be known.
+    fn usage_of(targets: &[ImportedTarget], wanted: &str, build: &BuildContext) -> Result<Usage, String> {
+        let known: HashSet<&str> = targets.iter().map(|target| target.name.as_str()).collect();
+        let mut requirements = Requirements::default();
+        for target in targets.iter().filter(|target| target.name == wanted) {
+            requirements.add_compile(target, build);
+            requirements.add_link(target, &known, None);
+        }
+        requirements.check_resolved(build)?;
+
+        let mut usage = Usage::default();
+        requirements.fill(&mut usage, build);
+        Ok(usage)
+    }
+
+    #[test]
+    fn runs_variables_of_hand_written_files() {
+        // SDL2's hand-written file: a macro, a prefix computed from its folder, regular expressions, platform branches
+        let prefix = scratch("sdl2");
+        let folder = prefix.join("lib/cmake/SDL2");
+        for file in ["include/SDL2/SDL.h", "lib/libSDL2.so", "lib/libSDL2main.a"] {
+            write(&prefix.join(file), "");
+        }
+        write(
+            &folder.join("sdl2-config.cmake"),
+            r#"macro(set_and_check _var _file)
+  set(${_var} "${_file}")
+  if(NOT EXISTS "${_file}")
+    message(FATAL_ERROR "missing ${_file}")
+  endif()
+endmacro()
+get_filename_component(CMAKE_CURRENT_LIST_DIR ${CMAKE_CURRENT_LIST_DIR} REALPATH)
+get_filename_component(prefix "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+set(libdir "${prefix}/lib")
+set_and_check(SDL2_INCLUDE_DIR "${prefix}/include/SDL2")
+set_and_check(SDL2_LIBDIR "${libdir}")
+unset(prefix)
+set(_sdl2_libraries_in "-lSDL2 -lm")
+string(REGEX MATCHALL "-[lm]([-a-zA-Z0-9._]+)" _sdl2_libraries "${_sdl2_libraries_in}")
+string(REGEX REPLACE "^-l" "" _sdl2_libraries "${_sdl2_libraries}")
+string(REGEX REPLACE ";-l" ";" _sdl2_libraries "${_sdl2_libraries}")
+list(REMOVE_ITEM _sdl2_libraries SDL2 SDL2main)
+if(WIN32)
+  add_library(SDL2::SDL2 SHARED IMPORTED)
+  set_target_properties(SDL2::SDL2 PROPERTIES IMPORTED_IMPLIB "${SDL2_LIBDIR}/SDL2.lib")
+else()
+  set(_sdl2_shared "${SDL2_LIBDIR}/libSDL2${CMAKE_SHARED_LIBRARY_SUFFIX}")
+  if(EXISTS "${_sdl2_shared}" AND NOT TARGET SDL2::SDL2)
+    add_library(SDL2::SDL2 SHARED IMPORTED)
+    set_target_properties(SDL2::SDL2 PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${SDL2_INCLUDE_DIR}"
+      INTERFACE_LINK_LIBRARIES "${_sdl2_libraries}"
+      IMPORTED_LOCATION "${_sdl2_shared}")
+  endif()
+endif()
+"#,
+        );
+
+        let gcc = build(Family::Gcc, Os::Linux, "Release");
+        let base = slash(&util::normalize(&std::fs::canonicalize(&prefix).unwrap()));
+        let base = base.strip_prefix("//?/").unwrap_or(&base).to_string();
+        let targets = read_imported_targets(&[folder.join("sdl2-config.cmake")], &ImportPrefix::Fixed(String::new()), &gcc);
+        let sdl2 = targets.iter().find(|target| target.name == "SDL2::SDL2").unwrap();
+        assert_eq!(sdl2.kind, "SHARED");
+        assert_eq!(slash(sdl2.files[0].location.as_ref().unwrap()), format!("{base}/lib/libSDL2.so"));
+        assert_eq!(sdl2.include_values, vec![format!("{base}/include/SDL2")]);
+        assert_eq!(sdl2.link_items, vec!["m"]);
+
+        // Windows: the other branch
+        let msvc = build(Family::Msvc, Os::Windows, "Release");
+        let targets = read_imported_targets(&[folder.join("sdl2-config.cmake")], &ImportPrefix::Fixed(String::new()), &msvc);
+        let location = targets[0].files[0].import_library.as_ref().unwrap();
+        assert_eq!(slash(location), format!("{base}/lib/SDL2.lib"));
+
+        std::fs::remove_dir_all(&prefix).ok();
+    }
+
+    #[test]
+    fn runs_included_variant_files() {
+        // Boost's: the config file globs its variants and includes each; a variant that does not suit returns early,
+        // and the variables it uses are gone once the config file finishes
+        let prefix = scratch("boost");
+        let folder = prefix.join("lib/cmake/boost_fs-1.83.0");
+        write(&prefix.join("lib/libboost_fs.so.1.83.0"), "");
+        write(
+            &folder.join("boost_fs-config.cmake"),
+            r#"if(TARGET Boost::fs)
+  return()
+endif()
+get_filename_component(_BOOST_CMAKEDIR "${CMAKE_CURRENT_LIST_DIR}/../" REALPATH)
+get_filename_component(_BOOST_LIBDIR "${_BOOST_CMAKEDIR}/../" ABSOLUTE)
+file(GLOB __boost_variants "${CMAKE_CURRENT_LIST_DIR}/libboost_fs-variant*.cmake")
+macro(_BOOST_SKIPPED fname reason)
+  list(APPEND __boost_skipped "${fname} (${reason})")
+endmacro()
+list(LENGTH __boost_variants _BOOST_SINGLE_VARIANT)
+if(NOT _BOOST_SINGLE_VARIANT EQUAL 1)
+  set(_BOOST_SINGLE_VARIANT 0)
+endif()
+foreach(f IN LISTS __boost_variants)
+  include(${f})
+endforeach()
+unset(_BOOST_LIBDIR)
+foreach(dep IN LISTS _BOOST_FS_DEPS)
+  set_property(TARGET Boost::fs APPEND PROPERTY INTERFACE_LINK_LIBRARIES Boost::${dep})
+endforeach()
+"#,
+        );
+        let variant = |link: &str, skip: &str, file: &str| {
+            format!(
+                "if(CMAKE_SIZEOF_VOID_P EQUAL 4)\n  return()\nendif()\nif(DEFINED Boost_USE_STATIC_LIBS)\n  return()\nelse()\n  if({skip} AND NOT _BOOST_SINGLE_VARIANT)\n    _BOOST_SKIPPED(\"{file}\" \"{link}\")\n    return()\n  endif()\nendif()\n\
+                 if(NOT \"${{Boost_USE_RELEASE_LIBS}}\" STREQUAL \"\" AND NOT Boost_USE_RELEASE_LIBS)\n  return()\nendif()\n\
+                 if(NOT TARGET Boost::fs)\n  add_library(Boost::fs {link} IMPORTED)\nendif()\n\
+                 set_target_properties(Boost::fs PROPERTIES\n  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE CXX\n  IMPORTED_LOCATION_RELEASE \"${{_BOOST_LIBDIR}}/{file}\"\n  )\n\
+                 set_property(TARGET Boost::fs APPEND\n  PROPERTY INTERFACE_COMPILE_DEFINITIONS \"BOOST_FS_DYN_LINK\"\n  )\nlist(APPEND _BOOST_FS_DEPS atomic headers)\n"
+            )
+        };
+        write(
+            &folder.join("libboost_fs-variant-shared.cmake"),
+            &variant("SHARED", "WIN32", "libboost_fs.so.1.83.0"),
+        );
+        write(
+            &folder.join("libboost_fs-variant-static.cmake"),
+            &variant("STATIC", "NOT WIN32", "libboost_fs.a"),
+        );
+
+        let gcc = build(Family::Gcc, Os::Linux, "Release");
+        let targets = read_imported_targets(&[folder.join("boost_fs-config.cmake")], &ImportPrefix::Fixed(String::new()), &gcc);
+        assert_eq!(targets.len(), 1);
+        let boost = &targets[0];
+        assert_eq!(boost.kind, "SHARED");
+        let location = boost.files[0].location.as_ref().unwrap();
+        assert!(
+            slash(location).ends_with("/lib/libboost_fs.so.1.83.0") && location.is_file(),
+            "{location:?}"
+        );
+        assert_eq!(boost.files[0].languages, Some(vec!["CXX".to_string()]));
+        assert_eq!(boost.links, vec!["Boost::atomic", "Boost::headers"]);
+        assert_eq!(usage_of(&targets, "Boost::fs", &gcc).unwrap().defines, vec!["BOOST_FS_DYN_LINK"]);
+
+        std::fs::remove_dir_all(&prefix).ok();
+    }
+
+    #[test]
+    fn values_of_unknown_variables_are_errors() {
+        // A variable a find module or find_library sets: its targets cannot be used, and the error says why
+        let folder = scratch("unknown");
+        write(
+            &folder.join("FooConfig.cmake"),
+            "find_library(FOO_LIBRARY foo)\nif(FOO_LIBRARY)\n  add_library(Foo::foo UNKNOWN IMPORTED)\n  set_target_properties(Foo::foo PROPERTIES\n    IMPORTED_LOCATION \"${FOO_LIBRARY}\"\n    INTERFACE_INCLUDE_DIRECTORIES \"${FOO_INCLUDE_DIR}\"\n    INTERFACE_COMPILE_DEFINITIONS \"FOO;$<$<CONFIG:Debug>:${FOO_DEBUG}>\")\nendif()\n",
+        );
+        let gcc = build(Family::Gcc, Os::Linux, "Release");
+        let targets = read_imported_targets(&[folder.join("FooConfig.cmake")], &ImportPrefix::Fixed(String::new()), &gcc);
+        assert!(targets[0].has_library);
+        let error = usage_of(&targets, "Foo::foo", &gcc).unwrap_err();
+        assert!(
+            error.contains("INTERFACE_INCLUDE_DIRECTORIES of target Foo::foo uses ${FOO_INCLUDE_DIR}"),
+            "{error}"
+        );
+        assert!(error.contains("IMPORTED_LOCATION of target Foo::foo uses ${FOO_LIBRARY}"), "{error}");
+        assert!(error.contains("FooConfig.cmake: ") && error.contains("pkg-config"), "{error}");
+
+        // Under a condition that does not hold for the build, an unknown variable does not matter
+        assert!(!error.contains("FOO_DEBUG"), "{error}");
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn set_property_appends_and_replaces() {
+        // Qt6CoreConfigExtras.cmake: QT_NO_DEBUG for the configurations that are not Debug
+        let folder = scratch("set_property");
+        write(
+            &folder.join("Qt6CoreConfig.cmake"),
+            "add_library(Qt6::Core SHARED IMPORTED)\nset_target_properties(Qt6::Core PROPERTIES INTERFACE_COMPILE_DEFINITIONS \"QT_CORE_LIB\")\n\
+             set(__qt_core_target Qt6::Core)\nif (NOT QT_NO_CREATE_TARGETS)\n  set_property(TARGET ${__qt_core_target} APPEND PROPERTY INTERFACE_COMPILE_DEFINITIONS $<$<NOT:$<CONFIG:Debug>>:QT_NO_DEBUG>)\n\
+               set_property(TARGET ${__qt_core_target} PROPERTY INTERFACE_COMPILE_FEATURES cxx_decltype)\n  set_property(TARGET Qt6::Core PROPERTY INTERFACE_COMPILE_FEATURES cxx_std_17)\nendif()\n\
+             target_link_libraries(Qt6::Core INTERFACE Threads::Threads)\n",
+        );
+        let read = |build: &BuildContext| {
+            let targets = read_imported_targets(&[folder.join("Qt6CoreConfig.cmake")], &ImportPrefix::Fixed(String::new()), build);
+            usage_of(&targets, "Qt6::Core", build).unwrap()
+        };
+        let release = read(&build(Family::Gcc, Os::Linux, "Release"));
+        assert_eq!(release.defines, vec!["QT_CORE_LIB", "QT_NO_DEBUG"]);
+        assert_eq!(release.cxx_standard, Some(2017));
+        assert_eq!(read(&build(Family::Gcc, Os::Linux, "Debug")).defines, vec!["QT_CORE_LIB"]);
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn consumer_properties_read_as_unset() {
+        // Qt6::Platform on Windows: UNICODE unless the user's target sets QT_NO_UNICODE_DEFINES; TYPE is unknown
+        let msvc = build(Family::Msvc, Os::Windows, "Release");
+        let value = "WIN32;$<$<NOT:$<BOOL:$<TARGET_PROPERTY:QT_NO_UNICODE_DEFINES>>>:UNICODE$<SEMICOLON>_UNICODE>;$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,SHARED_LIBRARY>:_WINDLL>";
+        assert_eq!(evaluate_list(value, &msvc), vec!["WIN32", "UNICODE", "_UNICODE"]);
+        assert!(evaluate_list("$<TARGET_PROPERTY:Qt6::Core,X>", &msvc).is_empty());
+    }
+
+    #[test]
+    fn generator_expressions_use_the_profiles_configuration() {
+        // A debug profile is Debug everywhere; only MSVC's debug runtime picks the packages' debug files
+        let profile = |name: &str| Profile::resolve(name, &Default::default()).unwrap();
+        let linux = Toolchain::for_tests(Family::Gcc, crate::platform::Platform::parse("x86_64-linux-gnu").unwrap(), false);
+        let windows = Toolchain::for_tests(Family::Msvc, crate::platform::Platform::parse("x86_64-pc-windows-msvc").unwrap(), true);
+        let configurations = |toolchain: &Toolchain, name: &str| {
+            let build = BuildContext::new(toolchain, &profile(name));
+            (build.cmake_configuration.clone(), build.configuration().to_string())
+        };
+        assert_eq!(configurations(&linux, "debug"), ("Debug".to_string(), "Release".to_string()));
+        assert_eq!(configurations(&linux, "release"), ("Release".to_string(), "Release".to_string()));
+        assert_eq!(configurations(&windows, "debug"), ("Debug".to_string(), "Debug".to_string()));
+        assert_eq!(configurations(&windows, "release"), ("Release".to_string(), "Release".to_string()));
+
+        // TBB's: debug checks for Debug builds on Linux too
+        let linux_debug = BuildContext::new(&linux, &profile("debug"));
+        assert_eq!(evaluate_list("$<$<CONFIG:DEBUG>:TBB_USE_DEBUG>", &linux_debug), vec!["TBB_USE_DEBUG"]);
     }
 }

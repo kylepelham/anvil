@@ -120,6 +120,11 @@ struct CompileInputs {
     flags: Vec<String>,
     /// Flags for one language's files only.
     language_flags: Vec<(Language, String)>,
+    /// The lowest C++ and C standards the dependencies ask for (years), and the target's raised to them.
+    required_std: Option<u32>,
+    required_c_std: Option<u32>,
+    std: Option<String>,
+    c_std: Option<String>,
 }
 
 /// What linking a binary needs from its dependencies.
@@ -868,9 +873,9 @@ impl<'a> Planner<'a> {
         let mut settings = FileSettings {
             language,
             standard: if matches!(language, Language::C | Language::ObjC) {
-                &target.c_std
+                inputs.c_std.as_deref().unwrap_or(&target.c_std)
             } else {
-                &target.std
+                inputs.std.as_deref().unwrap_or(&target.std)
             },
             opt: profile.opt,
             warnings: target.warnings,
@@ -1912,6 +1917,10 @@ impl<'a> Planner<'a> {
         }
         inputs.flags.extend(self.profile_settings(index, &self.model.profile.flags));
 
+        // A dependency's standard raises the target's, as CMake's compile features do
+        inputs.std = inputs.required_std.and_then(|year| crate::flags::raised_standard(&target.std, year));
+        inputs.c_std = inputs.required_c_std.and_then(|year| crate::flags::raised_standard(&target.c_std, year));
+
         dedup_in_order(&mut inputs.includes, |path| util::path_key(path));
         dedup_in_order(&mut inputs.system_includes, |path| util::path_key(path));
         dedup_in_order(&mut inputs.defines, |define| define.clone());
@@ -1946,6 +1955,8 @@ impl<'a> Planner<'a> {
         inputs.flags.extend(target.public_flags.iter().cloned());
         inputs.flags.extend(target.interface_flags.iter().cloned());
         inputs.language_flags.extend(target.public_language_flags.iter().cloned());
+        inputs.required_std = inputs.required_std.max(target.required_std);
+        inputs.required_c_std = inputs.required_c_std.max(target.required_c_std);
 
         for (dependency, public) in &target.deps {
             if *public {

@@ -191,6 +191,17 @@ pub fn normalize_standard(text: &str, language: Language) -> Result<String> {
     })
 }
 
+/// A normalized standard ("c++14", "gnu99") raised to `year` when it is older, GNU extensions kept; None when it is
+/// as new already.
+pub fn raised_standard(standard: &str, year: u32) -> Option<String> {
+    let split = standard.find(|character: char| character.is_ascii_digit())?;
+    let (prefix, digits) = standard.split_at(split);
+    let number: u32 = digits.parse().ok()?;
+    let current = if number >= 50 { 1900 + number } else { 2000 + number };
+
+    (current < year).then(|| format!("{prefix}{:02}", year % 100))
+}
+
 /// A line explaining a link failure Anvil recognizes, shown under the linker's output.
 pub fn link_failure_hint(output: &str) -> Option<&'static str> {
     let unresolved_winmain = output.lines().any(|line| {
@@ -1545,5 +1556,14 @@ mod tests {
         clang_cl.sanitizer_runtime_dir = Some(PathBuf::from("/llvm/lib/clang/22/lib/windows"));
         clang_cl.adapt_profile(&mut profile).unwrap();
         assert!(!profile.debug_runtime);
+    }
+
+    #[test]
+    fn standards_are_raised_to_what_dependencies_ask() {
+        assert_eq!(raised_standard("c++14", 2017).as_deref(), Some("c++17"));
+        assert_eq!(raised_standard("gnu++11", 2020).as_deref(), Some("gnu++20"));
+        assert_eq!(raised_standard("c++20", 2017), None);
+        assert_eq!(raised_standard("c99", 2011).as_deref(), Some("c11"));
+        assert_eq!(raised_standard("gnu17", 1999), None);
     }
 }

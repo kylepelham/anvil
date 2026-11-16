@@ -7,7 +7,7 @@ use crate::profile::Profile;
 use crate::toolchain::Toolchain;
 use crate::util::{self, slash};
 use crate::vcpkg_tree::{self, BuildContext, CmakePackage, ImportPrefix, ImportedFiles, ImportedTarget, Requirements, Usage};
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -84,7 +84,7 @@ pub fn find(request: &Request, toolchain: &Toolchain, profile: &Profile) -> Resu
 
     // The targets its users link, then what they need
     let wanted = reader.wanted_targets(request, main)?;
-    let usage = reader.usage(dependency, &wanted);
+    let usage = reader.usage(dependency, &wanted)?;
 
     let package = &reader.packages[main];
     Ok(Found {
@@ -437,7 +437,7 @@ impl Reader {
 
     /// What linking `wanted` gives its users: what the targets require, through the targets they name (read from
     /// their packages as they are named), their libraries in link order, and the DLLs of the shared ones.
-    fn usage(&mut self, dependency: &str, wanted: &[String]) -> Usage {
+    fn usage(&mut self, dependency: &str, wanted: &[String]) -> Result<Usage> {
         let mut requirements = Requirements::default();
         let mut compiled: HashSet<String> = HashSet::new();
         let mut linked: HashSet<String> = HashSet::new();
@@ -528,6 +528,9 @@ impl Reader {
 
         // What the targets require, then the rpaths
         let rpaths = std::mem::take(&mut usage.link_flags);
+        requirements
+            .check_resolved(&self.build)
+            .map_err(|message| anyhow!("dependency `{dependency}`: {message}"))?;
         requirements.fill(&mut usage, &self.build);
         usage.link_flags.extend(rpaths);
         if self.build.os() != Os::Windows {
@@ -538,7 +541,7 @@ impl Reader {
             });
         }
 
-        usage
+        Ok(usage)
     }
 
     /// The targets linked, each after every target that links it.
@@ -1333,7 +1336,7 @@ mod tests {
         assert!(error.contains("no target `Foo::nope`; its targets: Foo::core, Foo::gui"), "{error}");
 
         // What the gui target's users get: Bar read for Bar::bar, dependents linked first, an rpath to libgui.so
-        let usage = reader.usage("foo", &["Foo::gui".to_string()]);
+        let usage = reader.usage("foo", &["Foo::gui".to_string()]).unwrap();
         assert_eq!(usage.defines, vec!["FOO", "BAR"]);
         assert_eq!(usage.includes, vec![util::normalize(&prefix.join("include"))]);
         let libs: Vec<String> = usage.libs.iter().map(|lib| slash(lib)).collect();

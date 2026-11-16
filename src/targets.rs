@@ -144,6 +144,10 @@ pub struct Target {
     pub cmake_package: Option<crate::vcpkg_tree::CmakePackage>,
     /// For External targets: it links static libraries that may hold C++ code, so its users link as C++.
     pub cxx_libraries: bool,
+    /// For External targets: the lowest C++ and C standards its users compile with (a CMake package's cxx_std_17), as
+    /// years; a user's lower `std` is raised to it, as CMake does.
+    pub required_std: Option<u32>,
+    pub required_c_std: Option<u32>,
 }
 
 /// Per-file settings, with the patterns compiled.
@@ -397,6 +401,8 @@ impl Target {
             vcpkg: None,
             cmake_package: None,
             cxx_libraries: false,
+            required_std: None,
+            required_c_std: None,
         }
     }
 

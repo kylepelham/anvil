@@ -5,7 +5,7 @@ mod check_script;
 mod emit;
 mod interp;
 mod model;
-mod parse;
+pub(crate) mod parse;
 mod qt_commands;
 mod target_commands;
 mod test_groups;
