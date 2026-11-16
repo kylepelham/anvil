@@ -501,6 +501,7 @@ qt_add_resources(appquick "images" PREFIX "/img" FILES logo.png)
 target_link_libraries(appquick PRIVATE Qt::Quick)
 qt_add_library(helper helper.cpp)
 target_link_libraries(helper PUBLIC Qt6::Core)
+qt_disable_unicode_defines(helper)
 "#;
         let mut files = vec![("CMakeLists.txt", cmake)];
         for file in ["main.cpp", "backend.cpp", "backend.h", "helper.cpp", "Main.qml", "logo.png"] {
@@ -517,6 +518,11 @@ target_link_libraries(helper PUBLIC Qt6::Core)
         assert!(toml.contains("TODO: qt_add_qml_module(URI quickapp) is not converted"), "{toml}");
         assert!(toml.contains("write images.qrc listing logo.png under prefix \"/img\""), "{toml}");
         assert!(toml.contains("[target.helper]\nkind = \"shared\""), "{toml}");
+        assert!(
+            toml.contains("TODO: qt_disable_unicode_defines(helper) is not converted: Qt still defines UNICODE and _UNICODE")
+                && toml.contains("`flags = [\"-UUNICODE\", \"-U_UNICODE\"]` to its `when.windows` block"),
+            "{toml}"
+        );
     }
 
     #[test]
