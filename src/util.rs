@@ -186,6 +186,38 @@ pub fn folder_mtimes(_folder: &Path) -> Option<HashMap<String, i64>> {
     None
 }
 
+/// A file's modification time (as `mtime` gives it) and size, or None when it does not exist.
+#[cfg(windows)]
+pub fn stamp(path: &Path) -> Option<(i64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesExW, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA};
+
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+    // One system call, as `mtime`
+    if wide_path.len() < WINDOWS_MAX_PATH {
+        let mut data: WIN32_FILE_ATTRIBUTE_DATA = unsafe { std::mem::zeroed() };
+        let succeeded = unsafe { GetFileAttributesExW(wide_path.as_ptr(), GetFileExInfoStandard, &mut data as *mut _ as *mut _) };
+        if succeeded == 0 {
+            return None;
+        }
+
+        let write_time = ((data.ftLastWriteTime.dwHighDateTime as u64) << 32) | data.ftLastWriteTime.dwLowDateTime as u64;
+        let size = ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64;
+        return Some((write_time as i64, size));
+    }
+
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((system_time_ticks(metadata.modified().ok()?), metadata.len()))
+}
+
+/// A file's modification time (as `mtime` gives it) and size, or None when it does not exist.
+#[cfg(not(windows))]
+pub fn stamp(path: &Path) -> Option<(i64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((system_time_ticks(metadata.modified().ok()?), metadata.len()))
+}
+
 /// Modification time in the platform's native ticks, or None when the file does not exist.
 #[cfg(not(windows))]
 pub fn mtime(path: &Path) -> Option<i64> {
@@ -290,6 +322,10 @@ pub fn expand_env(text: &str) -> Result<String> {
             expanded.push('$');
             continue;
         }
+        if name == "ENV" && characters.peek() == Some(&'{') {
+            let variable: String = characters.clone().skip(1).take_while(|character| *character != '}').collect();
+            bail!("`$ENV{{{variable}}}` in \"{text}\" is CMake's; write {{env:{variable}}} or ${variable}");
+        }
 
         match std::env::var(&name) {
             Ok(value) => expanded.push_str(&value),
@@ -303,6 +339,18 @@ pub fn expand_env(text: &str) -> Result<String> {
 /// Expands `{env:NAME}` placeholders (in dependencies' definitions and flags too, where `$` is left alone). A missing
 /// variable is an error, not "".
 pub fn expand_env_placeholders(text: &str) -> Result<String> {
+    // A placeholder in another case is no placeholder ({ENV:X} would stay in a path as written)
+    if let Some(start) = text
+        .to_ascii_lowercase()
+        .match_indices("{env:")
+        .map(|(index, _)| index)
+        .find(|index| !text[*index..].starts_with("{env:"))
+    {
+        let written: String = text[start..].chars().take_while(|character| *character != '}').chain(['}']).collect();
+        let name = &written[5..written.len() - 1];
+        bail!("`{written}` in \"{text}\" is no placeholder: placeholders are lower case (did you mean `{{env:{name}}}`?)");
+    }
+
     let mut expanded = String::with_capacity(text.len());
     let mut rest = text;
 
@@ -322,6 +370,46 @@ pub fn expand_env_placeholders(text: &str) -> Result<String> {
     expanded.push_str(rest);
 
     Ok(expanded)
+}
+
+/// A path's environment variables expanded (`expand_env`), where a variable set but empty is an error: the path would
+/// silently become another (the package root, for a path of only that variable). With `split`, a path that is one
+/// variable alone (`{env:CMAKE_PREFIX_PATH}`) whose value is a list (`a;b` on Windows, `a:b` elsewhere) gives each entry.
+pub fn expand_env_path(text: &str, split: bool) -> Result<Vec<String>> {
+    static VARIABLE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\{env:([^}]*)\}|\$\{([^}]*)\}|\$([A-Za-z0-9_]+)").unwrap());
+
+    let names: Vec<&str> = VARIABLE
+        .captures_iter(text)
+        .filter_map(|captures| captures.iter().skip(1).flatten().next().map(|name| name.as_str()))
+        .collect();
+    if let Some(name) = names.iter().find(|name| std::env::var(name).is_ok_and(|value| value.trim().is_empty())) {
+        bail!("environment variable `{name}` is empty (used in \"{text}\"); set it to a folder, or write the path");
+    }
+
+    // Anvil's other placeholders ({root}, {target:...}) mean nothing in a path
+    static PLACEHOLDER: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?:^|[^$])(\{([A-Za-z_]+)(?::[^}]*)?\})").unwrap());
+    if let Some(captures) = PLACEHOLDER.captures_iter(text).find(|captures| !captures[2].eq_ignore_ascii_case("env")) {
+        bail!(
+            "`{}` in \"{text}\" is no placeholder here: paths take {{env:NAME}}, $NAME and ~, and a relative path is from the package's folder",
+            &captures[1]
+        );
+    }
+
+    // One variable alone: its list's entries
+    let whole = VARIABLE.find(text.trim()).is_some_and(|found| found.len() == text.trim().len());
+    if split && whole {
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let value = expand_env(text.trim())?;
+        return Ok(value
+            .split(separator)
+            .filter(|entry| !entry.trim().is_empty())
+            .map(String::from)
+            .collect());
+    }
+
+    Ok(vec![expand_env(text)?])
 }
 
 pub fn home_dir() -> PathBuf {
@@ -526,5 +614,35 @@ mod tests {
             .to_string();
         assert!(error.contains("`ANVIL_SURELY_UNSET_VARIABLE` is not set"), "{error}");
         assert!(expand_env_placeholders("{env:HOME").is_err());
+
+        // Another case, or CMake's form, is no placeholder
+        let error = expand_env_placeholders(&format!("{{ENV:{home}}}/sdk")).unwrap_err().to_string();
+        assert!(error.contains(&format!("did you mean `{{env:{home}}}`")), "{error}");
+        let error = expand_env(&format!("$ENV{{{home}}}/sdk")).unwrap_err().to_string();
+        assert!(error.contains(&format!("write {{env:{home}}}")), "{error}");
+    }
+
+    #[test]
+    fn expands_environment_paths() {
+        let (separator, list) = if cfg!(windows) { (';', "PATHEXT") } else { (':', "PATH") };
+        let value = std::env::var(list).unwrap();
+        let entries: Vec<String> = value.split(separator).filter(|entry| !entry.is_empty()).map(String::from).collect();
+
+        // A list split only where it is the whole path, and asked for
+        assert_eq!(expand_env_path(&format!("{{env:{list}}}"), true).unwrap(), entries);
+        assert_eq!(expand_env_path(&format!("{{env:{list}}}"), false).unwrap(), vec![value.clone()]);
+        assert_eq!(expand_env_path(&format!("{{env:{list}}}/x"), true).unwrap(), vec![format!("{value}/x")]);
+
+        // Other placeholders are said, not taken as folder names
+        let error = expand_env_path("{root}/sdk", true).unwrap_err().to_string();
+        assert!(error.contains("`{root}` in \"{root}/sdk\" is no placeholder here"), "{error}");
+        assert!(expand_env_path(&format!("${{{list}}}/x"), true).is_ok());
+
+        // An empty variable would make the path another
+        let empty = std::env::vars().find(|(_, value)| value.is_empty()).map(|(name, _)| name);
+        if let Some(name) = empty {
+            let error = expand_env_path(&format!("{{env:{name}}}"), true).unwrap_err().to_string();
+            assert!(error.contains(&format!("`{name}` is empty")), "{error}");
+        }
     }
 }

@@ -133,6 +133,8 @@ pub struct Model {
 
     /// Non-test targets naming a [dev-deps] entry, checked once every target is linked.
     dev_dep_uses: Vec<(usize, String)>,
+    /// The CMake package files read, each once however many dependencies need them.
+    cmake_reads: crate::cmake_package::Reads,
 }
 
 impl Model {
@@ -229,6 +231,7 @@ impl Model {
             loaded_as: HashMap::new(),
             lock: Some(lock),
             dev_dep_uses: Vec::new(),
+            cmake_reads: Default::default(),
         };
 
         // Root package and workspace members
@@ -1074,16 +1077,12 @@ impl Model {
         // the latter)
         let key_context = |key: &str| format!("dependency `{name}`, `{key}`");
         let expand = |key: &str, values: &Option<Vec<String>>| -> Result<Vec<PathBuf>> {
-            values
-                .iter()
-                .flatten()
-                .map(|text| {
-                    Ok(util::absolute(
-                        &package_root,
-                        Path::new(&util::expand_env(text).with_context(|| key_context(key))?),
-                    ))
-                })
-                .collect()
+            let mut paths = Vec::new();
+            for text in values.iter().flatten() {
+                let expanded = util::expand_env_path(text, key == "prefix").with_context(|| key_context(key))?;
+                paths.extend(expanded.iter().map(|path| util::absolute(&package_root, Path::new(path))));
+            }
+            Ok(paths)
         };
         let expand_words = |key: &str, values: &Option<Vec<String>>| -> Result<Vec<String>> {
             values
@@ -1109,6 +1108,23 @@ impl Model {
             spec.libs.as_deref() == Some(&[name.to_string()]) && spec.vcpkg.is_none() && spec.pkg_config.is_none() && spec.cmake.is_none();
         let system = system_form.then(|| crate::vcpkg_tree::system_dependency(name, &build)).flatten();
         if name == "vulkan" && system.as_ref().is_some_and(|usage| usage.libs.is_empty()) {
+            if let Some(sdk) = std::env::var_os("VULKAN_SDK").filter(|sdk| !sdk.is_empty()) {
+                let sdk = PathBuf::from(sdk);
+                let cpu = self.toolchain.platform.cpu;
+                let library = match self.toolchain.platform.os {
+                    crate::platform::Os::Windows => crate::vcpkg_tree::vulkan_sdk_library(&sdk, cpu),
+                    crate::platform::Os::Macos => sdk.join("lib/libvulkan.dylib"),
+                    crate::platform::Os::Linux => sdk.join("lib/libvulkan.so"),
+                };
+                bail!(
+                    "dependency `vulkan`: the Vulkan SDK in VULKAN_SDK ({}) has no {}, the loader library for {} programs; \
+                     install the SDK's {} libraries (a component of its installer), or build for another processor",
+                    slash(&sdk),
+                    slash(&library),
+                    cpu.name(),
+                    cpu.name()
+                );
+            }
             bail!(
                 "dependency `vulkan`: the Vulkan SDK is not installed (VULKAN_SDK is not set); install it from https://vulkan.lunarg.com \
                  (its installer sets VULKAN_SDK), or describe it with `include` and `libs`"
@@ -1170,7 +1186,10 @@ impl Model {
                 targets: spec.targets.as_deref(),
                 prefixes: &prefixes,
             };
-            let found = crate::cmake_package::find(&request, &self.toolchain, &self.profile)?;
+            // Its result kept in the output folder, once there is one (loading writes no output folder of its own)
+            let cache_folder = self.out_dir.join(".anvil").join("cmake-packages");
+            let cache = self.out_root.is_dir().then_some(cache_folder.as_path());
+            let found = crate::cmake_package::find(&request, &self.toolchain, &self.profile, cache, &self.cmake_reads)?;
             let usage = found.usage;
             target.public_system_include.extend(usage.includes);
             target.public_defines.extend(usage.defines);

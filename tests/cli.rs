@@ -4418,6 +4418,66 @@ fn cmake_package_from_anvil_install_gcc() {
 }
 
 #[test]
+fn cmake_package_lookups_follow_their_files_and_environment() {
+    require!("default");
+
+    // Foo, in one prefix, links Bar::Bar, in another: found in the dependency's other prefix
+    let prefixes = Project::empty("cmake_package_lookups_prefixes");
+    let package = |name: &str, value: u32, links: &str| {
+        format!(
+            "add_library({name}::{name} INTERFACE IMPORTED)\nset_target_properties({name}::{name} PROPERTIES \
+             INTERFACE_COMPILE_DEFINITIONS \"{}_VALUE={value}\" INTERFACE_LINK_LIBRARIES \"{links}\")\n",
+            name.to_uppercase()
+        )
+    };
+    prefixes.write("a/lib/cmake/Foo/FooConfig.cmake", &package("Foo", 1, "Bar::Bar"));
+    prefixes.write("b/lib/cmake/Bar/BarConfig.cmake", &package("Bar", 2, ""));
+    prefixes.write("c/lib/cmake/Foo/FooConfig.cmake", &package("Foo", 3, "Bar::Bar"));
+
+    let user = Project::empty("cmake_package_lookups");
+    let manifest = |prefix: &str| format!("[project]\nname = \"user\"\n\n[deps]\nfoo = {{ cmake = \"Foo\", prefix = {prefix} }}\n");
+    let both = format!("[{}, {}]", toml_path(&prefixes.path("a")), toml_path(&prefixes.path("b")));
+    user.write("anvil.toml", &manifest(&both));
+    user.write(
+        "src/main.cpp",
+        "#include <cstdio>\nint main() { std::printf(\"%d %d\\n\", FOO_VALUE, BAR_VALUE); }\n",
+    );
+    let run = user.anvil(&["run"]);
+    run.success();
+    assert_eq!(program_output(&run), "1 2");
+
+    // The lookup kept from the last run until a package file changes
+    user.anvil(&["build"]).success().up_to_date();
+    prefixes.write("a/lib/cmake/Foo/FooConfig.cmake", &package("Foo", 4, "Bar::Bar"));
+    let run = user.anvil(&["run"]);
+    run.success();
+    assert_eq!(program_output(&run), "4 2");
+
+    // Or the environment variable it came from, whose list is the prefixes
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let list = |first: &str| format!("{}{separator}{}", prefixes.path(first).display(), prefixes.path("b").display());
+    user.write("anvil.toml", &manifest("\"{env:ANVIL_IT_PREFIXES}\""));
+    for (first, expected) in [("a", "4 2"), ("c", "3 2")] {
+        let run = user.anvil_with(".", &[("ANVIL_IT_PREFIXES", &list(first))], &["run"]);
+        run.success();
+        assert_eq!(program_output(&run), expected);
+    }
+
+    // An empty variable, a placeholder in another case and an unknown target are said
+    user.anvil_with(".", &[("ANVIL_IT_PREFIXES", "")], &["build"])
+        .code(1)
+        .contains("environment variable `ANVIL_IT_PREFIXES` is empty");
+    user.write("anvil.toml", &manifest("\"{ENV:ANVIL_IT_PREFIXES}\""));
+    user.anvil(&["build"]).code(1).contains("did you mean `{env:ANVIL_IT_PREFIXES}`?");
+    user.write("anvil.toml", &manifest(&toml_path(&prefixes.path("a"))));
+    user.write("src/main.cpp", "int main() {}\n");
+    user.anvil(&["build"])
+        .success()
+        .contains("Foo::Foo (package Foo")
+        .contains("links Bar::Bar, which is left out");
+}
+
+#[test]
 fn cmake_package_from_a_vcpkg_tree() {
     require!("default", "vcpkg");
     if !cfg!(windows) {

@@ -12,6 +12,7 @@ mod delay_load;
 mod depfile;
 mod exec;
 mod export_header;
+mod find_module;
 mod flags;
 mod ide;
 mod install;

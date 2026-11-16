@@ -2,14 +2,21 @@
 //! find_package(<name> CONFIG) finds them, then read with the reader vcpkg's packages go through (crate::vcpkg_tree):
 //! their imported targets, what those give their users, and their files for the build's configuration.
 
+use crate::find_module::{self, CxxAbi, Search};
 use crate::platform::{Cpu, Os, Platform};
 use crate::profile::Profile;
 use crate::toolchain::Toolchain;
 use crate::util::{self, slash};
 use crate::vcpkg_tree::{self, BuildContext, CmakePackage, ImportPrefix, ImportedFiles, ImportedTarget, Requirements, Usage};
 use anyhow::{bail, Result};
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+// Bump when what a cache entry holds, or how it is read, changes
+const CACHE_VERSION: u32 = 1;
 
 // Namespaces of the targets CMake's own find modules define, which Anvil has built in (crate::vcpkg_tree::module_target)
 const FIND_MODULE_NAMESPACES: &[&str] = &["Threads", "OpenMP", "OpenGL", "Vulkan"];
@@ -43,17 +50,44 @@ pub struct Found {
 }
 
 /// Finds the package `request` names and reads what its targets (or its components', or those `targets` names) give
-/// their users for this toolchain and profile.
-pub fn find(request: &Request, toolchain: &Toolchain, profile: &Profile) -> Result<Found> {
+/// their users for this toolchain and profile. With a `cache_folder`, the result is kept there and given again while
+/// nothing it came from changed: the files read, the folders searched, the environment variables asked for, Anvil.
+pub fn find(request: &Request, toolchain: &Toolchain, profile: &Profile, cache_folder: Option<&Path>, reads: &Reads) -> Result<Found> {
+    let build = BuildContext::new(toolchain, profile);
+    let debug = vcpkg_tree::uses_debug_libraries(toolchain, profile);
+
+    // An earlier run's result, while still valid
+    let key = cache_key(request, toolchain, &build, debug);
+    let cache_file = cache_folder.map(|folder| folder.join(format!("cmake-{:016x}.json", util::hash_bytes(key.as_bytes()))));
+    if let Some(found) = cache_file.as_deref().and_then(|file| load_cached(file, &key)) {
+        return Ok(found);
+    }
+
+    let session = Session::new(reads);
+    session.variable("VULKAN_SDK");
+    let (found, cacheable) = find_in(request, toolchain, profile, build, debug, &session)?;
+
+    // A cache that cannot be written only costs the next run the search
+    if let (Some(file), true) = (cache_file, cacheable) {
+        let entry = session.entry(key, &found);
+        let _ = util::write_atomic(&file, serde_json::to_string(&entry)?.as_bytes());
+    }
+
+    Ok(found)
+}
+
+/// `find` without the cache: the result, and whether a cache entry can stand for it (Qt 5's packages are read by
+/// crate::qt, outside the session).
+fn find_in(
+    request: &Request,
+    toolchain: &Toolchain,
+    profile: &Profile,
+    build: BuildContext,
+    debug: bool,
+    session: &Session,
+) -> Result<(Found, bool)> {
     let dependency = request.dependency;
-    let mut reader = Reader {
-        build: BuildContext::new(toolchain, profile),
-        debug: vcpkg_tree::uses_debug_libraries(toolchain, profile),
-        platform: toolchain.platform.clone(),
-        packages: Vec::new(),
-        targets: Vec::new(),
-        searched: HashSet::new(),
-    };
+    let mut reader = Reader::new(build, debug, toolchain.platform.clone(), dependency, request.prefixes, session);
 
     // The package, compatible with the version asked for
     let wanted_version = match request.version {
@@ -64,7 +98,7 @@ pub fn find(request: &Request, toolchain: &Toolchain, profile: &Profile) -> Resu
         None => None,
     };
     let places = match request.prefixes.is_empty() {
-        true => default_places(request.package, &reader.platform),
+        true => default_places(request.package, &reader.platform, session),
         false => request
             .prefixes
             .iter()
@@ -78,16 +112,21 @@ pub fn find(request: &Request, toolchain: &Toolchain, profile: &Profile) -> Resu
 
     // Qt 5's packages are written by hand, with variables only running them fills in: read by their own rules
     if crate::qt::is_qt5_package(request.package) {
-        return crate::qt::read_qt5(request, located.config_file.parent().unwrap(), toolchain, profile);
+        let found = crate::qt::read_qt5(request, located.config_file.parent().unwrap(), toolchain, profile)?;
+        return Ok((found, false));
     }
     let main = reader.read_package(&located);
 
-    // The targets its users link, then what they need
+    // The targets its users link, then what they need, which a MinGW build cannot take from MSVC's C++ libraries
+    // (nor the other way round)
     let wanted = reader.wanted_targets(request, main)?;
     let usage = reader.usage(dependency, &wanted);
+    if toolchain.platform.os == Os::Windows {
+        check_abi(dependency, &usage.libs, toolchain, session)?;
+    }
 
     let package = &reader.packages[main];
-    Ok(Found {
+    let found = Found {
         package: CmakePackage {
             name: package.name.clone(),
             config: true,
@@ -96,7 +135,270 @@ pub fn find(request: &Request, toolchain: &Toolchain, profile: &Profile) -> Resu
             hint: Some(package.folder.clone()),
         },
         usage,
+    };
+
+    Ok((found, true))
+}
+
+/// MinGW cannot link MSVC's C++ libraries, nor MSVC MinGW's: their C++ names differ. A library of C functions only
+/// passes (both link those).
+fn check_abi(dependency: &str, libraries: &[PathBuf], toolchain: &Toolchain, session: &Session) -> Result<()> {
+    let wanted = if toolchain.is_msvc_abi() { CxxAbi::Msvc } else { CxxAbi::Gnu };
+    let archives = libraries.iter().filter(|library| {
+        let name = library.to_string_lossy().to_ascii_lowercase();
+        library.is_absolute() && (name.ends_with(".lib") || name.ends_with(".a"))
+    });
+
+    for library in archives.filter(|library| session.watch(library)) {
+        let Some(abi) = find_module::cxx_abi(library).filter(|abi| *abi != wanted) else {
+            continue;
+        };
+        let family = toolchain.family.name();
+        match abi {
+            CxxAbi::Msvc => bail!(
+                "dependency `{dependency}`: {} was built with MSVC (its C++ names are MSVC's), and {family} builds for MinGW, which cannot link \
+                 MSVC's C++ libraries; build with `--toolchain msvc` or `--toolchain clang-cl`, or use a MinGW build of the package",
+                slash(library)
+            ),
+            CxxAbi::Gnu => bail!(
+                "dependency `{dependency}`: {} was built with GCC or Clang for MinGW (its C++ names are theirs), which {family} cannot link; \
+                 build with `--toolchain gcc`, or use an MSVC build of the package",
+                slash(library)
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+/// What a cached result stands for: the request, the toolchain, the build its generator expressions are evaluated for
+/// and the configuration's libraries, and the Anvil that read it (a newer one may read packages differently).
+fn cache_key(request: &Request, toolchain: &Toolchain, build: &BuildContext, debug: bool) -> String {
+    static EXECUTABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let executable = std::env::current_exe().unwrap_or_default();
+        format!("{}:{:?}", slash(&executable), util::stamp(&executable))
+    });
+
+    format!(
+        "{CACHE_VERSION}|{}|{:016x}|{build:?}|{debug}|{}|{}|{:?}|{:?}|{:?}|{:?}",
+        *EXECUTABLE,
+        toolchain.identity(),
+        request.dependency,
+        request.package,
+        request.components,
+        request.version,
+        request.targets,
+        request.prefixes
+    )
+}
+
+/// The cached result in `file` for `key`, when nothing it came from changed since: its warnings said again.
+fn load_cached(file: &Path, key: &str) -> Option<Found> {
+    let entry: CacheEntry = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+    let valid = entry.key == key
+        && entry
+            .variables
+            .iter()
+            .all(|(name, value)| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned()) == *value)
+        && entry.folders.iter().all(|(folder, time)| util::mtime(folder) == *time)
+        && entry.files.iter().all(|(file, stamp)| util::stamp(file) == *stamp);
+    if !valid {
+        return None;
+    }
+
+    for warning in &entry.warnings {
+        crate::ui::warn(warning);
+    }
+
+    Some(Found {
+        package: entry.package,
+        usage: entry.usage,
     })
+}
+
+/// A result kept between runs, with what it came from: the environment variables asked for, the folders listed and
+/// the files read, with their time stamps (and sizes).
+#[derive(Serialize, Deserialize)]
+struct CacheEntry {
+    key: String,
+    variables: Vec<(String, Option<String>)>,
+    folders: Vec<(PathBuf, Option<i64>)>,
+    files: Vec<(PathBuf, Stamp)>,
+    warnings: Vec<String>,
+    package: CmakePackage,
+    usage: Usage,
+}
+
+/// A file's modification time and size (crate::util::stamp), None when it was not there.
+type Stamp = Option<(i64, u64)>;
+
+/// The folders listed and files read for a load's CMake packages, each once however many dependencies need them,
+/// with their time stamps as they were before. A Model's, so a load (an LSP session's next one) never sees an
+/// earlier load's.
+#[derive(Default)]
+pub struct Reads {
+    listings: Mutex<HashMap<String, Listing>>,
+    texts: Mutex<HashMap<String, FileText>>,
+}
+
+/// What one search reads from the machine (through its load's `Reads`): the folders it lists, the files it reads,
+/// the environment variables it asks for, as they were when first read (what a cache entry checks), and the warnings
+/// it gave.
+#[derive(Default)]
+pub(crate) struct Session<'a> {
+    shared: Option<&'a Reads>,
+    own: Reads,
+    recorded: RefCell<HashSet<String>>,
+    folders: RefCell<Vec<(PathBuf, Option<i64>)>>,
+    files: RefCell<Vec<(PathBuf, Stamp)>>,
+    variables: RefCell<BTreeMap<String, Option<String>>>,
+    warnings: RefCell<Vec<String>>,
+}
+
+/// A file's stamp before it was read, and its text (None when it could not be read).
+type FileText = (Stamp, Option<Arc<str>>);
+
+/// A folder's modification time before it was listed, and its entries.
+type Listing = (Option<i64>, Arc<[FolderEntry]>);
+
+/// One entry of a folder: its name, and whether it is a folder (links followed).
+struct FolderEntry {
+    name: String,
+    folder: bool,
+}
+
+impl<'a> Session<'a> {
+    fn new(reads: &'a Reads) -> Session<'a> {
+        Session {
+            shared: Some(reads),
+            ..Default::default()
+        }
+    }
+
+    fn reads(&self) -> &Reads {
+        self.shared.unwrap_or(&self.own)
+    }
+
+    /// An environment variable's value (lossy UTF-8).
+    pub(crate) fn variable(&self, name: &str) -> Option<String> {
+        let mut variables = self.variables.borrow_mut();
+        let value = variables
+            .entry(name.to_string())
+            .or_insert_with(|| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned()));
+
+        value.clone()
+    }
+
+    /// Whether `path` is a file, from its folder's listing.
+    pub(crate) fn is_file(&self, path: &Path) -> bool {
+        self.kind(path) == Some(false)
+    }
+
+    fn is_folder(&self, path: &Path) -> bool {
+        self.kind(path) == Some(true)
+    }
+
+    /// Whether `path` is a folder (or a file), when it exists: its parent's listing says.
+    fn kind(&self, path: &Path) -> Option<bool> {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return path.exists().then(|| path.is_dir());
+        };
+        let name = util::path_key(Path::new(name));
+
+        self.entries(parent)
+            .iter()
+            .find(|entry| util::path_key(Path::new(&entry.name)) == name)
+            .map(|entry| entry.folder)
+    }
+
+    /// A folder's entries (none when it cannot be listed), listed once.
+    fn entries(&self, folder: &Path) -> Arc<[FolderEntry]> {
+        let key = util::path_key(folder);
+        let known = self.reads().listings.lock().unwrap().get(&key).cloned();
+        let (time, entries) = known.unwrap_or_else(|| {
+            // Its time stamp before its listing: an entry added since changes it
+            let time = util::mtime(folder);
+            let entries: Arc<[FolderEntry]> = std::fs::read_dir(folder)
+                .map(|listing| {
+                    listing
+                        .flatten()
+                        .filter_map(|entry| {
+                            let kind = entry.file_type().ok()?;
+                            let folder = match kind.is_symlink() {
+                                true => std::fs::metadata(entry.path()).ok()?.is_dir(),
+                                false => kind.is_dir(),
+                            };
+                            Some(FolderEntry {
+                                name: entry.file_name().to_string_lossy().into_owned(),
+                                folder,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.reads().listings.lock().unwrap().insert(key.clone(), (time, entries.clone()));
+            (time, entries)
+        });
+
+        if self.recorded.borrow_mut().insert(format!("d{key}")) {
+            self.folders.borrow_mut().push((folder.to_path_buf(), time));
+        }
+        entries
+    }
+
+    /// A file's text, read once.
+    fn text(&self, file: &Path) -> Option<Arc<str>> {
+        let key = util::path_key(file);
+        let known = self.reads().texts.lock().unwrap().get(&key).cloned();
+        let (stamp, text) = known.unwrap_or_else(|| {
+            let stamp = util::stamp(file);
+            let text: Option<Arc<str>> = std::fs::read_to_string(file).ok().map(Arc::from);
+            self.reads().texts.lock().unwrap().insert(key.clone(), (stamp, text.clone()));
+            (stamp, text)
+        });
+
+        if self.recorded.borrow_mut().insert(format!("f{key}")) {
+            self.files.borrow_mut().push((file.to_path_buf(), stamp));
+        }
+        text
+    }
+
+    /// Notes that the result depends on a file's content read elsewhere (a library's): true, for use in conditions.
+    pub(crate) fn watch(&self, file: &Path) -> bool {
+        if self.recorded.borrow_mut().insert(format!("f{}", util::path_key(file))) {
+            self.files.borrow_mut().push((file.to_path_buf(), util::stamp(file)));
+        }
+        true
+    }
+
+    /// Says a warning, and keeps it for a cache entry to say again.
+    pub(crate) fn warn(&self, message: String) {
+        crate::ui::warn(&message);
+        self.warnings.borrow_mut().push(message);
+    }
+
+    /// The cache entry for a result of this session.
+    fn entry(&self, key: String, found: &Found) -> CacheEntry {
+        CacheEntry {
+            key,
+            variables: self
+                .variables
+                .borrow()
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            folders: self.folders.borrow().clone(),
+            files: self.files.borrow().clone(),
+            warnings: self.warnings.borrow().clone(),
+            package: found.package.clone(),
+            usage: found.usage.clone(),
+        }
+    }
+}
+
+/// A path's key, its links resolved: one file reached two ways is one.
+fn canonical_key(path: &Path) -> String {
+    util::path_key(&std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
 /// "1.2.3" as numbers; None for anything else (at most four numbers).
@@ -151,7 +453,7 @@ struct VersionFile {
 }
 
 /// The packages read for one dependency and the imported targets they define.
-struct Reader {
+struct Reader<'a> {
     build: BuildContext,
     debug: bool,
     platform: Platform,
@@ -160,9 +462,29 @@ struct Reader {
 
     /// Package names looked for, each once.
     searched: HashSet<String>,
+
+    /// The dependency, for messages; its `prefix` folders, where the packages its package names are looked for first
+    /// (as CMAKE_PREFIX_PATH).
+    dependency: String,
+    prefixes: Vec<PathBuf>,
+    session: &'a Session<'a>,
 }
 
-impl Reader {
+impl<'a> Reader<'a> {
+    fn new(build: BuildContext, debug: bool, platform: Platform, dependency: &str, prefixes: &[PathBuf], session: &'a Session<'a>) -> Reader<'a> {
+        Reader {
+            build,
+            debug,
+            platform,
+            packages: Vec::new(),
+            targets: Vec::new(),
+            searched: HashSet::new(),
+            dependency: dependency.to_string(),
+            prefixes: prefixes.to_vec(),
+            session,
+        }
+    }
+
     /// The first config file of `name` in `places` that suits the build (and the version): else what was found and
     /// why it did not suit.
     fn locate(&self, name: &str, places: &[(Place, String)], version: Option<&[u64]>) -> std::result::Result<Located, Vec<String>> {
@@ -171,17 +493,20 @@ impl Reader {
 
         for (place, _) in places {
             let (prefix, folders) = match place {
-                Place::Prefix(prefix) => (prefix.clone(), config_folders(prefix, name, &self.platform)),
+                Place::Prefix(prefix) => (prefix.clone(), config_folders(prefix, name, &self.platform, self.session)),
                 Place::Folder(folder) => (folder.clone(), vec![folder.clone()]),
             };
             for folder in folders {
-                let Some(config_file) = config_file_in(&folder, name) else { continue };
-                if !seen.insert(util::path_key(&config_file)) {
+                let Some(config_file) = config_file_in(&folder, name, self.session) else {
+                    continue;
+                };
+                // Each file once, also when two places reach it (/lib/cmake is /usr/lib/cmake where /lib links to usr/lib)
+                if !seen.insert(canonical_key(&config_file)) {
                     continue;
                 }
 
                 // CMake skips a package its version file finds unsuitable
-                let version_file = read_version_file(&config_file);
+                let version_file = read_version_file(&config_file, self.session);
                 match judge(version_file.as_ref(), version, pointer_size(self.platform.cpu)) {
                     Ok(()) => return Ok(Located { config_file, prefix }),
                     Err(reason) => rejected.push(format!("{} ({reason})", slash(&config_file))),
@@ -203,12 +528,12 @@ impl Reader {
             .to_string();
 
         // Its files: the config file and those it includes (its targets, each configuration's files)
-        let files = included_files(&located.config_file);
+        let files = included_files(&located.config_file, self.session);
         let mut named = Vec::new();
         let mut hints = Vec::new();
         let mut prefix = located.prefix.clone();
         for file in &files {
-            let Ok(text) = std::fs::read_to_string(file) else { continue };
+            let Some(text) = self.session.text(file) else { continue };
             for (package, package_hints) in named_packages(&text) {
                 if package != name && !named.contains(&package) {
                     named.push(package);
@@ -244,14 +569,19 @@ impl Reader {
         self.packages.len() - 1
     }
 
-    /// Finds and reads package `name`: beside the packages read already (find_dependency's usual places), then in
-    /// CMake's search. False when it is not there, or was looked for before.
-    fn read_named(&mut self, name: &str) -> bool {
+    /// Finds and reads package `name`: in the dependency's `prefix` folders (as CMAKE_PREFIX_PATH), beside the packages
+    /// read already (find_dependency's usual places), then, unless `nearby` only, in CMake's search. False when it is
+    /// not there, or was looked for before.
+    fn read_named(&mut self, name: &str, nearby: bool) -> bool {
         if !self.searched.insert(name.to_lowercase()) {
             return false;
         }
 
-        let mut places: Vec<(Place, String)> = Vec::new();
+        let mut places: Vec<(Place, String)> = self
+            .prefixes
+            .iter()
+            .map(|prefix| (Place::Prefix(prefix.clone()), String::new()))
+            .collect();
         for package in &self.packages {
             places.extend(package.hints.iter().map(|hint| (Place::Prefix(hint.clone()), String::new())));
             if let Some(parent) = package.folder.parent() {
@@ -259,9 +589,13 @@ impl Reader {
             }
             places.push((Place::Prefix(package.prefix.clone()), String::new()));
         }
-        places.extend(default_places(name, &self.platform));
 
-        match self.locate(name, &places, None) {
+        // CMake's search only when it is not near (its places, PATH among them, are then no part of the result)
+        let mut located = self.locate(name, &places, None);
+        if located.is_err() && !nearby {
+            located = self.locate(name, &default_places(name, &self.platform, self.session), None);
+        }
+        match located {
             Ok(located) => {
                 self.read_package(&located);
                 true
@@ -271,12 +605,14 @@ impl Reader {
     }
 
     /// Reads packages until one defines target `name` (`Qt6::Gui` is in package Qt6Gui, `Boost::filesystem` in
-    /// boost_filesystem, `fmt::fmt` in fmt): those the packages read name first, then names made from the target's.
+    /// boost_filesystem, `fmt::fmt` in fmt): those the packages read name first, then names made from the target's. A
+    /// find module's target (ZLIB::ZLIB) is looked for only near the packages: CMake finds it with the module.
     fn read_package_of(&mut self, name: &str) -> bool {
         let Some((namespace, short)) = name.split_once("::") else { return false };
         if FIND_MODULE_NAMESPACES.contains(&namespace) {
             return false;
         }
+        let nearby = find_module::find_module(name).is_some();
 
         let named: Vec<String> = self.packages.iter().flat_map(|package| package.named.iter().cloned()).collect();
         let mut candidates: Vec<String> = named.iter().filter(|package| package.eq_ignore_ascii_case(namespace)).cloned().collect();
@@ -292,12 +628,119 @@ impl Reader {
         candidates.extend(named);
 
         for candidate in candidates {
-            if self.read_named(&candidate) && self.has_target(name) {
+            if self.read_named(&candidate, nearby) && self.has_target(name) {
                 return true;
             }
         }
 
         false
+    }
+
+    /// Defines target `name`: from the packages (`read_package_of`), else as the find module that defines it would.
+    fn resolve(&mut self, name: &str) -> bool {
+        self.has_target(name) || self.read_package_of(name) || self.read_find_module(name)
+    }
+
+    /// Defines a find module's target (ZLIB::ZLIB) from the header and library found for it: in the prefix of the
+    /// package linking it, the dependency's `prefix` folders, the other packages' prefixes, CMAKE_PREFIX_PATH, then
+    /// the system's. False when the module is unknown or its files were not found (an optional one is then empty).
+    fn read_find_module(&mut self, name: &str) -> bool {
+        let Some(module) = find_module::find_module(name) else { return false };
+
+        let search = Search {
+            session: self.session,
+            prefixes: self.module_prefixes(name),
+            os: self.platform.os,
+            msvc_abi: self.build.is_msvc_abi(),
+            debug: self.debug,
+            architecture: library_architecture(&self.platform),
+            pointer_size: pointer_size(self.platform.cpu),
+        };
+        let target = match find_module::module_target(module, &search) {
+            Some((target, note)) => {
+                if let Some(note) = note {
+                    self.session.warn(format!("dependency `{}`: {name}: {note}", self.dependency));
+                }
+                target
+            }
+            None if module.optional => {
+                let mut empty = ImportedTarget::default();
+                empty.name = name.to_string();
+                empty.kind = "INTERFACE".to_string();
+                empty
+            }
+            None => return false,
+        };
+        self.targets.push(target);
+
+        true
+    }
+
+    /// Where a find module's files are looked for, each once: the prefix of the package linking the target first.
+    fn module_prefixes(&self, name: &str) -> Vec<PathBuf> {
+        let mut prefixes: Vec<PathBuf> = self.linking_package(name).map(|package| package.prefix.clone()).into_iter().collect();
+        prefixes.extend(self.prefixes.iter().cloned());
+        prefixes.extend(self.packages.iter().map(|package| package.prefix.clone()));
+
+        // CMAKE_PREFIX_PATH, then the system's (the Windows ones hold no libraries a find module would find)
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let listed = self.session.variable("CMAKE_PREFIX_PATH").unwrap_or_default();
+        prefixes.extend(listed.split(separator).filter(|entry| !entry.trim().is_empty()).map(PathBuf::from));
+        let system: &[&str] = match self.platform.os {
+            Os::Windows => &[],
+            Os::Linux => &["/usr/local", "/usr"],
+            Os::Macos => &["/opt/homebrew", "/usr/local", "/usr"],
+        };
+        prefixes.extend(system.iter().map(PathBuf::from));
+
+        let mut seen = HashSet::new();
+        prefixes.retain(|prefix| seen.insert(util::path_key(prefix)));
+        prefixes
+    }
+
+    /// The package whose target links target `name`.
+    fn linking_package(&self, name: &str) -> Option<&LoadedPackage> {
+        let linker = self.linker_of(name)?;
+        self.packages.iter().find(|package| package.targets.contains(&linker))
+    }
+
+    /// A target that links target `name`.
+    fn linker_of(&self, name: &str) -> Option<String> {
+        self.targets
+            .iter()
+            .find(|target| target.link_items.iter().chain(&target.links).any(|item| item == name))
+            .map(|target| target.name.clone())
+    }
+
+    /// Why target `name`, which a target of the packages links, is left out, and what to do.
+    fn unresolved_message(&self, name: &str) -> String {
+        let linker = match self.linker_of(name) {
+            Some(linker) => match self.packages.iter().find(|package| package.targets.contains(&linker)) {
+                Some(package) => format!("{linker} (package {}, {})", package.name, slash(&package.folder)),
+                None => linker,
+            },
+            None => "a target it uses".to_string(),
+        };
+        let why = match find_module::find_module(name) {
+            Some(module) => {
+                let prefixes: Vec<String> = self.module_prefixes(name).iter().map(|prefix| slash(prefix)).collect();
+                format!(
+                    "CMake's find module would define it, and Anvil found no {} in {}",
+                    module.wanted(),
+                    prefixes.join(", ")
+                )
+            }
+            None => {
+                let namespace = name.split_once("::").map_or(name, |(namespace, _)| namespace);
+                format!("Anvil found no CMake package that defines it (such as {namespace}) in the dependency's prefixes, beside its packages or in CMake's search")
+            }
+        };
+
+        format!(
+            "dependency `{}`: {linker} links {name}, which is left out: {why}; the build may fail to compile, link or start. \
+             Add the folder it is installed in to the dependency's `prefix` list (or CMAKE_PREFIX_PATH), or give it a [deps] entry of its own",
+            self.dependency
+        )
     }
 
     fn has_target(&self, name: &str) -> bool {
@@ -314,7 +757,7 @@ impl Reader {
         // Named
         if let Some(names) = request.targets {
             for name in names {
-                if !self.has_target(name) && !self.read_package_of(name) {
+                if !self.resolve(name) {
                     bail!(
                         "dependency `{dependency}`: CMake package {package_name} ({}) has no target `{name}`; its targets: {}",
                         slash(&self.packages[main].folder),
@@ -372,7 +815,7 @@ impl Reader {
             format!("{}_{}", name.to_lowercase(), component.to_lowercase()),
         ] {
             let before = self.packages.len();
-            if self.read_named(&candidate) {
+            if self.read_named(&candidate, false) {
                 return self.libraries_of(before);
             }
         }
@@ -472,14 +915,15 @@ impl Reader {
             unknown.dedup();
             for name in unknown {
                 tried.insert(name.clone());
-                self.read_package_of(&name);
+                self.resolve(&name);
             }
             if (compiled.len(), linked.len(), self.targets.len()) == before {
                 break;
             }
         }
 
-        // The targets of CMake's find modules they name (Threads::Threads, OpenGL::GL)
+        // The targets of CMake's find modules they name (Threads::Threads, OpenGL::GL); any other target still unknown is
+        // said, not dropped silently
         let mut usage = Usage::default();
         let mut named: Vec<String> = requirements.visible.union(&requirements.linked).cloned().collect();
         named.sort();
@@ -487,7 +931,16 @@ impl Reader {
             if self.has_target(name) {
                 continue;
             }
-            let Some(module) = vcpkg_tree::module_target(name, &self.build) else {
+            let namespace = name.split_once("::").map_or("", |(namespace, _)| namespace);
+            let module = FIND_MODULE_NAMESPACES
+                .contains(&namespace)
+                .then(|| vcpkg_tree::module_target(name, &self.build))
+                .flatten();
+            let Some(module) = module else {
+                // FindThreads gives Windows programs nothing
+                if name.contains("::") && name != "Threads::Threads" {
+                    self.session.warn(self.unresolved_message(name));
+                }
                 continue;
             };
             if requirements.visible.contains(name) {
@@ -496,6 +949,24 @@ impl Reader {
             if requirements.linked.contains(name) {
                 requirements.add_link(&module, &HashSet::new(), None);
                 vcpkg_tree::push_new(&mut usage.runtime, &module.runtime);
+
+                // Vulkan's loader is a file of the SDK, which may lack it for the target's processor
+                let library = module.link_items.iter().find(|item| Path::new(item).is_absolute());
+                if name == "Vulkan::Vulkan"
+                    && self.platform.os == Os::Windows
+                    && library.is_none_or(|library| !self.session.is_file(Path::new(library)))
+                {
+                    let missing = match library {
+                        Some(library) => format!("the Vulkan SDK has no {library}"),
+                        None => "VULKAN_SDK is not set".to_string(),
+                    };
+                    self.session.warn(format!(
+                        "dependency `{}`: {} links Vulkan::Vulkan, but {missing}: the build will not link; install the Vulkan SDK with its {} libraries",
+                        self.dependency,
+                        self.linker_of(name).unwrap_or_default(),
+                        self.platform.cpu.name()
+                    ));
+                }
             }
         }
 
@@ -505,7 +976,7 @@ impl Reader {
         let mut shared = Vec::new();
         for name in &order {
             let target = self.target(name).unwrap();
-            let Some(files) = pick_files(target, self.build.configuration(), self.debug) else {
+            let Some(files) = pick_files(target, self.build.configuration(), self.debug, self.session) else {
                 continue;
             };
             if self.build.is_msvc_abi() && self.debug != (files.configuration == "DEBUG") && !files.configuration.is_empty() {
@@ -518,7 +989,7 @@ impl Reader {
         // The C runtime of MSVC libraries must match the build's
         if !mismatched.is_empty() {
             let (runtime, wanted_configuration) = if self.debug { ("debug", "Debug") } else { ("release", "a release") };
-            crate::ui::warn(&format!(
+            self.session.warn(format!(
                 "dependency `{dependency}`: this build uses MSVC's {runtime} C runtime, and the package has no {wanted_configuration} configuration of {}: \
                  linking it with this runtime may fail (LNK2038) or corrupt the heap; install that configuration of the package, \
                  or build with a profile whose `debug-runtime` matches",
@@ -597,7 +1068,7 @@ impl Reader {
                 }
 
                 // A static library is C++ unless the package says it is only C
-                if target.kind != "SHARED" && vcpkg_tree::is_static_library(library) {
+                if target.kind != "SHARED" && self.session.watch(library) && vcpkg_tree::is_static_library(library) {
                     usage.cxx_libraries |= files
                         .languages
                         .as_ref()
@@ -612,11 +1083,11 @@ impl Reader {
     fn add_dependent_libraries(&mut self, mut pending: Vec<String>, usage: &mut Usage) {
         let mut done = HashSet::new();
         while let Some(name) = pending.pop() {
-            if !done.insert(name.clone()) || (!self.has_target(&name) && !self.read_package_of(&name)) {
+            if !done.insert(name.clone()) || !self.resolve(&name) {
                 continue;
             }
             let target = self.target(&name).unwrap();
-            let Some(files) = pick_files(target, self.build.configuration(), self.debug) else {
+            let Some(files) = pick_files(target, self.build.configuration(), self.debug, self.session) else {
                 continue;
             };
             let Some(location) = &files.location else { continue };
@@ -649,8 +1120,8 @@ impl Reader {
 /// The configuration of a target's files a build links, of those whose files are there: its own, else the unsuffixed
 /// files, else a debug or release one as the build links, else the first (CMake's choice, but never a debug
 /// configuration for a release build when a release one is there).
-fn pick_files<'a>(target: &'a ImportedTarget, configuration: &str, debug: bool) -> Option<&'a ImportedFiles> {
-    let present = |file: &Option<PathBuf>| file.as_ref().is_some_and(|file| file.is_file());
+fn pick_files<'a>(target: &'a ImportedTarget, configuration: &str, debug: bool, session: &Session) -> Option<&'a ImportedFiles> {
+    let present = |file: &Option<PathBuf>| file.as_ref().is_some_and(|file| session.is_file(file));
     let usable: Vec<&ImportedFiles> = target
         .files
         .iter()
@@ -667,10 +1138,11 @@ fn pick_files<'a>(target: &'a ImportedTarget, configuration: &str, debug: bool) 
 
 /// Where CMake's search looks when `prefix` is not given: `<name>_DIR`, `<name>_ROOT`, `CMAKE_PREFIX_PATH`, the
 /// prefixes of the folders on PATH (bin/ and sbin/ stand for their parent), then the system's.
-fn default_places(name: &str, platform: &Platform) -> Vec<(Place, String)> {
+fn default_places(name: &str, platform: &Platform, session: &Session) -> Vec<(Place, String)> {
     let separator = if cfg!(windows) { ';' } else { ':' };
     let list = |variable: &str| -> Vec<PathBuf> {
-        std::env::var(variable)
+        session
+            .variable(variable)
             .unwrap_or_default()
             .split(separator)
             .filter(|entry| !entry.trim().is_empty())
@@ -694,7 +1166,8 @@ fn default_places(name: &str, platform: &Platform) -> Vec<(Place, String)> {
     }
 
     // PATH's
-    for folder in std::env::var_os("PATH")
+    for folder in session
+        .variable("PATH")
         .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
         .unwrap_or_default()
     {
@@ -710,7 +1183,7 @@ fn default_places(name: &str, platform: &Platform) -> Vec<(Place, String)> {
     let system: Vec<PathBuf> = match platform.os {
         Os::Windows => ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"]
             .iter()
-            .filter_map(|variable| std::env::var_os(variable).map(PathBuf::from))
+            .filter_map(|variable| session.variable(variable).map(PathBuf::from))
             .collect(),
         Os::Linux => ["/usr/local", "/usr", "/", "/opt"].iter().map(PathBuf::from).collect(),
         Os::Macos => ["/opt/homebrew", "/usr/local", "/opt/local", "/usr", "/", "/opt"]
@@ -735,8 +1208,8 @@ fn default_places(name: &str, platform: &Platform) -> Vec<(Place, String)> {
 /// The folders under `prefix` where find_package(CONFIG) looks for package `name`'s config file, in its order:
 /// `<prefix>/`, `(cmake|CMake)/`, `<name>*/` and below it, `(lib/<arch>|lib64|lib32|lib|share)/cmake/<name>*/` and
 /// the like ("<name>*" matching any case).
-fn config_folders(prefix: &Path, name: &str, platform: &Platform) -> Vec<PathBuf> {
-    let cmake = |folder: &Path| -> Vec<PathBuf> { subfolders(folder, &["cmake", "CMake"]) };
+fn config_folders(prefix: &Path, name: &str, platform: &Platform, session: &Session) -> Vec<PathBuf> {
+    let cmake = |folder: &Path| -> Vec<PathBuf> { subfolders(folder, &["cmake", "CMake"], session) };
     let libraries = |folder: &Path| -> Vec<PathBuf> {
         let mut names = Vec::new();
         if let Some(architecture) = library_architecture(platform) {
@@ -750,28 +1223,28 @@ fn config_folders(prefix: &Path, name: &str, platform: &Platform) -> Vec<PathBuf
             .map(String::from),
         );
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
-        subfolders(folder, &names)
+        subfolders(folder, &names, session)
     };
     let mut folders = vec![prefix.to_path_buf()];
 
     // Windows-style: the prefix, its cmake/ folder, and the package's folder
     folders.extend(cmake(prefix));
-    let named = named_folders(prefix, name);
+    let named = named_folders(prefix, name, session);
     for folder in &named {
         folders.push(folder.clone());
         for cmake_folder in cmake(folder) {
             folders.push(cmake_folder.clone());
-            folders.extend(named_folders(&cmake_folder, name));
+            folders.extend(named_folders(&cmake_folder, name, session));
         }
     }
 
     // Unix-style: the library and share folders, under the prefix, then under the package's folder
     for base in std::iter::once(prefix.to_path_buf()).chain(named) {
         for library_folder in libraries(&base) {
-            for cmake_folder in subfolders(&library_folder, &["cmake"]) {
-                folders.extend(named_folders(&cmake_folder, name));
+            for cmake_folder in subfolders(&library_folder, &["cmake"], session) {
+                folders.extend(named_folders(&cmake_folder, name, session));
             }
-            for folder in named_folders(&library_folder, name) {
+            for folder in named_folders(&library_folder, name, session) {
                 folders.push(folder.clone());
                 folders.extend(cmake(&folder));
             }
@@ -786,23 +1259,22 @@ fn config_folders(prefix: &Path, name: &str, platform: &Platform) -> Vec<PathBuf
 }
 
 /// The subfolders of `folder` with these names (relative paths) that exist.
-fn subfolders(folder: &Path, names: &[&str]) -> Vec<PathBuf> {
+fn subfolders(folder: &Path, names: &[&str], session: &Session) -> Vec<PathBuf> {
     names
         .iter()
         .map(|name| folder.join(name))
-        .filter(|candidate| candidate.is_dir())
+        .filter(|candidate| session.is_folder(candidate))
         .collect()
 }
 
 /// The subfolders of `folder` whose names start with `name`, in any case, sorted.
-fn named_folders(folder: &Path, name: &str) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(folder) else { return Vec::new() };
+fn named_folders(folder: &Path, name: &str, session: &Session) -> Vec<PathBuf> {
     let lower = name.to_lowercase();
-    let mut found: Vec<PathBuf> = entries
-        .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().to_lowercase().starts_with(&lower))
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
+    let mut found: Vec<PathBuf> = session
+        .entries(folder)
+        .iter()
+        .filter(|entry| entry.folder && entry.name.to_lowercase().starts_with(&lower))
+        .map(|entry| folder.join(&entry.name))
         .collect();
     found.sort();
 
@@ -811,22 +1283,19 @@ fn named_folders(folder: &Path, name: &str) -> Vec<PathBuf> {
 
 /// The config file of package `name` in `folder`: `<name>Config.cmake` or `<lowercase name>-config.cmake`, as
 /// written first, else in any case.
-fn config_file_in(folder: &Path, name: &str) -> Option<PathBuf> {
+fn config_file_in(folder: &Path, name: &str, session: &Session) -> Option<PathBuf> {
     let wanted = [format!("{name}Config.cmake"), format!("{}-config.cmake", name.to_lowercase())];
-    let entries: Vec<String> = std::fs::read_dir(folder)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
+    let entries = session.entries(folder);
+    let files: Vec<&String> = entries.iter().filter(|entry| !entry.folder).map(|entry| &entry.name).collect();
 
-    let exact = entries.iter().find(|entry| wanted.contains(entry));
-    let any_case = entries.iter().find(|entry| wanted.iter().any(|file| file.eq_ignore_ascii_case(entry)));
-    exact.or(any_case).map(|entry| folder.join(entry)).filter(|file| file.is_file())
+    let exact = files.iter().find(|entry| wanted.contains(entry));
+    let any_case = files.iter().find(|entry| wanted.iter().any(|file| file.eq_ignore_ascii_case(entry)));
+    exact.or(any_case).map(|entry| folder.join(entry))
 }
 
 /// A config file and the files of its folder it includes, directly or through others: `include()` and `file(GLOB)`
 /// of `${CMAKE_CURRENT_LIST_DIR}/...` (a variable in the name matching anything).
-fn included_files(config_file: &Path) -> Vec<PathBuf> {
+fn included_files(config_file: &Path, session: &Session) -> Vec<PathBuf> {
     static REFERENCE: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r#"\$\{(?:CMAKE_CURRENT_LIST_DIR|_DIR|_IMPORT_DIR)\}/([^"\s)/]+)["\s)]"#).unwrap());
     static VARIABLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\$\{([^}]*)\}").unwrap());
@@ -834,16 +1303,15 @@ fn included_files(config_file: &Path) -> Vec<PathBuf> {
         std::sync::LazyLock::new(|| regex::Regex::new(r#"set\(\s*(\w+)\s+"?([^"\s)$]+)"?\s*\)"#).unwrap());
 
     let folder = config_file.parent().unwrap();
-    let names: Vec<String> = std::fs::read_dir(folder)
-        .map(|entries| entries.flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect())
-        .unwrap_or_default();
+    let entries = session.entries(folder);
+    let names: Vec<&String> = entries.iter().filter(|entry| !entry.folder).map(|entry| &entry.name).collect();
     let mut files = vec![config_file.to_path_buf()];
 
     let mut next = 0;
     while next < files.len() {
         // A name made of variables the file sets (`include("${CMAKE_CURRENT_LIST_DIR}/${targets_file}")`); one it
         // does not set matches anything, but not on its own
-        let text = std::fs::read_to_string(&files[next]).unwrap_or_default();
+        let text = session.text(&files[next]).unwrap_or_default();
         let variables: Vec<(String, String)> = SET
             .captures_iter(&text)
             .map(|captures| (captures[1].to_string(), captures[2].to_string()))
@@ -921,7 +1389,7 @@ fn named_packages(text: &str) -> Vec<(String, Vec<String>)> {
 
 /// The version file beside a config file (`<Name>ConfigVersion.cmake`, `<name>-config-version.cmake`), with the files
 /// of its folder it includes (Qt's ConfigVersionImpl).
-fn read_version_file(config_file: &Path) -> Option<VersionFile> {
+fn read_version_file(config_file: &Path, session: &Session) -> Option<VersionFile> {
     static VERSION: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r#"set\(\s*PACKAGE_VERSION\s+"?([^"\s)]+)"?\s*\)"#).unwrap());
     static POINTER_SIZE: std::sync::LazyLock<regex::Regex> =
@@ -932,10 +1400,10 @@ fn read_version_file(config_file: &Path) -> Option<VersionFile> {
         stem if stem.ends_with("-config") => format!("{stem}-version.cmake"),
         stem => format!("{stem}Version.cmake"),
     };
-    let version_file = config_file_in_any_case(config_file.parent()?, &version_name)?;
-    let text: String = included_files(&version_file)
+    let version_file = config_file_in_any_case(config_file.parent()?, &version_name, session)?;
+    let text: String = included_files(&version_file, session)
         .iter()
-        .filter_map(|file| std::fs::read_to_string(file).ok())
+        .filter_map(|file| session.text(file))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -957,12 +1425,12 @@ fn read_version_file(config_file: &Path) -> Option<VersionFile> {
 }
 
 /// A file of this name in `folder`, in any case.
-fn config_file_in_any_case(folder: &Path, name: &str) -> Option<PathBuf> {
-    std::fs::read_dir(folder)
-        .ok()?
-        .flatten()
-        .find(|entry| entry.file_name().to_string_lossy().eq_ignore_ascii_case(name))
-        .map(|entry| entry.path())
+fn config_file_in_any_case(folder: &Path, name: &str, session: &Session) -> Option<PathBuf> {
+    session
+        .entries(folder)
+        .iter()
+        .find(|entry| !entry.folder && entry.name.eq_ignore_ascii_case(name))
+        .map(|entry| folder.join(&entry.name))
 }
 
 /// Whether a package with this version file suits a build for `pointer_size`-byte pointers asking for `wanted`; else
@@ -1034,35 +1502,50 @@ fn library_architecture(platform: &Platform) -> Option<&'static str> {
     })
 }
 
-/// The package was not found: where Anvil looked, what it found and turned down, and how to point it at the package.
+/// The package was not found: where Anvil looked, what it found and turned down, and how to point it at the package
+/// (or, for a package CMake finds with its own Find module, what to write instead).
 fn not_found_message(request: &Request, places: &[(Place, String)], rejected: &[String]) -> String {
     let name = request.package;
     let dependency = request.dependency;
     let lower = name.to_lowercase();
-    let mut message = match rejected.is_empty() {
-        true => format!("dependency `{dependency}`: CMake package `{name}` not found (no {name}Config.cmake or {lower}-config.cmake)"),
-        false => format!("dependency `{dependency}`: no CMake package `{name}` that suits this build"),
+    let built_in = FIND_MODULE_NAMESPACES.iter().find(|namespace| namespace.eq_ignore_ascii_case(name));
+    let module_only = find_module::module_only_package(name);
+    let mut message = match (rejected.is_empty(), built_in.is_some() || module_only.is_some()) {
+        (true, true) => format!(
+            "dependency `{dependency}`: `{name}` has no CMake config file (no {name}Config.cmake or {lower}-config.cmake): CMake finds it with \
+             its own Find{name} module, which Anvil does not run"
+        ),
+        (true, false) => format!("dependency `{dependency}`: CMake package `{name}` not found (no {name}Config.cmake or {lower}-config.cmake)"),
+        (false, _) => format!("dependency `{dependency}`: no CMake package `{name}` that suits this build"),
     };
 
-    // Where: each place the user set, the system's, and how many came from PATH
-    let mut looked = Vec::new();
-    let mut path_count = 0;
+    // Where: each place once (one folder reached through a link too), the user's said missing, the others only when
+    // they are there
+    let mut looked: Vec<(String, String)> = Vec::new();
+    let mut seen = HashSet::new();
     for (place, origin) in places {
         let (Place::Prefix(path) | Place::Folder(path)) = place;
-        match origin.as_str() {
-            "PATH" => path_count += 1,
-            _ => looked.push(format!("{} ({origin})", slash(path))),
+        let exists = path.is_dir();
+        let user_given = !matches!(origin.as_str(), "PATH" | "system");
+        if !seen.insert(canonical_key(path)) || (!exists && !user_given) {
+            continue;
+        }
+        let text = match exists {
+            true => slash(path),
+            false => format!("{} (not there)", slash(path)),
+        };
+        match looked.last_mut().filter(|(last_origin, _)| last_origin == origin) {
+            Some((_, paths)) => paths.push_str(&format!(", {text}")),
+            None => looked.push((origin.clone(), text)),
         }
     }
-    if path_count > 0 {
-        looked.push(format!("the prefixes of the {path_count} folders on PATH"));
-    }
-    message.push_str(&format!("; looked in {}", looked.join(", ")));
+    let looked: Vec<String> = looked.iter().map(|(origin, paths)| format!("{origin}: {paths}")).collect();
+    message.push_str(&format!("; looked in {}", looked.join("; ")));
 
     // The variables that would have pointed at it
     let variables = [format!("{name}_DIR"), format!("{name}_ROOT"), "CMAKE_PREFIX_PATH".to_string()];
     let unset: Vec<&String> = variables.iter().filter(|variable| std::env::var_os(variable).is_none()).collect();
-    if request.prefixes.is_empty() && !unset.is_empty() {
+    if request.prefixes.is_empty() && !unset.is_empty() && module_only.is_none() && built_in.is_none() {
         let names: Vec<&str> = unset.iter().map(|variable| variable.as_str()).collect();
         message.push_str(&format!(" ({} not set)", names.join(", ")));
     }
@@ -1072,11 +1555,25 @@ fn not_found_message(request: &Request, places: &[(Place, String)], rejected: &[
         message.push_str(&format!("\n  found {rejection}"));
     }
 
-    message.push_str(&format!(
-        "\nhint: point at its install folder (the one holding lib/cmake/{name} or {name}Config.cmake): \
-         `{dependency} = {{ cmake = \"{name}\", prefix = \"...\" }}` in [deps], or the environment variable {name}_ROOT, or {name}_DIR \
-         for the folder of its config file"
-    ));
+    // What to write instead
+    match (built_in, module_only) {
+        (Some(namespace), _) => message.push_str(&format!(
+            "\nhint: Anvil has it built in, as CMake's module: `{} = \"system\"` in [deps]",
+            namespace.to_lowercase()
+        )),
+        (None, Some((_, pkg_config, port))) => {
+            let pkg_config = pkg_config.map(|module| format!("`{dependency} = {{ pkg-config = \"{module}\" }}`, or "));
+            message.push_str(&format!(
+                "\nhint: write {}`{dependency} = {{ vcpkg = \"{port}\" }}` in [deps]",
+                pkg_config.unwrap_or_default()
+            ));
+        }
+        (None, None) => message.push_str(&format!(
+            "\nhint: point at its install folder (the one holding lib/cmake/{name} or {name}Config.cmake): \
+             `{dependency} = {{ cmake = \"{name}\", prefix = \"...\" }}` in [deps], or the environment variable {name}_ROOT, or {name}_DIR \
+             for the folder of its config file"
+        )),
+    }
 
     message
 }
@@ -1137,7 +1634,7 @@ mod tests {
             "set(PACKAGE_VERSION \"2.5.1\")\nif(PACKAGE_FIND_VERSION_MAJOR STREQUAL CVF_VERSION_MAJOR)\nendif()\n\
              if(\"${CMAKE_SIZEOF_VOID_P}\" STREQUAL \"\" OR \"8\" STREQUAL \"\")\nendif()\nif(NOT CMAKE_SIZEOF_VOID_P STREQUAL \"8\")\nendif()\n",
         );
-        let version_file = read_version_file(&config).unwrap();
+        let version_file = read_version_file(&config, &Session::default()).unwrap();
         assert_eq!(
             version_file,
             VersionFile {
@@ -1159,7 +1656,7 @@ mod tests {
             "include(\"${CMAKE_CURRENT_LIST_DIR}/bar-config-version-impl.cmake\")\n",
         );
         write(&qt.join("bar-config-version-impl.cmake"), "set(PACKAGE_VERSION 6.4.2)\n");
-        let version_file = read_version_file(&qt.join("bar-config.cmake")).unwrap();
+        let version_file = read_version_file(&qt.join("bar-config.cmake"), &Session::default()).unwrap();
         assert_eq!(
             (version_file.version.as_deref(), version_file.compatibility),
             (Some("6.4.2"), Compatibility::AnyNewer)
@@ -1178,9 +1675,10 @@ mod tests {
         write(&folder.join("lib/x86_64-linux-gnu/cmake/foo/foo-config.cmake"), "");
         write(&folder.join("share/foo/cmake/FooConfig.cmake"), "");
         write(&folder.join("Foo/cmake/FooConfig.cmake"), "");
-        let found: Vec<PathBuf> = config_folders(&folder, "Foo", &unix)
+        let session = Session::default();
+        let found: Vec<PathBuf> = config_folders(&folder, "Foo", &unix, &session)
             .iter()
-            .filter_map(|folder| config_file_in(folder, "Foo"))
+            .filter_map(|folder| config_file_in(folder, "Foo", &session))
             .collect();
         let relative: Vec<String> = found.iter().map(|file| util::rel(file, &folder)).collect();
         assert_eq!(
@@ -1194,16 +1692,10 @@ mod tests {
         );
 
         // Any case finds it; an unsuitable one is passed over with the reason
-        assert!(config_file_in(&folder.join("Foo/cmake"), "FOO").is_some());
+        assert!(config_file_in(&folder.join("Foo/cmake"), "FOO", &session).is_some());
         write(&folder.join("Foo/cmake/FooConfigVersion.cmake"), "set(PACKAGE_VERSION \"1.0\")\n");
-        let reader = Reader {
-            build: test_build(),
-            debug: false,
-            platform: unix.clone(),
-            packages: Vec::new(),
-            targets: Vec::new(),
-            searched: HashSet::new(),
-        };
+        let session = Session::default();
+        let reader = Reader::new(test_build(), false, unix.clone(), "foo", &[], &session);
         let places = vec![(Place::Prefix(folder.clone()), "`prefix`".to_string())];
         let located = reader.locate("Foo", &places, Some(&[1])).ok().unwrap();
         assert_eq!(located.config_file, folder.join("Foo/cmake/FooConfig.cmake"));
@@ -1248,13 +1740,17 @@ mod tests {
         };
         let mut target = ImportedTarget::default();
         target.files = vec![missing.clone(), files("DEBUG"), files("RELWITHDEBINFO"), files("RELEASE")];
-        assert_eq!(pick_files(&target, "Debug", true).unwrap().configuration, "DEBUG");
-        assert_eq!(pick_files(&target, "MinSizeRel", false).unwrap().configuration, "RELEASE");
-        assert_eq!(pick_files(&target, "RelWithDebInfo", false).unwrap().configuration, "RELWITHDEBINFO");
+        let session = Session::default();
+        assert_eq!(pick_files(&target, "Debug", true, &session).unwrap().configuration, "DEBUG");
+        assert_eq!(pick_files(&target, "MinSizeRel", false, &session).unwrap().configuration, "RELEASE");
+        assert_eq!(
+            pick_files(&target, "RelWithDebInfo", false, &session).unwrap().configuration,
+            "RELWITHDEBINFO"
+        );
 
         // Only a debug one: CMake's choice, the first whose files are there
         target.files = vec![missing, files("DEBUG")];
-        assert_eq!(pick_files(&target, "Release", false).unwrap().configuration, "DEBUG");
+        assert_eq!(pick_files(&target, "Release", false, &session).unwrap().configuration, "DEBUG");
 
         std::fs::remove_dir_all(&folder).ok();
     }
@@ -1299,14 +1795,8 @@ mod tests {
             write(&prefix.join(library), "");
         }
 
-        let mut reader = Reader {
-            build: test_build(),
-            debug: false,
-            platform: platform(Os::Linux),
-            packages: Vec::new(),
-            targets: Vec::new(),
-            searched: HashSet::new(),
-        };
+        let session = Session::default();
+        let mut reader = Reader::new(test_build(), false, platform(Os::Linux), "foo", &[], &session);
         let places = vec![(Place::Prefix(prefix.clone()), "`prefix`".to_string())];
         let located = reader.locate("Foo", &places, None).ok().unwrap();
         let main = reader.read_package(&located);
@@ -1346,5 +1836,129 @@ mod tests {
         assert_eq!(usage.flags, vec!["-pthread"]);
 
         std::fs::remove_dir_all(&prefix).ok();
+    }
+
+    /// A package `name` in `prefix` whose target `name::name` defines NAME and links `links`.
+    fn write_package(prefix: &Path, name: &str, links: &str) {
+        write(
+            &prefix.join(format!("lib/cmake/{name}/{name}Config.cmake")),
+            &format!(
+                "add_library({name}::{name} INTERFACE IMPORTED)\n\
+                 set_target_properties({name}::{name} PROPERTIES INTERFACE_COMPILE_DEFINITIONS \"{}\" INTERFACE_LINK_LIBRARIES \"{links}\")\n",
+                name.to_uppercase()
+            ),
+        );
+    }
+
+    #[test]
+    fn reads_dependencies_from_the_other_prefixes_and_find_modules() {
+        let folder = scratch("prefixes");
+        let (first, second) = (folder.join("first"), folder.join("second"));
+
+        // Spd in the first prefix links Fmt::Fmt, in the second, and ZLIB::ZLIB, FindZLIB's, in the first's lib/
+        write_package(&first, "Spd", "Fmt::Fmt;ZLIB::ZLIB;Gone::Gone");
+        write_package(&second, "Fmt", "");
+        write(&first.join("include/zlib.h"), "");
+        write(&first.join("lib/libz.a"), "");
+
+        let session = Session::default();
+        let prefixes = vec![first.clone(), second];
+        let mut reader = Reader::new(test_build(), false, platform(Os::Linux), "spd", &prefixes, &session);
+        let places = vec![(Place::Prefix(first.clone()), "`prefix`".to_string())];
+        let located = reader.locate("Spd", &places, None).ok().unwrap();
+        reader.read_package(&located);
+        let usage = reader.usage("spd", &["Spd::Spd".to_string()]);
+        assert_eq!(usage.defines, vec!["SPD", "FMT"]);
+        assert_eq!(usage.includes, vec![util::normalize(&first.join("include"))]);
+        assert_eq!(usage.libs, vec![util::normalize(&first.join("lib/libz.a"))]);
+
+        // A target nothing defines is said, with the target linking it
+        let warnings = session.warnings.borrow();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("Spd::Spd (package Spd") && warnings[0].contains("links Gone::Gone, which is left out"),
+            "{warnings:?}"
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn caches_results_until_what_they_came_from_changes() {
+        let folder = scratch("cache");
+        let prefix = folder.join("prefix");
+        let cache = folder.join("cache");
+        write_package(&prefix, "Foo", "");
+        let toolchain = Toolchain::for_tests(crate::toolchain::Family::Gcc, platform(Os::Linux), false);
+        let profile = Profile::resolve("release", &Default::default()).unwrap();
+        let prefixes = vec![prefix.clone()];
+        let request = Request {
+            dependency: "foo",
+            package: "Foo",
+            components: &[],
+            version: None,
+            targets: None,
+            prefixes: &prefixes,
+        };
+        let defines = || {
+            find(&request, &toolchain, &profile, Some(&cache), &Reads::default())
+                .unwrap()
+                .usage
+                .defines
+        };
+        let entry = || std::fs::read_dir(&cache).unwrap().next().unwrap().unwrap().path();
+
+        // Written once, then read: a result changed only in the cache is what the next run gives
+        assert_eq!(defines(), vec!["FOO"]);
+        let text = std::fs::read_to_string(entry()).unwrap();
+        std::fs::write(entry(), text.replace("\"FOO\"", "\"CACHED\"")).unwrap();
+        assert_eq!(defines(), vec!["CACHED"]);
+
+        // A package file changed (its size) is read again
+        write_package(&prefix, "Foo", "m");
+        assert_eq!(defines(), vec!["FOO"]);
+
+        // So is a package added where the search looked before it found this one
+        let text = std::fs::read_to_string(entry()).unwrap();
+        std::fs::write(entry(), text.replace("\"FOO\"", "\"CACHED\"")).unwrap();
+        assert_eq!(defines(), vec!["CACHED"]);
+        std::fs::create_dir_all(prefix.join("Foo")).unwrap();
+        assert_eq!(defines(), vec!["FOO"]);
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn says_what_to_write_for_find_module_packages() {
+        let request = |package: &'static str| Request {
+            dependency: "x",
+            package,
+            components: &[],
+            version: None,
+            targets: None,
+            prefixes: &[],
+        };
+        let places = vec![
+            (Place::Prefix(PathBuf::from("/nowhere")), "PATH".to_string()),
+            (Place::Prefix(std::env::temp_dir()), "PATH".to_string()),
+            (Place::Prefix(std::env::temp_dir()), "system".to_string()),
+        ];
+
+        let message = not_found_message(&request("OpenSSL"), &places, &[]);
+        assert!(message.contains("`OpenSSL` has no CMake config file"), "{message}");
+        assert!(
+            message.contains("`x = { pkg-config = \"openssl\" }`, or `x = { vcpkg = \"openssl\" }`"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("nowhere") && message.matches(&slash(&std::env::temp_dir())).count() == 1,
+            "{message}"
+        );
+
+        let message = not_found_message(&request("NoSuch"), &places, &[]);
+        assert!(
+            message.contains("CMake package `NoSuch` not found") && message.contains("NoSuch_ROOT"),
+            "{message}"
+        );
     }
 }

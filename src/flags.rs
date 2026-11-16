@@ -20,7 +20,7 @@ const SYSTEM_LIBRARY_FOLDERS: &[&str] = &["/lib", "/lib64", "/usr/lib", "/usr/li
 // Anvil rebuilds it when their content changes, so the stamps are left out
 const NO_PCH_TIMESTAMP: &[&str] = &["-Xclang", "-fno-pch-timestamp"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Language {
     C,
     Cxx,
