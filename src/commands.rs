@@ -81,7 +81,7 @@ pub fn run(start_dir: &Path, build: &BuildArgs, name: Option<&str>, args: &[Stri
         if signal != libc::SIGINT {
             ui::error(&format!(
                 "{} was {}",
-                util::rel(&program, &std::env::current_dir()?),
+                util::rel(&setup.program, &std::env::current_dir()?),
                 crate::testrun::describe_exit(status)
             ));
         }
