@@ -283,6 +283,29 @@ pub fn release() {
 #[cfg(not(windows))]
 pub fn release() {}
 
+/// Ends Anvil with this exit code, its output flushed. On Windows the process terminates itself instead of calling
+/// ExitProcess, which kills the other threads wherever they are (a rayon pool's workers freeing memory as they end, the
+/// language server's compiler detection starting vcvarsall.bat) and then runs the DLLs' detach code in this thread:
+/// an allocation there can spin forever on heap state a killed thread left half-changed. Nothing Anvil needs runs at
+/// detach.
+#[cfg(windows)]
+pub fn exit(code: i32) -> ! {
+    use std::io::Write;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    unsafe { TerminateProcess(GetCurrentProcess(), code as u32) };
+
+    // Not reached: terminating itself does not return
+    std::process::exit(code)
+}
+
+#[cfg(not(windows))]
+pub fn exit(code: i32) -> ! {
+    std::process::exit(code)
+}
+
 #[cfg(windows)]
 mod windows {
     use std::io;
