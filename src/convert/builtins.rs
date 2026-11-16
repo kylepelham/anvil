@@ -394,7 +394,7 @@ impl Interpreter {
             "add_subdirectory" => self.command_add_subdirectory(command, &args)?,
             "project" => self.command_project(&args),
             "find_package" => self.command_find_package(command, &args),
-            "pkg_check_modules" | "pkg_search_module" => self.command_pkg_check_modules(&args),
+            "pkg_check_modules" | "pkg_search_module" => self.command_pkg_check_modules(command, &args),
             "find_program" | "find_library" | "find_path" | "find_file" => self.command_find(command, &args),
             "configure_file" => self.command_configure_file(command, &args),
             "execute_process" => self.command_execute_process(command, &args),
@@ -1974,7 +1974,14 @@ impl Interpreter {
                 self.set_variable(&format!("{name}_EXECUTABLE"), "python");
                 self.set_variable("PYTHON_EXECUTABLE", "python");
             }
-            "Threads" => self.set_variable("CMAKE_THREAD_LIBS_INIT", "Threads::Threads"),
+            "Threads" => {
+                // As FindThreads sets them: pthreads wherever the compiler has them (MinGW too), Win32 threads on
+                // Windows (MinGW has both)
+                self.set_variable("CMAKE_THREAD_LIBS_INIT", "Threads::Threads");
+                self.set_variable("CMAKE_USE_PTHREADS_INIT", &model::option_marker("!msvc"));
+                self.set_variable("CMAKE_HAVE_LIBC_PTHREAD", &model::option_marker("!msvc"));
+                self.set_variable("CMAKE_USE_WIN32_THREADS_INIT", &model::option_marker("windows"));
+            }
             "Git" => self.set_variable("GIT_EXECUTABLE", "git"),
             "OpenGL" => {
                 for variable in ["OPENGL_LIBRARIES", "OPENGL_LIBRARY", "OPENGL_gl_LIBRARY"] {
@@ -2054,24 +2061,31 @@ impl Interpreter {
         PackageSource::Port(port)
     }
 
-    /// Is a program on PATH, in one of `folders`, or among the MSVC tools (dumpbin beside link.exe, which build steps
-    /// find on the toolchain's PATH)?
-    fn finds_program(&mut self, name: &str, folders: &[PathBuf]) -> bool {
+    /// How a build finds a program: its name when it is on PATH or among the MSVC tools (dumpbin beside link.exe,
+    /// which build steps find on the toolchain's PATH), its path when only one of `folders` has it; None when nothing
+    /// has it.
+    fn find_program(&mut self, name: &str, folders: &[PathBuf]) -> Option<String> {
         let in_folder = |folder: &Path| {
             ["", ".exe", ".bat", ".cmd"]
                 .iter()
-                .any(|extension| folder.join(format!("{name}{extension}")).is_file())
+                .map(|extension| folder.join(format!("{name}{extension}")))
+                .find(|path| path.is_file())
         };
-        if util::which(name).is_some() || folders.iter().any(|folder| in_folder(folder)) {
-            return true;
+        if util::which(name).is_some() {
+            return Some(name.to_string());
+        }
+        if let Some(path) = folders.iter().find_map(|folder| in_folder(folder)) {
+            return Some(slash(&path));
         }
 
         let tool_folders = self.builtin.tool_folders.get_or_insert_with(msvc_tool_folders);
-        tool_folders.iter().any(|folder| in_folder(folder))
+        tool_folders.iter().any(|folder| in_folder(folder).is_some()).then(|| name.to_string())
     }
 
-    /// pkg_check_modules(PREFIX [REQUIRED] [IMPORTED_TARGET] modules...): PkgConfig::PREFIX and PREFIX_LIBRARIES.
-    fn command_pkg_check_modules(&mut self, args: &[String]) {
+    /// pkg_check_modules(PREFIX [REQUIRED] [IMPORTED_TARGET] modules...): PkgConfig::PREFIX and PREFIX_LIBRARIES. An
+    /// optional one finds its modules where this machine's pkg-config knows them (pkg_search_module: one of them);
+    /// otherwise PREFIX_FOUND is false, as on a machine without them, and the warning says so.
+    fn command_pkg_check_modules(&mut self, command: &Command, args: &[String]) {
         let Some((prefix, rest)) = args.split_first() else { return };
         let flags = [
             "REQUIRED",
@@ -2082,6 +2096,26 @@ impl Interpreter {
             "NO_CMAKE_ENVIRONMENT_PATH",
         ];
         let modules: Vec<String> = rest.iter().filter(|word| !flags.contains(&word.as_str())).cloned().collect();
+
+        // An optional one only where pkg-config knows it
+        let required = rest.iter().any(|word| word == "REQUIRED");
+        let search = command.name == "pkg_search_module";
+        if !required && !pkg_config_knows(&modules, search) {
+            self.set_variable(&format!("{prefix}_FOUND"), "");
+            let when = self
+                .current_condition()
+                .map(|condition| format!(" (when `{condition}`)"))
+                .unwrap_or_default();
+            self.warn(
+                command,
+                &format!(
+                    "{}({prefix} {}){when} is optional and pkg-config does not know it here, so it is taken as not found: what {prefix}_FOUND turns on is left out; install it and convert again to keep it",
+                    command.name,
+                    modules.join(" ")
+                ),
+            );
+            return;
+        }
 
         let imported = format!("PkgConfig::{prefix}");
         self.set_variable(&format!("{prefix}_FOUND"), "ON");
@@ -2106,7 +2140,8 @@ impl Interpreter {
 
         match command.name.as_str() {
             "find_program" => {
-                // Not on PATH (or in its PATHS and HINTS) here: not found, so steps and tests that need it drop out
+                // The first name found (as CMake stores it, but a name on PATH stays a name, so the result works on
+                // other machines); not found here: steps and tests that need it drop out
                 let keywords = Keywords::parse(rest, &[], &[], &["NAMES", "PATHS", "HINTS", "PATH_SUFFIXES", "DOC"]);
                 let names = if rest.first().map(String::as_str) == Some("NAMES") {
                     keywords.list("NAMES")
@@ -2114,8 +2149,8 @@ impl Interpreter {
                     vec![first_name.clone()]
                 };
                 let folders: Vec<PathBuf> = keywords.list("PATHS").iter().chain(&keywords.list("HINTS")).map(PathBuf::from).collect();
-                let found = names.iter().any(|name| self.finds_program(name, &folders));
-                if !found {
+                let found = names.iter().find_map(|name| self.find_program(name, &folders));
+                if found.is_none() {
                     let when = self
                         .current_condition()
                         .map(|condition| format!(" (when `{condition}`)"))
@@ -2125,7 +2160,7 @@ impl Interpreter {
                         &format!("find_program({variable} {}){when}: not found on this machine, so build steps and tests that run it are left out; install it and convert again to keep them", names.join(" ")),
                     );
                 }
-                let value = if found { first_name } else { format!("{variable}-NOTFOUND") };
+                let value = found.unwrap_or_else(|| format!("{variable}-NOTFOUND"));
                 self.set_variable(variable, &value);
             }
             "find_library" => self.set_variable(variable, &first_name),
@@ -2548,7 +2583,8 @@ impl Interpreter {
             },
             Truth::Known(found) => if found { "1" } else { "" }.to_string(),
         };
-        self.set_variable(&variable, &value);
+        // A cache entry, as CMake's: seen outside the function that ran the check
+        self.cache.insert(variable, value);
     }
 
     /// check_type_size(type VAR): VAR is the size, one per condition where it differs by platform. A type not in
@@ -2582,7 +2618,7 @@ impl Interpreter {
             })
             .filter(|(truth, _)| *truth != Truth::Known(false))
             .collect();
-        self.set_variable(variable, &super::interp::versions_value(sizes));
+        self.cache.insert(variable.to_string(), super::interp::versions_value(sizes));
     }
 
     /// get_property(var TARGET t PROPERTY p) and GLOBAL properties; other scopes read as empty.
@@ -3158,7 +3194,7 @@ static CLANG_FLAGS: LazyLock<regex::Regex> = LazyLock::new(|| {
         r"fprofile-instr-.+|fcoverage-mapping|fmodules.*|fexperimental-.+|Qunused-arguments|ferror-limit=.+|",
         r"fmacro-backtrace-limit=.+|f(no-)?spell-checking|fms-compatibility.*|f(no-)?delayed-template-parsing|",
         r"f(no-)?cxx-exceptions|fsanitize=(safe-stack|cfi.*|dataflow|memory|type|integer|implicit-.+|nullability.*|unsigned-integer-overflow)|flto=thin|fdebug-macro|",
-        r"fcomplete-member-pointers|fforce-emit-vtables|fstrict-vtable-pointers|fwhole-program-vtables)$"
+        r"fcomplete-member-pointers|fforce-emit-vtables|fstrict-vtable-pointers|fwhole-program-vtables|mbranches-within-32B-boundaries)$"
     ))
     .unwrap()
 });
@@ -3642,6 +3678,43 @@ fn msvc_tool_folders() -> Vec<PathBuf> {
         folders.extend(std::env::split_paths(path));
     }
     folders
+}
+
+/// Does this machine's pkg-config (PKG_CONFIG, else pkg-config or pkgconf on PATH) know every module, or with
+/// `any_one` one of them? Each spec as pkg_check_modules() takes it: `name`, or `name>=version` and the like.
+fn pkg_config_knows(modules: &[String], any_one: bool) -> bool {
+    let program = std::env::var("PKG_CONFIG")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .and_then(|configured| util::which(&configured))
+        .or_else(|| util::which("pkg-config"))
+        .or_else(|| util::which("pkgconf"));
+    let Some(program) = program else { return false };
+
+    let knows = |spec: &String| {
+        // pkg-config takes a version requirement as words of its own
+        let words: Vec<&str> = match spec.find(['<', '>', '=']) {
+            Some(start) => {
+                let operator_end = spec[start..]
+                    .find(|character| !"<>=".contains(character))
+                    .map_or(spec.len(), |end| start + end);
+                vec![&spec[..start], &spec[start..operator_end], &spec[operator_end..]]
+            }
+            None => vec![spec.as_str()],
+        };
+        std::process::Command::new(&program)
+            .arg("--exists")
+            .args(words.iter().map(|word| word.trim()).filter(|word| !word.is_empty()))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if any_one {
+        modules.iter().any(knows)
+    } else {
+        !modules.is_empty() && modules.iter().all(knows)
+    }
 }
 
 /// The ports a vcpkg port needs by default: its dependencies and its default features'.
@@ -4391,6 +4464,77 @@ endif()
             .warnings
             .iter()
             .any(|warning| warning.contains("find_program(NO_TOOL anvil-no-such-program)")));
+    }
+
+    #[test]
+    fn found_programs_and_modules_are_the_ones_this_machine_has() {
+        let cmake = r#"
+find_program(TOOL NAMES anvil-no-such-program anvil-test-tool PATHS ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+pkg_check_modules(NOPE anvil-no-such-module>=1.0)
+if(NOPE_FOUND)
+  set(USES_NOPE ON)
+endif()
+pkg_check_modules(NEEDED REQUIRED anvil-no-such-module)
+"#;
+        let interpreter = run("found", &[("CMakeLists.txt", cmake), ("tools/anvil-test-tool", "")]);
+
+        // The name found, as a path where only PATHS has it
+        assert!(
+            variable(&interpreter, "TOOL").ends_with("/tools/anvil-test-tool"),
+            "{}",
+            variable(&interpreter, "TOOL")
+        );
+
+        // An optional module pkg-config does not know is not found; a required one is
+        assert_eq!(variable(&interpreter, "NOPE_FOUND"), "");
+        assert_eq!(variable(&interpreter, "USES_NOPE"), "");
+        assert!(!interpreter.pkg_config.contains_key("NOPE"));
+        assert!(interpreter
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("pkg_check_modules(NOPE anvil-no-such-module>=1.0)")));
+        assert_eq!(variable(&interpreter, "NEEDED_FOUND"), "ON");
+    }
+
+    #[test]
+    fn threads_variables_are_per_platform() {
+        let cmake = r#"
+find_package(Threads REQUIRED)
+if(CMAKE_USE_PTHREADS_INIT)
+  set(PTHREADS ON)
+endif()
+if(CMAKE_USE_WIN32_THREADS_INIT)
+  set(WIN32_THREADS ON)
+endif()
+"#;
+        let interpreter = run("threads", &[("CMakeLists.txt", cmake)]);
+
+        assert_eq!(model::marked_condition(&variable(&interpreter, "CMAKE_USE_PTHREADS_INIT")), Some("!msvc"));
+        assert_eq!(variable(&interpreter, "PTHREADS"), model::conditional_item("!msvc", "ON"));
+        assert_eq!(variable(&interpreter, "WIN32_THREADS"), model::conditional_item("windows", "ON"));
+    }
+
+    #[test]
+    fn check_results_are_seen_outside_the_function_that_checks() {
+        let cmake = r#"
+include(CheckCCompilerFlag)
+function(enable_flag flag variable)
+  check_c_compiler_flag(${flag} ${variable})
+endfunction()
+enable_flag(-Wa,--noexecstack HAS_NOEXECSTACK)
+"#;
+        let interpreter = run("check-cache", &[("CMakeLists.txt", cmake)]);
+
+        assert_eq!(model::marked_condition(&variable(&interpreter, "HAS_NOEXECSTACK")), Some("!msvc"));
+    }
+
+    #[test]
+    fn clang_only_flags_pass_only_with_clang() {
+        assert_eq!(
+            flag_truth("-mbranches-within-32B-boundaries", Some("C")),
+            Some(Truth::Depends("clang & !msvc".into()))
+        );
+        assert_eq!(flag_truth("-mavx2", Some("C")), Some(Truth::Depends("!msvc".into())));
     }
 
     #[test]

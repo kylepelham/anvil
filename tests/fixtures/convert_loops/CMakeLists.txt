@@ -1,0 +1,33 @@
+cmake_minimum_required(VERSION 3.20)
+project(loops C)
+include(CheckCCompilerFlag)
+enable_testing()
+find_package(Threads REQUIRED)
+find_package(PkgConfig)
+if(PkgConfig_FOUND)
+  pkg_check_modules(NOPE anvil-no-such-module)
+endif()
+
+# The first flag that passes, as CMake keeps it
+foreach(flag /J -DPICKED_GNU)
+  string(REGEX REPLACE "[^A-Za-z]+" "_" variable "FLAG_${flag}")
+  check_c_compiler_flag(${flag} ${variable})
+  if(${variable})
+    string(APPEND CMAKE_C_FLAGS " ${flag}")
+    break()
+  endif()
+endforeach()
+
+# A truth value one branch sets
+set(HAS_PTHREAD 0)
+if(CMAKE_USE_PTHREADS_INIT)
+  set(HAS_PTHREAD 1)
+endif()
+
+add_executable(app main.c)
+target_compile_definitions(app PRIVATE HAS_PTHREAD=${HAS_PTHREAD})
+if(NOPE_FOUND)
+  target_sources(app PRIVATE nope.c)
+endif()
+add_test(NAME json COMMAND app)
+set_tests_properties(json PROPERTIES PASS_REGULAR_EXPRESSION "\"picked\": \"(msvc|gnu)\"}")

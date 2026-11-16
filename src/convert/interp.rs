@@ -122,6 +122,8 @@ pub enum Flow {
     Normal,
     Return(Truth),
     Break,
+    // A break() under a condition: the loop goes on only where it does not hold
+    BreakWhen(String),
     Continue,
 }
 
@@ -870,9 +872,10 @@ impl Interpreter {
         let mut flow = Flow::Normal;
 
         for node in nodes {
-            // A return under a condition that holds everywhere returns
+            // A return or break under a condition that holds everywhere returns or breaks
             let result = match self.run_node(node)? {
                 Flow::Return(Truth::Depends(condition)) => Flow::Return(model::simplify(&condition, None)),
+                Flow::BreakWhen(condition) => break_where(Flow::Normal, Truth::Depends(condition)),
                 other => other,
             };
             match result {
@@ -892,6 +895,13 @@ impl Interpreter {
                     };
                 }
                 Flow::Return(Truth::Known(false)) => {}
+
+                // So does a break under a condition
+                Flow::BreakWhen(condition) => {
+                    self.conditions.push(model::negate(&condition));
+                    pushed += 1;
+                    flow = break_where(flow, Truth::Depends(condition));
+                }
                 other => {
                     flow = other;
                     break;
@@ -1336,6 +1346,10 @@ impl Interpreter {
                 (previous @ Flow::Return(_), _, _) => previous,
                 (_, Flow::Break, Truth::Known(true)) => Flow::Break,
                 (_, Flow::Continue, Truth::Known(true)) => Flow::Continue,
+
+                // A break in a branch that runs only somewhere breaks there
+                (previous, Flow::Break, truth) => break_where(previous, truth),
+                (previous, Flow::BreakWhen(inner), truth) => break_where(previous, truth.and(Truth::Depends(inner))),
                 (previous, _, _) => previous,
             };
         }
@@ -1543,41 +1557,29 @@ impl Interpreter {
 
         let options = self.option_defaults();
         let mut flow = Flow::Normal;
+        // Where an earlier item broke the loop: the next ones run only where it did not
+        let mut broken: Option<String> = None;
         for item in items {
-            // An item a branch appended: the body runs for it as in that branch (keeping its variables only where
-            // this machine takes it)
-            let conditional = model::split_conditional_item(&item).map(|(condition, value)| (condition, value.to_string()));
-            if let Some((condition, value)) = conditional {
-                let on_host = model::holds_on_host(&condition, &|name| options.get(name).copied());
-                self.set_variable(variable, &value);
-                self.loops.push((variable.clone(), value));
-                let mark = self.mark();
-                self.conditions.push(condition.clone());
-                let result = self.run_block(body);
-                self.conditions.pop();
-                self.loops.pop();
+            // An item a branch appended runs as in that branch
+            let (condition, value) = match model::split_conditional_item(&item) {
+                Some((condition, value)) => (Some(condition), value.to_string()),
+                None => (None, item),
+            };
+            let condition = match (condition, &broken) {
+                (condition, None) => condition,
+                (None, Some(broken)) => Some(model::negate(broken)),
+                (Some(condition), Some(broken)) => Some(model::and(&condition, &model::negate(broken))),
+            };
 
-                let changes = self.changes_since(&mark, Truth::Depends(condition.clone()));
-                if on_host {
-                    self.release_mark();
-                } else {
-                    self.undo(mark);
-                }
-                self.merge_branches(&[changes], &Truth::Depends(model::negate(&condition)));
-                match result? {
-                    Flow::Return(inner) => flow = Flow::Return(Truth::Depends(condition).and(inner)),
-                    Flow::Break if on_host => break,
-                    _ => {}
-                }
-                continue;
-            }
-
-            self.set_variable(variable, &item);
-            self.loops.push((variable.clone(), item));
-            let result = self.run_block(body);
-            self.loops.pop();
-            match result? {
+            match self.run_foreach_item(variable, value, condition, body, &options, &mut flow)? {
                 Flow::Break => break,
+                Flow::BreakWhen(condition) => {
+                    let earlier = broken.take().map_or(Flow::Normal, Flow::BreakWhen);
+                    match break_where(earlier, Truth::Depends(condition)) {
+                        Flow::BreakWhen(condition) => broken = Some(condition),
+                        _ => break,
+                    }
+                }
                 returned @ Flow::Return(_) => {
                     flow = returned;
                     break;
@@ -1590,6 +1592,53 @@ impl Interpreter {
             self.scopes.set(scope, variable, previous);
         }
         Ok(flow)
+    }
+
+    /// Runs a foreach() body for one item. Under a condition (an item a branch appended, or one after a break() where
+    /// it did not happen) it runs as in a branch, keeping its variables only where this machine takes it; a return
+    /// there is kept in `flow`, and the loop goes on.
+    fn run_foreach_item(
+        &mut self,
+        variable: &str,
+        value: String,
+        condition: Option<String>,
+        body: &[Node],
+        options: &HashMap<String, bool>,
+        flow: &mut Flow,
+    ) -> Result<Flow> {
+        if let Some(condition) = condition {
+            let on_host = model::holds_on_host(&condition, &|name| options.get(name).copied());
+            self.set_variable(variable, &value);
+            self.loops.push((variable.to_string(), value));
+            let mark = self.mark();
+            self.conditions.push(condition.clone());
+            let result = self.run_block(body);
+            self.conditions.pop();
+            self.loops.pop();
+
+            let changes = self.changes_since(&mark, Truth::Depends(condition.clone()));
+            if on_host {
+                self.release_mark();
+            } else {
+                self.undo(mark);
+            }
+            self.merge_branches(&[changes], &Truth::Depends(model::negate(&condition)));
+            return Ok(match result? {
+                Flow::Return(inner) => {
+                    *flow = Flow::Return(Truth::Depends(condition).and(inner));
+                    Flow::Normal
+                }
+                Flow::Break => break_where(Flow::Normal, Truth::Depends(condition)),
+                Flow::BreakWhen(inner) => break_where(Flow::Normal, Truth::Depends(condition).and(Truth::Depends(inner))),
+                _ => Flow::Normal,
+            });
+        }
+
+        self.set_variable(variable, &value);
+        self.loops.push((variable.to_string(), value));
+        let result = self.run_block(body);
+        self.loops.pop();
+        result
     }
 
     fn run_while(&mut self, args: &[Arg], body: &[Node]) -> Result<Flow> {
@@ -1605,6 +1654,7 @@ impl Interpreter {
 
             match self.run_block(body)? {
                 Flow::Break => break,
+                Flow::BreakWhen(condition) if model::holds_on_host(&condition, &|_| None) => break,
                 flow @ Flow::Return(_) => return Ok(flow),
                 _ => {}
             }
@@ -2165,6 +2215,26 @@ fn per_condition_value(value: &str) -> Option<Vec<(String, String)>> {
     Some(alternatives)
 }
 
+/// The flow once a break() happens where `truth` holds, after `previous` (a break somewhere already, or a return,
+/// which stays).
+fn break_where(previous: Flow, truth: Truth) -> Flow {
+    let truth = match &previous {
+        Flow::BreakWhen(earlier) => Truth::Depends(earlier.clone()).or(truth),
+        _ => truth,
+    };
+    let truth = match truth {
+        Truth::Depends(condition) => model::simplify(&condition, None),
+        known => known,
+    };
+
+    match (previous, truth) {
+        (previous @ (Flow::Return(_) | Flow::Break), _) => previous,
+        (_, Truth::Known(true)) => Flow::Break,
+        (_, Truth::Known(false)) => Flow::Normal,
+        (_, Truth::Depends(condition)) => Flow::BreakWhen(condition),
+    }
+}
+
 /// A variable's value after branches changed it (`outcomes`: each branch's condition, what it left, and whether it
 /// changed it). Items branches removed stay under the conditions of those that kept them, and items they appended
 /// come after, under the conditions of those that appended them; a single value two branches or more set differently
@@ -2302,7 +2372,51 @@ fn merged_value(before: &Option<String>, outcomes: &[(Truth, Option<String>, boo
         );
     }
 
+    // A truth value (ON, false, ...) even one branch sets: one item per value too, a value branches further in set per
+    // condition taken apart, so `set(HAVE_X ON)` under a check reads back where the check passes
+    let truth_values = |value: &Option<String>| -> Option<Vec<(Truth, String)>> {
+        let value = value.as_deref().unwrap_or_default();
+        let alternatives = match per_condition_value(value) {
+            Some(alternatives) => alternatives
+                .into_iter()
+                .map(|(condition, text)| (Truth::Depends(condition), text))
+                .collect(),
+            None => vec![(Truth::Known(true), value.to_string())],
+        };
+        alternatives.iter().all(|(_, text)| is_truth_word(text)).then_some(alternatives)
+    };
+    if changed >= 1 && truth_values(before).is_some() {
+        let mut values: Vec<(String, Truth)> = Vec::new();
+        for (condition, value, _) in outcomes {
+            let alternatives = truth_values(value)?;
+            for (inner, text) in alternatives.into_iter().filter(|(_, text)| !text.is_empty()) {
+                let condition = match condition.clone().and(inner) {
+                    Truth::Depends(both) => model::simplify(&both, None),
+                    known => known,
+                };
+                match values.iter_mut().find(|(other, _)| *other == text) {
+                    Some((_, joined)) => *joined = either(joined.clone(), &condition),
+                    None => values.push((text, condition)),
+                }
+            }
+        }
+        return Some(
+            values
+                .into_iter()
+                .map(|(value, condition)| tagged(&value, condition))
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
+    }
+
     None
+}
+
+/// Is a value one of CMake's truth words (ON, OFF, TRUE, false, 1, 0, empty, ...)?
+fn is_truth_word(text: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    ["", "0", "1", "ON", "OFF", "TRUE", "FALSE", "YES", "NO", "Y", "N"].contains(&upper.as_str())
 }
 
 /// `item` under `condition`; an item already under a condition gets both.
@@ -2764,6 +2878,54 @@ set(OUTSIDE "${OPT_DIR}")
         if cfg!(windows) {
             assert_eq!(model::split_conditional_item(&sources[1]), Some(("unix".to_string(), "unix.c")));
         }
+    }
+
+    #[test]
+    fn a_truth_value_one_branch_replaces_is_one_per_condition() {
+        let cmake = r#"
+set(HAS false)
+if(NOT MSVC)
+  if(UNIX)
+    set(HAS true)
+  endif()
+endif()
+set(PLAIN a)
+if(UNIX)
+  set(PLAIN b)
+endif()
+"#;
+        let interpreter = run("truth-values", cmake);
+
+        assert_eq!(items(&interpreter, "HAS"), ["!msvc & unix: true", "msvc | !unix: false"]);
+        assert_eq!(variable(&interpreter, "PLAIN"), if cfg!(unix) { "b" } else { "a" });
+    }
+
+    #[test]
+    fn a_break_under_a_condition_ends_the_loop_only_there() {
+        let cmake = r#"
+foreach(flag one two three)
+  if(flag STREQUAL "one" AND MSVC)
+    list(APPEND CHOSEN ${flag})
+    break()
+  endif()
+  if(flag STREQUAL "two" AND UNIX)
+    list(APPEND CHOSEN ${flag})
+    break()
+  endif()
+  if(flag STREQUAL "three")
+    list(APPEND CHOSEN ${flag})
+    break()
+  endif()
+endforeach()
+foreach(word a b)
+  list(APPEND ALL ${word})
+  break()
+endforeach()
+"#;
+        let interpreter = run("conditional-break", cmake);
+
+        assert_eq!(items(&interpreter, "CHOSEN"), ["msvc: one", "!msvc & unix: two", "!(msvc | unix): three"]);
+        assert_eq!(variable(&interpreter, "ALL"), "a");
     }
 
     #[test]
