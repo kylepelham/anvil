@@ -256,6 +256,7 @@ fn check_tables(manifests: &[(PathBuf, String)]) {
             crate::targets::check_package(&manifest, &condition)?;
             crate::profile::Profile::check_all(&manifest.profile)
         };
+
         // The first error before the ones the check said after it
         let before = session::error_count();
         if let Err(error) = checked().at(Scope::file(path)) {
