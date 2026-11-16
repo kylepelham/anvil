@@ -1165,7 +1165,7 @@ mod tests {
             };
             let errors = validate(schema, &as_json(&std::fs::read_to_string(path).unwrap()));
             match parsed {
-                Err(error) if error.to_string().contains("unknown field") => {
+                Err(error) if format!("{error:#}").contains("unknown field") => {
                     assert!(!errors.is_empty(), "{}: a typo the schema misses", path.display())
                 }
                 _ => assert_eq!(errors, Vec::<String>::new(), "{}", path.display()),

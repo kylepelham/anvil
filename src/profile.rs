@@ -1,7 +1,9 @@
 //! Build profiles: the built-in `debug` and `release`, and user profiles that inherit from them.
 
+use crate::bail_at;
+use crate::located::{self, At, Place, Scope};
 use crate::manifest::ProfileSpec;
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use indexmap::IndexMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +127,11 @@ impl Opt {
         let text = match value {
             toml::Value::Integer(level) => level.to_string(),
             toml::Value::String(text) => text.clone(),
-            _ => bail!("opt: expected 0, 1, 2, 3, \"s\" or \"z\""),
+            _ => bail_at!(
+                Place::key("opt").value(located::value_text(value).unwrap_or_default()),
+                "invalid-value",
+                "opt: expected 0, 1, 2, 3, \"s\" or \"z\""
+            ),
         };
 
         Ok(match text.as_str() {
@@ -135,7 +141,11 @@ impl Opt {
             "3" => Opt::Fastest,
             "s" => Opt::Size,
             "z" => Opt::MinSize,
-            other => bail!("opt = \"{other}\": expected 0, 1, 2, 3, \"s\" or \"z\""),
+            other => bail_at!(
+                Place::key("opt").value(other),
+                "invalid-value",
+                "opt = \"{other}\": expected 0, 1, 2, 3, \"s\" or \"z\""
+            ),
         })
     }
 }
@@ -146,6 +156,7 @@ impl Profile {
         // Walk up the chain: the named profile first, a built-in last
         let mut chain = vec![name.to_string()];
         let mut current = name.to_string();
+        let inherits = |profile: &str| Place::absolute(located::keys(&["profile", profile, "inherits"]));
 
         loop {
             let parent = match specs.get(&current).and_then(|spec| spec.inherits.clone()) {
@@ -155,12 +166,26 @@ impl Profile {
                 None => {
                     let known: Vec<&str> = ["debug", "release"].into_iter().chain(specs.keys().map(|key| key.as_str())).collect();
                     let hint = crate::util::did_you_mean(&current, known.iter().copied());
-                    bail!("unknown profile `{current}`{hint}; known profiles: {}", known.join(", "));
+                    let place = match chain.iter().rev().nth(1) {
+                        Some(child) => inherits(child).value(&current),
+                        None => Place::default(),
+                    };
+                    bail_at!(
+                        place,
+                        "unknown-profile",
+                        "unknown profile `{current}`{hint}; known profiles: {}",
+                        known.join(", ")
+                    );
                 }
             };
 
             if chain.contains(&parent) {
-                bail!("profile `{name}` inherits from itself (through {})", chain.join(" -> "));
+                bail_at!(
+                    inherits(name).value(chain.get(1).unwrap_or(&parent)),
+                    "profile-cycle",
+                    "profile `{name}` inherits from itself (through {})",
+                    chain.join(" -> ")
+                );
             }
 
             chain.push(parent.clone());
@@ -171,7 +196,7 @@ impl Profile {
         let mut profile = Profile::builtin(chain.last().unwrap()).unwrap();
         for profile_name in chain.iter().rev() {
             if let Some(spec) = specs.get(profile_name) {
-                profile.apply(spec)?;
+                profile.apply(spec).at(Scope::keys(&["profile", profile_name]))?;
             }
         }
 
@@ -184,10 +209,12 @@ impl Profile {
     /// Checks every `[profile]` table, used or not: what it inherits, its values, the machine it names.
     pub fn check_all(specs: &IndexMap<String, ProfileSpec>) -> Result<()> {
         for (name, spec) in specs {
-            let context = || format!("in [profile.{name}]");
-            Profile::resolve(name, specs).with_context(context)?;
+            let context = || Scope::default().text(format!("in [profile.{name}]"));
+            Profile::resolve(name, specs).at(context())?;
             if let Some(target) = &spec.target {
-                crate::platform::Platform::parse(target).with_context(context)?;
+                crate::platform::Platform::parse(target)
+                    .at(Scope::keys(&["profile", name]))
+                    .at(context())?;
             }
         }
 
@@ -238,7 +265,11 @@ impl Profile {
         if let Some(sanitize) = &spec.sanitize {
             if let Some(sanitizer) = sanitize.iter().find(|sanitizer| !SANITIZERS.contains(&sanitizer.as_str())) {
                 let hint = crate::util::did_you_mean(sanitizer, SANITIZERS.iter().copied());
-                bail!("sanitize: unknown sanitizer `{sanitizer}`{hint}; common ones are address, undefined, thread, memory and leak");
+                bail_at!(
+                    Place::key("sanitize").value(sanitizer),
+                    "invalid-value",
+                    "sanitize: unknown sanitizer `{sanitizer}`{hint}; common ones are address, undefined, thread, memory and leak"
+                );
             }
             self.sanitize = sanitize.clone();
         }

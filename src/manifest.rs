@@ -1,10 +1,12 @@
 //! The `anvil.toml` schema. Every table rejects unknown keys, so a typo is an error with a suggestion instead of a
 //! silently ignored setting.
 
+use crate::bail_at;
+use crate::located::{self, At, Located, Part, Place, Scope};
 use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -28,12 +30,19 @@ pub struct Manifest {
     #[serde(default)]
     pub options: IndexMap<String, toml::Value>,
     pub vcpkg: Option<VcpkgSpec>,
-    /// [[test]] tables, each with its cases expanded (crate::test_cases).
-    #[serde(default, deserialize_with = "deserialize_tests")]
+    /// [[test]] tables as written; `test` holds their tests.
+    #[serde(default, rename = "test")]
+    pub test_tables: Vec<toml::Table>,
+    /// The [[test]] tables' tests, each table with its cases expanded (crate::test_cases).
+    #[serde(skip)]
     pub test: Vec<TestSpec>,
     /// Files written before the build (what CMake writes at configure time).
     #[serde(default)]
     pub write: Vec<WriteSpec>,
+
+    /// The file it was read from (none for a package made from a folder's layout).
+    #[serde(skip)]
+    pub file: Option<PathBuf>,
 }
 
 /// `[[write]] path = "{out}/generated/list.txt", text = "..."`: rewritten only when the text changes.
@@ -366,6 +375,10 @@ pub struct TestSpec {
     pub reject: Option<Vec<String>>,
     /// The exit code that passes (default 0).
     pub exit_code: Option<i32>,
+
+    /// Which [[test]] table of its file it comes from.
+    #[serde(skip)]
+    pub table: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -525,13 +538,22 @@ pub fn parse_dep(name: &str, value: &toml::Value) -> Result<DepSpec> {
                 libs: Some(vec![name.into()]),
                 ..Default::default()
             }),
-            other => bail!(
+            other => bail_at!(
+                Place::keys(&["deps", name]).value(other),
+                "invalid-dependency",
                 "dependency `{name} = \"{other}\"`: the short form is \"vcpkg\", \"pkg-config\", \"cmake\" or \"system\"; \
                  otherwise use a table, e.g. {name} = {{ path = \"../{name}\" }} or {{ git = \"https://...\", tag = \"v1.0\" }}"
             ),
         },
         toml::Value::Table(_) => parse_dep_table(name, value),
-        _ => bail!("dependency `{name}`: expected a string or a table"),
+        _ => {
+            let place = Place::keys(&["deps", name]);
+            let place = match located::value_text(value) {
+                Some(text) => place.value(text),
+                None => place,
+            };
+            bail_at!(place, "invalid-dependency", "dependency `{name}`: expected a string or a table")
+        }
     }
 }
 
@@ -540,20 +562,36 @@ pub fn parse_options(options: &IndexMap<String, toml::Value>) -> Result<IndexMap
     let mut parsed = IndexMap::new();
 
     for (name, value) in options {
+        let option = Place::keys(&["options", name]);
         let default = match value {
             toml::Value::Boolean(default) => *default,
             toml::Value::Table(table) => {
                 if let Some(key) = table.keys().find(|key| !OPTION_KEYS.contains(&key.as_str())) {
                     let hint = crate::util::did_you_mean(key, OPTION_KEYS.iter().copied());
-                    bail!("option `{name}`: unknown key `{key}`{hint}; an option takes `default` and `description`");
+                    bail_at!(
+                        option.join(key),
+                        "bad-option",
+                        "option `{name}`: unknown key `{key}`{hint}; an option takes `default` and `description`"
+                    );
                 }
                 match (table.get("default"), table.get("description")) {
-                    (_, Some(description)) if !description.is_str() => bail!("option `{name}`: description must be a text"),
+                    (_, Some(description)) if !description.is_str() => bail_at!(
+                        with_value(option.join("description"), description),
+                        "bad-option",
+                        "option `{name}`: description must be a text"
+                    ),
                     (Some(toml::Value::Boolean(default)), _) => *default,
-                    _ => bail!("option `{name}`: expected `{name} = true|false` or `{name} = {{ default = true, description = \"...\" }}`"),
+                    (default, _) => bail_at!(
+                        match default {
+                            Some(default) => with_value(option.join("default"), default),
+                            None => option,
+                        },
+                        "bad-option",
+                        "option `{name}`: expected `{name} = true|false` or `{name} = {{ default = true, description = \"...\" }}`"
+                    ),
                 }
             }
-            _ => bail!("option `{name}`: expected true or false"),
+            _ => bail_at!(with_value(option, value), "bad-option", "option `{name}`: expected true or false"),
         };
         parsed.insert(name.clone(), default);
     }
@@ -567,51 +605,55 @@ pub fn parse_unity(value: &toml::Value) -> Result<Option<usize>> {
         toml::Value::Boolean(true) => Ok(Some(DEFAULT_UNITY_BATCH)),
         toml::Value::Boolean(false) => Ok(None),
         toml::Value::Integer(batch) if *batch >= 2 => Ok(Some(*batch as usize)),
-        toml::Value::Integer(batch) => bail!("unity = {batch}: a batch holds 2 files or more; write unity = false to turn it off"),
-        _ => bail!("unity: expected true, false or a number of files per batch"),
+        toml::Value::Integer(batch) => bail_at!(
+            Place::key("unity").value(batch.to_string()),
+            "invalid-value",
+            "unity = {batch}: a batch holds 2 files or more; write unity = false to turn it off"
+        ),
+        _ => bail_at!(
+            with_value(Place::key("unity"), value),
+            "invalid-value",
+            "unity: expected true, false or a number of files per batch"
+        ),
     }
 }
 
 pub fn load(path: &Path) -> Result<Manifest> {
     let text = crate::lsp::session::read_text(path).with_context(|| format!("reading {}", path.display()))?;
-    parse_str(&text).map_err(|error| anyhow::anyhow!("{}: {error}", crate::util::slash(path)))
+    let mut manifest = parse_str(&text).at(Scope::file(path).text(crate::util::slash(path)))?;
+    manifest.file = Some(path.to_path_buf());
+
+    Ok(manifest)
 }
 
 /// A tests.toml file: [[test]] tables only, kept next to what they test.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TestsFile {
-    #[serde(default, deserialize_with = "deserialize_tests")]
-    test: Vec<TestSpec>,
+    #[serde(default)]
+    test: Vec<toml::Table>,
 }
 
 pub fn load_tests(path: &Path) -> Result<Vec<TestSpec>> {
     let text = crate::lsp::session::read_text(path).with_context(|| format!("reading {}", path.display()))?;
-    parse_tests(&text).map_err(|error| anyhow::anyhow!("{}: {error}", crate::util::slash(path)))
+    parse_tests(&text).at(Scope::file(path).text(crate::util::slash(path)))
 }
 
 /// A tests.toml file's text.
 pub fn parse_tests(text: &str) -> Result<Vec<TestSpec>> {
     let file: TestsFile = toml::from_str(text)?;
-    Ok(file.test)
+    expand_tests(&file.test)
 }
 
 /// [[test]] tables, one test per case.
-fn deserialize_tests<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Vec<TestSpec>, D::Error> {
-    use serde::de::Error;
-
-    let tables = Vec::<toml::Table>::deserialize(deserializer)?;
+fn expand_tests(tables: &[toml::Table]) -> Result<Vec<TestSpec>> {
     let mut tests = Vec::new();
-    for table in &tables {
-        let expanded = crate::test_cases::expand(table).map_err(|error| D::Error::custom(format!("{error:#}")))?;
+
+    for (index, table) in tables.iter().enumerate() {
+        let expanded = crate::test_cases::expand(table).at(Scope::item("test", index))?;
         for test in expanded {
-            let name = test.get("name").and_then(|name| name.as_str()).unwrap_or("?").to_string();
-            let spec = TestSpec::deserialize(toml::Value::Table(test)).map_err(|error| D::Error::custom(format!("test `{name}`: {error}")))?;
-            if spec.command.to_command().is_empty() {
-                return Err(D::Error::custom(format!(
-                    "test `{name}`: `command` is empty; give the program and its arguments, such as [\"{{target:app}}\", \"--self-test\"]"
-                )));
-            }
+            let mut spec = test_spec(test).at(Scope::item("test", index))?;
+            spec.table = index;
             tests.push(spec);
         }
     }
@@ -619,21 +661,95 @@ fn deserialize_tests<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::
     Ok(tests)
 }
 
-/// A build step's command must name a program: an empty one is a mistake, not a step that does nothing.
-fn check_step_commands(table: &str, spec: &TargetSpec) -> Result<()> {
-    let commands = spec
-        .run
-        .iter()
-        .map(|run| ("run", &run.command))
-        .chain(spec.pre_build.iter().map(|step| ("pre-build", &step.command)))
-        .chain(spec.post_build.iter().map(|step| ("post-build", &step.command)));
-    for (key, command) in commands {
-        if command.to_command().is_empty() {
-            bail!("{table} [[{key}]]: `command` is empty; give the program and its arguments, such as [\"python\", \"tools/gen.py\"]");
+/// One test's table.
+fn test_spec(test: toml::Table) -> Result<TestSpec> {
+    let name = test.get("name").and_then(|name| name.as_str()).unwrap_or("?").to_string();
+    let probe = toml::Table::from_iter([("name".to_string(), "x".into()), ("command".to_string(), "x".into())]);
+    let spec = TestSpec::deserialize(toml::Value::Table(test.clone()))
+        .map_err(|error| table_error::<TestSpec>(&test, &error, &probe, &format!("test `{name}`: ")))?;
+
+    if spec.command.to_command().is_empty() {
+        bail_at!(
+            Place::key("command"),
+            "empty-command",
+            "test `{name}`: `command` is empty; give the program and its arguments, such as [\"{{target:app}}\", \"--self-test\"]"
+        );
+    }
+
+    Ok(spec)
+}
+
+/// A table's deserialize error, at the key it is about: an unknown one (with a did-you-mean), else the first whose
+/// value alone fails beside `probe` (the keys the table needs). `prefix` goes before serde's message.
+fn table_error<T: serde::de::DeserializeOwned>(table: &toml::Table, error: &toml::de::Error, probe: &toml::Table, prefix: &str) -> anyhow::Error {
+    let message = explain_unknown_key(error.message());
+
+    let unknown = regex::Regex::new(r"unknown field `([^`]+)`")
+        .unwrap()
+        .captures(&message)
+        .map(|captures| captures[1].to_string());
+    let place = match unknown {
+        Some(key) => Place::key(&key),
+        None => {
+            let failing = table.iter().find(|(key, value)| {
+                let mut alone = probe.clone();
+                alone.insert(key.to_string(), (*value).clone());
+                T::deserialize(toml::Value::Table(alone)).is_err()
+            });
+            match failing {
+                Some((key, value)) => with_value(Place::key(key), value),
+                None => Place::default(),
+            }
+        }
+    };
+
+    Located::new(place, serde_code(&message), format!("{prefix}{message}")).into()
+}
+
+/// The diagnostic code of serde's message.
+fn serde_code(message: &str) -> &'static str {
+    match message {
+        _ if message.starts_with("unknown field") => "unknown-key",
+        _ if message.starts_with("invalid type") => "wrong-type",
+        _ if message.starts_with("missing field") => "missing-key",
+        _ if message.starts_with("duplicate") => "duplicate-key",
+        _ => "invalid-value",
+    }
+}
+
+/// A place with the scalar value it is about, when the value is one.
+fn with_value(place: Place, value: &toml::Value) -> Place {
+    match located::value_text(value) {
+        Some(text) => place.value(text),
+        None => place,
+    }
+}
+
+/// A build step's command must name a program: an empty one is a mistake, not a step that does nothing. `path` is
+/// the table's key path.
+fn check_step_commands(table: &str, path: &[Part], spec: &TargetSpec) -> Result<()> {
+    let commands = [
+        ("run", spec.run.iter().map(|run| &run.command).collect::<Vec<_>>()),
+        ("pre-build", spec.pre_build.iter().map(|step| &step.command).collect()),
+        ("post-build", spec.post_build.iter().map(|step| &step.command).collect()),
+    ];
+    for (key, list) in commands {
+        for (index, command) in list.into_iter().enumerate() {
+            if command.to_command().is_empty() {
+                let mut place = path.to_vec();
+                place.extend([Part::Key(key.to_string()), Part::Index(index), Part::Key("command".to_string())]);
+                bail_at!(
+                    Place::absolute(place),
+                    "empty-command",
+                    "{table} [[{key}]]: `command` is empty; give the program and its arguments, such as [\"python\", \"tools/gen.py\"]"
+                );
+            }
         }
     }
     for (condition, block) in &spec.when {
-        check_step_commands(&format!("{table} when.\"{condition}\""), block)?;
+        let mut block_path = path.to_vec();
+        block_path.extend(located::keys(&["when", condition]));
+        check_step_commands(&format!("{table} when.\"{condition}\""), &block_path, block)?;
     }
 
     Ok(())
@@ -641,32 +757,45 @@ fn check_step_commands(table: &str, spec: &TargetSpec) -> Result<()> {
 
 pub fn parse_str(text: &str) -> Result<Manifest> {
     let error = match toml::from_str::<Manifest>(text) {
-        Ok(manifest) => {
-            // The name becomes target and folder names
-            if let Some(name) = manifest.project.as_ref().and_then(|project| project.name.as_deref()) {
-                if name.contains(['/', '\\']) || name.trim().is_empty() {
-                    bail!("[project] name = \"{name}\": a name cannot be empty or hold `/` or `\\` (it names the main target)");
-                }
-            }
-            check_step_commands("[defaults]", &manifest.defaults)?;
-            for (table, specs) in [("target", &manifest.target), ("preset", &manifest.preset)] {
-                for (name, spec) in specs {
-                    check_step_commands(&format!("[{table}.{name}]"), spec)?;
-                }
-            }
-            return Ok(manifest);
-        }
+        Ok(manifest) => return finish(manifest),
         Err(error) => error,
     };
 
     bail!("{}", explain_unknown_key(&error.to_string()))
 }
 
+/// A manifest's checks after its tables parse: its tests expanded, its name, its build steps' commands.
+pub fn finish(mut manifest: Manifest) -> Result<Manifest> {
+    manifest.test = expand_tests(&manifest.test_tables)?;
+
+    // The name becomes target and folder names
+    if let Some(name) = manifest.project.as_ref().and_then(|project| project.name.as_deref()) {
+        if name.contains(['/', '\\']) || name.trim().is_empty() {
+            bail_at!(
+                Place::keys(&["project", "name"]).value(name),
+                "invalid-name",
+                "[project] name = \"{name}\": a name cannot be empty or hold `/` or `\\` (it names the main target)"
+            );
+        }
+    }
+    check_step_commands("[defaults]", &located::keys(&["defaults"]), &manifest.defaults)?;
+    for (table, specs) in [("target", &manifest.target), ("preset", &manifest.preset)] {
+        for (name, spec) in specs {
+            check_step_commands(&format!("[{table}.{name}]"), &located::keys(&[table, name]), spec)?;
+        }
+    }
+
+    Ok(manifest)
+}
+
 fn parse_dep_table(name: &str, value: &toml::Value) -> Result<DepSpec> {
+    let table = value.as_table().cloned().unwrap_or_default();
     let spec: DepSpec = value
         .clone()
         .try_into()
-        .map_err(|error: toml::de::Error| anyhow::anyhow!("dependency `{name}`: {}", error.message()))?;
+        .map_err(|error: toml::de::Error| table_error::<DepSpec>(&table, &error, &toml::Table::new(), &format!("dependency `{name}`: ")))
+        .at(Scope::keys(&["deps", name]))?;
+    let entry = |key: &str| Place::keys(&["deps", name, key]);
 
     // Exactly one origin, or a prebuilt include/libs description
     let origins = [
@@ -678,13 +807,17 @@ fn parse_dep_table(name: &str, value: &toml::Value) -> Result<DepSpec> {
     ];
     let given_origins: Vec<&str> = origins.iter().filter(|(_, given)| *given).map(|(key, _)| *key).collect();
     if given_origins.len() > 1 {
-        bail!(
+        bail_at!(
+            entry(given_origins[1]),
+            "invalid-dependency",
             "dependency `{name}`: give only one of vcpkg, path, git, pkg-config and cmake, not {}",
             given_origins.join(" and ")
         );
     }
     if given_origins.is_empty() && spec.include.is_none() && spec.libs.is_none() {
-        bail!(
+        bail_at!(
+            Place::keys(&["deps", name]),
+            "invalid-dependency",
             "dependency `{name}`: say where it comes from: vcpkg = \"{name}\", path = \"...\", git = \"...\", pkg-config = \"...\", \
              cmake = \"<Package>\" (an installed CMake package), or include/libs for a prebuilt one"
         );
@@ -695,13 +828,27 @@ fn parse_dep_table(name: &str, value: &toml::Value) -> Result<DepSpec> {
     let references = [("tag", &spec.tag), ("branch", &spec.branch), ("rev", &spec.rev)];
     let given: Vec<&str> = references.iter().filter(|(_, value)| value.is_some()).map(|(key, _)| *key).collect();
     if given.len() > 1 {
-        bail!("dependency `{name}`: give one of tag, branch and rev, not {}", given.join(" and "));
+        bail_at!(
+            entry(given[1]),
+            "invalid-dependency",
+            "dependency `{name}`: give one of tag, branch and rev, not {}",
+            given.join(" and ")
+        );
     }
     if let (Some(key), None) = (given.first(), &spec.git) {
-        bail!("dependency `{name}`: `{key}` picks a commit of a git dependency; this one has no `git`");
+        bail_at!(
+            entry(key),
+            "invalid-dependency",
+            "dependency `{name}`: `{key}` picks a commit of a git dependency; this one has no `git`"
+        );
     }
     if spec.vcpkg.is_none() && (!spec.features.is_empty() || spec.default_features.is_some()) {
-        bail!("dependency `{name}`: `features` and `default-features` are vcpkg's; this one has no `vcpkg`");
+        let key = if spec.features.is_empty() { "default-features" } else { "features" };
+        bail_at!(
+            entry(key),
+            "invalid-dependency",
+            "dependency `{name}`: `features` and `default-features` are vcpkg's; this one has no `vcpkg`"
+        );
     }
     let cmake_keys = [
         ("components", spec.components.is_some()),
@@ -710,16 +857,29 @@ fn parse_dep_table(name: &str, value: &toml::Value) -> Result<DepSpec> {
         ("prefix", spec.prefix.is_some()),
     ];
     if let (Some((key, _)), None) = (cmake_keys.iter().find(|(_, given)| *given), &spec.cmake) {
-        bail!("dependency `{name}`: `{key}` belongs to an installed CMake package; this one has no `cmake = \"<Package>\"`");
+        bail_at!(
+            entry(key),
+            "invalid-dependency",
+            "dependency `{name}`: `{key}` belongs to an installed CMake package; this one has no `cmake = \"<Package>\"`"
+        );
     }
     if let Some(version) = &spec.version {
         if crate::cmake_package::parse_version(version).is_none() {
-            bail!("dependency `{name}`: version = \"{version}\" is not a version; write numbers such as \"1.2\" or \"6.5.3\" (the oldest compatible one)");
+            bail_at!(
+                entry("version").value(version),
+                "invalid-dependency",
+                "dependency `{name}`: version = \"{version}\" is not a version; write numbers such as \"1.2\" or \"6.5.3\" (the oldest compatible one)"
+            );
         }
     }
     if !source_package {
         if spec.target.is_some() || spec.sources.is_some() {
-            bail!("dependency `{name}`: `target` and `sources` belong to a path or git dependency");
+            let key = if spec.target.is_some() { "target" } else { "sources" };
+            bail_at!(
+                entry(key),
+                "invalid-dependency",
+                "dependency `{name}`: `target` and `sources` belong to a path or git dependency"
+            );
         }
     } else {
         let prebuilt_keys = [
@@ -730,7 +890,9 @@ fn parse_dep_table(name: &str, value: &toml::Value) -> Result<DepSpec> {
             ("runtime", spec.runtime.is_some()),
         ];
         if let Some((key, _)) = prebuilt_keys.iter().find(|(_, given)| *given) {
-            bail!(
+            bail_at!(
+                entry(key),
+                "invalid-dependency",
                 "dependency `{name}`: `{key}` describes a prebuilt or vcpkg library, not a path or git package; \
                  put it in the package's anvil.toml (a target's public settings) instead"
             );

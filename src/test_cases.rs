@@ -16,6 +16,8 @@
 //! the template's text; a list parameter fills a whole list item (`"{path-args}"` becomes its words) or is joined:
 //! `{path-args:@@}`. `{name}` is the test's name.
 
+use crate::bail_at;
+use crate::located::{self, At, Part, Place};
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 
@@ -51,25 +53,40 @@ pub fn expand(table: &toml::Table) -> Result<Vec<toml::Table>> {
         return Ok(vec![table.clone()]);
     };
     let Some(matrix) = matrix.as_table() else {
-        bail!("[[test]] matrix: expected a table of axes (`matrix.view = [\"a\", \"b\"]`)");
+        let place = match located::value_text(matrix) {
+            Some(text) => Place::key("matrix").value(text),
+            None => Place::key("matrix"),
+        };
+        bail_at!(
+            place,
+            "invalid-matrix",
+            "[[test]] matrix: expected a table of axes (`matrix.view = [\"a\", \"b\"]`)"
+        );
     };
 
     let mut template = table.clone();
     template.remove("matrix");
 
     // Every combination: one entry of each axis, the first axis outermost
-    let mut combinations: Vec<Vec<(&str, &toml::Value)>> = vec![Vec::new()];
+    let mut combinations: Vec<Vec<(&str, usize, &toml::Value)>> = vec![Vec::new()];
     for (axis, entries) in matrix {
         let entries = match entries.as_array() {
             Some(entries) if !entries.is_empty() => entries,
-            _ => bail!("[[test]] matrix.{axis}: expected a list of entries"),
+            _ => {
+                let place = Place::keys(&["matrix", axis]);
+                let place = match located::value_text(entries) {
+                    Some(text) => place.value(text),
+                    None => place,
+                };
+                bail_at!(place, "invalid-matrix", "[[test]] matrix.{axis}: expected a list of entries")
+            }
         };
         combinations = combinations
             .into_iter()
             .flat_map(|combination| {
-                entries.iter().map(move |entry| {
+                entries.iter().enumerate().map(move |(index, entry)| {
                     let mut combination = combination.clone();
-                    combination.push((axis.as_str(), entry));
+                    combination.push((axis.as_str(), index, entry));
                     combination
                 })
             })
@@ -89,14 +106,20 @@ pub fn expand(table: &toml::Table) -> Result<Vec<toml::Table>> {
         if twin.is_some() {
             let name = test.get("name").and_then(|name| name.as_str()).unwrap_or_default();
             let Some(pattern) = template.get("name").and_then(|name| name.as_str()) else {
-                bail!("[[test]] matrix: two of its entries name their tests `{name}`; test names must be unique");
+                bail_at!(
+                    Place::key("matrix").value(name),
+                    "invalid-matrix",
+                    "[[test]] matrix: two of its entries name their tests `{name}`; test names must be unique"
+                );
             };
             let missing: Vec<String> = matrix
                 .keys()
                 .filter(|axis| !pattern.contains(&format!("{{{axis}}}")))
                 .map(|axis| format!("{{{axis}}}"))
                 .collect();
-            bail!(
+            bail_at!(
+                Place::key("name").value(pattern),
+                "invalid-matrix",
                 "[[test]] `{pattern}`: its matrix makes two tests named `{name}`; put every axis in the name pattern (not in it: {})",
                 missing.join(", ")
             );
@@ -106,25 +129,34 @@ pub fn expand(table: &toml::Table) -> Result<Vec<toml::Table>> {
     Ok(tests)
 }
 
-fn expand_combination(template: &toml::Table, combination: &[(&str, &toml::Value)]) -> Result<toml::Table> {
-    // The entries' parameters and test keys, each set once
+fn expand_combination(template: &toml::Table, combination: &[(&str, usize, &toml::Value)]) -> Result<toml::Table> {
+    // The entries' parameters (with where each is) and test keys, each set once
     let mut parameters: Vec<(String, Parameter)> = Vec::new();
+    let mut places: Vec<Place> = Vec::new();
     let mut keys = toml::Table::new();
-    for (axis, entry) in combination {
-        let entry = match entry {
-            toml::Value::Table(table) => table.clone(),
-            text => toml::Table::from_iter([(axis.to_string(), (*text).clone())]),
+    for (axis, index, entry) in combination {
+        let entry_place = Place {
+            path: vec![Part::Key("matrix".into()), Part::Key(axis.to_string()), Part::Index(*index)],
+            ..Default::default()
+        };
+        let (entry, is_table) = match entry {
+            toml::Value::Table(table) => (table.clone(), true),
+            text => (toml::Table::from_iter([(axis.to_string(), (*text).clone())]), false),
         };
         for (key, value) in entry {
+            let place = if is_table { entry_place.clone().join(&key) } else { entry_place.clone() };
             let taken = keys.contains_key(&key) || parameters.iter().any(|(name, _)| *name == key);
             if taken {
-                bail!("[[test]] matrix: two entries of one test set `{key}`");
+                bail_at!(place, "invalid-matrix", "[[test]] matrix: two entries of one test set `{key}`");
             }
             if TEST_KEYS.contains(&key.as_str()) {
                 keys.insert(key, value);
             } else {
-                let parameter = parameter(&value).with_context(|| format!("[[test]] matrix.{axis}: `{key}`"))?;
+                let parameter = parameter(&value)
+                    .map_err(|error| error.context(format!("[[test]] matrix.{axis}: `{key}`")))
+                    .located(place.clone(), "invalid-matrix")?;
                 parameters.push((key, parameter));
+                places.push(place);
             }
         }
     }
@@ -137,7 +169,11 @@ fn expand_combination(template: &toml::Table, combination: &[(&str, &toml::Value
     };
     let name = keys.get("name").or(template.get("name")).and_then(|name| name.as_str());
     let Some(name) = name.map(|name| filler.fill_text(name)) else {
-        bail!("[[test]] with a matrix: give it a `name` pattern (`name = \"stills_{{view}}\"`) or name every entry");
+        bail_at!(
+            Place::key("matrix"),
+            "invalid-matrix",
+            "[[test]] with a matrix: give it a `name` pattern (`name = \"stills_{{view}}\"`) or name every entry"
+        );
     };
     filler.name = name.clone();
 
@@ -148,8 +184,11 @@ fn expand_combination(template: &toml::Table, combination: &[(&str, &toml::Value
     test.insert("name".to_string(), toml::Value::String(name.clone()));
 
     // A parameter nothing uses is a typo
-    if let Some((unused, _)) = parameters.iter().find(|(key, _)| !filler.used.contains(key.as_str())) {
-        bail!(
+    if let Some(position) = parameters.iter().position(|(key, _)| !filler.used.contains(key.as_str())) {
+        let unused = &parameters[position].0;
+        bail_at!(
+            places[position].clone(),
+            "invalid-matrix",
             "test `{name}`: parameter `{unused}` is used nowhere in its [[test]] (a test key? those are: {})",
             TEST_KEYS.join(", ")
         );

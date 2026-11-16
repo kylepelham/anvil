@@ -280,8 +280,10 @@ impl<'a> Server<'a> {
                 std::thread::sleep(Duration::from_millis(delay));
             }
 
-            // Reported whatever happens: pulls wait for it
-            let found = std::panic::catch_unwind(|| crate::toolchain::Toolchain::find(requested.as_deref(), &crate::platform::Platform::host()));
+            // Reported whatever happens: pulls wait for it. In a session of its own: its warnings (an unusable CXX) are
+            // the checks' to report
+            let find = || crate::toolchain::Toolchain::find(requested.as_deref(), &crate::platform::Platform::host());
+            let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session::run(session::Session::default(), find).0));
             match found {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => eprintln!("anvil lsp: no compiler found ({error:#}); checks that need one are skipped"),

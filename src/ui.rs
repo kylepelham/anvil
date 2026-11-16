@@ -51,7 +51,23 @@ pub fn status(verb: &str, message: &str) {
 }
 
 pub fn warn(message: &str) {
-    if crate::lsp::session::capture_warning(message) {
+    if crate::lsp::session::capture_warning(message, None) {
+        return;
+    }
+    print_line(&format!("{} {message}", paint(YELLOW, "warning:")));
+}
+
+/// A warning about a place in a manifest: printed as `warn` prints it, marked there by the language server.
+pub fn warn_at(place: crate::located::Place, code: &'static str, message: &str) {
+    if crate::lsp::session::capture_warning(message, Some((place, code))) {
+        return;
+    }
+    print_line(&format!("{} {message}", paint(YELLOW, "warning:")));
+}
+
+/// A warning said once per run (`warned` is its own flag); under the language server, in every check.
+pub fn warn_once(warned: &AtomicBool, message: &str) {
+    if crate::lsp::session::capture_warning(message, None) || warned.swap(true, Ordering::Relaxed) {
         return;
     }
     print_line(&format!("{} {message}", paint(YELLOW, "warning:")));

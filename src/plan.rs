@@ -778,6 +778,7 @@ impl<'a> Planner<'a> {
             cxx: &model.toolchain.cxx,
             cc: &model.toolchain.cc,
             condition: &model.condition,
+            file: package.manifest.file.as_deref(),
         }
     }
 

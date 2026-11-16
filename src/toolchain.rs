@@ -84,7 +84,11 @@ impl Family {
             "clang-cl" => Family::ClangCl,
             "clang" => Family::Clang,
             "gcc" | "g++" | "mingw" => Family::Gcc,
-            other => bail!("unknown toolchain `{other}` (expected msvc, clang-cl, clang or gcc)"),
+            other => crate::bail_at!(
+                crate::located::Place::default().value(other),
+                "toolchain",
+                "unknown toolchain `{other}` (expected msvc, clang-cl, clang or gcc)"
+            ),
         })
     }
 
@@ -370,17 +374,16 @@ fn without_launcher(text: &str) -> String {
         .to_string()
 }
 
-/// Says once that CXX is set to a compiler Anvil cannot use, so it chooses one itself.
+/// Says once that CXX is set to a compiler Anvil cannot use, so it chooses one itself (under the language server, in
+/// every check).
 fn warn_unusable_cxx(reason: &str) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
 
     let cxx = std::env::var("CXX").unwrap_or_default();
-    crate::ui::warn(&format!(
-        "CXX={cxx} is not used: {reason}. Choosing a compiler automatically (unset CXX, or pass --toolchain)"
-    ));
+    crate::ui::warn_once(
+        &WARNED,
+        &format!("CXX={cxx} is not used: {reason}. Choosing a compiler automatically (unset CXX, or pass --toolchain)"),
+    );
 }
 
 /// A program by name (on PATH) or path, made absolute.

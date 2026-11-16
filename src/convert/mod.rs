@@ -121,7 +121,7 @@ fn check_output(conversion: &Conversion) -> Result<()> {
 
     // anvil.toml: the words its conditions may use
     let manifest =
-        crate::manifest::parse_str(&conversion.toml).map_err(|error| anyhow!("the converted anvil.toml does not load ({BUG}):\n{error}"))?;
+        crate::manifest::parse_str(&conversion.toml).map_err(|error| anyhow!("the converted anvil.toml does not load ({BUG}):\n{error:#}"))?;
     let options: Vec<String> = manifest.options.keys().cloned().collect();
     let profiles: Vec<String> = manifest.profile.keys().cloned().collect();
     crate::cond::check_names(&profiles, &options).map_err(|error| anyhow!("the converted anvil.toml: {error} ({BUG})"))?;
@@ -132,7 +132,7 @@ fn check_output(conversion: &Conversion) -> Result<()> {
 
     let mut files = vec![("anvil.toml".to_string(), conversion.toml.as_str())];
     for (path, text) in &conversion.tests_files {
-        crate::manifest::parse_tests(text).map_err(|error| anyhow!("the converted {} does not load ({BUG}):\n{error}", slash(path)))?;
+        crate::manifest::parse_tests(text).map_err(|error| anyhow!("the converted {} does not load ({BUG}):\n{error:#}", slash(path)))?;
         files.push((slash(path), text.as_str()));
     }
 

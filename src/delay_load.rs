@@ -3,6 +3,8 @@
 //! the binary imports nothing from (a misspelt name, an import library not linked), link.exe with a warning (LNK4199)
 //! and lld-link silently.
 
+use crate::bail_at;
+use crate::located::Place;
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::path::Path;
@@ -22,22 +24,40 @@ pub fn check_names(names: &[String]) -> Result<()> {
         let file_name = name.rsplit(['/', '\\', ':']).next().unwrap_or(name);
 
         if name.trim().is_empty() || name.trim() != name {
-            bail!("delay-load = [\"{name}\"]: write the DLL's file name alone, such as \"nvml.dll\"");
+            bail_at!(
+                Place::key("delay-load").value(name),
+                "invalid-delay-load",
+                "delay-load = [\"{name}\"]: write the DLL's file name alone, such as \"nvml.dll\""
+            );
         }
         if file_name != name {
-            bail!("delay-load = [\"{name}\"]: name the DLL's file without a folder (\"{file_name}\"); Windows finds it at run time as any DLL");
+            bail_at!(
+                Place::key("delay-load").value(name),
+                "invalid-delay-load",
+                "delay-load = [\"{name}\"]: name the DLL's file without a folder (\"{file_name}\"); Windows finds it at run time as any DLL"
+            );
         }
         if let Some(stem) = [".lib", ".a"].iter().find_map(|extension| lowered.strip_suffix(extension)) {
-            bail!(
+            bail_at!(
+                Place::key("delay-load").value(name),
+                "invalid-delay-load",
                 "delay-load = [\"{name}\"]: name the DLL (\"{}.dll\"), not its import library, which `libs` or `deps` links",
                 &name[..stem.len()]
             );
         }
         if !lowered.ends_with(".dll") || lowered == ".dll" {
-            bail!("delay-load = [\"{name}\"]: name the DLL's file with its extension (\"{name}.dll\")");
+            bail_at!(
+                Place::key("delay-load").value(name),
+                "invalid-delay-load",
+                "delay-load = [\"{name}\"]: name the DLL's file with its extension (\"{name}.dll\")"
+            );
         }
         if !seen.insert(lowered) {
-            bail!("delay-load = [\"{name}\"]: listed twice");
+            bail_at!(
+                Place::key("delay-load").value(name),
+                "invalid-delay-load",
+                "delay-load = [\"{name}\"]: listed twice"
+            );
         }
     }
 

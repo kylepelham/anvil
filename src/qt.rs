@@ -1009,7 +1009,7 @@ fn candidate_headers(model: &Model, target: &Target, sources: &[PathBuf]) -> Res
         if !walked.insert((util::path_key(folder), pattern.clone())) {
             continue;
         }
-        for header in targets::expand_pattern_list(folder, &[pattern], &model.out_root, false, false)? {
+        for header in targets::expand_pattern_list(folder, &[pattern], &model.out_root, false, false, None)? {
             let name = stem(&header).to_lowercase();
             let base = name.strip_suffix("_p").unwrap_or(&name);
             if names.contains(base) {
@@ -1044,7 +1044,7 @@ fn conventional_files(model: &Model, target: &Target) -> Result<Vec<PathBuf>> {
         true => "src/**/*.{ui,qrc}",
         false => "*.{ui,qrc}",
     };
-    let found = targets::expand_pattern_list(&target.dir, &[pattern.to_string()], &model.out_root, false, false)?;
+    let found = targets::expand_pattern_list(&target.dir, &[pattern.to_string()], &model.out_root, false, false, None)?;
     Ok(found
         .into_iter()
         .filter(|file| !target.sources.iter().any(|source| util::path_key(source) == util::path_key(file)))
