@@ -738,7 +738,8 @@ pub fn substitute_targets(word: &str, model: &Model) -> Result<String> {
         }
     }
 
-    Ok(result)
+    // The other placeholders of a target's files ({target-dir:X})
+    plan::substitute_targets(&result, model)
 }
 
 /// Writes one IDE's files.

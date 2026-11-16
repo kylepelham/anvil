@@ -295,6 +295,8 @@ pub struct BuiltinState {
     pub package_options: Vec<String>,
     /// Imported programs of found packages (Python3::Interpreter), as the program a command runs.
     pub imported_programs: HashMap<String, String>,
+    /// Folders file(MAKE_DIRECTORY) makes at configure time, with where: one nothing else makes is a TODO.
+    pub made_folders: Vec<(String, PathBuf)>,
 }
 
 /// Where an optional find_package() finds its package.
@@ -1438,21 +1440,23 @@ impl Interpreter {
                     Some(content) if operation == "CONFIGURE" => {
                         let (only_at, escape_quotes) = (keywords.has("@ONLY"), keywords.has("ESCAPE_QUOTES"));
                         let variants = self.configure_variants(command, "CONTENT", &content, only_at, escape_quotes, is_c_family(&path));
+                        let variants = with_newline_style(variants, keywords.value("NEWLINE_STYLE").as_deref());
                         self.record_variants(command, &path, variants);
                     }
                     content => self.record_write(command, path, content, false),
                 }
             }
             "COPY" => {
-                let files: Vec<&String> = rest.iter().take_while(|word| *word != "DESTINATION").collect();
-                let destination = rest.iter().skip_while(|word| *word != "DESTINATION").nth(1).cloned().unwrap_or_default();
-                self.warn(
-                    command,
-                    &format!(
-                        "file(COPY) of {} file(s) or folder(s) to {destination} at configure time is not converted; copy them with a build step, or read them where they are",
-                        files.len()
-                    ),
-                );
+                if let Err(reason) = self.file_copy(rest) {
+                    let files = rest.iter().take_while(|word| *word != "DESTINATION").count();
+                    let destination = rest.iter().skip_while(|word| *word != "DESTINATION").nth(1).cloned().unwrap_or_default();
+                    self.warn(
+                        command,
+                        &format!(
+                            "file(COPY) of {files} file(s) or folder(s) to {destination} at configure time is not converted ({reason}); copy them with a build step, or read them where they are"
+                        ),
+                    );
+                }
             }
             "DOWNLOAD" | "UPLOAD" => self.warn(command, &format!("file({operation}) is not converted")),
             "COPY_FILE" => {
@@ -1463,16 +1467,31 @@ impl Interpreter {
                 );
             }
 
-            // Changes to the file system that a configure does but conversion must not
+            "MAKE_DIRECTORY" => {
+                let location = self.location(command);
+                let folders: Vec<PathBuf> = rest.iter().map(|folder| self.resolve_path(folder)).collect();
+                self.builtin
+                    .made_folders
+                    .extend(folders.into_iter().map(|folder| (location.clone(), folder)));
+            }
+            "TOUCH" | "CREATE_LINK" | "RENAME" | "ARCHIVE_EXTRACT" => {
+                self.warn(
+                    command,
+                    &format!("file({operation}) at configure time is not converted; do it with a build step"),
+                );
+            }
+
+            // Changes to the file system that a converted build does not need: removing what an earlier configure
+            // made, permissions, locks, install-time work
             _ => {}
         }
     }
 
     /// A file written at configure time; APPEND adds to an earlier write of the same file.
     fn record_write(&mut self, command: &Command, path: PathBuf, text: Option<String>, append: bool) {
-        // Text made from a process's output, or from something not found, is not known now
+        // Text made from a process's output is not known now (one holding something not found is written, with a TODO)
         let unknown = self.calls_ran_process.iter().any(|ran| *ran);
-        let text = text.filter(|text| !unknown && !text.contains("-NOTFOUND"));
+        let text = text.filter(|_| !unknown);
 
         let key = util::path_key(&path);
         let earlier = self.configure_writes.iter_mut().rfind(|write| util::path_key(&write.path) == key);
@@ -2243,6 +2262,8 @@ impl Interpreter {
         } else {
             self.configure_variants(command, input, &template, has("@ONLY"), has("ESCAPE_QUOTES"), is_c_family(&output_path))
         };
+        let newline_style = flags.iter().skip_while(|word| *word != "NEWLINE_STYLE").nth(1);
+        let variants = with_newline_style(variants, newline_style.map(String::as_str));
         let unchanged = matches!(variants.as_slice(), [(None, text)] if *text == template);
         if unchanged && !from_build && template.lines().count() > LARGE_WRITE_LINES {
             self.add_copy_step(&input_path, &output_path);
@@ -2496,6 +2517,78 @@ impl Interpreter {
             target: None,
             stage: None,
         });
+    }
+
+    /// file(COPY) of the project's files and folders into the build folder: a copy step for each file, so the build
+    /// copies them (again when they change). PATTERN/FILES_MATCHING choose files by name; an error says why not.
+    fn file_copy(&mut self, args: &[String]) -> std::result::Result<(), String> {
+        let sources: Vec<&String> = args.iter().take_while(|word| *word != "DESTINATION").collect();
+        let options: Vec<&String> = args.iter().skip_while(|word| *word != "DESTINATION").skip(2).collect();
+        let destination = args.iter().skip_while(|word| *word != "DESTINATION").nth(1).ok_or("no DESTINATION")?;
+        let destination = self.resolve_path(destination);
+        if !slash(&destination).starts_with("{out}") {
+            return Err("its destination is not in the build folder".into());
+        }
+
+        // PATTERN <glob> [EXCLUDE], FILES_MATCHING; permissions do not matter to a copy
+        let files_matching = options.iter().any(|word| *word == "FILES_MATCHING");
+        let (mut included, mut excluded) = (Vec::new(), Vec::new());
+        let mut words = options.iter().peekable();
+        while let Some(word) = words.next() {
+            match word.as_str() {
+                "PATTERN" => {
+                    let pattern = words.next().ok_or("PATTERN without a pattern")?;
+                    let glob = globset::Glob::new(pattern).map_err(|_| format!("PATTERN {pattern}"))?.compile_matcher();
+                    match words.peek().map(|word| word.as_str()) {
+                        Some("EXCLUDE") => excluded.push(glob),
+                        _ => included.push(glob),
+                    }
+                }
+                "REGEX" => return Err("REGEX".into()),
+                _ => {}
+            }
+        }
+        let excluded_name = |name: &str| excluded.iter().any(|glob| glob.is_match(name));
+        let included_name = |name: &str| !files_matching || included.iter().any(|glob| glob.is_match(name));
+
+        // Each file and where it goes: a folder's own name stays unless it ends in `/`
+        let mut copies = Vec::new();
+        for source in sources {
+            let path = self.resolve_path(source);
+            if util::strip_prefix_ci(&util::normalize(&path), &self.root).is_none() {
+                return Err(format!("{source} is not in the project"));
+            }
+            if path.is_file() {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                if !excluded_name(&name) && included_name(&name) {
+                    copies.push((path.clone(), destination.join(&name)));
+                }
+                continue;
+            }
+            if !path.is_dir() {
+                return Err(format!("{source} does not exist when converting"));
+            }
+            let target_folder = match source.ends_with('/') {
+                true => destination.clone(),
+                false => destination.join(path.file_name().unwrap_or_default()),
+            };
+            let walk = walkdir::WalkDir::new(&path).sort_by_file_name().into_iter();
+            let entries = walk.filter_entry(|entry| entry.depth() == 0 || !excluded_name(&entry.file_name().to_string_lossy()));
+            for entry in entries.filter_map(|entry| entry.ok()).filter(|entry| entry.file_type().is_file()) {
+                if included_name(&entry.file_name().to_string_lossy()) {
+                    let relative = entry.path().strip_prefix(&path).unwrap_or(entry.path());
+                    copies.push((entry.path().to_path_buf(), target_folder.join(relative)));
+                }
+            }
+        }
+
+        if copies.len() > LARGE_COPY_FILES {
+            return Err(format!("{} files, more than {LARGE_COPY_FILES}", copies.len()));
+        }
+        for (from, to) in copies {
+            self.add_copy_step(&from, &PathBuf::from(slash(&to)));
+        }
+        Ok(())
     }
 
     fn command_execute_process(&mut self, command: &Command, args: &[String]) {
@@ -2779,6 +2872,9 @@ impl Interpreter {
 
 // configure_file outputs up to this many lines are written into anvil.toml; a larger unchanged copy is a copy step
 const LARGE_WRITE_LINES: usize = 200;
+
+// file(COPY) of up to this many files becomes copy steps; more is left for the user (a data folder to read in place)
+const LARGE_COPY_FILES: usize = 100;
 
 // A configured file depending on more conditions than this (outside `#if`) is written as on this machine
 const MAX_VARIANT_CONDITIONS: usize = 3;
@@ -3681,6 +3777,18 @@ fn is_c_family(path: &Path) -> bool {
         .unwrap_or_default();
 
     ["h", "hh", "hpp", "hxx", "inl", "ipp", "c", "cc", "cpp", "cxx"].contains(&extension.as_str())
+}
+
+/// Configured texts with the line endings NEWLINE_STYLE asks for: CRLF (also WIN32 and DOS), else as written (LF).
+fn with_newline_style(variants: Vec<(Option<String>, String)>, style: Option<&str>) -> Vec<(Option<String>, String)> {
+    if !matches!(style, Some("CRLF" | "WIN32" | "DOS")) {
+        return variants;
+    }
+
+    variants
+        .into_iter()
+        .map(|(condition, text)| (condition, text.replace("\r\n", "\n").replace('\n', "\r\n")))
+        .collect()
 }
 
 /// Is a configured file one only an install or an IDE uses (pkg-config files, package config files, uninstall

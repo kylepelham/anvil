@@ -1658,6 +1658,41 @@ impl Interpreter {
         let multi = ["OUTPUT", "COMMAND", "DEPENDS", "BYPRODUCTS", "IMPLICIT_DEPENDS"];
         let keywords = Keywords::parse(args, &flags, &single, &multi);
 
+        // Words branches added under a condition Anvil keeps (`if(OPTION)`, `if(WIN32)`): one step per version, under
+        // its condition, rather than this machine's words everywhere
+        if !keywords.has("APPEND") {
+            let groups: Vec<String> = keywords.groups("COMMAND").iter().map(|words| words.join(";")).collect();
+            let texts: Vec<&str> = groups.iter().map(String::as_str).collect();
+            if let Some(versions) = super::interp::texts_versions(&texts).filter(|versions| versions.len() > 1) {
+                let keyword_words: Vec<&str> = flags.iter().chain(&single).chain(&multi).copied().collect();
+                for (condition, version) in versions {
+                    let Truth::Depends(condition) = condition else { continue };
+                    let mut version_args: Vec<String> = Vec::new();
+                    let mut groups = version.iter();
+                    let mut in_command = false;
+                    for arg in args {
+                        if arg == "COMMAND" {
+                            version_args.push(arg.clone());
+                            version_args.extend(groups.next().map(|text| model::list_elements(text)).unwrap_or_default());
+                            in_command = true;
+                            continue;
+                        }
+                        if keyword_words.contains(&arg.as_str()) {
+                            in_command = false;
+                        }
+                        if !in_command {
+                            version_args.push(arg.clone());
+                        }
+                    }
+                    let before = self.custom_commands.len();
+                    self.command_add_custom_command(command, &version_args);
+                    for added in &mut self.custom_commands[before..] {
+                        added.condition = model::and_optional(&added.condition, &Some(condition.clone()));
+                    }
+                }
+                return;
+            }
+        }
         let mut commands: Vec<Vec<String>> = keywords
             .groups("COMMAND")
             .iter()

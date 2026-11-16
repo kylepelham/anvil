@@ -834,10 +834,10 @@ fn run_action(index: usize, action: &Action, low_priority: bool) -> Outcome {
         return outcome;
     }
 
-    // Stamps mark that a pre-build or post-build command ran
+    // Stamps mark that a pre-build or post-build command ran, and when (an action the stamp is an input of runs again)
     if action.stamp {
         for stamp in &action.outputs {
-            if let Err(error) = std::fs::write(stamp, b"") {
+            if let Err(error) = std::fs::write(stamp, util::now_ticks().to_string()) {
                 outcome.success = false;
                 outcome.error = Some(format!("{}: writing {}: {error}", action.description, stamp.display()));
                 return outcome;

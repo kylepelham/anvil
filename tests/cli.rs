@@ -6092,3 +6092,64 @@ fn environment_variables_in_definitions_and_flags() {
         .code(1)
         .contains("in [target.app]: \"{env:ANVIL_IT_EMPTY}\" is empty once its environment variables are filled in");
 }
+
+// 75. A converted CMake project's build steps name targets' files ($<TARGET_FILE_DIR:x>, $<TARGET_LINKER_FILE:x>,
+//     $<TARGET_PDB_FILE:x>; a post-build step its own target's) and CMake's file name suffixes, and file(CONFIGURE)
+//     writes its file; a generator expression Anvil cannot read is a TODO the summary counts
+
+const TARGET_FILES_CMAKE: &str = r#"cmake_minimum_required(VERSION 3.20)
+project(target_files C)
+add_library(shared SHARED lib.c)
+add_executable(app main.c)
+target_link_libraries(app PRIVATE shared)
+add_custom_command(TARGET app PRE_LINK COMMAND ${CMAKE_COMMAND} -E rm -f $<TARGET_PDB_FILE:app> VERBATIM)
+add_custom_command(TARGET app POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:app> $<TARGET_FILE_DIR:app>/copy_$<TARGET_FILE_NAME:app>)
+add_custom_command(TARGET shared POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_LINKER_FILE:shared> $<TARGET_LINKER_FILE_DIR:shared>/copy_$<TARGET_LINKER_FILE_NAME:shared>)
+add_custom_command(TARGET shared POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:shared> $<TARGET_FILE_DIR:shared>/copy_shared${CMAKE_SHARED_LIBRARY_SUFFIX})
+file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/gen/lines.txt CONTENT "name=@PROJECT_NAME@\n" @ONLY NEWLINE_STYLE CRLF)
+enable_testing()
+add_test(NAME runs COMMAND app)
+add_test(NAME pdb_name COMMAND ${CMAKE_COMMAND} -E echo $<TARGET_PDB_FILE_NAME:app>)
+"#;
+
+#[test]
+fn convert_target_files_in_steps() {
+    require!("default");
+    let project = Project::empty("convert_target_files");
+    project.write("CMakeLists.txt", TARGET_FILES_CMAKE);
+    project.write("lib.c", "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nint value(void) { return 42; }\n");
+    project.write(
+        "main.c",
+        "#ifdef _WIN32\n__declspec(dllimport)\n#endif\nint value(void);\nint main(void) { return value() == 42 ? 0 : 1; }\n",
+    );
+
+    project.anvil(&["convert"]).success().contains("1 things to review");
+    let converted = project.read("anvil.toml");
+    for expected in [
+        "command = \"cmake -E rm -f {pdb:app}\"",
+        "command = \"cmake -E copy {target:app} {target-dir:app}/copy_{target-filename:app}\"",
+        "command = \"cmake -E copy {lib:shared} {lib-dir:shared}/copy_{lib-filename:shared}\"",
+        "# TODO: generator expression kept as text, which Anvil does not read: $<TARGET_PDB_FILE_NAME:app>",
+    ] {
+        assert!(converted.contains(expected), "{expected}\n{converted}");
+    }
+
+    // Each toolchain's build makes every copy, beside the file it copies
+    for toolchain in common::toolchains() {
+        project.anvil(&["test", "--toolchain", toolchain]).success();
+    }
+    let files = files_under(&project.path("out"));
+    let copies: Vec<&String> = files
+        .iter()
+        .filter(|file| file.rsplit('/').next().unwrap().starts_with("copy_"))
+        .collect();
+    assert_eq!(copies.len(), 3 * common::toolchains().len(), "{files:?}");
+    let lines: Vec<&String> = files.iter().filter(|file| file.ends_with("gen/lines.txt")).collect();
+    assert_eq!(
+        std::fs::read(project.path(&format!("out/{}", lines[0]))).unwrap(),
+        b"name=target_files\r\n"
+    );
+}

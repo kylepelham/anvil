@@ -223,7 +223,11 @@ fn run_one(model: &Model, index: usize, test: &TestCase) -> TestResult {
         }
     };
 
-    // A missing folder would only say "could not start"
+    // A folder of the build's output is made, as CMake's configure makes those its tests run in; a missing folder
+    // elsewhere would only say "could not start"
+    if !test.workdir.is_dir() && test.workdir.starts_with(&model.out_dir) {
+        let _ = std::fs::create_dir_all(&test.workdir);
+    }
     if !test.workdir.is_dir() {
         result.detail = format!("its workdir {} does not exist", slash(&test.workdir));
         return result;

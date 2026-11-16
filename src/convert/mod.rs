@@ -81,12 +81,15 @@ fn unmark_values(conversion: &mut Conversion, folder: &Path) {
         } else {
             ("hold values", "they are")
         };
-        conversion.warnings.push(format!(
+        let warning = format!(
             "{file}, [{place}]: {} {holds} the converter could not work out; write what {what} on each platform",
             values.join(", ")
-        ));
+        );
 
         *text = marker.replace_all(text, "$${$1}").replace("\\u0002", "").replace("\\u0003", " ");
+        text.push_str(&format!("# TODO: {warning}\n"));
+        conversion.todo_count += 1;
+        conversion.warnings.push(warning);
     }
 }
 
@@ -1067,8 +1070,9 @@ add_custom_target(docs ALL DEPENDS ${CMAKE_BINARY_DIR}/doc.txt)
 
         assert!(toml.contains(r#"deps = ["zlib"]"#), "{toml}");
         assert!(!toml.contains("header-deps"), "{toml}");
+        let values: String = toml.lines().filter(|line| !line.starts_with('#')).collect();
         assert!(
-            !toml.contains("HARFBUZZ") && !toml.contains("HAS_NOPE") && !toml.contains("NOTFOUND"),
+            !values.contains("HARFBUZZ") && !values.contains("HAS_NOPE") && !values.contains("NOTFOUND"),
             "{toml}"
         );
         assert!(
@@ -1157,5 +1161,91 @@ target_link_libraries(tool PRIVATE delayimp.lib)
 
         // A static library's options pass on to whatever links it: they stay raw flags
         assert!(toml.contains("\"/DELAYLOAD:core.dll\""), "{toml}");
+    }
+
+    #[test]
+    fn everything_left_for_the_user_is_a_counted_todo() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(review C)
+get_target_property(defines missing::target INTERFACE_COMPILE_DEFINITIONS)
+file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/abi.txt CONTENT "define|${defines}\n")
+add_executable(app main.c)
+file(GENERATE OUTPUT ${CMAKE_BINARY_DIR}/app.txt CONTENT "$<TARGET_FILE:app>")
+target_compile_definitions(app PRIVATE "SUFFIX=\"${CMAKE_SHARED_LIBRARY_SUFFIX}\"")
+add_custom_command(TARGET app POST_BUILD COMMAND ${CMAKE_COMMAND} -E echo $<TARGET_PDB_FILE_NAME:app>)
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/kept ${CMAKE_BINARY_DIR}/empty)
+file(WRITE ${CMAKE_BINARY_DIR}/kept/file.txt "text")
+"#;
+        let conversion = convert_files("review", &[("CMakeLists.txt", cmake), ("main.c", "int main(void) { return 0; }\n")]);
+        let toml = &conversion.toml;
+
+        // A write holding something not found is written, with a TODO; one only the build knows is a TODO
+        assert!(toml.contains("text = \"define|defines-NOTFOUND\\n\""), "{toml}");
+        assert!(toml.contains("# TODO: the text holds `defines-NOTFOUND`"), "{toml}");
+        assert!(
+            toml.contains("# TODO: CMakeLists.txt:7: CMake writes {out}/app.txt at configure time"),
+            "{toml}"
+        );
+
+        // CMake's file name suffixes are each platform's
+        assert!(toml.contains("[target.app.when.windows]\ndefines = ['SUFFIX=\".dll\"']"), "{toml}");
+        assert!(toml.contains("[target.app.when.macos]\ndefines = ['SUFFIX=\".dylib\"']"), "{toml}");
+
+        // A folder made at configure time that nothing else makes
+        assert!(
+            toml.contains("# TODO: CMakeLists.txt:10: file(MAKE_DIRECTORY {out}/empty) at configure time"),
+            "{toml}"
+        );
+        assert!(!toml.contains("MAKE_DIRECTORY {out}/kept"), "{toml}");
+
+        // A generator expression kept as text has its TODO above it, and every warning one at the end
+        let kept = toml
+            .find("# TODO: generator expression kept as text, which Anvil does not read: $<TARGET_PDB_FILE_NAME:app>")
+            .unwrap();
+        assert!(toml[kept..].lines().nth(1).unwrap().starts_with("command = "), "{toml}");
+        let warnings = conversion
+            .warnings
+            .iter()
+            .filter(|warning| !warning.starts_with("generator expression"))
+            .count();
+        assert!(warnings > 0, "{:?}", conversion.warnings);
+        assert_eq!(conversion.todo_count, toml.matches("# TODO:").count(), "{toml}");
+        assert_eq!(conversion.todo_count, 3 + warnings, "{toml}");
+    }
+
+    #[test]
+    fn file_copy_becomes_copy_steps() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(copies C)
+add_executable(app_test main.c)
+file(GLOB inputs "inputs/*")
+file(COPY ${inputs} DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/inputs/)
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/game/ DESTINATION ${CMAKE_BINARY_DIR}/projects/game PATTERN src EXCLUDE)
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/game DESTINATION ${CMAKE_BINARY_DIR}/whole FILES_MATCHING PATTERN "*.json")
+file(COPY /elsewhere/file.txt DESTINATION ${CMAKE_BINARY_DIR})
+"#;
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("main.c", "int main(void) { return 0; }\n"),
+            ("inputs/one", "1\n"),
+            ("inputs/two", "2\n"),
+            ("game/game.project", "{}\n"),
+            ("game/content/main.json", "{}\n"),
+            ("game/src/code.c", "\n"),
+        ];
+        let conversion = convert_files("file-copy", &files);
+        let toml = &conversion.toml;
+
+        // The files a glob found, as that glob; a folder's contents with and without its own name, as PATTERN says
+        assert!(toml.contains("for-each = [\"inputs/*\"]\noutput = \"{out}/inputs/{filename}\""), "{toml}");
+        assert!(toml.contains("output = \"{out}/projects/game/game.project\""), "{toml}");
+        assert!(toml.contains("output = \"{out}/projects/game/content/main.json\""), "{toml}");
+        assert!(toml.contains("output = \"{out}/whole/game/content/main.json\""), "{toml}");
+        assert!(!toml.contains("code.c") && !toml.contains("{out}/whole/game/game.project"), "{toml}");
+
+        // A file from outside the project stays a TODO
+        assert!(toml.contains("# TODO: CMakeLists.txt:9: file(COPY) of 1 file(s)"), "{toml}");
     }
 }

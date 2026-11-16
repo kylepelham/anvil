@@ -402,17 +402,15 @@ pub fn step_programs(model: &Model, roots: &[usize]) -> Result<Vec<String>> {
         pending.extend(target.deps.iter().map(|(dependency, _)| *dependency));
         pending.extend(target.header_deps.iter().chain(&target.needs).copied());
 
-        // Executables a step runs; anything else a step names (a library it inspects) is the target machine's
-        for words in step_commands(target) {
-            for name in target_references(&words) {
-                let referenced = model.find_target(&name)?;
-                if model.targets[referenced].kind.is_executable() {
-                    if !programs.contains(&name) {
-                        programs.push(name);
-                    }
-                } else {
-                    pending.push(referenced);
+        // Executables a step runs; anything else a step names (a library it inspects, a program's folder) is the
+        // target machine's
+        for (kind, name, referenced) in step_references(model, index)? {
+            if kind == "target" && model.targets[referenced].kind.is_executable() {
+                if !programs.contains(&name) {
+                    programs.push(name);
                 }
+            } else {
+                pending.push(referenced);
             }
         }
     }
@@ -420,10 +418,29 @@ pub fn step_programs(model: &Model, roots: &[usize]) -> Result<Vec<String>> {
     Ok(programs)
 }
 
-/// The commands of a target's build steps: [[run]], pre-build and post-build.
-fn step_commands(target: &Target) -> Vec<Vec<String>> {
-    let steps = target.pre_build.iter().chain(&target.post_build).map(|step| step.command.to_command());
-    target.runs.iter().map(|run| run.command.to_command()).chain(steps).collect()
+/// What a target's build steps ([[run]], pre-build and post-build) name with `{target:X}` and the other placeholders
+/// of TARGET_PLACEHOLDERS: (kind, name, target). A pre- or post-build step naming its own target is left out: it runs
+/// before the target compiles or after it links, so the target's files are only paths there.
+fn step_references(model: &Model, index: usize) -> Result<Vec<(&'static str, String, usize)>> {
+    let target = &model.targets[index];
+    let runs = target.runs.iter().map(|run| (run.command.to_command(), false));
+    let steps = target
+        .pre_build
+        .iter()
+        .chain(&target.post_build)
+        .map(|step| (step.command.to_command(), true));
+
+    let mut references = Vec::new();
+    for (words, own_files_allowed) in runs.chain(steps) {
+        for (kind, name) in words.iter().flat_map(|word| target_placeholders(word)) {
+            let referenced = model.find_target(&name)?;
+            if !(own_files_allowed && referenced == index) {
+                references.push((kind, name, referenced));
+            }
+        }
+    }
+
+    Ok(references)
 }
 
 /// The file a target produces, without planning anything (for `anvil run` and tests).
@@ -444,21 +461,32 @@ pub fn artifact_path(model: &Model, target: &Target) -> Option<PathBuf> {
     Some(folder.join(format!("{prefix}{}{suffix}", target.output_name)))
 }
 
-/// `{target:NAME}` references in a command.
+/// The targets `{target:NAME}` and the other placeholders of TARGET_PLACEHOLDERS name in a command.
 pub fn target_references(words: &[String]) -> Vec<String> {
-    let mut names = Vec::new();
+    words.iter().flat_map(|word| target_placeholders(word)).map(|(_, name)| name).collect()
+}
 
-    for word in words {
-        let mut rest = word.as_str();
-        while let Some(start) = rest.find("{target:") {
-            let after = &rest[start + 8..];
-            let Some(end) = after.find('}') else { break };
-            names.push(after[..end].to_string());
-            rest = &after[end + 1..];
-        }
+// Placeholders naming a target's files, `{kind:NAME}`: its file, that file's folder and name; the file its users link
+// (a Windows DLL's import library), its folder and name; the MSVC linker's debug information beside the file
+pub const TARGET_PLACEHOLDERS: &[&str] = &["target", "target-dir", "target-filename", "lib", "lib-dir", "lib-filename", "pdb"];
+
+/// Each `{kind:NAME}` of TARGET_PLACEHOLDERS in a text, as (kind, name).
+pub fn target_placeholders(text: &str) -> Vec<(&'static str, String)> {
+    let mut found = Vec::new();
+    let mut rest = text;
+
+    while let Some(start) = rest.find('{') {
+        rest = &rest[start + 1..];
+        let Some((kind, after)) = rest.split_once(':') else { break };
+        let Some(kind) = TARGET_PLACEHOLDERS.iter().find(|candidate| **candidate == kind) else {
+            continue;
+        };
+        let Some(end) = after.find('}') else { break };
+        found.push((*kind, after[..end].to_string()));
+        rest = &after[end + 1..];
     }
 
-    names
+    found
 }
 
 /// What a listed source file is to the build.
@@ -511,17 +539,44 @@ fn source_kind(source: &Path, family: crate::toolchain::Family) -> Result<Source
     Ok(kind)
 }
 
-/// Replaces `{target:NAME}` with each target's artifact path.
+/// Replaces `{target:NAME}` (and the other placeholders of TARGET_PLACEHOLDERS) with each target's files.
 pub fn substitute_targets(word: &str, model: &Model) -> Result<String> {
     let mut result = word.to_string();
 
-    for name in target_references(&[word.to_string()]) {
+    for (kind, name) in target_placeholders(word) {
         let index = model.find_target(&name)?;
-        let path = referenced_file(model, &model.targets[index]).with_context(|| format!("{{target:{name}}}: `{name}` produces no file"))?;
-        result = result.replace(&format!("{{target:{name}}}"), &path_text(&path));
+        let target = &model.targets[index];
+        let file = referenced_file(model, target).with_context(|| format!("{{{kind}:{name}}}: `{name}` produces no file"))?;
+
+        // What users link: a Windows DLL's (or exporting program's) import library, else the file
+        let linked = match kind {
+            "lib" | "lib-dir" | "lib-filename" => import_library(model, target).unwrap_or_else(|| file.clone()),
+            _ => file.clone(),
+        };
+        let value = match kind {
+            "target-dir" => path_text(file.parent().unwrap_or(Path::new(""))),
+            "target-filename" => file.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            "lib" => path_text(&linked),
+            "lib-dir" => path_text(linked.parent().unwrap_or(Path::new(""))),
+            "lib-filename" => linked.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            "pdb" => path_text(&file.with_extension("pdb")),
+            _ => path_text(&file),
+        };
+        result = result.replace(&format!("{{{kind}:{name}}}"), &value);
     }
 
     Ok(result)
+}
+
+/// The import library a Windows DLL, or a Windows program that exports symbols, makes for its users to link.
+fn import_library(model: &Model, target: &Target) -> Option<PathBuf> {
+    let exports = target.kind == Kind::Shared || (target.exports && model.toolchain.targets_windows());
+    if !exports || target.kind == Kind::External {
+        return None;
+    }
+
+    let name = model.toolchain.shared_lib_names(&targets::sanitize_name(&target.name)).1?;
+    Some(model.package_out_dir(target.package).join("lib").join(name))
 }
 
 /// The file {target:NAME} stands for: what the target builds, or a package's library when it has exactly one.
@@ -588,9 +643,9 @@ impl<'a> Planner<'a> {
             let mut before: Vec<usize> = target.deps.iter().map(|(dependency, _)| *dependency).collect();
             before.extend(target.header_deps.iter().copied());
             before.extend(target.needs.iter().copied());
-            for words in step_commands(target) {
-                for name in target_references(&words).into_iter().filter(|name| !host_tools.contains_key(name)) {
-                    before.push(model.find_target(&name)?);
+            for (kind, name, referenced) in step_references(model, index)? {
+                if !(kind == "target" && host_tools.contains_key(&name)) {
+                    before.push(referenced);
                 }
             }
             for name in target_references(&target.link_flags) {
@@ -624,7 +679,7 @@ impl<'a> Planner<'a> {
         // Build steps first: what they generate may be compiled or included; pre-build commands gate the compiles
         let generated_sources = self.plan_runs(index)?;
         let pre_build = self.plan_steps(index, Stage::PreBuild, &[])?;
-        self.generation.entry(index).or_default().extend(pre_build);
+        self.generation.entry(index).or_default().extend(pre_build.iter().copied());
         if matches!(target.kind, Kind::External | Kind::Headers | Kind::Custom) {
             return Ok(());
         }
@@ -646,6 +701,11 @@ impl<'a> Planner<'a> {
         let Some((_, link_action)) = self.link_artifact.get(&index).cloned() else {
             return Ok(());
         };
+
+        // A pre-build step naming the target's own files (`cmake -E rm -f {pdb:X}`, CMake's PRE_LINK) links it again
+        // whenever it runs, so what it removed is made again
+        let own_steps = self.own_file_steps(index, &pre_build)?;
+        self.actions[link_action].inputs.extend(own_steps);
         let post_build = self.plan_steps(index, Stage::PostBuild, &[link_action])?;
         if let Some(last) = post_build.last() {
             self.link_artifact.get_mut(&index).unwrap().1 = *last;
@@ -656,6 +716,29 @@ impl<'a> Planner<'a> {
 
     /// Pre-build or post-build commands, in order. Each reruns when the target's sources (pre) or its file (post)
     /// change, or its command does; a stamp records that it ran.
+    /// The stamps of those of a target's planned pre-build steps that name its own files ({pdb:X} of X).
+    fn own_file_steps(&self, index: usize, planned: &[usize]) -> Result<Vec<PathBuf>> {
+        let target = &self.model.targets[index];
+        let active = target.pre_build.iter().filter_map(|step| match &step.cond {
+            Some(condition) => self.model.condition.test(condition).map(|holds| holds.then_some(step)).transpose(),
+            None => Some(Ok(step)),
+        });
+
+        let mut stamps = Vec::new();
+        for (step, action) in active.zip(planned) {
+            let words = step?.command.to_command();
+            let placeholders = words.iter().flat_map(|word| target_placeholders(word));
+            if placeholders
+                .into_iter()
+                .any(|(_, name)| self.model.find_target(&name).ok() == Some(index))
+            {
+                stamps.extend(self.actions[*action].outputs.iter().cloned());
+            }
+        }
+
+        Ok(stamps)
+    }
+
     fn plan_steps(&mut self, index: usize, stage: Stage, first_after: &[usize]) -> Result<Vec<usize>> {
         let target = &self.model.targets[index];
         let (steps, stage_name, inputs) = match stage {
@@ -1284,14 +1367,7 @@ impl<'a> Planner<'a> {
         // Shared libraries on Windows produce an import library dependents link against, and so do programs that
         // export symbols to the modules they load
         let shared = target.kind == Kind::Shared;
-        let import_lib = match shared || (target.exports && self.toolchain.targets_windows()) {
-            true => self
-                .toolchain
-                .shared_lib_names(&targets::sanitize_name(&target.name))
-                .1
-                .map(|name| self.model.package_out_dir(target.package).join("lib").join(name)),
-            false => None,
-        };
+        let import_lib = import_library(self.model, target);
 
         // Objects: the target's own, then object libraries'
         let own_objects = self.objects.get(&index).cloned().unwrap_or_default();
@@ -1674,9 +1750,8 @@ impl<'a> Planner<'a> {
                 "{inputs}" => words.extend(invocation.inputs.iter().map(|input| path_text(input))),
                 "{outputs}" => words.extend(invocation.outputs.iter().map(|output| path_text(output))),
                 _ => {
-                    let names_build_files = ["{input}", "{output}", "{depfile}", "{target:"]
-                        .iter()
-                        .any(|placeholder| word.contains(placeholder));
+                    let names_build_files = ["{input}", "{output}", "{depfile}"].iter().any(|placeholder| word.contains(placeholder))
+                        || !target_placeholders(word).is_empty();
                     let mut word = word
                         .replace("{output}", &path_text(&invocation.outputs[0]))
                         .replace("{depfile}", &path_text(&depfile));
@@ -1684,15 +1759,19 @@ impl<'a> Planner<'a> {
                         word = word.replace("{input}", &path_text(first));
                     }
 
-                    for name in target_references(std::slice::from_ref(&word)) {
-                        if let Some((program, action)) = self.host_tools.get(&name) {
+                    for (kind, name) in target_placeholders(&word) {
+                        if let Some((program, action)) = self.host_tools.get(&name).filter(|_| kind == "target") {
                             after.push(*action);
                             extra_inputs.push(program.clone());
                             word = word.replace(&format!("{{target:{name}}}"), &path_text(program));
                             continue;
                         }
 
+                        // The target's own files in its pre- or post-build step are only paths
                         let referenced = self.model.find_target(&name)?;
+                        if referenced == index {
+                            continue;
+                        }
                         let artifact =
                             artifact_path(self.model, &self.model.targets[referenced]).context("{target:...} names a target without a file")?;
                         if let Some((_, action)) = self.link_artifact.get(&referenced) {
@@ -1900,13 +1979,17 @@ impl<'a> Planner<'a> {
         }
 
         // Other targets' files: this machine's build of a program a cross build runs, or the target's file
-        for name in target_references(std::slice::from_ref(&line)) {
-            let placeholder = format!("{{target:{name}}}");
-            let value = match self.host_tools.get(&name) {
+        for (kind, name) in target_placeholders(&line) {
+            let placeholder = format!("{{{kind}:{name}}}");
+            let value = match self.host_tools.get(&name).filter(|_| kind == "target") {
                 Some((program, _)) => path_text(program),
                 None => substitute_targets(&placeholder, self.model)?,
             };
-            values.push(ShellValue::new(&placeholder, vec![value], true));
+            values.push(ShellValue::new(
+                &placeholder,
+                vec![value],
+                kind != "target-filename" && kind != "lib-filename",
+            ));
         }
 
         Ok(fill_shell_line(&line, &values, cfg!(windows)))
@@ -2622,6 +2705,22 @@ mod tests {
             .collect();
 
         assert_eq!(crate::exec::command_line(&action).starts_with("sccache "), !cfg!(windows));
+    }
+
+    #[test]
+    fn finds_the_placeholders_of_target_files() {
+        let text = "{root}/x {target:app} {target-dir:pkg/lib}/{lib-filename:core} {pdb:app}.bak {env:HOME} {hash:a,b}";
+        assert_eq!(
+            target_placeholders(text),
+            [
+                ("target", "app".to_string()),
+                ("target-dir", "pkg/lib".to_string()),
+                ("lib-filename", "core".to_string()),
+                ("pdb", "app".to_string())
+            ]
+        );
+        assert_eq!(target_references(&[text.to_string()]), ["app", "pkg/lib", "core", "app"]);
+        assert!(target_placeholders("{target:unclosed").is_empty());
     }
 
     fn values() -> Vec<ShellValue> {
