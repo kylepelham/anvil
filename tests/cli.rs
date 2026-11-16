@@ -4613,12 +4613,13 @@ fn cmake_packages_with_variables_linux() {
     }
 
     // Boost's files compute their folders and include a variant file each; SDL2's hand-written one computes its
-    // libraries with string(REGEX)
+    // libraries with string(REGEX). With no `targets`, SDL2 is SDL2::SDL2 alone (not its static twin, SDL2main or
+    // SDL2_test)
     let project = Project::empty("cmake_boost_sdl2");
     project.write(
         "anvil.toml",
         "[project]\nname = \"user\"\n\n[deps]\nboost = { cmake = \"Boost\", components = [\"filesystem\", \"program_options\"] }\n\
-         sdl2 = { cmake = \"SDL2\", targets = [\"SDL2::SDL2\"] }\n",
+         sdl2 = { cmake = \"SDL2\" }\n",
     );
     project.write(
         "src/main.cpp",
@@ -4626,9 +4627,14 @@ fn cmake_packages_with_variables_linux() {
          int main(int, char**) { boost::program_options::options_description options(\"o\"); SDL_version version; SDL_GetVersion(&version);\n\
          std::printf(\"%s sdl %d\\n\", boost::filesystem::path(\"/a/b.txt\").filename().string().c_str(), version.major); }\n",
     );
-    let run = project.anvil(&["run"]);
+    let run = project.anvil(&["run", "-v"]);
     run.success();
     assert_eq!(program_output(&run), "b.txt sdl 2");
+    let output = run.output();
+    assert!(
+        output.contains("libSDL2.so") && !output.contains("libSDL2.a") && !output.contains("libSDL2main.a"),
+        "{output}"
+    );
     let commands = project.read("out/compile_commands.json");
     assert!(
         commands.contains("BOOST_FILESYSTEM_DYN_LINK") && commands.contains("/usr/include/SDL2"),

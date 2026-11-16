@@ -293,6 +293,8 @@ pub struct BuiltinState {
     pub tool_folders: Option<Vec<PathBuf>>,
     /// The `<Package>_FOUND` options optional find_package()s of vcpkg ports became.
     pub package_options: Vec<String>,
+    /// Imported programs of found packages (Python3::Interpreter), as the program a command runs.
+    pub imported_programs: HashMap<String, String>,
 }
 
 /// Where an optional find_package() finds its package.
@@ -1971,8 +1973,12 @@ impl Interpreter {
         // Variables some packages are known for
         match name.as_str() {
             "Python3" | "Python" | "PythonInterp" => {
-                self.set_variable(&format!("{name}_EXECUTABLE"), "python");
-                self.set_variable("PYTHON_EXECUTABLE", "python");
+                let python = self.python_program(command, name);
+                self.set_variable(&format!("{name}_EXECUTABLE"), &python);
+                self.set_variable("PYTHON_EXECUTABLE", &python);
+                if name != "PythonInterp" {
+                    self.builtin.imported_programs.insert(format!("{name}::Interpreter"), python);
+                }
             }
             "Threads" => {
                 // As FindThreads sets them: pthreads wherever the compiler has them (MinGW too), Win32 threads on
@@ -2059,6 +2065,27 @@ impl Interpreter {
             return PackageSource::Absent(format!("its port `{port}` depends on this project"));
         }
         PackageSource::Port(port)
+    }
+
+    /// The Python interpreter, as find_program() finds a program: the first of FindPython's names on this machine
+    /// (`python` first on Windows, where `python3` is often the Store's stand-in), else the usual name here.
+    fn python_program(&mut self, command: &Command, package: &str) -> String {
+        let names = match cfg!(windows) {
+            true => ["python", "python3"],
+            false => ["python3", "python"],
+        };
+        if let Some(found) = names.iter().find_map(|name| self.find_program(name, &[])) {
+            return found;
+        }
+
+        self.warn(
+            command,
+            &format!(
+                "find_package({package}): no {} or {} on this machine; commands run `{}`",
+                names[0], names[1], names[0]
+            ),
+        );
+        names[0].to_string()
     }
 
     /// How a build finds a program: its name when it is on PATH or among the MSVC tools (dumpbin beside link.exe,

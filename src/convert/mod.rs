@@ -344,6 +344,34 @@ add_custom_target(fonts ALL DEPENDS ${COOKED})
     }
 
     #[test]
+    fn steps_merged_into_for_each_keep_their_other_inputs() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(gen C)
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/conf.h COMMAND cmake -E touch ${CMAKE_BINARY_DIR}/conf.h)
+foreach(name a b)
+  add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/${name}.out
+    COMMAND tool ${CMAKE_CURRENT_SOURCE_DIR}/${name}.c ${CMAKE_BINARY_DIR}/${name}.out
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${name}.c ${CMAKE_BINARY_DIR}/conf.h)
+endforeach()
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/c.out
+  COMMAND tool ${CMAKE_CURRENT_SOURCE_DIR}/c.c ${CMAKE_BINARY_DIR}/c.out
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/c.c)
+add_custom_target(gen ALL DEPENDS ${CMAKE_BINARY_DIR}/a.out ${CMAKE_BINARY_DIR}/b.out ${CMAKE_BINARY_DIR}/c.out)
+"#;
+        let files = [("CMakeLists.txt", cmake), ("a.c", "\n"), ("b.c", "\n"), ("c.c", "\n")];
+        let toml = convert_files("foreachinputs", &files).toml;
+
+        // a and b wait for conf.h as one step; c, without it, is a step of its own; no output is made twice
+        assert!(
+            toml.contains("for-each = [\"a.c\", \"b.c\"]\ninputs = [\"{out}/conf.h\", \"{input}\"]\noutput = \"{out}/{stem}.out\""),
+            "{toml}"
+        );
+        assert!(toml.contains("output = \"{out}/c.out\""), "{toml}");
+        assert!(!toml.contains("output = \"{out}/a.out\""), "{toml}");
+    }
+
+    #[test]
     fn find_path_becomes_the_package_with_the_header() {
         let cmake = r#"
 cmake_minimum_required(VERSION 3.20)
@@ -486,6 +514,39 @@ set_target_properties(gen PROPERTIES AUTOMOC OFF)
             "{toml}"
         );
         assert!(!toml.contains("TODO:"), "{toml}");
+    }
+
+    #[test]
+    fn qt_headers_without_a_source_of_their_name_stay_in_sources() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.16)
+project(widgets CXX)
+set(CMAKE_AUTOMOC ON)
+find_package(Qt6 REQUIRED COMPONENTS Widgets)
+add_library(model STATIC lib/model.cpp lib/model.h lib/signals.h lib/plain.h)
+target_link_libraries(model PUBLIC Qt6::Widgets)
+add_executable(app app/main.cpp app/dialog.h)
+target_link_libraries(app PRIVATE model)
+add_executable(tool tool/main.cpp tool/notifier.h)
+"#;
+        let q_object = "class A : public QObject {\n    Q_OBJECT\n};\n";
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("lib/model.cpp", "\n"),
+            ("lib/model.h", q_object),
+            ("lib/signals.h", q_object),
+            ("lib/plain.h", "struct B {};\n"),
+            ("app/main.cpp", "int main() {}\n"),
+            ("app/dialog.h", q_object),
+            ("tool/main.cpp", "int main() {}\n"),
+            ("tool/notifier.h", q_object),
+        ];
+        let toml = convert_files("qtheaders", &files).toml;
+
+        // model.h is found beside model.cpp; app uses Qt through model; tool uses no Qt, so moc never runs for it
+        assert!(toml.contains(r#"sources = ["lib/model.cpp", "lib/signals.h"]"#), "{toml}");
+        assert!(toml.contains(r#"sources = ["app/main.cpp", "app/dialog.h"]"#), "{toml}");
+        assert!(toml.contains(r#"sources = ["tool/main.cpp"]"#), "{toml}");
     }
 
     #[test]
@@ -915,6 +976,62 @@ target_include_directories(app PRIVATE ${CMAKE_BINARY_DIR}/gen)
             "{:?}",
             conversion.warnings
         );
+    }
+
+    #[test]
+    fn written_files_get_include_folders_and_compilers_they_can_hold() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(gen C)
+find_package(ZLIB REQUIRED)
+configure_file(gen.cmake.in gen.cmake @ONLY)
+add_executable(app main.c)
+target_link_libraries(app PRIVATE ZLIB::ZLIB)
+"#;
+        let template = "set(CC \"@CMAKE_C_COMPILER@\")\nset(ZLIB \"@ZLIB_INCLUDE_DIRS@\")\n";
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("gen.cmake.in", template),
+            ("main.c", "int main(void) { return 0; }\n"),
+        ];
+        let toml = convert_files("writedeps", &files).toml;
+
+        // {cc} is filled in when the file is written; zlib's headers are vcpkg's, or where the compiler looks anyway
+        assert!(toml.contains("set(CC \"{cc}\")"), "{toml}");
+        let zlib = toml.contains("set(ZLIB \"{vcpkg}/include\")") || toml.contains("set(ZLIB \"\")");
+        assert!(zlib && !toml.contains("{header-dep:"), "{toml}");
+    }
+
+    #[test]
+    fn python_runs_as_found_on_this_machine() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(py C)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_executable(app main.c)
+add_test(NAME script COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/check.py $<TARGET_FILE:app>)
+add_test(NAME wrapped COMMAND app $<TARGET_FILE:Python3::Interpreter>)
+add_custom_command(OUTPUT gen.c COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/gen.py gen.c)
+add_executable(gen gen.c)
+"#;
+        let files = [
+            ("CMakeLists.txt", cmake),
+            ("main.c", "int main(void) { return 0; }\n"),
+            ("check.py", "\n"),
+            ("gen.py", "\n"),
+        ];
+        let toml = convert_files("python", &files).toml;
+
+        // The name find_program() would store: python3 before python, but python first on Windows
+        let names = if cfg!(windows) { ["python", "python3"] } else { ["python3", "python"] };
+        let python = names.iter().find(|name| crate::util::which(name).is_some()).unwrap_or(&names[0]);
+        assert!(
+            toml.contains(&format!("command = \"{python} {{root}}/check.py {{target:app}}\"")),
+            "{toml}"
+        );
+        assert!(toml.contains(&format!("command = \"{{target:app}} {python}\"")), "{toml}");
+        assert!(toml.contains(&format!("command = \"{python} {{root}}/gen.py")), "{toml}");
+        assert!(!toml.contains("Python3::Interpreter"), "{toml}");
     }
 
     #[test]

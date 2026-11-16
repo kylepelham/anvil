@@ -1981,7 +1981,7 @@ impl Model {
                     }
                 }
 
-                let fill = |text: &str| fill_test_text(text, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name);
+                let fill = |text: &str| fill_test_text(text, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name, &self.toolchain);
                 let path = util::absolute(&package.root, Path::new(&fill(&spec.path)));
                 let text = fill(&spec.text);
 
@@ -2066,6 +2066,14 @@ impl Model {
             let files = tests_files(&package.root, &self.out_root);
             for file in &files {
                 specs.extend(manifest::load_tests(file)?.into_iter().map(|spec| (spec, file.as_path())));
+
+                // `{out}/<folder>` of a tests file in a folder exists for its tests, as CMake's build folder there does
+                let listing = crate::lsp::session::active() || self.options.list_only;
+                let folder = file.parent().and_then(|folder| util::strip_prefix_ci(folder, &package.root));
+                if let Some(folder) = folder.filter(|folder| !listing && !folder.as_os_str().is_empty()) {
+                    let build_folder = self.out_dir.join(folder);
+                    std::fs::create_dir_all(&build_folder).with_context(|| format!("creating {}", slash(&build_folder)))?;
+                }
             }
 
             // Outside the root package, `{target:X}` naming the package's own X says so (as in its targets)
@@ -2091,13 +2099,22 @@ impl Model {
 
                 let workdir = match &spec.workdir {
                     Some(workdir) => {
-                        let filled = fill_test_text(workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name);
+                        let filled = fill_test_text(workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name, &self.toolchain);
                         let expanded = util::expand_env(&filled).located(Place::key("workdir").value(workdir), "invalid-value");
                         util::absolute(&package.root, Path::new(&expanded.at(context())?))
                     }
                     None => package.root.clone(),
                 };
-                let mut test = test_case(spec, workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name).at(context())?;
+                let mut test = test_case(
+                    spec,
+                    workdir,
+                    package,
+                    &self.out_dir,
+                    &self.vcpkg_dir,
+                    &self.profile.name,
+                    &self.toolchain,
+                )
+                .at(context())?;
                 for word in &mut test.command {
                     *word = qualify_references(word, &package.name, &own);
                 }
@@ -2169,9 +2186,17 @@ impl Model {
         let workdir = target.workdir.clone().unwrap_or_else(|| package.root.clone());
         let scope = Scope::target(&target.name);
         let file = Scope::place(Place::default().file(package.manifest.file.as_deref()));
-        test_case(&spec, workdir, package, &self.out_dir, &self.vcpkg_dir, &self.profile.name)
-            .at(scope)
-            .at(file)
+        test_case(
+            &spec,
+            workdir,
+            package,
+            &self.out_dir,
+            &self.vcpkg_dir,
+            &self.profile.name,
+            &self.toolchain,
+        )
+        .at(scope)
+        .at(file)
     }
 }
 
@@ -2889,8 +2914,16 @@ fn tests_files_uncached(root: &Path, out_root: &Path) -> Vec<PathBuf> {
 }
 
 /// One test from its keys, as [[test]] tables and test targets both give them, with its workdir resolved.
-fn test_case(spec: &TestSpec, workdir: PathBuf, package: &Package, out_dir: &Path, vcpkg_dir: &Path, profile: &str) -> Result<TestCase> {
-    let fill = |text: &String| fill_test_text(text, package, out_dir, vcpkg_dir, profile);
+fn test_case(
+    spec: &TestSpec,
+    workdir: PathBuf,
+    package: &Package,
+    out_dir: &Path,
+    vcpkg_dir: &Path,
+    profile: &str,
+    toolchain: &Toolchain,
+) -> Result<TestCase> {
+    let fill = |text: &String| fill_test_text(text, package, out_dir, vcpkg_dir, profile, toolchain);
     let pattern = |key: &str, pattern: &Option<String>| {
         let written = pattern.clone().unwrap_or_default();
         compile_test_regex(key, &pattern.as_ref().map(fill)).located(Place::key(key).value(written), "invalid-regex")
@@ -3073,8 +3106,8 @@ fn visit_after(index: usize, tests: &[TestCase], index_of: &HashMap<&str, usize>
     None
 }
 
-/// {root}, {out}, {profile}, {config}, {version} and {vcpkg} in a test's or written file's text.
-pub fn fill_test_text(text: &str, package: &Package, out_dir: &Path, vcpkg_dir: &Path, profile: &str) -> String {
+/// {root}, {out}, {profile}, {config}, {version}, {vcpkg}, {cxx} and {cc} in a test's or written file's text.
+pub fn fill_test_text(text: &str, package: &Package, out_dir: &Path, vcpkg_dir: &Path, profile: &str, toolchain: &Toolchain) -> String {
     if !text.contains('{') {
         return text.to_string();
     }
@@ -3085,6 +3118,8 @@ pub fn fill_test_text(text: &str, package: &Package, out_dir: &Path, vcpkg_dir: 
         .replace("{config}", &crate::targets::config_name(profile))
         .replace("{version}", package.version())
         .replace("{vcpkg}", &slash(vcpkg_dir))
+        .replace("{cxx}", &slash(&toolchain.cxx))
+        .replace("{cc}", &slash(&toolchain.cc))
 }
 
 /// `expect` and `reject` patterns, with placeholders filled in (`{out}/x.png written`).

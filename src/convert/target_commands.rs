@@ -1149,7 +1149,14 @@ impl Interpreter {
             }
 
             // What a shared build defines in place of <target>_EXPORTS ("" for nothing)
-            "DEFINE_SYMBOL" => self.targets.get_mut(target).unwrap().define_symbol = Some(items.join(";")),
+            "DEFINE_SYMBOL" => {
+                let condition = self.current_condition();
+                self.targets.get_mut(target).unwrap().define_symbols.push(Item {
+                    condition,
+                    public: false,
+                    value: items.join(";"),
+                });
+            }
             "WINDOWS_EXPORT_ALL_SYMBOLS" => {
                 if model::constant_truth(&items.join(";")) == Some(true) {
                     let note = "WINDOWS_EXPORT_ALL_SYMBOLS: Anvil does not export every symbol of a DLL; mark the API with an \
@@ -1540,6 +1547,7 @@ impl Interpreter {
         } else {
             self.plain_words_kept(&words)
         };
+        self.run_imported_programs(&mut command);
         let workdir = workdir.map(|dir| self.resolve_text_path(&dir));
         let condition = self.current_condition();
         let helper = self.call_stack.last().cloned();
@@ -1566,6 +1574,19 @@ impl Interpreter {
             loops,
             dir: self.current_dir(),
         });
+    }
+
+    /// The programs of imported targets a command runs (`Python3::Interpreter` first, or
+    /// `$<TARGET_FILE:Python3::Interpreter>` anywhere), as find_package() found them.
+    fn run_imported_programs(&self, words: &mut [String]) {
+        for (target, program) in &self.builtin.imported_programs {
+            if let Some(first) = words.first_mut().filter(|first| *first == target) {
+                *first = program.clone();
+            }
+            for word in words.iter_mut() {
+                *word = word.replace(&format!("{{target:{target}}}"), program);
+            }
+        }
     }
 
     /// gtest_discover_tests(target ...) and gtest_add_tests(TARGET target ...): the program is the test.
@@ -1637,12 +1658,15 @@ impl Interpreter {
         let multi = ["OUTPUT", "COMMAND", "DEPENDS", "BYPRODUCTS", "IMPLICIT_DEPENDS"];
         let keywords = Keywords::parse(args, &flags, &single, &multi);
 
-        let commands: Vec<Vec<String>> = keywords
+        let mut commands: Vec<Vec<String>> = keywords
             .groups("COMMAND")
             .iter()
             .map(|words| self.plain_words(words))
             .filter(|words| !words.is_empty())
             .collect();
+        for words in &mut commands {
+            self.run_imported_programs(words);
+        }
         let outputs: Vec<PathBuf> = keywords.list("OUTPUT").iter().map(|output| self.resolve_output(output)).collect();
 
         // APPEND adds commands to the step that makes the same output
@@ -1706,11 +1730,14 @@ impl Interpreter {
             command_groups.push(keywords.unparsed.clone());
         }
         command_groups.extend(keywords.groups("COMMAND"));
-        let commands: Vec<Vec<String>> = command_groups
+        let mut commands: Vec<Vec<String>> = command_groups
             .iter()
             .map(|words| self.plain_words(words))
             .filter(|words| !words.is_empty())
             .collect();
+        for words in &mut commands {
+            self.run_imported_programs(words);
+        }
 
         // Without ALL, built only when asked for or needed
         self.create_target(name, TargetKind::Custom, &[]);
@@ -2667,29 +2694,33 @@ fn define_export_symbol(target: &mut Target) {
         return;
     }
 
-    let symbol = match &target.define_symbol {
-        Some(symbol) => symbol.clone(),
-        None => {
-            let default = format!("{}_EXPORTS", c_identifier(&target.name));
-            if !mentions_symbol(target, &default) {
-                return;
-            }
-            default
-        }
-    };
-    if symbol.is_empty() {
-        return;
+    // DEFINE_SYMBOL where it is set (one set everywhere replaces those before it)
+    let everywhere = |item: &Item<String>| item.condition.is_none() || item.condition == target.condition;
+    let last_everywhere = target.define_symbols.iter().rposition(everywhere);
+    let set = &target.define_symbols[last_everywhere.unwrap_or(0)..];
+    let mut symbols: Vec<(Option<String>, String)> = set.iter().map(|item| (item.condition.clone(), item.value.clone())).collect();
+
+    // CMake's `<target>_EXPORTS` elsewhere, when its code uses it
+    let default = format!("{}_EXPORTS", c_identifier(&target.name));
+    if last_everywhere.is_none() && mentions_symbol(target, &default) {
+        let elsewhere = set
+            .iter()
+            .filter_map(|item| item.condition.as_deref())
+            .fold(None, |all, condition| model::and_optional(&all, &Some(model::negate(condition))));
+        symbols.push((elsewhere, default));
     }
 
-    let condition = match shared {
+    let shared_condition = match shared {
         Truth::Depends(condition) => Some(condition),
         Truth::Known(_) => None,
     };
-    target.defines.push(Item {
-        condition,
-        public: false,
-        value: symbol,
-    });
+    for (condition, symbol) in symbols.into_iter().filter(|(_, symbol)| !symbol.is_empty()) {
+        target.defines.push(Item {
+            condition: model::and_optional(&shared_condition, &condition),
+            public: false,
+            value: symbol,
+        });
+    }
 }
 
 /// Where a target builds as a shared library: its kind, kinds set under conditions, and BUILD_SHARED_LIBS (written
@@ -3215,6 +3246,28 @@ set_target_properties(core PROPERTIES DEFINE_SYMBOL CORE_BUILDING)
         assert!(!toml.contains("[target.core.when.BUILD_SHARED_LIBS]"), "{toml}");
         assert!(
             toml.contains("[target.core.when.\"(!FORCE_STATIC & !windows) | (!FORCE_STATIC & BUILD_SHARED_LIBS)\"]\ndefines = [\"CORE_BUILDING\"]"),
+            "{toml}"
+        );
+    }
+
+    #[test]
+    fn define_symbols_set_per_platform_stay_there() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(png C)
+add_library(png SHARED png.c)
+if(APPLE)
+  set_target_properties(png PROPERTIES DEFINE_SYMBOL "")
+elseif(WIN32)
+  set_target_properties(png PROPERTIES DEFINE_SYMBOL PNG_BUILD_DLL)
+endif()
+"#;
+        let toml = convert_files("define-symbols", &[("CMakeLists.txt", cmake), ("png.c", "#ifdef png_EXPORTS\n#endif\n")]);
+
+        // PNG_BUILD_DLL on Windows only; png_EXPORTS, which the code reads, where neither branch sets one
+        assert!(toml.contains("[target.png.when.windows]\ndefines = [\"PNG_BUILD_DLL\"]"), "{toml}");
+        assert!(
+            toml.contains("[target.png.when.\"!macos & !windows\"]\ndefines = [\"png_EXPORTS\"]"),
             "{toml}"
         );
     }
