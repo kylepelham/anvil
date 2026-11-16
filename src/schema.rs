@@ -440,7 +440,7 @@ fn target_table(kind: Table) -> Value {
             "delay-load",
             array(
                 "DLLs a Windows program or shared library loads on its first call into them instead of at start (\"nvml.dll\"): \
-                 /DELAYLOAD with delayimp.lib (MSVC and clang-cl; MinGW cannot). Other systems ignore it.",
+                 /DELAYLOAD with delayimp.lib (MSVC ABI: cl, clang-cl, clang on Windows; MinGW cannot). Other systems ignore it.",
                 json!({ "type": "string", "pattern": DLL_NAME_PATTERN, "examples": ["nvml.dll"] }),
             ),
         ),
@@ -451,7 +451,7 @@ fn target_table(kind: Table) -> Value {
                 &[],
                 "The compiler driver that links it, as CMake's LINKER_LANGUAGE: \"c++\" links the C++ runtime (a C program \
                  using a prebuilt C++ library in `libs`), \"c\" does not. Default: by the languages compiled into it and its \
-                 static libraries. On a static or object library: what the binaries linking it count it as. MSVC ignores it.",
+                 static libraries. On a static or object library: what the binaries linking it count it as. The MSVC ABI ignores it.",
             ),
         ),
         (

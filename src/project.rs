@@ -147,6 +147,7 @@ impl Model {
         let (root, manifest) = locate(&options.start_dir)?;
         let project = manifest.project.clone().unwrap_or_default();
         let mut profile = Profile::resolve(&options.profile, &manifest.profile)?;
+        profile.expand_environment(&manifest.profile)?;
 
         // The machine to build for: the command line's, the profile's, else this one (always this one for host tools)
         let platform = match options.target.as_deref().or(profile.target.as_deref()) {
@@ -1205,7 +1206,7 @@ impl Model {
                 .iter()
                 .flatten()
                 .map(|text| {
-                    util::expand_env_placeholders(text)
+                    util::expand_env_word(text)
                         .with_context(|| key_context(name))
                         .located(key(name).value(text), "invalid-dependency")
                 })

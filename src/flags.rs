@@ -376,6 +376,22 @@ impl Toolchain {
         flags
     }
 
+    /// A normalized standard as this compiler's `-std=` spells it: gcc before 14 and clang before 18 know C23 only as
+    /// c2x, clang before 17 knows C++23 only as c++2b (gcc has c++23 since 11; c++26 is new in gcc 14 and clang 17).
+    pub fn standard_spelling(&self, standard: &str) -> String {
+        let major: Option<u32> = self.version.split('.').next().and_then(|number| number.parse().ok());
+        let Some(major) = major else { return standard.to_string() };
+        let clang = matches!(self.family, Family::Clang | Family::ClangCl);
+
+        let older_name = match standard {
+            "c23" | "gnu23" if (self.family == Family::Gcc && major < 14) || (clang && major < 18) => "2x",
+            "c++23" | "gnu++23" if clang && major < 17 => "2b",
+            _ => return standard.to_string(),
+        };
+
+        format!("{}{older_name}", &standard[..standard.len() - 2])
+    }
+
     // Linking
 
     /// Arguments for linking an executable or shared library (program: `self.linker`).
@@ -613,7 +629,7 @@ impl Toolchain {
         if spec.language == Language::Cxx {
             flags.extend(["/EHsc".into(), "/permissive-".into(), "/Zc:__cplusplus".into()]);
         }
-        flags.extend(msvc_standard_flag(spec.standard, clang_cl));
+        flags.extend(msvc_standard_flag(spec.standard, clang_cl, &self.standard_spelling(spec.standard)));
 
         // Optimization and debug info
         flags.push(
@@ -696,7 +712,7 @@ impl Toolchain {
     fn gnu_compile_flags(&self, spec: &CompileSpec) -> Vec<String> {
         let profile = spec.profile;
         let windows_clang = self.family == Family::Clang && self.is_msvc_abi();
-        let mut flags: Vec<String> = vec![format!("-std={}", spec.standard)];
+        let mut flags: Vec<String> = vec![format!("-std={}", self.standard_spelling(spec.standard))];
 
         // Objective-C sources say so, with the C or C++ standard
         match spec.language {
@@ -1158,12 +1174,13 @@ fn is_library_file(word: &str) -> bool {
     !word.starts_with('-') && (extensions.iter().any(|extension| lowered.ends_with(extension)) || lowered.contains(".so."))
 }
 
-fn msvc_standard_flag(standard: &str, clang_cl: bool) -> Vec<String> {
+fn msvc_standard_flag(standard: &str, clang_cl: bool, spelling: &str) -> Vec<String> {
     let flag = match standard {
         "c++14" => "/std:c++14",
         "c++17" | "gnu++17" => "/std:c++17",
         "c++20" | "gnu++20" => "/std:c++20",
-        "c++23" | "gnu++23" if clang_cl => "/clang:-std=c++23",
+        // clang-cl's /std: knows no C++23 and no C23 (it ignores /std:clatest): clang's own name for them
+        "c++23" | "gnu++23" | "c23" | "gnu23" if clang_cl => return vec![format!("/clang:-std={}", spelling.replace("gnu", "c"))],
         "c++23" | "gnu++23" | "c++26" | "gnu++26" => "/std:c++latest",
         "c11" | "gnu11" => "/std:c11",
         "c17" | "c18" | "gnu17" | "gnu18" => "/std:c17",
@@ -1301,6 +1318,43 @@ mod tests {
         assert!(error.contains("std = \"c++99\": C++ standards are 11, 14, 17, 20, 23 and 26"), "{error}");
         let error = normalize_standard("c98", Language::C).unwrap_err().to_string();
         assert!(error.contains("c-std = \"c98\": C standards are 89, 90, 99"), "{error}");
+    }
+
+    #[test]
+    fn older_compilers_get_the_draft_names_of_new_standards() {
+        let toolchain = |family: Family, version: &str| {
+            let mut toolchain = Toolchain::for_tests(family, platform(Cpu::X64, Os::Linux), false);
+            toolchain.version = version.to_string();
+            toolchain
+        };
+        let spelled = |family: Family, version: &str, standard: &str| toolchain(family, version).standard_spelling(standard);
+
+        // C23: c2x before gcc 14 and clang 18
+        assert_eq!(spelled(Family::Gcc, "13.2.0", "c23"), "c2x");
+        assert_eq!(spelled(Family::Gcc, "13.2.0", "gnu23"), "gnu2x");
+        assert_eq!(spelled(Family::Gcc, "14.1.0", "c23"), "c23");
+        assert_eq!(spelled(Family::Clang, "17.0.6", "gnu23"), "gnu2x");
+        assert_eq!(spelled(Family::Clang, "18.1.8", "c23"), "c23");
+
+        // C++23: c++2b before clang 17; gcc has c++23 since 11
+        assert_eq!(spelled(Family::Clang, "16.0.6", "c++23"), "c++2b");
+        assert_eq!(spelled(Family::Clang, "16.0.6", "gnu++23"), "gnu++2b");
+        assert_eq!(spelled(Family::Clang, "17.0.1", "c++23"), "c++23");
+        assert_eq!(spelled(Family::Gcc, "11.1.0", "c++23"), "c++23");
+
+        // Older standards and unknown versions keep their names
+        assert_eq!(spelled(Family::Gcc, "9.1.0", "c17"), "c17");
+        assert_eq!(spelled(Family::Clang, "unknown", "c23"), "c23");
+        assert_eq!(spelled(Family::Gcc, "", "c23"), "c23");
+
+        // clang-cl: clang's own option, its /std: knowing neither
+        let clang_cl = toolchain(Family::ClangCl, "17.0.6");
+        assert_eq!(msvc_standard_flag("c23", true, &clang_cl.standard_spelling("c23")), ["/clang:-std=c2x"]);
+        assert_eq!(
+            msvc_standard_flag("gnu++23", true, &clang_cl.standard_spelling("gnu++23")),
+            ["/clang:-std=c++23"]
+        );
+        assert_eq!(msvc_standard_flag("c23", false, "c23"), ["/std:clatest"]);
     }
 
     #[test]

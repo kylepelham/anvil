@@ -221,6 +221,33 @@ impl Profile {
         Ok(())
     }
 
+    /// Fills `{env:NAME}` in the definitions and flags, for the profile a build uses (one it does not use may name
+    /// variables this machine does not set). An error names the `[profile]` table that wrote the value.
+    pub fn expand_environment(&mut self, specs: &IndexMap<String, ProfileSpec>) -> Result<()> {
+        let chain = self.chain.clone();
+        let expand = |key: &str, list: &mut Vec<String>, written: fn(&ProfileSpec) -> &Option<Vec<String>>| -> Result<()> {
+            for text in list.iter_mut() {
+                let owner = chain.iter().find(|name| {
+                    specs
+                        .get(*name)
+                        .is_some_and(|spec| written(spec).iter().flatten().any(|value| value == text))
+                });
+                let owner = owner.map_or("", String::as_str);
+                let place = Place::absolute(located::keys(&["profile", owner, key])).value(text.as_str());
+                *text = crate::util::expand_env_word(text)
+                    .located(place, "invalid-value")
+                    .at(Scope::default().text(format!("in [profile.{owner}]")))?;
+            }
+            Ok(())
+        };
+
+        expand("defines", &mut self.defines, |spec| &spec.defines)?;
+        expand("flags", &mut self.flags, |spec| &spec.flags)?;
+        expand("link-flags", &mut self.link_flags, |spec| &spec.link_flags)?;
+
+        Ok(())
+    }
+
     fn builtin(name: &str) -> Option<Profile> {
         let debug = name == "debug";
         if !debug && name != "release" {

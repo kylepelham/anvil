@@ -222,7 +222,7 @@ enum CommandLine {
     /// Write the project files of an IDE (vs: a solution and projects; vscode: tasks, launch and settings; clion,
     /// zed): build, run and debug every program from it. Every build keeps them up to date.
     Ide {
-        /// The IDEs (default: those set up before, and those whose folders are here).
+        /// The IDEs (default: those whose files or folders are here). Those set up before are refreshed too while their files are there.
         #[arg(value_enum)]
         ides: Vec<ide::Ide>,
 

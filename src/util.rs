@@ -372,6 +372,17 @@ pub fn expand_env_placeholders(text: &str) -> Result<String> {
     Ok(expanded)
 }
 
+/// A definition or flag with its `{env:NAME}` placeholders expanded (`expand_env_placeholders`). One that the
+/// variables leave empty is an error: the compiler would get an empty argument.
+pub fn expand_env_word(text: &str) -> Result<String> {
+    let expanded = expand_env_placeholders(text)?;
+    if expanded.trim().is_empty() && !text.trim().is_empty() {
+        bail!("\"{text}\" is empty once its environment variables are filled in: set them, or leave the entry out");
+    }
+
+    Ok(expanded)
+}
+
 /// A path's environment variables expanded (`expand_env`), where a variable set but empty is an error: the path would
 /// silently become another (the package root, for a path of only that variable). With `split`, a path that is one
 /// variable alone (`{env:CMAKE_PREFIX_PATH}`) whose value is a list (`a;b` on Windows, `a:b` elsewhere) gives each entry.

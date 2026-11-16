@@ -700,16 +700,23 @@ impl Target {
         self.interface_include = paths(&["interface", "include"], &settings.interface_include)?;
 
         // Flags and linking
-        // Definitions and flags may name folders: {root}, {out}, {gen}
-        let placeholders = |list: Vec<String>| -> Vec<String> { list.iter().map(|text| expand_placeholders(text, scope, &self.name)).collect() };
-        self.defines = placeholders(settings.defines);
-        self.public_defines = placeholders(settings.public_defines);
-        self.interface_defines = placeholders(settings.interface_defines);
-        self.flags = placeholders(settings.flags);
-        self.public_flags = placeholders(settings.public_flags);
-        self.interface_flags = placeholders(settings.interface_flags);
+        // Definitions and flags may name folders ({root}, {out}, {gen}) and environment variables ({env:NAME})
+        let words = |key: &[&str], list: Vec<String>| -> Result<Vec<String>> {
+            list.iter()
+                .map(|text| {
+                    let expanded = expand_placeholders(text, scope, &self.name);
+                    util::expand_env_word(&expanded).located(origins.place(&[key], text), "invalid-value")
+                })
+                .collect()
+        };
+        self.defines = words(&["defines"], settings.defines)?;
+        self.public_defines = words(&["public", "defines"], settings.public_defines)?;
+        self.interface_defines = words(&["interface", "defines"], settings.interface_defines)?;
+        self.flags = words(&["flags"], settings.flags)?;
+        self.public_flags = words(&["public", "flags"], settings.public_flags)?;
+        self.interface_flags = words(&["interface", "flags"], settings.interface_flags)?;
 
-        self.link_flags = placeholders(settings.link_flags);
+        self.link_flags = words(&["link-flags"], settings.link_flags)?;
         self.libs = settings
             .libs
             .iter()
@@ -718,7 +725,7 @@ impl Target {
         self.lib_dirs = paths(&["lib-dirs"], &settings.lib_dirs)?;
         self.link_depends = paths(&["link-depends"], &settings.link_depends)?;
         self.cuda_arch = settings.cuda_arch.unwrap_or_default();
-        self.cuda_flags = placeholders(settings.cuda_flags);
+        self.cuda_flags = words(&["cuda-flags"], settings.cuda_flags)?;
         self.dep_names = settings.deps;
         self.header_dep_names = settings.header_deps;
         self.need_names = settings.needs;
@@ -1218,7 +1225,7 @@ impl Accumulated {
         let origins = &mut self.origins;
         let public = spec.public.clone().unwrap_or_default();
         let interface = spec.interface.clone().unwrap_or_default();
-        let lists: [(&[&str], &Option<Vec<String>>); 14] = [
+        let lists: [(&[&str], &Option<Vec<String>>); 18] = [
             (&["sources"], &spec.sources),
             (&["include"], &spec.include),
             (&["system-include"], &spec.system_include),
@@ -1233,15 +1240,23 @@ impl Accumulated {
             (&["data"], &spec.data),
             (&["expect"], &spec.expect),
             (&["reject"], &spec.reject),
+            (&["defines"], &spec.defines),
+            (&["flags"], &spec.flags),
+            (&["link-flags"], &spec.link_flags),
+            (&["cuda-flags"], &spec.cuda_flags),
         ];
         for (key, values) in lists {
             origins.note(path, key, values.iter().flatten());
         }
-        let nested: [(&[&str], &Option<Vec<String>>); 4] = [
+        let nested: [(&[&str], &Option<Vec<String>>); 8] = [
             (&["public", "include"], &public.include),
             (&["public", "system-include"], &public.system_include),
             (&["public", "deps"], &public.deps),
+            (&["public", "defines"], &public.defines),
+            (&["public", "flags"], &public.flags),
             (&["interface", "include"], &interface.include),
+            (&["interface", "defines"], &interface.defines),
+            (&["interface", "flags"], &interface.flags),
         ];
         for (key, values) in nested {
             origins.note(path, key, values.iter().flatten());
@@ -1732,15 +1747,22 @@ fn resolve_file_rule(rule: &FileRule, dir: &Path, scope: &PackageScope, target_n
         builder.add(glob.located(Place::default().value(&pattern), "invalid-value")?);
     }
 
-    // Definitions and flags may name folders, as the target's do
-    let placeholders =
-        |list: &Option<Vec<String>>| -> Vec<String> { list.iter().flatten().map(|text| expand_placeholders(text, scope, target_name)).collect() };
+    // Definitions and flags may name folders and environment variables, as the target's do
+    let placeholders = |key: &str, list: &Option<Vec<String>>| -> Result<Vec<String>> {
+        list.iter()
+            .flatten()
+            .map(|text| {
+                let expanded = expand_placeholders(text, scope, target_name);
+                util::expand_env_word(&expanded).located(Place::key(key).value(text), "invalid-value")
+            })
+            .collect()
+    };
 
     Ok(Some(ResolvedFileRule {
         patterns: rule.patterns.to_vec(),
         matcher: builder.build()?,
-        defines: placeholders(&rule.defines),
-        flags: placeholders(&rule.flags),
+        defines: placeholders("defines", &rule.defines)?,
+        flags: placeholders("flags", &rule.flags)?,
         warnings: rule.warnings.as_deref().map(Warnings::parse).transpose()?,
         arch: rule.arch.as_deref().map(Arch::parse).transpose()?,
         opt: rule.opt.as_ref().map(Opt::parse).transpose()?,

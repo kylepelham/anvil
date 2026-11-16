@@ -5588,6 +5588,56 @@ fn ide_vscode_never_loses_what_it_cannot_merge() {
     project.anvil(&["build"]).success().lacks("Updated");
 }
 
+// Naming IDEs writes those; the others set up before are refreshed while their files are there, and one whose files
+// were deleted leaves the record (builds drop it too), so nothing brings it back until it is named again
+#[test]
+fn ide_writes_the_named_ides_and_leaves_deleted_ones_out() {
+    require!("default");
+    let project = Project::empty("ide_named");
+    project.write("anvil.toml", "[project]\nname = \"named\"\n");
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+    let recorded = |ide: &str| project.read(".anvil/ide.toml").contains(&format!("\"{ide}\""));
+    let remove = |folder: &str| std::fs::remove_dir_all(project.path(folder)).unwrap();
+
+    project.anvil(&["ide", "vscode", "zed"]).success();
+    assert!(project.path(".vscode/tasks.json").is_file() && project.path(".zed/tasks.json").is_file());
+    assert!(recorded("vscode") && recorded("zed"));
+
+    // Zed's files deleted: naming VS Code leaves them deleted, and Zed out of the record
+    remove(".zed");
+    project.anvil(&["ide", "vscode"]).success().lacks(".zed");
+    assert!(!project.path(".zed").exists() && recorded("vscode") && !recorded("zed"));
+
+    // Naming Zed again brings it back, and refreshes VS Code's files, which are there
+    std::fs::remove_file(project.path(".vscode/tasks.json")).unwrap();
+    project
+        .anvil(&["ide", "zed"])
+        .success()
+        .contains("Wrote .zed/tasks.json")
+        .contains("Wrote .vscode/tasks.json");
+    assert!(recorded("vscode") && recorded("zed"));
+
+    // A build drops an IDE whose files are gone: a new .vscode folder later gets nothing from builds
+    remove(".vscode");
+    project.anvil(&["build"]).success();
+    assert!(!recorded("vscode") && recorded("zed"));
+    std::fs::create_dir(project.path(".vscode")).unwrap();
+    project.write("src/extra.c", "int extra(void) { return 1; }\n");
+    project.anvil(&["build"]).success().lacks(".vscode");
+    assert!(!project.path(".vscode/tasks.json").exists());
+
+    // `all` writes every IDE
+    project.anvil(&["ide", "all"]).success();
+    assert!(project.path(".vscode/tasks.json").is_file() && project.path(".idea/customTargets.xml").is_file());
+    if cfg!(windows) {
+        // A deleted solution stays deleted when another IDE is named
+        assert!(project.path("named.sln").is_file() && recorded("vs"));
+        std::fs::remove_file(project.path("named.sln")).unwrap();
+        project.anvil(&["ide", "clion"]).success();
+        assert!(!project.path("named.sln").exists() && !recorded("vs") && recorded("clion"));
+    }
+}
+
 // 68. The link driver follows every file compiled into a binary: generated C++ sources, a C file compiled as C++ by a
 // file rule's `-xc++` (`/TP`), and `link-language` for a prebuilt C++ library (converted from LINKER_LANGUAGE).
 // Objects link in the order the sources are listed whatever their language, generated ones after
@@ -5930,4 +5980,109 @@ fn listing_targets_writes_no_files() {
     // The build writes them
     project.anvil(&["build"]).success();
     assert_eq!(project.read("generated.h"), "#pragma once\n");
+}
+
+// 73. The newest standards compile with every toolchain: c-std = "c23" and std = "c++23" reach the compiler as names it
+// knows (gcc before 14 and clang before 18 call C23 c2x, clang before 17 calls C++23 c++2b; clang-cl's /std: knows
+// neither), and the files see the standard's version
+fn newest_standards(toolchain: &str, test: &str) {
+    let project = Project::empty(test);
+    project.write("anvil.toml", "[project]\nname = \"newest\"\nstd = \"c++23\"\nc-std = \"c23\"\n");
+    project.write(
+        "src/main.cpp",
+        "#include <cstdio>\nextern \"C\" int c_is_c23(void);\n\
+         int main() { std::printf(\"C++23 %d, C23 %d\\n\", __cplusplus > 202002L, c_is_c23()); }\n",
+    );
+    project.write("src/version.c", "int c_is_c23(void) { return __STDC_VERSION__ > 201710L; }\n");
+
+    let run = project.anvil(&["run", "--toolchain", toolchain, "-v"]);
+    run.success();
+    assert_eq!(program_output(&run), "C++23 1, C23 1");
+}
+
+#[test]
+fn newest_standards_gcc() {
+    require!("gcc");
+    newest_standards("gcc", "newest_standards_gcc");
+}
+
+#[test]
+fn newest_standards_clang() {
+    require!("clang");
+    newest_standards("clang", "newest_standards_clang");
+}
+
+#[test]
+fn newest_standards_clang_cl() {
+    require!("clang-cl");
+    newest_standards("clang-cl", "newest_standards_clang_cl");
+}
+
+#[test]
+fn newest_standards_msvc() {
+    require!("msvc");
+    newest_standards("msvc", "newest_standards_msvc");
+}
+
+// 74. `{env:NAME}` in definitions and flags (a target's, its presets', file rules', the profile's) as in paths: the
+// value reaches the compiler and a new value recompiles; an unset variable, or one that leaves an entry empty, is an
+// error naming it
+#[test]
+fn environment_variables_in_definitions_and_flags() {
+    require!("default");
+    let project = Project::empty("env_defines");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"envd\"\n\n[preset.sized]\ndefines = [\"WIDTH={env:ANVIL_IT_WIDTH}\"]\n\n\
+         [target.app]\nkind = \"exe\"\npreset = \"sized\"\nsources = [\"src/*.c\"]\n\n\
+         [[target.app.file]]\nmatch = \"src/height.c\"\ndefines = [\"HEIGHT={env:ANVIL_IT_HEIGHT}\"]\n\n\
+         [profile.ci]\ninherits = \"debug\"\ndefines = [\"DEPTH={env:ANVIL_IT_DEPTH}\"]\n",
+    );
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\nint height(void);\n\
+         int main(void) {\n#ifdef DEPTH\n    printf(\"%d %d %d\\n\", WIDTH, height(), DEPTH);\n#else\n    printf(\"%d %d\\n\", WIDTH, height());\n#endif\n    return 0;\n}\n",
+    );
+    project.write("src/height.c", "int height(void) { return HEIGHT; }\n");
+    let sizes = |width: &'static str, height: &'static str| vec![("ANVIL_IT_WIDTH", width), ("ANVIL_IT_HEIGHT", height)];
+
+    let run = project.anvil_with(".", &sizes("640", "360"), &["run"]);
+    run.success();
+    assert_eq!(program_output(&run), "640 360");
+    project.anvil_with(".", &sizes("640", "360"), &["build"]).success().up_to_date();
+
+    // A new value recompiles the files that use it
+    let run = project.anvil_with(".", &sizes("640", "480"), &["run"]);
+    assert_eq!(run.success().compiled(), 1);
+    assert_eq!(program_output(&run), "640 480");
+    let run = project.anvil_with(".", &sizes("800", "480"), &["run"]);
+    assert_eq!(run.success().compiled(), 2);
+    assert_eq!(program_output(&run), "800 480");
+
+    // The profile's, only when it builds
+    let mut ci = sizes("800", "600");
+    ci.push(("ANVIL_IT_DEPTH", "32"));
+    let run = project.anvil_with(".", &ci, &["run", "-p", "ci"]);
+    assert_eq!(program_output(run.success()), "800 600 32");
+    project
+        .anvil_with(".", &sizes("800", "600"), &["build", "-p", "ci"])
+        .code(1)
+        .contains("in [profile.ci]: environment variable `ANVIL_IT_DEPTH` is not set");
+
+    // Unset, or leaving an entry empty
+    project
+        .anvil_with(".", &[("ANVIL_IT_WIDTH", "1")], &["build"])
+        .code(1)
+        .contains("environment variable `ANVIL_IT_HEIGHT` is not set (used in \"HEIGHT={env:ANVIL_IT_HEIGHT}\")");
+    project.edit(
+        "anvil.toml",
+        "sources = [\"src/*.c\"]",
+        "sources = [\"src/*.c\"]\ndefines = [\"{env:ANVIL_IT_EMPTY}\"]",
+    );
+    let mut empty = sizes("1", "2");
+    empty.push(("ANVIL_IT_EMPTY", ""));
+    project
+        .anvil_with(".", &empty, &["build"])
+        .code(1)
+        .contains("in [target.app]: \"{env:ANVIL_IT_EMPTY}\" is empty once its environment variables are filled in");
 }

@@ -1,4 +1,4 @@
-//! One check of a project, as `anvil targets` loads it (nothing fetched, installed, built or written), on the
+//! One check of a project, as `anvil targets` loads it (nothing fetched, installed or built), on the
 //! editor's unsaved text: TOML errors with the parser's own spans, every unknown key and wrong type (the parser
 //! stops at the first, so each is blanked out and the text parsed again), then the project model's checks and
 //! warnings, each placed by crate::lsp::locate.

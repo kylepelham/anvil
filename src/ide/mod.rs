@@ -446,7 +446,7 @@ impl UserText {
 }
 
 /// The project as `anvil targets --json -p <profile>` with the record's toolchain, machine and options describes it,
-/// and the manifests that load read. Nothing is fetched, installed or written, and the load's warnings stay quiet (the
+/// and the manifests that load read. Nothing is fetched, installed or built, and the load's warnings stay quiet (the
 /// build prints its own).
 pub fn gather_profile(root: &Path, record: &Record, profile: &str) -> (Result<Project>, Vec<PathBuf>) {
     let build = BuildArgs {
@@ -487,9 +487,9 @@ pub fn setup(start_dir: &Path, build: &BuildArgs, requested: &[Ide]) -> Result<(
     let root = model.root.clone();
     let name = model.packages[0].name.clone();
 
-    // The IDEs asked for (every one for `all`), or with none those in use here, and those set up before
+    // The IDEs asked for (every one for `all`), or with none those in use here; of those set up before, the ones whose
+    // files are still there (deleting an IDE's files drops it, until `anvil ide <it>` again)
     let previous = Record::load(&root);
-    let mut ides: Vec<Ide> = previous.iter().flat_map(|record| record.ides.clone()).collect();
     let mut chosen: Vec<Ide> = match requested.contains(&Ide::All) {
         true if cfg!(windows) => vec![Ide::Vs, Ide::Vscode, Ide::Clion, Ide::Zed],
         true => vec![Ide::Vscode, Ide::Clion, Ide::Zed],
@@ -501,6 +501,11 @@ pub fn setup(start_dir: &Path, build: &BuildArgs, requested: &[Ide]) -> Result<(
             .filter(|ide| ide.anchor(&root, &name).exists() || (*ide == Ide::Vs && root.join(".vs").is_dir()))
             .collect();
     }
+    let mut ides: Vec<Ide> = previous
+        .iter()
+        .flat_map(|record| record.ides.clone())
+        .filter(|ide| chosen.contains(ide) || ide.anchor(&root, &name).exists())
+        .collect();
     for ide in chosen {
         if !ides.contains(&ide) {
             ides.push(ide);
@@ -611,9 +616,20 @@ pub fn refresh(model: &Model, build: &BuildArgs) {
 
     let name = &model.packages[0].name;
     let mut project = None;
+
+    // An IDE whose files are gone is dropped: deleting them stops their refreshes until `anvil ide <it>` again
+    let present: Vec<Ide> = record.ides.iter().copied().filter(|ide| ide.anchor(&model.root, name).exists()).collect();
+    if present != record.ides {
+        record.ides = present;
+        if let Err(error) = record.save(&model.root) {
+            ui::warn(&format!("IDE files not refreshed: {error:#}"));
+            return;
+        }
+    }
+
     for ide in record.ides.clone() {
-        // Deleting an IDE's files stops their refreshes; only Visual Studio builds other profiles
-        if !ide.anchor(&model.root, name).exists() || (ide != Ide::Vs && model.profile.name != record.profile) {
+        // Only Visual Studio builds other profiles
+        if ide != Ide::Vs && model.profile.name != record.profile {
             continue;
         }
 
