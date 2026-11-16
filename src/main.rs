@@ -502,7 +502,7 @@ fn main() {
             return;
         }
         if exec::INTERRUPTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            std::process::exit(130);
+            job::exit(130);
         }
     });
 
@@ -521,7 +521,7 @@ fn main() {
         };
         if let Err(reason) = entered {
             ui::error(&format!("-C {}: {reason}", dir.display()));
-            std::process::exit(1);
+            job::exit(1);
         }
     }
 
@@ -592,11 +592,11 @@ fn main() {
         job::release();
     }
     match result {
-        Ok(code) => std::process::exit(code),
+        Ok(code) => job::exit(code),
         Err(error) => {
             ui::clear_progress();
             ui::error(&format!("{error:#}"));
-            std::process::exit(1);
+            job::exit(1);
         }
     }
 }
