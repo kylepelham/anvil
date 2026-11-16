@@ -49,7 +49,7 @@ pub(crate) struct ImportedTarget {
     pub(crate) kind: String,
     /// INTERFACE_INCLUDE_DIRECTORIES (prefixes expanded) and INTERFACE_COMPILE_DEFINITIONS as written: evaluated per
     /// language, like compile options.
-    include_values: Vec<String>,
+    pub(crate) include_values: Vec<String>,
     define_values: Vec<String>,
     /// Targets its users link too (not those under $<LINK_ONLY:...>).
     pub(crate) links: Vec<String>,
@@ -225,7 +225,7 @@ pub fn uses_debug_libraries(toolchain: &Toolchain, profile: &Profile) -> bool {
 }
 
 /// What a project needs from one vcpkg dependency (and everything it depends on).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Usage {
     /// The triplet's include folder, then the subfolders packages export (include/vma, include/libpng16).
     pub includes: Vec<PathBuf>,
@@ -248,7 +248,7 @@ pub struct Usage {
 }
 
 /// How CMake users find and link an installed port: `find_package(<name> [CONFIG])`, then its targets.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct CmakePackage {
     pub name: String,
     /// find_package needs CONFIG (a config file only), else CMake's own Find module finds it too.
@@ -1124,13 +1124,12 @@ pub(crate) fn module_target(name: &str, build: &BuildContext) -> Option<Imported
             target.link_items.push(library.into());
         }
         "Vulkan::Vulkan" => {
-            // FindVulkan's: the SDK VULKAN_SDK names (its Lib32 for 32-bit Windows), else the system's loader
+            // FindVulkan's: the SDK VULKAN_SDK names (its library for the target's processor), else the system's loader
             let sdk = std::env::var_os("VULKAN_SDK").filter(|sdk| !sdk.is_empty()).map(PathBuf::from);
             match (sdk, build.os) {
                 (Some(sdk), Os::Windows) => {
-                    let lib_folder = if matches!(build.cpu, Cpu::X86 | Cpu::Arm) { "Lib32" } else { "Lib" };
                     target.include_values.push(slash(&sdk.join("Include")));
-                    target.link_items.push(slash(&sdk.join(lib_folder).join("vulkan-1.lib")));
+                    target.link_items.push(slash(&vulkan_sdk_library(&sdk, build.cpu)));
                 }
                 (Some(sdk), os) => {
                     let library = if os == Os::Macos { "libvulkan.dylib" } else { "libvulkan.so" };
@@ -1145,6 +1144,17 @@ pub(crate) fn module_target(name: &str, build: &BuildContext) -> Option<Imported
     }
 
     Some(target)
+}
+
+/// The Windows Vulkan SDK's loader library for programs of `cpu`: Lib for x64, Lib32 for 32-bit, Lib-ARM64 for ARM64.
+pub(crate) fn vulkan_sdk_library(sdk: &Path, cpu: Cpu) -> PathBuf {
+    let folder = match cpu {
+        Cpu::X64 => "Lib",
+        Cpu::X86 | Cpu::Arm => "Lib32",
+        Cpu::Arm64 => "Lib-ARM64",
+    };
+
+    sdk.join(folder).join("vulkan-1.lib")
 }
 
 /// A warning about the OpenMP runtime, once per run however many packages and targets use OpenMP (under the language
