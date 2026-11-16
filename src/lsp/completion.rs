@@ -37,6 +37,15 @@ const PLACEHOLDERS: &[(&str, &str)] = &[
     ("cxx", "The C++ compiler's path."),
     ("cc", "The C compiler's path."),
     ("target:", "A target's file (a step waits for it): {target:app}, {target:pkg/tool}."),
+    ("target-dir:", "The folder of a target's file: {target-dir:app}."),
+    ("target-filename:", "The file name of a target's file: {target-filename:app}."),
+    (
+        "lib:",
+        "What programs link to use a target (a Windows DLL's import library, else its file).",
+    ),
+    ("lib-dir:", "The folder of what programs link to use a target."),
+    ("lib-filename:", "The file name of what programs link to use a target."),
+    ("pdb:", "The MSVC debug information beside a target's file."),
     (
         "hash:",
         "16 hex digits that change when the listed files, `compiler` or `flags` do (in defines and flags).",
