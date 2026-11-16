@@ -105,6 +105,8 @@ pub struct Target {
     pub link_depends: Vec<PathBuf>,
     /// DLLs loaded on the first call into them (programs and shared libraries; Windows only).
     pub delay_load: Vec<String>,
+    /// `link-language`: C++ (the C++ runtime linked) or C, overriding what the compiled languages say.
+    pub link_language: Option<Language>,
 
     // The output file: prefix, name and extension (None: the platform's)
     pub output_prefix: Option<String>,
@@ -221,6 +223,7 @@ struct Accumulated {
     delay_load: Vec<String>,
     /// `delay-load` from [defaults] and presets, which only targets that link a binary take.
     shared_delay_load: Vec<String>,
+    link_language: Option<String>,
     pch: Option<String>,
     unity: Option<toml::Value>,
     warnings: Option<String>,
@@ -375,6 +378,7 @@ impl Target {
             exports: false,
             link_depends: Vec::new(),
             delay_load: Vec::new(),
+            link_language: None,
             output_prefix: None,
             output_name: name.to_string(),
             output_suffix: None,
@@ -677,6 +681,7 @@ impl Target {
             self.delay_load = [settings.shared_delay_load, settings.delay_load].concat();
             crate::delay_load::check_names(&self.delay_load)?;
         }
+        self.link_language = settings.link_language.as_deref().map(parse_link_language).transpose()?;
 
         // Code generation
         self.std = normalize_standard(settings.std.as_deref().unwrap_or(scope.std), Language::Cxx)?;
@@ -872,6 +877,9 @@ fn check_spec(spec: &TargetSpec, table: Table, condition: &CondContext) -> Resul
     if let Some(names) = &spec.delay_load {
         crate::delay_load::check_names(names)?;
     }
+    if let Some(language) = &spec.link_language {
+        parse_link_language(language)?;
+    }
 
     // Per-file settings and build steps
     for rule in &spec.file {
@@ -1022,6 +1030,7 @@ impl Accumulated {
         set_if_some(&mut self.output_dir, &spec.output_dir);
         set_if_some(&mut self.version, &spec.version);
         set_if_some(&mut self.soversion, &spec.soversion);
+        set_if_some(&mut self.link_language, &spec.link_language);
         set_if_some(&mut self.install, &spec.install);
         set_if_some(&mut self.qt, &spec.qt);
         set_if_some(&mut self.workdir, &spec.workdir);
@@ -1062,6 +1071,15 @@ fn library_version(text: &str, key: &str, scope: &PackageScope, target_name: &st
     }
 
     Ok(version)
+}
+
+/// `link-language`: "c++" (CMake's CXX) or "c".
+fn parse_link_language(text: &str) -> Result<Language> {
+    match text {
+        "c++" => Ok(Language::Cxx),
+        "c" => Ok(Language::C),
+        other => bail!("link-language = \"{other}\": expected \"c++\" (link through the C++ compiler, with its runtime) or \"c\""),
+    }
 }
 
 /// The source patterns of a when block and those inside it.

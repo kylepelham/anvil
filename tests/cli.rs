@@ -5495,3 +5495,325 @@ fn ide_vscode_never_loses_what_it_cannot_merge() {
     assert!(text.contains("anvil: mine") && text.contains("\"label\": \"anvil: build\""), "{text}");
     project.anvil(&["build"]).success().lacks("Updated");
 }
+
+// 68. The link driver follows every file compiled into a binary: generated C++ sources, a C file compiled as C++ by a
+// file rule's `-xc++` (`/TP`), and `link-language` for a prebuilt C++ library (converted from LINKER_LANGUAGE).
+// Objects link in the order the sources are listed whatever their language, generated ones after
+
+// C++ that needs the C++ runtime to link: operator new, exceptions, std::string
+const CXX_COUNT: &str = "#include <stdexcept>\n#include <string>\n\
+     extern \"C\" int cxx_count(const char* text) {\n\
+         std::string* words = new std::string(text);\n\
+         try { if (words->empty()) throw std::runtime_error(\"empty\"); } catch (const std::exception&) { delete words; return -1; }\n\
+         int size = (int)words->size();\n\
+         delete words;\n\
+         return size;\n\
+     }\n";
+
+const C_MAIN: &str = "#include <stdio.h>\nint cxx_count(const char* text);\n\
+     int main(void) { printf(\"%d\\n\", cxx_count(\"hello\")); return 0; }\n";
+
+fn link_driver_follows_what_compiles(toolchain: &str, test: &str) {
+    let project = Project::empty(test);
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"drivers\"\n\n\
+         [target.stepped]\nkind = \"exe\"\nsources = [\"src/main.c\"]\n\n\
+         [[target.stepped.run]]\ninputs = [\"count.cpp.in\"]\noutput = \"{gen}/count.cpp\"\ncommand = \"cmake -E copy {root}/count.cpp.in {output}\"\n\n\
+         [target.forced]\nkind = \"exe\"\nsources = [\"src/main.c\", \"src/count.c\"]\n\n\
+         [[target.forced.file]]\nmatch = \"src/count.c\"\nif = \"msvc\"\nflags = [\"/TP\"]\n\n\
+         [[target.forced.file]]\nmatch = \"src/count.c\"\nif = \"!msvc\"\nflags = [\"-xc++\"]\n\n\
+         [target.mixed]\nkind = \"exe\"\nsources = [\"mixed/main.c\", \"mixed/zeta.c\", \"mixed/alpha.cpp\"]\n",
+    );
+    project.write("src/main.c", C_MAIN);
+    project.write("count.cpp.in", CXX_COUNT);
+    project.write("src/count.c", CXX_COUNT);
+    project.write(
+        "mixed/main.c",
+        "int zeta(void);\nint alpha(void);\nint main(void) { return zeta() + alpha(); }\n",
+    );
+    project.write("mixed/zeta.c", "int zeta(void) { return 0; }\n");
+    project.write("mixed/alpha.cpp", "extern \"C\" int alpha() { return 0; }\n");
+
+    let build = project.anvil(&["build", "-v", "--toolchain", toolchain]);
+    build.success();
+    for program in ["stepped", "forced"] {
+        let run = project.anvil(&["run", program, "--toolchain", toolchain]);
+        run.success();
+        assert_eq!(program_output(&run), "5", "{program}");
+    }
+
+    // C, C, then C++, as listed; generated sources after the listed ones
+    let exe = if cfg!(windows) { ".exe" } else { "" };
+    let mixed = link_line(&build, &format!("mixed{exe}"));
+    let position = |line: &str, name: &str| line.find(name).unwrap_or_else(|| panic!("{name} is not linked: {line}"));
+    assert!(position(&mixed, "main.c") < position(&mixed, "zeta.c"), "{mixed}");
+    assert!(position(&mixed, "zeta.c") < position(&mixed, "alpha.cpp"), "{mixed}");
+    let stepped = link_line(&build, &format!("stepped{exe}"));
+    assert!(position(&stepped, "main.c") < position(&stepped, "count.cpp"), "{stepped}");
+
+    project.anvil(&["build", "--toolchain", toolchain]).success().up_to_date();
+}
+
+#[test]
+fn link_driver_follows_what_compiles_gcc() {
+    require!("gcc");
+    link_driver_follows_what_compiles("gcc", "link_driver_gcc");
+}
+
+#[test]
+fn link_driver_follows_what_compiles_clang() {
+    require!("clang");
+    link_driver_follows_what_compiles("clang", "link_driver_clang");
+}
+
+#[test]
+fn link_driver_follows_what_compiles_msvc() {
+    require!("msvc");
+    link_driver_follows_what_compiles("msvc", "link_driver_msvc");
+}
+
+/// A C program on a prebuilt C++ static library, through `libs` and through a [deps] entry's `libs`: linked through
+/// the C++ compiler with `link-language = "c++"`, on the program or on a static library between them.
+fn link_language_for_prebuilt_libraries(toolchain: &str, test: &str) {
+    let library = Project::empty(&format!("{test}_library"));
+    library.write(
+        "anvil.toml",
+        "[project]\nname = \"cxxlib\"\n\n[target.cxxlib]\nkind = \"lib\"\nsources = [\"count.cpp\"]\n",
+    );
+    library.write("count.cpp", CXX_COUNT);
+    library.anvil(&["build", "--toolchain", toolchain]).success();
+    let archive = std::fs::read_dir(library.path(&format!("out/debug-{toolchain}/lib")))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.file_name().is_some_and(|name| name.to_string_lossy().contains("cxxlib")))
+        .expect("the library's archive");
+    let archive = archive.to_string_lossy().replace('\\', "/");
+
+    let project = Project::empty(test);
+    project.write("src/main.c", C_MAIN);
+    project.write("wrap/wrap.c", "int wrap(void) { return 0; }\n");
+    let manifests = [
+        format!("[project]\nname = \"app\"\n\n[target.app]\nkind = \"exe\"\nsources = [\"src/main.c\"]\nlibs = [\"{archive}\"]\nlink-language = \"c++\"\n"),
+        format!(
+            "[project]\nname = \"app\"\n\n[deps]\ncxxlib = {{ libs = [\"{archive}\"] }}\n\n\
+             [target.app]\nkind = \"exe\"\nsources = [\"src/main.c\"]\ndeps = [\"cxxlib\"]\nlink-language = \"c++\"\n"
+        ),
+        format!(
+            "[project]\nname = \"app\"\n\n[target.wrap]\nkind = \"lib\"\nsources = [\"wrap/wrap.c\"]\nlibs = [\"{archive}\"]\nlink-language = \"c++\"\n\n\
+             [target.app]\nkind = \"exe\"\nsources = [\"src/main.c\"]\ndeps = [\"wrap\"]\n"
+        ),
+    ];
+    for manifest in &manifests {
+        project.write("anvil.toml", manifest);
+        let run = project.anvil(&["run", "app", "--toolchain", toolchain]);
+        run.success();
+        assert_eq!(program_output(&run), "5", "{manifest}");
+    }
+
+    // Without it gcc and clang (outside the MSVC ABI) link C through the C compiler, which lacks the C++ runtime
+    if toolchain == "gcc" || (toolchain == "clang" && !cfg!(windows)) {
+        project.write("anvil.toml", &manifests[0].replace("link-language = \"c++\"\n", ""));
+        let build = project.anvil(&["build", "--toolchain", toolchain]);
+        assert_ne!(build.code, 0, "{}", build.output());
+    }
+
+    // Only "c++" and "c"
+    project.write("anvil.toml", &manifests[0].replace("\"c++\"", "\"cpp\""));
+    let build = project.anvil(&["build", "--toolchain", toolchain]);
+    assert_ne!(build.code, 0, "{}", build.output());
+    build.contains("in [target.app]: link-language = \"cpp\": expected \"c++\"");
+}
+
+#[test]
+fn link_language_for_prebuilt_libraries_gcc() {
+    require!("gcc");
+    link_language_for_prebuilt_libraries("gcc", "link_language_gcc");
+}
+
+#[test]
+fn link_language_for_prebuilt_libraries_clang() {
+    require!("clang");
+    link_language_for_prebuilt_libraries("clang", "link_language_clang");
+}
+
+#[test]
+fn link_language_for_prebuilt_libraries_msvc() {
+    require!("msvc");
+    link_language_for_prebuilt_libraries("msvc", "link_language_msvc");
+}
+
+#[test]
+fn linker_language_converts_to_link_language() {
+    let project = Project::empty("convert_linker_language");
+    project.write(
+        "CMakeLists.txt",
+        "cmake_minimum_required(VERSION 3.20)\nproject(lang C CXX)\nadd_executable(app main.c)\n\
+         set_target_properties(app PROPERTIES LINKER_LANGUAGE CXX)\nadd_library(util STATIC util.c)\n\
+         set_target_properties(util PROPERTIES LINKER_LANGUAGE CXX)\n",
+    );
+    project.write("main.c", "int main(void) { return 0; }\n");
+    project.write("util.c", "int util(void) { return 0; }\n");
+
+    project.anvil(&["convert"]).success();
+    let manifest = project.read("anvil.toml");
+    assert_eq!(manifest.matches("link-language = \"c++\"").count(), 1, "{manifest}");
+}
+
+// 69. Stale outputs and installs (Linux): a shared library's new `version` removes the files and links of the old one
+// Anvil made (nothing else), and a reinstall removes the old links, whose files were removed first
+#[cfg(target_os = "linux")]
+#[test]
+fn a_new_library_version_replaces_the_old_files() {
+    require!("default");
+    let project = Project::fixture("shared", "version_bump");
+    project.edit(
+        "anvil.toml",
+        "kind = \"shared\"",
+        "kind = \"shared\"\nversion = \"1.2.3\"\nsoversion = \"1\"",
+    );
+    let run = project.anvil(&["run", "app"]);
+    run.success();
+    project.anvil(&["install", "--prefix", "out/prefix"]).success();
+    let folder = project.root.join(run.program()).parent().unwrap().to_path_buf();
+    std::fs::write(folder.join("libmylib.so.7"), "not Anvil's").unwrap();
+
+    project.edit(
+        "anvil.toml",
+        "version = \"1.2.3\"\nsoversion = \"1\"",
+        "version = \"2.0.0\"\nsoversion = \"2\"",
+    );
+    let run = project.anvil(&["run", "app"]);
+    run.success();
+    assert_eq!(program_output(&run), "answer 42");
+    let mut files: Vec<String> = std::fs::read_dir(&folder)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("libmylib"))
+        .collect();
+    files.sort();
+    assert_eq!(files, ["libmylib.so", "libmylib.so.2", "libmylib.so.2.0.0", "libmylib.so.7"]);
+    project.anvil(&["build"]).success().up_to_date();
+
+    // The reinstall leaves no link to a removed file
+    project.anvil(&["install", "--prefix", "out/prefix"]).success();
+    let mut installed: Vec<String> = std::fs::read_dir(project.path("out/prefix/lib"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("libmylib"))
+        .collect();
+    installed.sort();
+    assert_eq!(installed, ["libmylib.so", "libmylib.so.2", "libmylib.so.2.0.0"]);
+}
+
+// 70. A .clang-tidy's HeaderFilterRegex turns Anvil's own header filter off only when it is set, not in a comment
+#[test]
+fn tidy_header_filter_only_when_set() {
+    require!("default");
+    let project = Project::empty("tidy_header_filter");
+    project.write("anvil.toml", "[project]\nname = \"filter\"\n");
+    project.write("src/check.h", "inline int check(int* value) { if (value = 0) return 1; return 0; }\n");
+    project.write(
+        "src/main.cpp",
+        "#include \"check.h\"\nint main() { int value = 0; return check(&value); }\n",
+    );
+    project.write(
+        ".clang-tidy",
+        "Checks: '-*,bugprone-assignment-in-if-condition'\n# HeaderFilterRegex: 'nothing'\n",
+    );
+
+    let run = project.anvil(&["tidy"]);
+    if lint_tool_missing(&run, "clang-tidy") {
+        return;
+    }
+    run.code(1).contains("check.h:1:");
+
+    project.write(
+        ".clang-tidy",
+        "Checks: '-*,bugprone-assignment-in-if-condition'\nHeaderFilterRegex: 'nothing'\n",
+    );
+    project.anvil(&["tidy"]).success().contains("nothing found");
+}
+
+// 71. SIGTERM and SIGHUP to Anvil (Linux): a test's process group ends with it, the processes the test started too, and
+// Anvil ends by the signal; `anvil run` without a terminal passes the signal to its program's whole group
+
+/// The processes running `sleep <seconds>`.
+#[cfg(target_os = "linux")]
+fn sleeping(seconds: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let command = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        if command == format!("sleep\0{seconds}\0").as_bytes() {
+            found.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    found
+}
+
+/// Starts anvil with `args` in the project, waits for `sleep <seconds>` to run, signals Anvil, and returns its status
+/// once the sleeps are gone (a panic when they stay).
+#[cfg(target_os = "linux")]
+fn signal_anvil(project: &Project, args: &[&str], seconds: &str, signal: &str) -> std::process::ExitStatus {
+    let mut anvil = Command::new(common::ANVIL)
+        .args(args)
+        .current_dir(&project.root)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    while sleeping(seconds).len() < 2 {
+        assert!(started.elapsed() < Duration::from_secs(120), "the test's processes never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Command::new("kill").args([signal, &anvil.id().to_string()]).status().unwrap();
+    let status = anvil.wait().unwrap();
+
+    let ended = std::time::Instant::now();
+    while !sleeping(seconds).is_empty() {
+        assert!(
+            ended.elapsed() < Duration::from_secs(10),
+            "still running after {signal}: {:?}",
+            sleeping(seconds)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    status
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn termination_stops_tests_and_programs_with_their_children() {
+    use std::os::unix::process::ExitStatusExt;
+
+    require!("default");
+    let project = Project::empty("termination");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"spawner\"\n\n[[test]]\nname = \"spawns\"\ncommand = [\"{target:spawner}\", \"3917\"]\n",
+    );
+    project.write(
+        "src/main.c",
+        "#include <unistd.h>\nint main(int argc, char** argv) {\n\
+             if (fork() == 0) { execlp(\"sleep\", \"sleep\", argv[1], (char*)0); _exit(1); }\n\
+             execlp(\"sleep\", \"sleep\", argv[1], (char*)0);\n\
+             return 1;\n}\n",
+    );
+    project.anvil(&["build", "--all"]).success();
+
+    for (signal, number) in [("-TERM", libc::SIGTERM), ("-HUP", libc::SIGHUP)] {
+        let status = signal_anvil(&project, &["test"], "3917", signal);
+        assert_eq!(status.signal(), Some(number), "{status:?}");
+    }
+
+    // `anvil run`: its program gets the signal, and Anvil exits as a shell would after it (128 + the signal)
+    let status = signal_anvil(&project, &["run", "--", "3918"], "3918", "-TERM");
+    assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{status:?}");
+}

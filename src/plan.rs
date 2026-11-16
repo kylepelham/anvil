@@ -81,6 +81,9 @@ pub struct Action {
     /// DLLs the linked binary (the first output) must delay-load, with the error to show when it does not.
     pub must_delay_load: Vec<(String, String)>,
 
+    /// A shared library's link (Linux, macOS): its names, so that versions an earlier build made go when it runs.
+    pub library_names: Option<LibraryNames>,
+
     /// The outputs are stamps the action does not make itself: written once it succeeds.
     pub stamp: bool,
 
@@ -97,6 +100,14 @@ pub struct Action {
     /// Everything about how the action runs (kind, program, arguments, folder, declared inputs); a change means the
     /// output is stale. Set once the action is planned.
     pub command_hash: u64,
+}
+
+/// A shared library's names on Linux and macOS: the one links give (libfoo.so) and the versioned ones this build makes
+/// (libfoo.so.1.4.0, libfoo.so.3).
+#[derive(Debug, Clone)]
+pub struct LibraryNames {
+    pub unversioned: PathBuf,
+    pub current: Vec<String>,
 }
 
 pub struct Plan {
@@ -179,6 +190,32 @@ struct Planner<'a> {
 
     /// The Qt each target that uses it builds with (crate::qt).
     qt: HashMap<usize, Arc<crate::qt::Qt>>,
+
+    /// Targets that compile C++ (CUDA, Objective-C++, generated C++, C files compiled as C++): what links them needs
+    /// the C++ runtime.
+    compiles_cxx: HashSet<usize>,
+}
+
+impl LibraryNames {
+    /// Whether a file name in the library's folder is another version of it: libfoo.so.1.2.0 (macOS:
+    /// libfoo.1.2.0.dylib), numbers and letters joined by dots, as `version` takes.
+    pub fn is_other_version(&self, name: &str) -> bool {
+        let base = self.unversioned.file_name().unwrap_or_default().to_string_lossy();
+        let version = match base.strip_suffix(".dylib") {
+            Some(stem) => name
+                .strip_prefix(stem)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .and_then(|rest| rest.strip_suffix(".dylib")),
+            None => name.strip_prefix(base.as_ref()).and_then(|rest| rest.strip_prefix('.')),
+        };
+        let is_version = version.is_some_and(|version| {
+            version
+                .split('.')
+                .all(|part| !part.is_empty() && part.chars().all(|character| character.is_ascii_alphanumeric()))
+        });
+
+        is_version && !self.current.iter().any(|current| current == name)
+    }
 }
 
 impl Action {
@@ -233,6 +270,7 @@ impl Action {
             symlink: false,
             must_create: Vec::new(),
             must_delay_load: Vec::new(),
+            library_names: None,
             stamp: false,
             incremental_state: None,
             raw_args: false,
@@ -473,15 +511,6 @@ fn source_kind(source: &Path, family: crate::toolchain::Family) -> Result<Source
     Ok(kind)
 }
 
-/// Whether a target compiles C++ (CUDA and Objective-C++ too), whose link needs the C++ runtime.
-fn has_cxx_sources(target: &Target, family: crate::toolchain::Family) -> bool {
-    target.sources.iter().any(|source| match source_kind(source, family) {
-        Ok(SourceKind::Cxx | SourceKind::Cuda) => true,
-        Ok(SourceKind::ObjC) => source.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("mm")),
-        _ => false,
-    })
-}
-
 /// Replaces `{target:NAME}` with each target's artifact path.
 pub fn substitute_targets(word: &str, model: &Model) -> Result<String> {
     let mut result = word.to_string();
@@ -526,6 +555,7 @@ impl<'a> Planner<'a> {
             host_tools: HashMap::new(),
             named_files: Vec::new(),
             qt: crate::qt::installations(model),
+            compiles_cxx: HashSet::new(),
         }
     }
 
@@ -779,21 +809,23 @@ impl<'a> Planner<'a> {
         let inputs = self.compile_inputs(index);
         let barrier = self.generation_barrier(index);
 
-        // Split sources: resources, assembly, files with their own settings, and the rest (which may batch and use the PCH)
+        // Split sources: resources, assembly, files with their own settings, and the rest (which may batch and use the PCH);
+        // each keeps its place in the list, which orders the objects
         let has_rule = |source: &Path| target.file_rules.iter().any(|rule| rule.matcher.is_match(slash(source)));
         let mut resources = Vec::new();
         let mut assembly = Vec::new();
         let mut cuda = Vec::new();
         let mut plain_cxx = Vec::new();
         let mut others = Vec::new();
-        for source in sources {
+        for (position, source) in sources.iter().enumerate() {
+            let entry = (position, source.clone());
             match source_kind(source, self.toolchain.family)? {
                 SourceKind::Header | SourceKind::Definition | SourceKind::Manifest | SourceKind::Qt => {}
-                SourceKind::Resource => resources.push(source.clone()),
-                SourceKind::Assembly => assembly.push(source.clone()),
-                SourceKind::Cuda => cuda.push(source.clone()),
-                SourceKind::Cxx if !has_rule(source) => plain_cxx.push(source.clone()),
-                SourceKind::Cxx | SourceKind::C | SourceKind::ObjC => others.push(source.clone()),
+                SourceKind::Resource => resources.push(entry),
+                SourceKind::Assembly => assembly.push(entry),
+                SourceKind::Cuda => cuda.push(entry),
+                SourceKind::Cxx if !has_rule(source) => plain_cxx.push(entry),
+                SourceKind::Cxx | SourceKind::C | SourceKind::ObjC => others.push(entry),
             }
         }
 
@@ -803,54 +835,62 @@ impl<'a> Planner<'a> {
             _ => None,
         };
 
-        // Unity batches replace the plain files they include
-        let mut compile_list: Vec<(PathBuf, bool)> = Vec::new();
+        // Unity batches replace the plain files they include, in the place of their first
+        let mut compile_list: Vec<(usize, PathBuf, bool)> = Vec::new();
         match target.unity {
             Some(batch_size) if plain_cxx.len() > 1 => {
-                for source in &plain_cxx {
+                for (_, source) in &plain_cxx {
                     self.add_compile_command(index, source, &inputs, pch.as_ref());
                 }
 
                 for (batch, chunk) in plain_cxx.chunks(batch_size).enumerate() {
                     let unity_file = object_dir.join("unity").join(format!("unity_{batch}.cpp"));
-                    let content: String = chunk.iter().map(|source| format!("#include \"{}\"\n", slash(source))).collect();
+                    let content: String = chunk.iter().map(|(_, source)| format!("#include \"{}\"\n", slash(source))).collect();
                     util::write_if_changed(&unity_file, content.as_bytes())?;
-                    compile_list.push((unity_file, true));
+                    compile_list.push((chunk[0].0, unity_file, true));
                 }
             }
-            _ => compile_list.extend(plain_cxx.iter().map(|source| (source.clone(), true))),
+            _ => compile_list.extend(plain_cxx.iter().map(|(position, source)| (*position, source.clone(), true))),
         }
-        compile_list.extend(others.iter().map(|source| (source.clone(), false)));
+        compile_list.extend(others.iter().map(|(position, source)| (*position, source.clone(), false)));
 
-        // One action per translation unit
-        let mut objects: Vec<(PathBuf, usize)> = Vec::new();
+        // One action per translation unit; cl's precompiled header object goes first
+        let mut objects: Vec<(usize, PathBuf, usize)> = Vec::new();
         if let Some(pch) = &pch {
             if self.toolchain.family.is_msvc_style() {
-                objects.push((self.actions[pch.action].outputs[0].clone(), pch.action));
+                objects.push((0, self.actions[pch.action].outputs[0].clone(), pch.action));
             }
         }
 
-        for (source, may_use_pch) in compile_list {
+        let mut compiles_cxx = !cuda.is_empty();
+        for (position, source, may_use_pch) in compile_list {
             let pch_for_file = if may_use_pch { pch.as_ref() } else { None };
-            let action = self.plan_compile(index, &source, &inputs, pch_for_file, &barrier)?;
-            objects.push((self.actions[action].outputs[0].clone(), action));
+            let (action, language) = self.plan_compile(index, &source, &inputs, pch_for_file, &barrier)?;
+            compiles_cxx |= matches!(language, Language::Cxx | Language::ObjCxx);
+            objects.push((position, self.actions[action].outputs[0].clone(), action));
+        }
+        if compiles_cxx {
+            self.compiles_cxx.insert(index);
         }
 
-        for source in resources {
+        for (position, source) in resources {
             let action = self.plan_resource(index, &source, &inputs, &barrier)?;
-            objects.push((self.actions[action].outputs[0].clone(), action));
+            objects.push((position, self.actions[action].outputs[0].clone(), action));
         }
 
-        for source in assembly {
+        for (position, source) in assembly {
             let action = self.plan_assemble(index, &source, &inputs, &barrier)?;
-            objects.push((self.actions[action].outputs[0].clone(), action));
+            objects.push((position, self.actions[action].outputs[0].clone(), action));
         }
 
-        for source in cuda {
+        for (position, source) in cuda {
             let action = self.plan_cuda(index, &source, &inputs, &barrier)?;
-            objects.push((self.actions[action].outputs[0].clone(), action));
+            objects.push((position, self.actions[action].outputs[0].clone(), action));
         }
 
+        // Objects link in the order their sources are listed (generated ones after, in the order they are made)
+        objects.sort_by_key(|(position, _, _)| *position);
+        let objects = objects.into_iter().map(|(_, object, action)| (object, action)).collect();
         self.objects.insert(index, objects);
         Ok(())
     }
@@ -868,6 +908,12 @@ impl<'a> Planner<'a> {
             "mm" => Language::ObjCxx,
             _ => Language::Cxx,
         };
+
+        // A switch in its flags compiles it as another language (`-x c++`, `/TP`: CMake's LANGUAGE property)
+        let source_text = slash(source);
+        let rules = || target.file_rules.iter().filter(|rule| rule.matcher.is_match(&source_text));
+        let flags = inputs.flags.iter().chain(rules().flat_map(|rule| &rule.flags));
+        let language = language_switch(flags, self.toolchain.family.is_msvc_style()).unwrap_or(language);
 
         // The target's settings, borrowed until a file rule adds to them
         let mut settings = FileSettings {
@@ -901,8 +947,7 @@ impl<'a> Planner<'a> {
         if target.file_rules.is_empty() {
             return settings;
         }
-        let source_text = slash(source);
-        for rule in target.file_rules.iter().filter(|rule| rule.matcher.is_match(&source_text)) {
+        for rule in rules() {
             apply_file_rule(&mut settings, rule);
         }
 
@@ -957,6 +1002,7 @@ impl<'a> Planner<'a> {
         object_dir.join(format!("{hashed_name}.{extension}"))
     }
 
+    /// One translation unit: its action, and the language it compiles as.
     fn plan_compile(
         &mut self,
         index: usize,
@@ -964,7 +1010,7 @@ impl<'a> Planner<'a> {
         inputs: &CompileInputs,
         pch: Option<&PrecompiledHeader>,
         barrier: &[usize],
-    ) -> Result<usize> {
+    ) -> Result<(usize, Language)> {
         let target = &self.model.targets[index];
         let settings = self.file_settings(target, source, inputs);
         let spec = self.compile_spec(&settings, self.position_independent(target));
@@ -997,12 +1043,13 @@ impl<'a> Planner<'a> {
         action.echo_line = self.compiler_echo(source);
         action.color_diagnostics = self.color_diagnostics();
         action.launcher = self.launcher(pch.is_some());
+        let language = settings.language;
 
         self.compile_commands.push(CompileEntry {
             source: source.to_path_buf(),
             command: CompileCommand::Planned(self.actions.len()),
         });
-        Ok(self.push(action))
+        Ok((self.push(action), language))
     }
 
     /// The compiler cache a compile runs through: none for sccache with cl's precompiled headers (/Yc, /Yu), which
@@ -1323,8 +1370,16 @@ impl<'a> Planner<'a> {
         action.after = own_objects.iter().map(|(_, action)| *action).chain(link.after.iter().copied()).collect();
         action.after.extend(referenced_actions);
         action.response = self.response_style();
-        // A link where it writes (the library was versioned before) is not to be written through
+        // A link where it writes (the library was versioned before) is not to be written through, and versions an
+        // earlier build made under other numbers go
         action.remove_outputs_first = shared && !self.toolchain.targets_windows();
+        if action.remove_outputs_first {
+            let current = library_version.iter().flat_map(|version| [version.file.clone(), version.soname.clone()]);
+            action.library_names = Some(LibraryNames {
+                unversioned: output.clone(),
+                current: current.collect(),
+            });
+        }
         if action.args.iter().any(|argument| argument == "/INCREMENTAL") {
             action.incremental_state = Some(output.with_extension("ilk"));
         }
@@ -1401,19 +1456,24 @@ impl<'a> Planner<'a> {
         Ok(())
     }
 
-    /// Whether a binary links C++ code, as CMake's LINKER_LANGUAGE decides: its own sources, those of the static and
-    /// object libraries it links, or a package's static library that may be C++. Shared libraries and programs carry
-    /// their own runtime.
+    /// Whether a binary links C++ code, as CMake's LINKER_LANGUAGE decides: its `link-language`, else what it compiles
+    /// (generated sources too), what the static and object libraries it links compile (or their `link-language`), or a
+    /// package's static library that may be C++. Shared libraries and programs carry their own runtime.
     fn links_cxx(&self, index: usize) -> bool {
+        if let Some(language) = self.model.targets[index].link_language {
+            return language == Language::Cxx;
+        }
+
         let mut order = Vec::new();
         self.visit_link(index, index, &mut HashSet::new(), &mut order);
 
         order.iter().any(|dependency| {
             let target = &self.model.targets[*dependency];
+            let compiles_cxx = self.compiles_cxx.contains(dependency);
             match target.kind {
                 Kind::External => target.cxx_libraries,
-                Kind::Static | Kind::Object => has_cxx_sources(target, self.toolchain.family),
-                _ => *dependency == index && has_cxx_sources(target, self.toolchain.family),
+                Kind::Static | Kind::Object | Kind::Headers => target.link_language.map_or(compiles_cxx, |language| language == Language::Cxx),
+                _ => *dependency == index && compiles_cxx,
             }
         })
     }
@@ -2277,6 +2337,44 @@ enum CompileCommand {
     Alone(Box<Action>),
 }
 
+/// The language a compiler switch in `flags` compiles a file as, the last one deciding: gcc's and clang's `-x c++`
+/// (`-xc++`, `-x c`, `-x objective-c++`, `-x none` for the extension's), cl's `/TP` and `/TC`. None without one.
+fn language_switch<'f>(flags: impl Iterator<Item = &'f String>, msvc_style: bool) -> Option<Language> {
+    let mut language = None;
+    let mut after_x = false;
+
+    for flag in flags {
+        let value = if msvc_style {
+            match flag.as_str() {
+                "/TP" | "-TP" => "c++",
+                "/TC" | "-TC" => "c",
+                _ => continue,
+            }
+        } else if std::mem::take(&mut after_x) {
+            flag.as_str()
+        } else if flag == "-x" {
+            after_x = true;
+            continue;
+        } else {
+            match flag.strip_prefix("-x") {
+                Some(value) => value,
+                None => continue,
+            }
+        };
+
+        language = match value {
+            "c++" | "c++-header" => Some(Language::Cxx),
+            "c" | "c-header" => Some(Language::C),
+            "objective-c++" | "objective-c++-header" => Some(Language::ObjCxx),
+            "objective-c" | "objective-c-header" => Some(Language::ObjC),
+            "none" => None,
+            _ => language,
+        };
+    }
+
+    language
+}
+
 /// A file rule's settings on top of the target's.
 fn apply_file_rule(settings: &mut FileSettings, rule: &targets::ResolvedFileRule) {
     if !rule.defines.is_empty() {
@@ -2585,5 +2683,48 @@ mod tests {
         assert!(matches!(kind("x.inl"), Ok(SourceKind::Header)));
         assert!(kind("m.ixx").err().unwrap().to_string().contains("C++20 modules"));
         assert!(kind("notes.txt").is_err());
+    }
+
+    #[test]
+    fn language_switches_in_flags() {
+        let switch = |flags: &[&str], msvc_style: bool| {
+            let flags: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
+            language_switch(flags.iter(), msvc_style)
+        };
+
+        assert_eq!(switch(&["-O2", "-xc++"], false), Some(Language::Cxx));
+        assert_eq!(switch(&["-x", "c++-header"], false), Some(Language::Cxx));
+        assert_eq!(switch(&["-xc++", "-x", "c"], false), Some(Language::C));
+        assert_eq!(switch(&["-x", "objective-c++"], false), Some(Language::ObjCxx));
+        assert_eq!(switch(&["-xc++", "-x", "none"], false), None);
+        assert_eq!(switch(&["-x", "assembler-with-cpp"], false), None);
+        assert_eq!(switch(&["/TP"], false), None);
+        assert_eq!(switch(&["/W4", "/TP"], true), Some(Language::Cxx));
+        assert_eq!(switch(&["-TP", "/TC"], true), Some(Language::C));
+        assert_eq!(switch(&["-xc++"], true), None);
+    }
+
+    #[test]
+    fn other_versions_of_a_library() {
+        let linux = LibraryNames {
+            unversioned: PathBuf::from("/out/libfoo.so"),
+            current: vec!["libfoo.so.1.4.0".into(), "libfoo.so.3".into()],
+        };
+        assert!(linux.is_other_version("libfoo.so.1.3.0"));
+        assert!(linux.is_other_version("libfoo.so.2"));
+        assert!(!linux.is_other_version("libfoo.so.1.4.0"));
+        assert!(!linux.is_other_version("libfoo.so.3"));
+        assert!(!linux.is_other_version("libfoo.so"));
+        assert!(!linux.is_other_version("libfoo.so.1..2"));
+        assert!(!linux.is_other_version("libfoo.so.1-old"));
+        assert!(!linux.is_other_version("libfoobar.so.1"));
+
+        let macos = LibraryNames {
+            unversioned: PathBuf::from("/out/libfoo.dylib"),
+            current: Vec::new(),
+        };
+        assert!(macos.is_other_version("libfoo.1.2.0.dylib"));
+        assert!(!macos.is_other_version("libfoo.dylib"));
+        assert!(!macos.is_other_version("libfoo.1.2.0.dylib.dSYM"));
     }
 }

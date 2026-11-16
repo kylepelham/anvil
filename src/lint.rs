@@ -458,15 +458,17 @@ fn tidy_arguments(toolchain: &toolchain::Toolchain, database_dir: &Path) -> Vec<
     arguments
 }
 
-/// Does the .clang-tidy that applies to a file set HeaderFilterRegex (itself, or a parent one it inherits)?
+/// Does the .clang-tidy that applies to a file set HeaderFilterRegex (itself, or a parent one it inherits)? Anvil passes
+/// no --config-file, and clang-tidy reads no other file name (no _clang-tidy), so this is the one clang-tidy reads.
 fn sets_header_filter(file: &Path) -> bool {
     let inherits = regex::Regex::new(r"(?m)^\s*InheritParentConfig:\s*true").unwrap();
+    let header_filter = regex::Regex::new(r"(?m)^\s*HeaderFilterRegex\s*:").unwrap();
 
     for folder in file.ancestors().skip(1) {
         let Ok(text) = std::fs::read_to_string(folder.join(".clang-tidy")) else {
             continue;
         };
-        if text.contains("HeaderFilterRegex") {
+        if header_filter.is_match(&text) {
             return true;
         }
         if !inherits.is_match(&text) {
@@ -1251,5 +1253,31 @@ Suppressed 7 warnings (5 in non-user code, 2 with check filters).
             parse_diagnostics("USAGE: clang-tidy.exe [options] <source0>\nOPTIONS:\n  --fix - Apply\nError: no checks enabled.\n");
         assert!(diagnostics.is_empty());
         assert_eq!(other, ["Error: no checks enabled."]);
+    }
+
+    #[test]
+    fn finds_the_header_filter_clang_tidy_reads() {
+        let root = std::env::temp_dir().join(format!("anvil-lint-test-filter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src").join("a.cpp");
+        let write = |folder: &str, name: &str, text: &str| std::fs::write(root.join(folder).join(name), text).unwrap();
+
+        // A comment, another key that contains the name, and a _clang-tidy (which clang-tidy never reads) set nothing
+        write("src", ".clang-tidy", "Checks: '-*'\n# HeaderFilterRegex: 'x'\nMyHeaderFilterRegex: 1\n");
+        write("src", "_clang-tidy", "HeaderFilterRegex: 'x'\n");
+        assert!(!sets_header_filter(&file));
+
+        write("src", ".clang-tidy", "Checks: '-*'\n  HeaderFilterRegex : 'src/.*'\n");
+        assert!(sets_header_filter(&file));
+
+        // Inherited from the folder above, only with InheritParentConfig
+        write(".", ".clang-tidy", "HeaderFilterRegex: 'x'\n");
+        write("src", ".clang-tidy", "Checks: '-*'\n");
+        assert!(!sets_header_filter(&file));
+        write("src", ".clang-tidy", "InheritParentConfig: true\n");
+        assert!(sets_header_filter(&file));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

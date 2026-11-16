@@ -1,14 +1,32 @@
 //! Process trees: a test's program and every process it starts stop together at its timeout and at Ctrl-C (a job
 //! object on Windows, a process group on Unix); what a test leaves running when it ends by itself (a server later
 //! tests use) goes on. Anvil also puts itself in a job, so that whoever kills Anvil (an IDE's stop button) stops its
-//! compilers and tests with it (on Linux, `anvil run`'s program and the tests end with Anvil).
+//! compilers and tests with it (on Linux, `anvil run`'s program and the tests end with Anvil). On Unix, SIGTERM and
+//! SIGHUP stop the running tests' process groups before Anvil ends, and reach `anvil run`'s program; after a SIGKILL,
+//! which nothing can catch, only the programs Anvil started directly end with it (Linux), not what they started.
 
 use std::io;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::AtomicBool;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicI32, Ordering};
 
 /// `anvil run`'s program is running: Ctrl-C is its to handle (it gets the console's Ctrl-C itself), Anvil waits.
 pub static FOREGROUND_PROGRAM: AtomicBool = AtomicBool::new(false);
+
+// How many running tests' process groups a SIGTERM to Anvil stops (more run only with as many jobs; those beyond end
+// with Anvil on Linux, without their children)
+#[cfg(unix)]
+const GROUP_SLOTS: usize = 256;
+
+// The process groups of the running tests (0: a free slot), read by the signal handler
+#[cfg(unix)]
+static GROUPS: [AtomicI32; GROUP_SLOTS] = [const { AtomicI32::new(0) }; GROUP_SLOTS];
+
+// `anvil run`'s program, as kill() takes it: its process id when it shares Anvil's process group (a terminal's), minus
+// its group's id when it has its own; 0 when none runs
+#[cfg(unix)]
+static RUN_PROGRAM: AtomicI32 = AtomicI32::new(0);
 
 // cl's PDB server (/Zi, vcpkg's port builds) is shared by every compiler using the same endpoint name
 #[cfg(windows)]
@@ -19,6 +37,9 @@ pub struct ProcessTree {
     child: Child,
     #[cfg(windows)]
     job: Option<windows::Job>,
+    /// Its slot in GROUPS, when it got one.
+    #[cfg(unix)]
+    slot: Option<usize>,
 }
 
 impl ProcessTree {
@@ -48,7 +69,15 @@ impl ProcessTree {
 
         command.process_group(0);
         end_with_anvil(command);
-        Ok(ProcessTree { child: command.spawn()? })
+        let child = command.spawn()?;
+
+        // Its group, whose id is the program's, for a SIGTERM to Anvil to stop
+        let group = child.id() as i32;
+        let slot = GROUPS
+            .iter()
+            .position(|slot| slot.compare_exchange(0, group, Ordering::SeqCst, Ordering::SeqCst).is_ok());
+
+        Ok(ProcessTree { child, slot })
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
@@ -85,6 +114,15 @@ impl ProcessTree {
     }
 }
 
+#[cfg(unix)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot {
+            GROUPS[slot].store(0, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Makes a program Anvil starts and waits for (`anvil run`'s, a test's) end when Anvil does, however Anvil ends (an
 /// IDE's stop button, a CI timeout), as Anvil's job does on Windows: on Linux the kernel kills it when the thread that
 /// started it ends. Not done for compiles: they end soon by themselves, and spawning without it is faster.
@@ -109,6 +147,70 @@ pub fn end_with_anvil(command: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 pub fn end_with_anvil(_command: &mut Command) {}
 
+/// Runs `anvil run`'s program and waits for it. With a terminal it shares Anvil's process group, so the terminal's
+/// Ctrl-C, Ctrl-Z and input reach it as they would a program the shell started; without one (an IDE, CI, a script) it
+/// gets a group of its own, which a SIGTERM, SIGHUP or SIGINT to Anvil reaches whole, its children too.
+#[cfg(unix)]
+pub fn run_program(command: &mut Command) -> io::Result<ExitStatus> {
+    use std::os::unix::process::CommandExt;
+
+    let terminal = [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
+        .iter()
+        .any(|descriptor| unsafe { libc::isatty(*descriptor) } == 1);
+    if !terminal {
+        command.process_group(0);
+    }
+
+    let mut child = command.spawn()?;
+    let id = child.id() as i32;
+    RUN_PROGRAM.store(if terminal { id } else { -id }, Ordering::SeqCst);
+    let status = child.wait();
+    RUN_PROGRAM.store(0, Ordering::SeqCst);
+
+    status
+}
+
+#[cfg(windows)]
+pub fn run_program(command: &mut Command) -> io::Result<ExitStatus> {
+    command.status()
+}
+
+/// Ctrl-C while `anvil run`'s program runs: passed on when it has a process group of its own (no terminal sends it
+/// there); one sharing Anvil's gets the terminal's own.
+pub fn forward_interrupt() {
+    #[cfg(unix)]
+    {
+        let program = RUN_PROGRAM.load(Ordering::SeqCst);
+        if program < 0 {
+            unsafe { libc::kill(program, libc::SIGINT) };
+        }
+    }
+}
+
+/// SIGTERM and SIGHUP: `anvil run`'s program gets the signal and Anvil waits for it, exiting as it does; otherwise the
+/// running tests' process groups are killed and Anvil ends by the signal. Only async-signal-safe calls here.
+#[cfg(unix)]
+extern "C" fn on_termination(signal: libc::c_int) {
+    let program = RUN_PROGRAM.load(Ordering::SeqCst);
+    if program != 0 {
+        unsafe { libc::kill(program, signal) };
+        return;
+    }
+
+    for slot in &GROUPS {
+        let group = slot.load(Ordering::SeqCst);
+        if group > 0 {
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
+    }
+
+    // Ended by the signal itself, as the shell expects (exit code 128 + the signal); delivered once the handler returns
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
 /// Puts Anvil in a job that stops everything it started when Anvil dies or is killed. `release` before a normal exit.
 #[cfg(windows)]
 pub fn contain_self() {
@@ -124,8 +226,20 @@ pub fn contain_self() {
     }
 }
 
-#[cfg(not(windows))]
-pub fn contain_self() {}
+/// Stops what Anvil started when it is terminated (SIGTERM, SIGHUP): see `on_termination`.
+#[cfg(unix)]
+pub fn contain_self() {
+    let handler: extern "C" fn(libc::c_int) = on_termination;
+    for signal in [libc::SIGTERM, libc::SIGHUP] {
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+    }
+}
 
 /// Keeps Anvil's own input and output handles out of the processes it starts, except as the standard handles it
 /// gives them: a test's server outliving Anvil would otherwise hold Anvil's output open, and whoever reads it (a CI

@@ -29,6 +29,7 @@ const KIND_ALIASES: &[&str] = &[
 const WARNINGS: &[&str] = &["off", "default", "high", "all"];
 const WARNINGS_ALIASES: &[&str] = &["none", "extra", "pedantic"];
 const ARCHES: &[&str] = &["avx", "avx2", "avx512", "native"];
+const LINK_LANGUAGES: &[&str] = &["c++", "c"];
 const TOOLCHAINS: &[&str] = &["msvc", "clang-cl", "clang", "gcc"];
 const TOOLCHAIN_ALIASES: &[&str] = &["auto", "cl", "g++", "mingw"];
 const LINKAGES: &[&str] = &["static", "dynamic"];
@@ -441,6 +442,16 @@ fn target_table(kind: Table) -> Value {
                 "DLLs a Windows program or shared library loads on its first call into them instead of at start (\"nvml.dll\"): \
                  /DELAYLOAD with delayimp.lib (MSVC and clang-cl; MinGW cannot). Other systems ignore it.",
                 json!({ "type": "string", "pattern": DLL_NAME_PATTERN, "examples": ["nvml.dll"] }),
+            ),
+        ),
+        (
+            "link-language",
+            choice(
+                LINK_LANGUAGES,
+                &[],
+                "The compiler driver that links it, as CMake's LINKER_LANGUAGE: \"c++\" links the C++ runtime (a C program \
+                 using a prebuilt C++ library in `libs`), \"c\" does not. Default: by the languages compiled into it and its \
+                 static libraries. On a static or object library: what the binaries linking it count it as. MSVC ignores it.",
             ),
         ),
         (

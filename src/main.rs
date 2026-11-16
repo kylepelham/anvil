@@ -492,9 +492,11 @@ fn main() {
     let cli = Cli::parse();
     ui::init(cli.quiet);
 
-    // Ctrl-C: finish what is running, save the build database, stop. `anvil run`'s program handles its own.
+    // Ctrl-C: finish what is running, save the build database, stop. `anvil run`'s program handles its own (passed on
+    // to it when it runs without a terminal).
     let _ = ctrlc::set_handler(|| {
         if job::FOREGROUND_PROGRAM.load(std::sync::atomic::Ordering::Relaxed) {
+            job::forward_interrupt();
             return;
         }
         if exec::INTERRUPTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
