@@ -180,7 +180,13 @@ fn conditions_pick_platform_sources() {
 
     let run = project.anvil(&["run"]);
     run.success();
-    let expected = if cfg!(windows) { "platform windows" } else { "platform linux" };
+    let expected = if cfg!(windows) {
+        "platform windows"
+    } else if cfg!(target_os = "macos") {
+        "platform macos"
+    } else {
+        "platform linux"
+    };
     assert_eq!(program_output(&run), expected);
 
     let manifest = project.read("anvil.toml");
@@ -4814,7 +4820,9 @@ fn targets_json_describes_programs_as_run_starts_them() {
     assert_eq!(game["workdir"], description["root"]);
     let run = project.anvil(&["run", "game"]);
     run.success().contains("game 2");
-    assert_eq!(project.path(&run.program()), Path::new(&output));
+    // The same file, however the temp folder is spelled (macOS's /var is /private/var, Windows' RUNNER~1 runneradmin)
+    let started = std::fs::canonicalize(project.path(&run.program())).unwrap();
+    assert_eq!(started, std::fs::canonicalize(&output).unwrap());
     assert!(Path::new(&output).is_file());
 
     // Tests: the program a test of the project runs, and its command
@@ -4968,16 +4976,14 @@ fn ide_vs_solution_builds_through_anvil_with_msbuild() {
         &[".anvil/vs/game.vcxproj", "-p:Configuration=Debug", "-p:Platform=x64"],
     );
     assert!(!failed.0, "{}", failed.1);
-    let main = project.path("src/main.c").display().to_string().replace('/', "\\");
     let error_line = failed
         .1
         .lines()
         .find(|line| line.contains("error C2065"))
         .unwrap_or_else(|| panic!("{}", failed.1));
-    assert!(
-        error_line.to_lowercase().starts_with(&format!("{}(7)", main.to_lowercase())),
-        "{error_line}"
-    );
+    let (file, _) = error_line.split_once("(7)").unwrap_or_else(|| panic!("{error_line}"));
+    let main = std::fs::canonicalize(project.path("src/main.c")).unwrap();
+    assert_eq!(std::fs::canonicalize(file).ok(), Some(main), "{error_line}");
 }
 
 /// MSBuild of the newest Visual Studio, found by vswhere.

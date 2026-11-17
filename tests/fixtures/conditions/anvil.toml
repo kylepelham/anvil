@@ -9,3 +9,6 @@ sources = ["src/win/*.c"]
 
 [target.app.when.linux]
 sources = ["src/linux/*.c"]
+
+[target.app.when.macos]
+sources = ["src/macos/*.c"]
