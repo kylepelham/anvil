@@ -50,6 +50,39 @@ pub fn absolute(base: &Path, path: &Path) -> PathBuf {
     }
 }
 
+/// An existing path with its short (8.3) folder names spelled out, as compilers report them (`RUNNER~1` is
+/// `runneradmin`); unchanged when it has none or cannot be read.
+#[cfg(windows)]
+pub fn long_path(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+
+    if !path.to_string_lossy().contains('~') {
+        return path.to_path_buf();
+    }
+
+    // The first call says how long the buffer must be
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let needed = unsafe { GetLongPathNameW(wide_path.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return path.to_path_buf();
+    }
+
+    let mut buffer = vec![0u16; needed as usize];
+    let written = unsafe { GetLongPathNameW(wide_path.as_ptr(), buffer.as_mut_ptr(), needed) };
+    if written == 0 || written >= needed {
+        return path.to_path_buf();
+    }
+
+    buffer.truncate(written as usize);
+    PathBuf::from(std::ffi::OsString::from_wide(&buffer))
+}
+
+#[cfg(not(windows))]
+pub fn long_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 /// Forward-slash form of a path, for messages and generated files.
 pub fn slash(path: &Path) -> String {
     let text = path.to_string_lossy();

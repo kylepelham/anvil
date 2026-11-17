@@ -1329,6 +1329,7 @@ fn lint_tool_missing(run: &Run, tool: &str) -> bool {
 fn fmt_checks_then_formats_the_package() {
     let project = Project::fixture("lint", "fmt");
     project.write("out/debug/generated.cpp", "int  generated( ){return 1;}\n");
+    let ugly = project.read("third_party/ugly.cpp");
 
     let check = project.anvil(&["fmt", "--check"]);
     if lint_tool_missing(&check, "clang-format") {
@@ -1345,7 +1346,7 @@ fn fmt_checks_then_formats_the_package() {
 
     project.anvil(&["fmt"]).success().contains("Formatted src/main.cpp");
     assert!(project.read("src/main.cpp").contains("int main() { return pick(twice(1)); }"));
-    assert_eq!(project.read("third_party/ugly.cpp"), "int  ugly( ){return 1;}\n");
+    assert_eq!(project.read("third_party/ugly.cpp"), ugly);
     project.anvil(&["fmt", "--check"]).success().contains("4 files already formatted");
 
     // Without a .clang-format, nothing is rewritten in clang-format's own style
@@ -1637,14 +1638,34 @@ fn vcpkg_triplet_must_use_the_profile_runtime() {
 fn vcpkg_interface_options_reach_users() {
     require!("msvc", "windows", "vcpkg");
     let project = Project::empty("vcpkg_options");
-    project.write("src/main.cpp", "int main() { return 0; }\n");
+    project.write("src/main.cpp", "#include <optflags.h>\nint main() { return 0; }\n");
     project.write(
         "anvil.toml",
-        "[project]\nname = \"app\"\n\n[vcpkg]\ntriplet = \"x64-windows-static-md\"\n\n[deps]\nglaze = \"vcpkg\"\n\n\
-         [target.app]\nkind = \"exe\"\nsources = [\"src/main.cpp\"]\ndeps = [\"glaze\"]\n",
+        "[project]\nname = \"app\"\n\n[vcpkg]\ntriplet = \"x64-windows-static-md\"\noverlay-ports = [\"ports\"]\n\n\
+         [deps]\noptflags = \"vcpkg\"\n\n[target.app]\nkind = \"exe\"\nsources = [\"src/main.cpp\"]\ndeps = [\"optflags\"]\n",
     );
 
-    // glaze's INTERFACE_COMPILE_OPTIONS, and in release its $<$<CONFIG:Release>:...> compile and link options
+    // A port's options as glaze 6 had them (a port of its own, so a newer glaze, whose /GL is opt-in, changes nothing)
+    project.write("ports/optflags/vcpkg.json", "{ \"name\": \"optflags\", \"version\": \"1.0.0\" }\n");
+    project.write("ports/optflags/optflags.h", "#pragma once\n");
+    project.write(
+        "ports/optflags/optflagsConfig.cmake",
+        "get_filename_component(_IMPORT_PREFIX \"${CMAKE_CURRENT_LIST_DIR}/../..\" ABSOLUTE)\n\
+         add_library(optflags::optflags INTERFACE IMPORTED)\n\
+         set_target_properties(optflags::optflags PROPERTIES\n\
+         \x20 INTERFACE_INCLUDE_DIRECTORIES \"${_IMPORT_PREFIX}/include\"\n\
+         \x20 INTERFACE_COMPILE_OPTIONS \"/Zc:preprocessor;/permissive-;/Zc:lambda;$<$<CONFIG:Release>:/GL>;$<$<CONFIG:MinSizeRel>:/GL>\"\n\
+         \x20 INTERFACE_LINK_OPTIONS \"$<$<CONFIG:Release>:/LTCG;/INCREMENTAL:NO>;$<$<CONFIG:MinSizeRel>:/LTCG;/INCREMENTAL:NO>\")\n",
+    );
+    project.write(
+        "ports/optflags/portfile.cmake",
+        "set(VCPKG_POLICY_EMPTY_PACKAGE enabled)\n\
+         file(INSTALL \"${CMAKE_CURRENT_LIST_DIR}/optflags.h\" DESTINATION \"${CURRENT_PACKAGES_DIR}/include\")\n\
+         file(INSTALL \"${CMAKE_CURRENT_LIST_DIR}/optflagsConfig.cmake\" DESTINATION \"${CURRENT_PACKAGES_DIR}/share/optflags\")\n\
+         file(WRITE \"${CURRENT_PACKAGES_DIR}/share/optflags/copyright\" \"MIT\")\n",
+    );
+
+    // Its INTERFACE_COMPILE_OPTIONS, and in release its $<$<CONFIG:Release>:...> compile and link options
     project.anvil(&["build", "--toolchain", "msvc"]).success();
     let commands = project.read("out/compile_commands.json");
     assert!(commands.contains("\"/Zc:preprocessor\"") && !commands.contains("\"/GL\""), "{commands}");

@@ -525,6 +525,15 @@ fn main() {
         }
     }
 
+    // Short (8.3) folder names spelled out: the paths Anvil makes from the folder name each file as its compilers'
+    // dependency lists do, so a generated header is one file to both
+    if let Ok(here) = std::env::current_dir() {
+        let long = util::long_path(&here);
+        if long != here {
+            let _ = std::env::set_current_dir(long);
+        }
+    }
+
     let start_dir = PathBuf::from(".");
     let command = cli.command.unwrap_or(CommandLine::Build {
         targets: Vec::new(),

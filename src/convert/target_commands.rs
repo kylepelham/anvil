@@ -2738,9 +2738,12 @@ fn define_export_symbol(target: &mut Target) {
     // CMake's `<target>_EXPORTS` elsewhere, when its code uses it
     let default = format!("{}_EXPORTS", c_identifier(&target.name));
     if last_everywhere.is_none() && mentions_symbol(target, &default) {
-        let elsewhere = set
-            .iter()
-            .filter_map(|item| item.condition.as_deref())
+        // Simplest first, not in the order branches ran (this machine's branch runs last), so every machine writes
+        // the same condition
+        let mut conditions: Vec<&str> = set.iter().filter_map(|item| item.condition.as_deref()).collect();
+        conditions.sort_by_key(|condition| (condition.len(), *condition));
+        let elsewhere = conditions
+            .into_iter()
             .fold(None, |all, condition| model::and_optional(&all, &Some(model::negate(condition))));
         symbols.push((elsewhere, default));
     }

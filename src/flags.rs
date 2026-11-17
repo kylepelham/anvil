@@ -908,6 +908,12 @@ impl Toolchain {
         if windows_clang {
             args.push(clang_ms_runtime_flag(profile));
         }
+
+        // clang's driver names libcmt whatever -fms-runtime-lib says: lld-link reads the objects' runtime first and
+        // gets away with it, link.exe mixes the two C runtimes and fails (__imp__CrtDbgReport, __imp__beginthreadex)
+        if windows_clang && (profile.debug_runtime || !profile.static_runtime) {
+            args.push("-Wl,/NODEFAULTLIB:libcmt".into());
+        }
         if profile.lto {
             args.push(if self.family == Family::Clang { "-flto=thin" } else { "-flto=auto" }.into());
             if self.family == Family::Clang && self.lld {

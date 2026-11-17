@@ -1968,12 +1968,21 @@ fn symbol_host_text(symbol: &str) -> &'static str {
 
     match symbol {
         "WIN32" | "CMAKE_HOST_WIN32" | "MSVC" => on(cfg!(windows)),
-        "CMAKE_COMPILER_IS_GNUCXX" | "CMAKE_COMPILER_IS_GNUCC" => on(!cfg!(windows)),
+        "CMAKE_COMPILER_IS_GNUCXX" | "CMAKE_COMPILER_IS_GNUCC" => on(!cfg!(windows) && !cfg!(target_os = "macos")),
         "MSVC_VERSION" if cfg!(windows) => "1950",
         "UNIX" | "CMAKE_HOST_UNIX" => on(cfg!(unix)),
         "LINUX" => on(cfg!(target_os = "linux")),
         "APPLE" | "CMAKE_HOST_APPLE" => on(cfg!(target_os = "macos")),
-        "CMAKE_CXX_COMPILER_ID" | "CMAKE_C_COMPILER_ID" | "CMAKE_CXX_COMPILER_FRONTEND_VARIANT" | "CMAKE_C_COMPILER_FRONTEND_VARIANT" => {
+        "CMAKE_CXX_COMPILER_ID" | "CMAKE_C_COMPILER_ID" => {
+            if cfg!(windows) {
+                "MSVC"
+            } else if cfg!(target_os = "macos") {
+                "AppleClang"
+            } else {
+                "GNU"
+            }
+        }
+        "CMAKE_CXX_COMPILER_FRONTEND_VARIANT" | "CMAKE_C_COMPILER_FRONTEND_VARIANT" => {
             if cfg!(windows) {
                 "MSVC"
             } else {
@@ -2001,6 +2010,7 @@ fn symbol_host_text(symbol: &str) -> &'static str {
         "CMAKE_SYSTEM_PROCESSOR" => match (cfg!(windows), cfg!(target_arch = "aarch64")) {
             (true, true) => "ARM64",
             (true, false) => "AMD64",
+            (false, true) if cfg!(target_os = "macos") => "arm64",
             (false, true) => "aarch64",
             (false, false) => "x86_64",
         },
@@ -3243,8 +3253,14 @@ set(cxx_exception_flags "${cxx_base_flags} -EHsc")
             "{alternatives:?}"
         );
 
-        // Text that a conditional item cannot hold is this machine's
-        let header_text = if cfg!(windows) { "builds/<system> only" } else { "unix builds" };
+        // Text that a conditional item cannot hold is this machine's (Apple clang is neither)
+        let header_text = if cfg!(windows) {
+            "builds/<system> only"
+        } else if cfg!(target_os = "macos") {
+            ""
+        } else {
+            "unix builds"
+        };
         assert_eq!(variable(&interpreter, "header_text"), header_text);
     }
 

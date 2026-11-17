@@ -379,7 +379,7 @@ fn is_atom(text: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || "_-.+".contains(character))
 }
 
-/// Would a condition hold on this machine with this compiler (Windows + MSVC here)? Used to let the host's branch
+/// Would a condition hold on this machine with its usual compiler (MSVC on Windows, Apple clang on macOS, else gcc)? Used to let the host's branch
 /// set variables last, so values computed later match a real configure.
 pub fn holds_on_host(condition: &str, options: &dyn Fn(&str) -> Option<bool>) -> bool {
     let Some(parsed) = bdd::parse(condition) else { return false };
@@ -391,8 +391,9 @@ pub fn holds_on_host(condition: &str, options: &dyn Fn(&str) -> Option<bool>) ->
             "macos" => cfg!(target_os = "macos"),
             "unix" => cfg!(unix),
             "msvc" | "cl" => cfg!(windows),
-            "gnu" | "gcc" => !cfg!(windows),
-            "clang" | "clang-cl" | "mingw" | "cross" => false,
+            "gnu" | "gcc" => !cfg!(windows) && !cfg!(target_os = "macos"),
+            "clang" => cfg!(target_os = "macos"),
+            "clang-cl" | "mingw" | "cross" => false,
             "x64" => cfg!(target_arch = "x86_64"),
             "x86" => cfg!(target_arch = "x86"),
             "arm64" => cfg!(target_arch = "aarch64"),

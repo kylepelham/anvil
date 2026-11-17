@@ -4745,7 +4745,13 @@ string(TOUPPER "abc" PLAIN)
 "#;
         let interpreter = run("case", &[("CMakeLists.txt", cmake)]);
 
-        let (id, system) = if cfg!(windows) { ("msvc", "WINDOWS") } else { ("gnu", "LINUX") };
+        let (id, system) = if cfg!(windows) {
+            ("msvc", "WINDOWS")
+        } else if cfg!(target_os = "macos") {
+            ("appleclang", "DARWIN")
+        } else {
+            ("gnu", "LINUX")
+        };
         assert_eq!(variable(&interpreter, "CID"), id);
         assert_eq!(variable(&interpreter, "BT"), "{config}");
         assert_eq!(variable(&interpreter, "OUT"), format!("{{out}}/GEN-{system}"));
