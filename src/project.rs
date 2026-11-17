@@ -96,6 +96,8 @@ pub struct TestCase {
     pub expect: Vec<regex::Regex>,
     pub reject: Vec<regex::Regex>,
     pub exit_code: Option<i32>,
+    /// What `anvil test -L` picks it by.
+    pub labels: Vec<String>,
 }
 
 pub struct Model {
@@ -2182,6 +2184,7 @@ impl Model {
             expect: Some(target.expect.clone()),
             reject: Some(target.reject.clone()),
             exit_code: target.exit_code,
+            labels: Some(target.labels.clone()),
             ..Default::default()
         };
 
@@ -2932,6 +2935,14 @@ fn test_case(
         compile_test_regex(key, &pattern.as_ref().map(fill)).located(Place::key(key).value(written), "invalid-regex")
     };
 
+    let mut labels: Vec<String> = Vec::new();
+    for label in spec.labels.iter().flatten() {
+        crate::test_cases::check_label(label)?;
+        if !labels.contains(label) {
+            labels.push(label.clone());
+        }
+    }
+
     Ok(TestCase {
         name: spec.name.clone(),
         command: spec.command.to_command().iter().map(fill).collect(),
@@ -2948,6 +2959,7 @@ fn test_case(
         expect: compile_test_regexes("expect", spec.expect.as_deref().unwrap_or_default(), &fill)?,
         reject: compile_test_regexes("reject", spec.reject.as_deref().unwrap_or_default(), &fill)?,
         exit_code: spec.exit_code,
+        labels,
     })
 }
 

@@ -14,7 +14,7 @@
       "output": "{out}/plugin{exe}", "workdir": "{root}", "args": [], "env": {}, "dir": "{root}/dep", "gui": true }
   ],
   "tests": [
-    { "name": "smoke", "program": "game", "command": ["{out}/game{exe}", "--smoke"], "workdir": "{root}" },
+    { "name": "smoke", "program": "game", "command": ["{out}/game{exe}", "--smoke"], "workdir": "{root}", "labels": ["fast"] },
     { "name": "fails_on_purpose", "program": "game", "command": ["{out}/game{exe}", "fail"], "workdir": "{root}" },
     { "name": "dep/lint", "program": null, "command": ["python", "lint.py"], "workdir": "{root}/dep" }
   ]

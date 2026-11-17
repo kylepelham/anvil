@@ -664,7 +664,7 @@ impl Emitter {
                         converted.blocks.set(condition, key, Value::Bool(true));
                     }
                 }
-                "gui" | "default" | "qt" => converted.blocks.set(condition, key, Value::Bool(value == "true")),
+                "gui" | "default" | "qt" | "lto" => converted.blocks.set(condition, key, Value::Bool(value == "true")),
                 _ => converted.blocks.set(condition, key, Value::Text(value.clone())),
             }
         }
@@ -3835,6 +3835,7 @@ fn test_fields(test: &TestOut) -> Vec<(&'static str, test_groups::Field)> {
         ("expect", &properties.expect),
         ("reject", &properties.reject),
         ("after", &properties.after),
+        ("labels", &properties.labels),
     ];
     for (name, items) in lists.into_iter().filter(|(_, items)| !items.is_empty()) {
         fields.push((name, Field::List(items.clone())));
@@ -3949,6 +3950,9 @@ fn render_test_properties(output: &mut String, properties: &TestProperties) -> u
     }
     if !properties.after.is_empty() {
         let _ = writeln!(output, "after = {}", list(&properties.after, ""));
+    }
+    if !properties.labels.is_empty() {
+        let _ = writeln!(output, "labels = {}", list(&properties.labels, ""));
     }
 
     // Environment as an inline table

@@ -1,10 +1,11 @@
 //! IDE support. `anvil targets --json` describes the project for editor extensions; `anvil ide` writes the project
-//! files of Visual Studio, VS Code, CLion and Zed. What it writes only calls anvil (no flags or source lists a build
+//! files of Visual Studio, VS Code, CLion, Zed and Qt Creator. What it writes only calls anvil (no flags or source lists a build
 //! depends on), and every build refreshes the files `anvil ide` wrote (`refresh`), writing one only when its text
 //! changes, so nothing an IDE reads goes stale.
 
 mod clion;
 mod jsonc;
+mod qtcreator;
 mod vs;
 mod vscode;
 mod zed;
@@ -51,6 +52,8 @@ pub enum Ide {
     Clion,
     /// Zed: tasks and debug configurations in .zed/.
     Zed,
+    /// Qt Creator (experimental): a workspace project, .qtcreator/project.json.
+    Qtcreator,
     /// Every one of them (Visual Studio on Windows only).
     All,
 }
@@ -161,6 +164,7 @@ impl Ide {
             Ide::Vscode => "vscode",
             Ide::Clion => "clion",
             Ide::Zed => "zed",
+            Ide::Qtcreator => "qtcreator",
             Ide::All => "all",
         }
     }
@@ -172,6 +176,7 @@ impl Ide {
             Ide::Vscode => root.join(".vscode"),
             Ide::Clion => root.join(".idea"),
             Ide::Zed => root.join(".zed"),
+            Ide::Qtcreator => qtcreator::outputs(root).remove(0),
             Ide::All => root.to_path_buf(),
         }
     }
@@ -491,12 +496,12 @@ pub fn setup(start_dir: &Path, build: &BuildArgs, requested: &[Ide]) -> Result<(
     // files are still there (deleting an IDE's files drops it, until `anvil ide <it>` again)
     let previous = Record::load(&root);
     let mut chosen: Vec<Ide> = match requested.contains(&Ide::All) {
-        true if cfg!(windows) => vec![Ide::Vs, Ide::Vscode, Ide::Clion, Ide::Zed],
-        true => vec![Ide::Vscode, Ide::Clion, Ide::Zed],
+        true if cfg!(windows) => vec![Ide::Vs, Ide::Vscode, Ide::Clion, Ide::Zed, Ide::Qtcreator],
+        true => vec![Ide::Vscode, Ide::Clion, Ide::Zed, Ide::Qtcreator],
         false => requested.to_vec(),
     };
     if chosen.is_empty() {
-        chosen = [Ide::Vs, Ide::Vscode, Ide::Clion, Ide::Zed]
+        chosen = [Ide::Vs, Ide::Vscode, Ide::Clion, Ide::Zed, Ide::Qtcreator]
             .into_iter()
             .filter(|ide| ide.anchor(&root, &name).exists() || (*ide == Ide::Vs && root.join(".vs").is_dir()))
             .collect();
@@ -512,7 +517,7 @@ pub fn setup(start_dir: &Path, build: &BuildArgs, requested: &[Ide]) -> Result<(
         }
     }
     if ides.is_empty() {
-        bail!("no IDE files here to refresh; say which IDE: `anvil ide vs`, `vscode`, `clion`, `zed` or `all`");
+        bail!("no IDE files here to refresh; say which IDE: `anvil ide vs`, `vscode`, `clion`, `zed`, `qtcreator` or `all`");
     }
 
     // One refresh at a time
@@ -560,9 +565,15 @@ pub fn setup(start_dir: &Path, build: &BuildArgs, requested: &[Ide]) -> Result<(
             Ide::Vscode => "VS Code: Ctrl+Shift+B builds, F5 debugs (pick a program in Run and Debug)".to_string(),
             Ide::Clion => "CLion: open the folder (compile_commands.json is the project); run configurations build first".to_string(),
             Ide::Zed => "Zed: `task: spawn` builds, `debugger: start` (F4) debugs".to_string(),
+            Ide::Qtcreator => "Qt Creator (experimental, 15 or later): File > Open Workspace on this folder builds and runs; \
+                               open compile_commands.json as a second project for the code model"
+                .to_string(),
             Ide::All => continue,
         };
         ui::note(&hint);
+    }
+    if record.ides.contains(&Ide::Qtcreator) {
+        qtcreator::note_environments(&project);
     }
     warn_unignored(&root, &name, &record);
 
@@ -702,6 +713,7 @@ fn targets_json(model: &Model, project: &Project) -> Result<Value> {
             "command": command,
             "workdir": slash(&test.workdir),
             "env": environment_object(&test.env),
+            "labels": test.labels,
         }));
     }
 
@@ -749,6 +761,7 @@ fn generate(ide: Ide, model: &Model, project: &Project, record: &Record, writer:
         Ide::Vscode => vscode::generate(project, record, writer),
         Ide::Clion => clion::generate(project, record, writer),
         Ide::Zed => zed::generate(project, record, writer),
+        Ide::Qtcreator => qtcreator::generate(project, record, writer),
         Ide::All => Ok(()),
     }
 }
@@ -809,6 +822,7 @@ fn fingerprint(ide: Ide, project: &Project, record: &Record, watched: &[PathBuf]
         Ide::Vscode => vscode::outputs(&project.root),
         Ide::Clion => clion::outputs(&project.root),
         Ide::Zed => zed::outputs(&project.root),
+        Ide::Qtcreator => qtcreator::outputs(&project.root),
         Ide::All => Vec::new(),
     };
     for output in outputs.iter().chain(watched) {
@@ -991,6 +1005,31 @@ fn environment_object(env: &[(String, String)]) -> Value {
     Value::Object(env.iter().map(|(name, value)| (name.clone(), Value::String(value.clone()))).collect())
 }
 
+/// The output folder of a profile's builds, as the model names it: a toolchain or machine `anvil ide` was given gets its
+/// own, as on the command line.
+pub fn profile_out_dir(project: &Project, record: &Record, profile: &str, platform: &Platform) -> PathBuf {
+    if profile == project.profile {
+        return project.out_dir.clone();
+    }
+
+    let mut folder = profile.to_string();
+    if record.toolchain.is_some() {
+        folder.push_str(&format!("-{}", project.toolchain.family.name()));
+    }
+    if record.target.is_some() && platform.is_cross() {
+        folder.push_str(&format!("-{}", platform.name()));
+    }
+    project.out_root.join(folder)
+}
+
+/// A word of a command line: quoted when it holds spaces or quotes.
+pub fn quote_word(word: &str) -> String {
+    match word.is_empty() || word.contains([' ', '\t', '"']) {
+        true => format!("\"{}\"", word.replace('"', "\\\"")),
+        false => word.to_string(),
+    }
+}
+
 /// A path as an IDE variable sees it: `<variable>/rel` inside the project root, else in full.
 pub fn project_path(path: &Path, root: &Path, variable: &str) -> String {
     match util::strip_prefix_ci(path, root) {
@@ -1009,6 +1048,9 @@ fn warn_unignored(root: &Path, name: &str, record: &Record) {
     let mut wanted = vec![format!("/{STATE_FOLDER}/"), "/compile_commands.json".to_string()];
     if record.ides.contains(&Ide::Vs) {
         wanted.extend([format!("/{name}.sln"), "/.vs/".to_string()]);
+    }
+    if record.ides.contains(&Ide::Qtcreator) {
+        wanted.push("/.qtcreator/".to_string());
     }
     let listed = |entry: &String| {
         let bare = entry.trim_matches('/');

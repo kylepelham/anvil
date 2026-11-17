@@ -23,6 +23,8 @@ export class AnvilTests implements vscode.Disposable {
   readonly controller = vscode.tests.createTestController("anvil", "Anvil");
   /** Each test's last result in this session: passed, failed, skipped or errored, with its message. */
   readonly outcomes = new Map<string, { outcome: string; message: string }>();
+  /** A run profile per test label, which runs only the tests carrying it. */
+  readonly labelProfiles = new Map<string, vscode.TestRunProfile>();
 
   constructor(private readonly project: () => Project | undefined) {
     this.controller.createRunProfile("Run", vscode.TestRunProfileKind.Run, (request, token) => this.run(request, token), true);
@@ -33,7 +35,28 @@ export class AnvilTests implements vscode.Disposable {
   }
 
   dispose(): void {
+    for (const profile of this.labelProfiles.values()) {
+      profile.dispose();
+    }
     this.controller.dispose();
+  }
+
+  /** One run profile per label the tests carry; those of labels no longer carried go. */
+  private updateLabelProfiles(tests: Test[]): void {
+    const labels = new Set(tests.flatMap((test) => test.labels ?? []));
+    for (const [label, profile] of this.labelProfiles) {
+      if (!labels.has(label)) {
+        profile.dispose();
+        this.labelProfiles.delete(label);
+      }
+    }
+    for (const label of [...labels].sort()) {
+      if (!this.labelProfiles.has(label)) {
+        const profile = this.controller.createRunProfile(`Run: ${label}`, vscode.TestRunProfileKind.Run, (request, token) => this.run(request, token), false);
+        profile.tag = new vscode.TestTag(label);
+        this.labelProfiles.set(label, profile);
+      }
+    }
   }
 
   /** Show the model's tests: grouped by package when a name has one (`pkg/name`). */
@@ -50,6 +73,7 @@ export class AnvilTests implements vscode.Disposable {
       const item = this.controller.createTestItem(test.name, slash >= 0 ? test.name.slice(slash + 1) : test.name, location?.uri);
       item.range = location?.range;
       item.description = test.program ?? test.command[0];
+      item.tags = (test.labels ?? []).map((label) => new vscode.TestTag(label));
 
       if (slash < 0) {
         top.push(item);
@@ -65,6 +89,7 @@ export class AnvilTests implements vscode.Disposable {
       group.children.add(item);
     }
     this.controller.items.replace(top);
+    this.updateLabelProfiles(tests);
   }
 
   async run(request: vscode.TestRunRequest, token: vscode.CancellationToken): Promise<void> {
@@ -169,7 +194,9 @@ export class AnvilTests implements vscode.Disposable {
     const tests = this.project()?.model?.tests ?? [];
     const excluded = new Set(request.exclude?.map((item) => item.id) ?? []);
     const included = request.include ? new Set(request.include.map((item) => item.id)) : undefined;
+    const tag = request.profile?.tag?.id;
     return tests
+      .filter((test) => tag === undefined || (test.labels ?? []).includes(tag))
       .map((test) => test.name)
       .filter((name) => {
         const group = PACKAGE_PREFIX + name.slice(0, Math.max(0, name.lastIndexOf("/")));

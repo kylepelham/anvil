@@ -257,6 +257,13 @@ suite("fake anvil", () => {
     assert.strictEqual(all.length, 1);
     assert.strictEqual(all[0][1], "-p");
     assert.strictEqual(tests.outcomes.get("dep/lint")?.outcome, "passed");
+
+    // A label's run profile runs only the tests carrying it
+    assert.deepStrictEqual(smoke.tags.map((tag) => tag.id), ["fast"]);
+    clearFakeCalls();
+    const fast = tests.labelProfiles.get("fast")!;
+    await tests.run(new vscode.TestRunRequest(undefined, undefined, fast), source.token);
+    assert.deepStrictEqual(fakeCalls().filter((call) => call[0] === "test").map((call) => call[1]), ["smoke"]);
   });
 
   test("problem patterns read cl, clang-cl, gcc and clang diagnostics", () => {

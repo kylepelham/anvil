@@ -178,6 +178,8 @@ pub struct TargetSpec {
     pub werror: Option<bool>,
     /// avx | avx2 | avx512 | native
     pub arch: Option<String>,
+    /// Link-time optimization of the target's code, in place of the profile's `lto`.
+    pub lto: Option<bool>,
     /// GPUs .cu files compile for: "native", "all", "86" (code and PTX), "86-real", "86-virtual".
     pub cuda_arch: Option<StrOrList>,
     /// Extra nvcc options for .cu files.
@@ -255,6 +257,8 @@ pub struct TargetSpec {
     pub reject: Option<Vec<String>>,
     /// The exit code that passes (default 0).
     pub exit_code: Option<i32>,
+    /// Names `anvil test -L` picks tests by.
+    pub labels: Option<Vec<String>>,
 }
 
 /// `[target.X.public]`: what the target and every target using it get.
@@ -321,6 +325,7 @@ pub struct FileRule {
     pub warnings: Option<String>,
     pub arch: Option<String>,
     pub opt: Option<toml::Value>,
+    pub lto: Option<bool>,
 }
 
 /// A build step: code generation, shader compilation, copying.
@@ -375,6 +380,8 @@ pub struct TestSpec {
     pub reject: Option<Vec<String>>,
     /// The exit code that passes (default 0).
     pub exit_code: Option<i32>,
+    /// Names `anvil test -L` picks tests by.
+    pub labels: Option<Vec<String>>,
 
     /// Which [[test]] table of its file it comes from.
     #[serde(skip)]

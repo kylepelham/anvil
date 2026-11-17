@@ -194,6 +194,9 @@ struct Planner<'a> {
     /// Targets that compile C++ (CUDA, Objective-C++, generated C++, C files compiled as C++): what links them needs
     /// the C++ runtime.
     compiles_cxx: HashSet<usize>,
+
+    /// Targets with objects compiled for link-time optimization: what links them links with it.
+    lto_objects: HashSet<usize>,
 }
 
 impl LibraryNames {
@@ -611,6 +614,7 @@ impl<'a> Planner<'a> {
             named_files: Vec::new(),
             qt: crate::qt::installations(model),
             compiles_cxx: HashSet::new(),
+            lto_objects: HashSet::new(),
         }
     }
 
@@ -684,6 +688,15 @@ impl<'a> Planner<'a> {
             return Ok(());
         }
 
+        // Link-time optimization does nothing for unoptimized code but slow its link
+        let profile = &self.model.profile;
+        if target.lto == Some(true) && profile.debug && profile.opt == Opt::None {
+            crate::ui::note(&format!(
+                "`{}` has lto = true, but profile `{}` does not optimize (debug, opt = 0): LTO only slows its link",
+                target.name, profile.name
+            ));
+        }
+
         // Compiles, with the sources Qt's tools write
         let mut sources = target.sources.clone();
         sources.extend(generated_sources);
@@ -693,7 +706,7 @@ impl<'a> Planner<'a> {
         // The binary
         match target.kind {
             Kind::Static => self.plan_archive(index)?,
-            Kind::Exe | Kind::Test | Kind::Shared => self.plan_link(index)?,
+            Kind::Exe | Kind::Test | Kind::Shared => self.plan_link(index, &sources)?,
             _ => {}
         }
 
@@ -1011,6 +1024,7 @@ impl<'a> Planner<'a> {
             warnings: target.warnings,
             werror: target.werror,
             arch: target.arch,
+            lto: target.lto.unwrap_or(profile.lto),
             defines: Cow::Borrowed(&inputs.defines),
             includes: &inputs.includes,
             system_includes: &inputs.system_includes,
@@ -1047,6 +1061,7 @@ impl<'a> Planner<'a> {
             warnings: settings.warnings,
             werror: settings.werror,
             arch: settings.arch,
+            lto: settings.lto,
             defines: &settings.defines,
             includes: settings.includes,
             system_includes: settings.system_includes,
@@ -1128,6 +1143,9 @@ impl<'a> Planner<'a> {
         action.color_diagnostics = self.color_diagnostics();
         action.launcher = self.launcher(pch.is_some());
         let language = settings.language;
+        if settings.lto {
+            self.lto_objects.insert(index);
+        }
 
         self.compile_commands.push(CompileEntry {
             source: source.to_path_buf(),
@@ -1345,7 +1363,7 @@ impl<'a> Planner<'a> {
 
         let description = format!("Archiving {}", library.file_name().unwrap().to_string_lossy());
         let mut action = Action::new(ActionKind::Archive, description, self.toolchain.archiver.clone(), self.env.clone());
-        action.args = self.toolchain.archive_args(&object_paths, &library, &self.model.profile);
+        action.args = self.toolchain.archive_args(&object_paths, &library, self.lto_objects.contains(&index));
         action.inputs = object_paths;
         action.outputs = vec![library.clone()];
         action.after = objects.iter().map(|(_, action)| *action).collect();
@@ -1359,7 +1377,8 @@ impl<'a> Planner<'a> {
         Ok(())
     }
 
-    fn plan_link(&mut self, index: usize) -> Result<()> {
+    /// Links a program or shared library; `sources` are its own and those its build steps write.
+    fn plan_link(&mut self, index: usize, sources: &[PathBuf]) -> Result<()> {
         let target = &self.model.targets[index];
         let output = artifact_path(self.model, target).unwrap();
         let link = self.link_inputs(index);
@@ -1388,8 +1407,8 @@ impl<'a> Planner<'a> {
             flags.push(substitute_targets(flag, self.model)?);
         }
 
-        // Module-definition files and manifests listed with the sources
-        let (source_args, source_files) = self.source_link_args(target)?;
+        // Module-definition files and manifests listed with the sources or written by build steps
+        let (source_args, source_files) = self.source_link_args(sources)?;
         flags.extend(source_args);
         let cxx = self.links_cxx(index);
 
@@ -1431,6 +1450,7 @@ impl<'a> Planner<'a> {
             cxx,
             library_version: library_version.as_ref(),
             delay_load: &target.delay_load,
+            lto: self.links_lto(index),
         };
 
         // Binaries without C++ code link through the C compiler, as CMake links by the languages linked
@@ -1555,18 +1575,34 @@ impl<'a> Planner<'a> {
         })
     }
 
+    /// Whether a binary links objects compiled for link-time optimization: its own, or a static or object library's.
+    fn links_lto(&self, index: usize) -> bool {
+        let mut order = Vec::new();
+        self.visit_link(index, index, &mut HashSet::new(), &mut order);
+        order.iter().any(|dependency| {
+            let kind = self.model.targets[*dependency].kind;
+            let linked_in = *dependency == index || matches!(kind, Kind::Static | Kind::Object);
+            linked_in && self.lto_objects.contains(dependency)
+        })
+    }
+
     /// Link arguments for the module-definition files and manifests among a target's sources, and those files (their
     /// change relinks). Windows only; GNU toolchains have no manifest step, so a manifest is left out there.
-    fn source_link_args(&self, target: &Target) -> Result<(Vec<String>, Vec<PathBuf>)> {
+    fn source_link_args(&self, sources: &[PathBuf]) -> Result<(Vec<String>, Vec<PathBuf>)> {
         let mut args = Vec::new();
         let mut files = Vec::new();
         if !self.toolchain.targets_windows() {
             return Ok((args, files));
         }
 
+        // A file listed in `sources` that a build step also writes goes to the link once
         let msvc_style = self.toolchain.family.is_msvc_style();
         let msvc_abi = self.toolchain.is_msvc_abi();
-        for source in &target.sources {
+        let mut seen = HashSet::new();
+        for source in sources {
+            if !seen.insert(util::path_key(source)) {
+                continue;
+            }
             let text = path_text(source);
             match source_kind(source, self.toolchain.family)? {
                 SourceKind::Definition if msvc_style => args.push(format!("/DEF:{text}")),
@@ -1634,7 +1670,7 @@ impl<'a> Planner<'a> {
         Ok(())
     }
 
-    /// Build steps: returns the generated files that should be compiled.
+    /// Build steps: returns the generated files that should be compiled or linked.
     fn plan_runs(&mut self, index: usize) -> Result<Vec<PathBuf>> {
         let target = &self.model.targets[index];
         let scope = self.package_scope(index);
@@ -1652,7 +1688,7 @@ impl<'a> Planner<'a> {
             }
         }
 
-        // Generated C and C++ files compile into the target
+        // Generated C and C++ files compile into the target; module-definition files and manifests go to its link
         let mut generated_sources = Vec::new();
         let mut actions = Vec::new();
         for (run, invocation) in invocations {
@@ -1661,7 +1697,8 @@ impl<'a> Planner<'a> {
                     .extension()
                     .map(|extension| extension.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                if util::is_source_ext(&extension) {
+                let link_input = extension.eq_ignore_ascii_case("def") || extension.eq_ignore_ascii_case("manifest");
+                if util::is_source_ext(&extension) || link_input {
                     generated_sources.push(output.clone());
                 }
             }
@@ -2470,6 +2507,7 @@ fn apply_file_rule(settings: &mut FileSettings, rule: &targets::ResolvedFileRule
     settings.warnings = rule.warnings.unwrap_or(settings.warnings);
     settings.arch = rule.arch.or(settings.arch);
     settings.opt = rule.opt.unwrap_or(settings.opt);
+    settings.lto = rule.lto.unwrap_or(settings.lto);
 }
 
 /// Settings of one source file (CompileSpec borrows from it): the target's, copied only where file rules add to them.
@@ -2481,6 +2519,7 @@ struct FileSettings<'a> {
     warnings: crate::flags::Warnings,
     werror: bool,
     arch: Option<crate::flags::Arch>,
+    lto: bool,
     defines: Cow<'a, [String]>,
     includes: &'a [PathBuf],
     system_includes: &'a [PathBuf],

@@ -22,10 +22,8 @@ const CONFIGURATION_SUFFIXES: &[(&str, Option<&str>)] = &[
     ("_MINSIZEREL", Some("minsizerel")),
 ];
 
-// Test properties that only label or weigh tests for CTest's scheduler (TODO: LABELS as test labels, when `anvil test`
-// can pick tests by label)
+// Test properties that only weigh tests for CTest's scheduler
 const IGNORED_TEST_PROPERTIES: &[&str] = &[
-    "LABELS",
     "PROCESSORS",
     "COST",
     "TIMEOUT_AFTER_MATCH",
@@ -45,7 +43,6 @@ const IGNORED_PROPERTIES: &[&str] = &[
     "_POSTFIX",
     "MACOSX_",
     "MACHO_",
-    "INTERPROCEDURAL_OPTIMIZATION",
     "MAP_IMPORTED_CONFIG_",
     "IMPORTED_CONFIGURATIONS",
     "FOLDER",
@@ -1181,13 +1178,44 @@ impl Interpreter {
                 let property = VISIBILITY_PROPERTIES.iter().find(|name| **name == base_property).unwrap();
                 self.set_visibility(target, property, &items);
             }
-            // Anvil links a whole program optimized only per profile (`lto`)
-            optimization
-                if optimization.starts_with("INTERPROCEDURAL_OPTIMIZATION")
-                    && items.iter().any(|item| model::constant_truth(item) != Some(false)) =>
-            {
-                let note = format!("{property}: Anvil has no link-time optimization per target; set `lto = true` in the profiles that want it");
-                self.targets.get_mut(target).unwrap().notes.push(note);
+            // Link-time optimization of the target's code: `lto`, under the profile of a configuration's suffix
+            // (`_RELEASE`); OFF matters only where CMAKE_INTERPROCEDURAL_OPTIMIZATION turns it on for every target
+            optimization if optimization.starts_with("INTERPROCEDURAL_OPTIMIZATION") => {
+                // Nothing compiles in an interface, custom or imported target: CMake ignores it there too
+                let converted = &self.targets[target];
+                if matches!(converted.kind, TargetKind::Interface | TargetKind::Custom) || converted.imported {
+                    return;
+                }
+                let suffix = &optimization["INTERPROCEDURAL_OPTIMIZATION".len()..];
+                let Some((_, profile)) = CONFIGURATION_SUFFIXES.iter().find(|(known, _)| *known == suffix) else {
+                    let note = format!("{property}: no profile is converted for that configuration; set `lto` in a when block on its profile");
+                    self.targets.get_mut(target).unwrap().notes.push(note);
+                    return;
+                };
+                let global = CONFIGURATION_SUFFIXES.iter().any(|(suffix, _)| {
+                    let variable = self.get_variable(&format!("CMAKE_INTERPROCEDURAL_OPTIMIZATION{suffix}"));
+                    variable.is_some_and(|value| model::constant_truth(&value) == Some(true))
+                });
+                for (condition, value) in self.conditional_values(Some(target), &items) {
+                    let condition = model::and_optional(&condition, &profile.map(String::from));
+                    let converted = self.targets.get_mut(target).unwrap();
+                    match model::constant_truth(&value) {
+                        Some(true) => converted.settings.push(Item {
+                            condition,
+                            public: false,
+                            value: ("lto", "true".to_string()),
+                        }),
+                        Some(false) if global => converted.settings.push(Item {
+                            condition,
+                            public: false,
+                            value: ("lto", "false".to_string()),
+                        }),
+                        Some(false) => {}
+                        None => converted
+                            .notes
+                            .push(format!("{property} {value}: not a value Anvil reads; set `lto = true` or `false`")),
+                    }
+                }
             }
             // A shared library's version in its file name and SONAME (libfoo.so.1.2.3, libfoo.so.1); the project's
             // version as {version}
@@ -2365,6 +2393,19 @@ fn apply_test_property(properties: &mut TestProperties, property: &str, items: &
         "DEPENDS" => extend_or_replace(&mut properties.after, items, append),
         "FIXTURES_SETUP" => extend_or_replace(&mut properties.fixtures_setup, items, append),
         "FIXTURES_REQUIRED" => extend_or_replace(&mut properties.fixtures_required, items, append),
+        "LABELS" => {
+            if !append {
+                properties.labels.clear();
+            }
+            for label in items {
+                if crate::test_cases::check_label(label).is_err() {
+                    let note = format!("test label \"{label}\" is left out: a label is letters, digits, `_`, `.` and `-`");
+                    properties.notes.push(note);
+                } else if !properties.labels.contains(label) {
+                    properties.labels.push(label.clone());
+                }
+            }
+        }
         "ENVIRONMENT" => {
             if !append {
                 properties.env.clear();
@@ -2879,7 +2920,10 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 add_library(core SHARED core.cpp)
 set_target_properties(core PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 2)
 add_library(plain STATIC plain.c)
-set_target_properties(plain PROPERTIES C_VISIBILITY_PRESET hidden SOVERSION 1)
+set_target_properties(plain PROPERTIES C_VISIBILITY_PRESET hidden SOVERSION 1 INTERPROCEDURAL_OPTIMIZATION OFF)
+set_target_properties(core PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
+add_library(api INTERFACE)
+set_target_properties(api PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
 add_executable(app main.cpp)
 set_target_properties(app PROPERTIES CXX_VISIBILITY_PRESET default VISIBILITY_INLINES_HIDDEN OFF INTERPROCEDURAL_OPTIMIZATION ON)
 "#;
@@ -2911,12 +2955,20 @@ set_target_properties(app PROPERTIES CXX_VISIBILITY_PRESET default VISIBILITY_IN
         assert!(toml.contains("version = \"{version}\"") && toml.contains("soversion = \"2\""), "{toml}");
         assert_eq!(toml.matches("soversion").count(), 1, "{toml}");
 
-        // CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE is the release profile's LTO; a target's is a note
+        // CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE is the release profile's LTO; a target's is its `lto`, a
+        // configuration's under that profile, OFF against the variable `lto = false`; an interface has nothing to optimize
         assert!(toml.contains("[profile.release]\nlto = true"), "{toml}");
         assert!(
-            toml.contains("INTERPROCEDURAL_OPTIMIZATION: Anvil has no link-time optimization per target"),
+            toml.contains("[target.app]\nkind = \"exe\"\nsources = [\"main.cpp\"]\nlto = true"),
             "{toml}"
         );
+        assert!(toml.contains("[target.core.when.relwithdebinfo]\nlto = true"), "{toml}");
+        assert!(
+            toml.contains("[target.plain]\nkind = \"lib\"\nsources = [\"plain.c\"]\nlto = false"),
+            "{toml}"
+        );
+        assert_eq!(toml.matches("lto = ").count(), 4, "{toml}");
+        assert!(!toml.contains("INTERPROCEDURAL_OPTIMIZATION"), "{toml}");
     }
 
     #[test]
@@ -3369,5 +3421,27 @@ set_tests_properties(json PROPERTIES PASS_REGULAR_EXPRESSION "\"source-location\
         assert!(toml.contains(r#"pass-regex = '"source-location": \{|done'"#), "{toml}");
         assert!(toml.contains(r#"fail-regex = '\[unclosed'"#), "{toml}");
         assert!(toml.contains("# TODO: FAIL_REGULAR_EXPRESSION `[unclosed` is not a regex"), "{toml}");
+    }
+
+    #[test]
+    fn test_labels_convert() {
+        let cmake = r#"
+cmake_minimum_required(VERSION 3.20)
+project(labels C)
+enable_testing()
+add_executable(app main.c)
+add_test(NAME quick COMMAND app)
+add_test(NAME slow COMMAND app --slow)
+set_tests_properties(quick slow PROPERTIES LABELS "unit;fast")
+set_property(TEST slow APPEND PROPERTY LABELS "slow" "has space")
+gtest_discover_tests(app PROPERTIES LABELS gtest)
+"#;
+        let toml = convert_files("labels", &[("CMakeLists.txt", cmake), ("main.c", "int main(void) { return 0; }\n")]);
+
+        // LABELS are `labels`, appended to; one Anvil cannot take is a TODO
+        assert!(toml.contains("labels = [\"unit\", \"fast\"]\n"), "{toml}");
+        assert!(toml.contains("labels = [\"unit\", \"fast\", \"slow\"]"), "{toml}");
+        assert!(toml.contains("labels = [\"gtest\"]"), "{toml}");
+        assert!(toml.contains("# TODO: test label \"has space\" is left out"), "{toml}");
     }
 }

@@ -1,12 +1,23 @@
 [project]
 name = "testkeys"
 
+[preset.quick]
+labels = ["fast"]
+
 [target.tool]
 kind = "exe"
+
+[target.selftest]
+kind = "test"
+sources = ["src/main.c"]
+args = ["print", "self"]
+preset = "quick"
+labels = ["target", "fast"]
 
 [[test]]
 name = "ok_print"
 command = ["{target:tool}", "print", "hello world"]
+labels = ["fast", "print"]
 expect = ["hello", "w.rld"]
 reject = ["goodbye"]
 
@@ -15,6 +26,7 @@ name = "ok_exit_code"
 command = ["{target:tool}", "exit", "3", "three"]
 exit-code = 3
 expect = ["three"]
+labels = ["fast"]
 
 [[test]]
 name = "ok_will_fail"
@@ -24,11 +36,13 @@ will-fail = true
 [[test]]
 name = "ok_first"
 command = ["{target:tool}", "touch", "{out}/first.done", "300"]
+labels = ["order"]
 
 [[test]]
 name = "ok_second"
 command = ["{target:tool}", "exists", "{out}/first.done"]
 after = ["ok_first"]
+labels = ["order"]
 
 [[test]]
 name = "ok_serial"
@@ -51,22 +65,33 @@ command = ["{target:tool}", "probe", "{out}/serial.lock", "400"]
 name = "bad_expect"
 command = ["{target:tool}", "print", "hello"]
 expect = ["goodbye"]
+labels = ["broken"]
 
 [[test]]
 name = "bad_reject"
 command = ["{target:tool}", "print", "an ERROR here"]
 reject = ["ERROR"]
+labels = ["broken"]
 
 [[test]]
 name = "bad_exit"
 command = ["{target:tool}", "exit", "2", "two"]
+labels = ["broken"]
 
 [[test]]
 name = "bad_will_fail"
 command = ["{target:tool}", "print", "fine"]
 will-fail = true
+labels = ["broken"]
 
 [[test]]
 name = "slow_timeout"
 command = ["{target:tool}", "sleep", "30000"]
 timeout = 1
+labels = ["slow"]
+
+[[test]]
+name = "m_{word}"
+command = ["{target:tool}", "print", "{word}"]
+labels = ["matrix"]
+matrix.word = ["alpha", { word = "beta", labels = ["matrix", "slow"] }]

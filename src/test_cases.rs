@@ -39,7 +39,24 @@ pub const TEST_KEYS: &[&str] = &[
     "expect",
     "reject",
     "exit-code",
+    "labels",
 ];
+
+/// A label `anvil test -L` picks tests by: letters, digits, `_`, `.` and `-`, so the command line takes it as it is.
+pub fn check_label(label: &str) -> Result<()> {
+    let valid = !label.is_empty()
+        && label
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-'));
+    if !valid {
+        bail_at!(
+            Place::key("labels").value(label),
+            "invalid-label",
+            "labels: \"{label}\" is not a label; use letters, digits, `_`, `.` and `-`"
+        );
+    }
+    Ok(())
+}
 
 /// A parameter's value.
 enum Parameter {

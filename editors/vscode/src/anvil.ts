@@ -35,6 +35,8 @@ export interface Test {
   command: string[];
   workdir: string;
   env?: Record<string, string>;
+  /** What `anvil test -L` picks it by (absent from versions of Anvil before labels). */
+  labels?: string[];
 }
 
 /** What `anvil targets --json` prints (version 1). */

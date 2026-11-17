@@ -561,7 +561,7 @@ pub fn suggest<'a>(word: &str, candidates: impl IntoIterator<Item = &'a str>) ->
 pub fn is_source_ext(extension: &str) -> bool {
     matches!(
         extension.to_ascii_lowercase().as_str(),
-        "c" | "cc" | "cpp" | "cxx" | "c++" | "rc" | "asm" | "s" | "cu"
+        "c" | "cc" | "cpp" | "cxx" | "c++" | "m" | "mm" | "rc" | "asm" | "s" | "cu"
     )
 }
 

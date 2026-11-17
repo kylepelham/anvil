@@ -44,6 +44,9 @@ const DLL_NAME_PATTERN: &str = r"^[^/\\:\s][^/\\:]*\.[dD][lL][lL]$";
 // What crate::project::check_version takes
 const VERSION_PATTERN: &str = r#"^[^\s/\\";]+$"#;
 
+// What crate::test_cases::check_label takes
+const LABEL_PATTERN: &str = r"^[A-Za-z0-9_.-]+$";
+
 // Every spelling crate::flags::normalize_standard takes ("20", "cxx20", "GNU++20")
 const CXX_STANDARD_PATTERN: &str = r"^([cC]\+\+)*([cC][xX][xX])*([cC][pP][pP])*([gG][nN][uU]\+\+)*[cC]*(11|14|17|20|23|26)$";
 const C_STANDARD_PATTERN: &str = r"^([cC]\+\+)*([cC][xX][xX])*([cC][pP][pP])*([gG][nN][uU]\+\+)*([gG][nN][uU])*[cC]*(89|90|99|11|17|18|23)$";
@@ -385,6 +388,10 @@ fn target_table(kind: Table) -> Value {
         ("werror", flag("Warnings are errors.")),
         ("arch", choice(ARCHES, &[], "Instruction set: avx, avx2, avx512 or native.")),
         (
+            "lto",
+            flag("Link-time optimization of this target's code, in place of the profile's `lto` (not for headers or custom targets)."),
+        ),
+        (
             "cuda-arch",
             text_or_texts(
                 "GPUs .cu files compile for: \"native\", \"all\", \"86\" (code and PTX), \"86-real\", \"86-virtual\", a list or \"75;86\".",
@@ -554,6 +561,7 @@ fn file_rule() -> Value {
         ("warnings", choice(WARNINGS, WARNINGS_ALIASES, "off, default, high or all.")),
         ("arch", choice(ARCHES, &[], "Instruction set: avx, avx2, avx512 or native.")),
         ("opt", optimization()),
+        ("lto", flag("Link-time optimization of these files, in place of the target's.")),
     ];
 
     table("Settings for the source files `match` names.", properties, &["match"])
@@ -744,6 +752,13 @@ fn test_settings() -> Vec<(&'static str, Value)> {
         (
             "exit-code",
             integer("The exit code that passes (default 0).", i32::MIN as i64, i32::MAX as i64),
+        ),
+        (
+            "labels",
+            array(
+                "Labels `anvil test -L` picks tests by (letters, digits, `_`, `.`, `-`).",
+                json!({ "type": "string", "pattern": LABEL_PATTERN, "examples": ["slow"] }),
+            ),
         ),
     ]
 }

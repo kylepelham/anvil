@@ -230,7 +230,7 @@ fn configurations<'a>(model: &Model, project: &'a Project, record: &Record, writ
         let description = match described {
             Ok(described) => Description::Own(Box::new(described)),
             Err(error) => {
-                let out_dir = moved_out_dir(model, project, record, profile, &platform);
+                let out_dir = super::profile_out_dir(project, record, profile, &platform);
                 ui::warn(&format!(
                     "Visual Studio's {name} configuration describes the project as `-p {}` does, moved to {}: loading it for `{profile}` failed: {error:#}",
                     project.profile,
@@ -256,23 +256,6 @@ fn configurations<'a>(model: &Model, project: &'a Project, record: &Record, writ
     writer.watched.dedup();
 
     Ok(configurations)
-}
-
-/// The output folder of a profile's builds, as the model names it: a toolchain or machine `anvil ide` was given gets its
-/// own, as on the command line.
-fn moved_out_dir(model: &Model, project: &Project, record: &Record, profile: &str, platform: &Platform) -> PathBuf {
-    if profile == project.profile {
-        return project.out_dir.clone();
-    }
-
-    let mut folder = profile.to_string();
-    if record.toolchain.is_some() {
-        folder.push_str(&format!("-{}", model.toolchain.family.name()));
-    }
-    if record.target.is_some() && platform.is_cross() {
-        folder.push_str(&format!("-{}", platform.name()));
-    }
-    project.out_root.join(folder)
 }
 
 /// A target's Makefile project: anvil builds and cleans it, IntelliSense reads the compile commands, the debugger
@@ -606,13 +589,7 @@ fn condition(configuration: &Configuration) -> String {
 
 /// Words as one command line: quoted when they hold spaces or quotes.
 fn command_line(words: &[String]) -> String {
-    let quoted: Vec<String> = words
-        .iter()
-        .map(|word| match word.is_empty() || word.contains([' ', '\t', '"']) {
-            true => format!("\"{}\"", word.replace('"', "\\\"")),
-            false => word.clone(),
-        })
-        .collect();
+    let quoted: Vec<String> = words.iter().map(|word| super::quote_word(word)).collect();
     quoted.join(" ")
 }
 

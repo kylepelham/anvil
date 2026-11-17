@@ -127,7 +127,7 @@ pub fn run_tests(model: &Model, tests: &[TestCase], options: &TestOptions) -> Re
     // What failed, for --rerun-failed; the report
     write_last_failed(model, &results)?;
     if let Some(path) = &options.junit {
-        write_junit(path, &model.packages[0].name, &results, started.elapsed())?;
+        write_junit(path, &model.packages[0].name, tests, &results, started.elapsed())?;
     }
 
     // The tally
@@ -555,7 +555,7 @@ fn write_last_failed(model: &Model, results: &[TestResult]) -> Result<()> {
 }
 
 /// A JUnit XML report: one testsuite for the project, a testcase per test that ran.
-fn write_junit(path: &Path, project: &str, results: &[TestResult], elapsed: Duration) -> Result<()> {
+fn write_junit(path: &Path, project: &str, tests: &[TestCase], results: &[TestResult], elapsed: Duration) -> Result<()> {
     let count = |outcome: Outcome| results.iter().filter(|result| result.outcome == outcome).count();
     let project = xml_escape(project);
     let totals = format!(
@@ -576,15 +576,28 @@ fn write_junit(path: &Path, project: &str, results: &[TestResult], elapsed: Dura
             xml_escape(&result.name),
             result.elapsed.as_secs_f64()
         );
+
+        // Labels as a property, which CI test reports show and filter by
+        let labels = &tests[result.index].labels;
+        let mut body = String::new();
+        if !labels.is_empty() {
+            let value = xml_escape(&labels.join(","));
+            body.push_str(&format!("      <properties><property name=\"labels\" value=\"{value}\"/></properties>\n"));
+        }
+
         let message = xml_escape(&result.detail);
         match result.outcome {
-            Outcome::Passed => xml.push_str(&format!("{opening}/>\n")),
-            Outcome::Skipped => xml.push_str(&format!("{opening}>\n      <skipped/>\n    </testcase>\n")),
-            Outcome::Failed => xml.push_str(&format!(
-                "{opening}>\n      <failure message=\"{message}\">{}</failure>\n    </testcase>\n",
+            Outcome::Passed => {}
+            Outcome::Skipped => body.push_str("      <skipped/>\n"),
+            Outcome::Failed => body.push_str(&format!(
+                "      <failure message=\"{message}\">{}</failure>\n",
                 xml_escape(&result.output)
             )),
-            Outcome::Interrupted => xml.push_str(&format!("{opening}>\n      <error message=\"{message}\"/>\n    </testcase>\n")),
+            Outcome::Interrupted => body.push_str(&format!("      <error message=\"{message}\"/>\n")),
+        }
+        match body.is_empty() {
+            true => xml.push_str(&format!("{opening}/>\n")),
+            false => xml.push_str(&format!("{opening}>\n{body}    </testcase>\n")),
         }
     }
     xml.push_str("  </testsuite>\n</testsuites>\n");

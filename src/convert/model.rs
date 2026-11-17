@@ -148,6 +148,8 @@ pub struct TestProperties {
     pub after: Vec<String>,
     pub fixtures_setup: Vec<String>,
     pub fixtures_required: Vec<String>,
+    /// LABELS, those `anvil test -L` takes.
+    pub labels: Vec<String>,
     pub disabled: bool,
     pub notes: Vec<String>,
 }

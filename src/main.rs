@@ -220,7 +220,7 @@ enum CommandLine {
     },
 
     /// Write the project files of an IDE (vs: a solution and projects; vscode: tasks, launch and settings; clion,
-    /// zed): build, run and debug every program from it. Every build keeps them up to date.
+    /// zed, qtcreator): build, run and debug every program from it. Every build keeps them up to date.
     Ide {
         /// The IDEs (default: those whose files or folders are here). Those set up before are refreshed too while their files are there.
         #[arg(value_enum)]
@@ -357,9 +357,21 @@ pub struct TestArgs {
     /// Only tests whose name contains this.
     pub filter: Option<String>,
 
+    /// Only tests carrying this label; repeated, those carrying any of them.
+    #[arg(short = 'L', long = "label", value_name = "LABEL")]
+    pub labels: Vec<String>,
+
+    /// Leave out tests carrying this label (repeatable).
+    #[arg(long = "exclude-label", value_name = "LABEL")]
+    pub exclude_labels: Vec<String>,
+
     /// Print the tests that would run, without building or running them.
     #[arg(long)]
     pub list: bool,
+
+    /// Print each label the tests carry, with how many carry it.
+    #[arg(long)]
+    pub list_labels: bool,
 
     /// Run only the tests that failed last time (and have not passed since).
     #[arg(long)]

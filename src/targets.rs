@@ -103,6 +103,8 @@ pub struct Target {
     pub warnings: Warnings,
     pub werror: bool,
     pub arch: Option<Arch>,
+    /// `lto`: link-time optimization of its code (None: the profile's).
+    pub lto: Option<bool>,
     pub cuda_arch: Vec<String>,
     pub cuda_flags: Vec<String>,
     pub gui: Gui,
@@ -144,6 +146,7 @@ pub struct Target {
     pub expect: Vec<String>,
     pub reject: Vec<String>,
     pub exit_code: Option<i32>,
+    pub labels: Vec<String>,
 
     /// For External targets: the vcpkg package (name, only these libs) to fill in after install.
     pub vcpkg: Option<(String, Option<Vec<String>>)>,
@@ -168,6 +171,7 @@ pub struct ResolvedFileRule {
     pub warnings: Option<Warnings>,
     pub arch: Option<Arch>,
     pub opt: Option<Opt>,
+    pub lto: Option<bool>,
 }
 
 /// What a target's paths and placeholders resolve against.
@@ -236,6 +240,9 @@ struct Accumulated {
     warnings: Option<String>,
     werror: Option<bool>,
     arch: Option<String>,
+    lto: Option<bool>,
+    /// `lto` from [defaults] and presets, which only targets that compile take.
+    shared_lto: Option<bool>,
     cuda_arch: Option<Vec<String>>,
     cuda_flags: Vec<String>,
     std: Option<String>,
@@ -272,6 +279,7 @@ struct Accumulated {
     expect: Vec<String>,
     reject: Vec<String>,
     exit_code: Option<i32>,
+    labels: Vec<String>,
 
     /// Which table set each value.
     origins: Origins,
@@ -387,6 +395,7 @@ impl Target {
             warnings: Warnings::Default,
             werror: false,
             arch: None,
+            lto: None,
             cuda_arch: Vec::new(),
             cuda_flags: Vec::new(),
             gui: Gui::Off,
@@ -417,6 +426,7 @@ impl Target {
             expect: Vec::new(),
             reject: Vec::new(),
             exit_code: None,
+            labels: Vec::new(),
             vcpkg: None,
             cmake_package: None,
             cxx_libraries: false,
@@ -771,6 +781,19 @@ impl Target {
         self.werror = settings.werror.unwrap_or(false);
         self.arch = settings.arch.as_deref().map(Arch::parse).transpose().at(origins.scope(&["arch"]))?;
 
+        // Link-time optimization: only a target that compiles has code to optimize
+        if settings.lto.is_some() && !compiles {
+            bail_at!(
+                origins.key(&["lto"]),
+                "invalid-lto",
+                "lto: a {} target compiles nothing; set it on the targets whose code it optimizes",
+                self.kind.name()
+            );
+        }
+        if compiles {
+            self.lto = settings.lto.or(settings.shared_lto);
+        }
+
         // Output
         self.gui = settings
             .gui
@@ -875,6 +898,7 @@ impl Target {
         self.expect = settings.expect;
         self.reject = settings.reject;
         self.exit_code = settings.exit_code;
+        self.labels = settings.labels;
         self.origins = origins;
 
         Ok(())
@@ -1021,6 +1045,9 @@ fn check_spec(spec: &TargetSpec, table: Table, condition: &CondContext) -> Resul
     if let Some(language) = &spec.link_language {
         parse_link_language(language)?;
     }
+    for label in spec.labels.iter().flatten() {
+        crate::test_cases::check_label(label)?;
+    }
 
     // Per-file settings and build steps
     for (index, rule) in spec.file.iter().enumerate() {
@@ -1078,6 +1105,7 @@ fn test_key(spec: &TargetSpec) -> Option<Vec<Part>> {
         ("expect", spec.expect.is_some()),
         ("reject", spec.reject.is_some()),
         ("exit-code", spec.exit_code.is_some()),
+        ("labels", spec.labels.is_some()),
     ];
 
     let own = keys.iter().find(|(_, given)| *given).map(|(key, _)| located::keys(&[key]));
@@ -1180,6 +1208,10 @@ impl Accumulated {
         set_if_some(&mut self.warnings, &spec.warnings);
         set_if_some(&mut self.werror, &spec.werror);
         set_if_some(&mut self.arch, &spec.arch);
+        match table {
+            Table::Shared | Table::SharedWhen => set_if_some(&mut self.shared_lto, &spec.lto),
+            _ => set_if_some(&mut self.lto, &spec.lto),
+        }
         set_if_some(&mut self.std, &spec.std);
         set_if_some(&mut self.c_std, &spec.c_std);
         set_if_some(&mut self.gui, &spec.gui);
@@ -1205,6 +1237,11 @@ impl Accumulated {
         self.expect.extend(spec.expect.iter().flatten().cloned());
         self.reject.extend(spec.reject.iter().flatten().cloned());
         set_if_some(&mut self.exit_code, &spec.exit_code);
+        for label in spec.labels.iter().flatten() {
+            if !self.labels.contains(label) {
+                self.labels.push(label.clone());
+            }
+        }
 
         // Conditional blocks; the sources of every one, holding or not, leave the convention
         for (condition_text, block) in &spec.when {
@@ -1225,7 +1262,7 @@ impl Accumulated {
         let origins = &mut self.origins;
         let public = spec.public.clone().unwrap_or_default();
         let interface = spec.interface.clone().unwrap_or_default();
-        let lists: [(&[&str], &Option<Vec<String>>); 18] = [
+        let lists: [(&[&str], &Option<Vec<String>>); 19] = [
             (&["sources"], &spec.sources),
             (&["include"], &spec.include),
             (&["system-include"], &spec.system_include),
@@ -1240,6 +1277,7 @@ impl Accumulated {
             (&["data"], &spec.data),
             (&["expect"], &spec.expect),
             (&["reject"], &spec.reject),
+            (&["labels"], &spec.labels),
             (&["defines"], &spec.defines),
             (&["flags"], &spec.flags),
             (&["link-flags"], &spec.link_flags),
@@ -1279,6 +1317,7 @@ impl Accumulated {
             ("skip-regex", spec.skip_regex.clone()),
             ("unity", spec.unity.as_ref().and_then(located::value_text)),
             ("gui", spec.gui.as_ref().and_then(located::value_text)),
+            ("lto", spec.lto.map(|lto| lto.to_string())),
         ];
         for (key, value) in single {
             origins.note(path, &[key], value.iter());
@@ -1766,6 +1805,7 @@ fn resolve_file_rule(rule: &FileRule, dir: &Path, scope: &PackageScope, target_n
         warnings: rule.warnings.as_deref().map(Warnings::parse).transpose()?,
         arch: rule.arch.as_deref().map(Arch::parse).transpose()?,
         opt: rule.opt.as_ref().map(Opt::parse).transpose()?,
+        lto: rule.lto,
     }))
 }
 

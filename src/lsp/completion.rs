@@ -307,6 +307,10 @@ fn value_items(view: &View, cursor: &Cursor, offset: usize) -> Vec<Item> {
                 let tests = view.tests_of(view.package()).into_iter().map(|name| (name, "test".into())).collect();
                 name_items(view, tests, whole, false)
             }
+            "labels" => {
+                let labels = view.labels(&token.span).into_iter().map(|label| (label, "label".into())).collect();
+                name_items(view, labels, whole, false)
+            }
             "target" if is_dependency_entry(&cursor.path) => {
                 let package = match &cursor.path[1] {
                     Part::Key(name) => view.dependency_package(file, name).unwrap_or_default(),
@@ -722,6 +726,10 @@ mod tests {
 
         // vcpkg ports under [deps], by the name typed
         assert_eq!(at("[deps]\nfm|"), vec!["fmt", "fmtlog"]);
+
+        // Labels the tests carry elsewhere, not the one being typed
+        let labels = at("[target.unit]\nkind = \"test\"\nlabels = [\"slow\", \"gpu\"]\n[[test]]\nname = \"t\"\ncommand = \"x\"\nlabels = [\"s|\"]");
+        assert_eq!(labels, vec!["gpu", "slow"]);
     }
 
     fn items(path: &str, text: &str) -> Vec<Item> {

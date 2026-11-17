@@ -6183,3 +6183,406 @@ fn convert_target_files_in_steps() {
         b"name=target_files\r\n"
     );
 }
+
+// 76. A module-definition file a build step writes reaches the link of the DLL the step belongs to (a program of the
+//     project writes it, as Ona's dumpbin step writes its own), and its change relinks; a generated Objective-C file
+//     compiles
+
+#[cfg(windows)]
+const DEF_GENERATOR: &str = r#"#include <stdio.h>
+/* defgen <names> <file.def>: a module-definition file exporting each name listed */
+int main(int argc, char** argv)
+{
+    char name[256];
+    FILE* names;
+    FILE* def;
+    if (argc != 3) return 2;
+    names = fopen(argv[1], "r");
+    def = fopen(argv[2], "w");
+    if (!names || !def) return 1;
+    fputs("EXPORTS\n", def);
+    while (fscanf(names, "%255s", name) == 1) fprintf(def, "    %s\n", name);
+    fclose(names);
+    return fclose(def) == 0 ? 0 : 1;
+}
+"#;
+
+#[cfg(windows)]
+fn generated_def_exports(toolchain: &str, test: &str) {
+    let project = Project::empty(test);
+    project.write(
+        "anvil.toml",
+        r#"[project]
+name = "gendef"
+
+[target.defgen]
+kind = "exe"
+sources = ["tools/defgen.c"]
+
+[target.math]
+kind = "shared"
+sources = ["lib/math.c"]
+
+[[target.math.run]]
+inputs = ["lib/exports.txt"]
+output = "{gen}/math.def"
+command = ["{target:defgen}", "{root}/lib/exports.txt", "{output}"]
+
+[target.app]
+kind = "exe"
+sources = ["src/main.c"]
+deps = ["math"]
+"#,
+    );
+    project.write("tools/defgen.c", DEF_GENERATOR);
+    project.write(
+        "lib/math.c",
+        "int triple(int x) { return 3 * x; }\nint quadruple(int x) { return 4 * x; }\n",
+    );
+    project.write("lib/exports.txt", "triple\n");
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\nint triple(int x);\nint main(void) { printf(\"%d\\n\", triple(14)); return 0; }\n",
+    );
+
+    // Nothing in the code is dllexport: the generated .def alone exports triple
+    let run = project.anvil(&["run", "app", "--toolchain", toolchain]);
+    run.success();
+    assert_eq!(program_output(&run), "42");
+    project.anvil(&["build", "--toolchain", toolchain]).success().up_to_date();
+
+    // Another name listed: the step writes the .def again, and the DLL relinks exporting it
+    project.write("lib/exports.txt", "triple\nquadruple\n");
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\nint triple(int x);\nint quadruple(int x);\n\
+         int main(void) { printf(\"%d\\n\", quadruple(10) + triple(1)); return 0; }\n",
+    );
+    let run = project.anvil(&["run", "app", "--toolchain", toolchain]);
+    run.success();
+    assert!(run.actions().contains(&"Linking math.dll".to_string()), "{:?}", run.actions());
+    assert_eq!(program_output(&run), "43");
+}
+
+#[test]
+#[cfg(windows)]
+fn generated_def_exports_msvc() {
+    require!("msvc");
+    generated_def_exports("msvc", "gendef_msvc");
+}
+
+#[test]
+#[cfg(windows)]
+fn generated_def_exports_gcc() {
+    require!("gcc");
+    generated_def_exports("gcc", "gendef_gcc");
+}
+
+#[cfg(unix)]
+const COPY_TOOL: &str = r#"#include <stdio.h>
+/* copy <from> <to> */
+int main(int argc, char** argv)
+{
+    char buffer[4096];
+    size_t read;
+    FILE* from;
+    FILE* to;
+    if (argc != 3) return 2;
+    from = fopen(argv[1], "rb");
+    to = fopen(argv[2], "wb");
+    if (!from || !to) return 1;
+    while ((read = fread(buffer, 1, sizeof buffer, from)) > 0) fwrite(buffer, 1, read, to);
+    fclose(from);
+    return fclose(to) == 0 ? 0 : 1;
+}
+"#;
+
+#[test]
+#[cfg(unix)]
+fn generated_objective_c_compiles() {
+    require!("clang");
+    let project = Project::empty("generated_objc");
+    project.write(
+        "anvil.toml",
+        r#"[project]
+name = "genobjc"
+
+[target.copy]
+kind = "exe"
+sources = ["tools/copy.c"]
+
+[target.app]
+kind = "exe"
+sources = ["src/main.c"]
+
+[[target.app.run]]
+inputs = ["src/answer.m.in"]
+output = "{gen}/answer.m"
+command = ["{target:copy}", "{root}/src/answer.m.in", "{output}"]
+"#,
+    );
+    project.write("tools/copy.c", COPY_TOOL);
+    project.write("src/answer.m.in", "int answer(void) { return 42; }\n");
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\nint answer(void);\nint main(void) { printf(\"%d\\n\", answer()); return 0; }\n",
+    );
+
+    let run = project.anvil(&["run", "app", "-v", "--toolchain", "clang"]);
+    run.success().contains("objective-c");
+    assert_eq!(program_output(&run), "42");
+}
+
+// 77. `lto` per target: a library compiled for link-time optimization, one of its files not (a file rule), linked into
+//     a program compiled without it: the library's objects get /GL (-flto), its archive lib /LTCG, the program's link
+//     /LTCG (-flto); in an unoptimized build it is a note, and on a headers target an error
+
+fn lto_per_target(toolchain: &str, test: &str) {
+    let project = Project::empty(test);
+    project.write(
+        "anvil.toml",
+        r#"[project]
+name = "ltotarget"
+
+[target.core]
+kind = "lib"
+sources = ["core/*.c"]
+lto = true
+
+[[target.core.file]]
+match = "core/plain.c"
+lto = false
+
+[target.app]
+kind = "exe"
+sources = ["src/main.c"]
+deps = ["core"]
+"#,
+    );
+    project.write("core/twice.c", "int twice(int x) { return 2 * x; }\n");
+    project.write("core/plain.c", "int plain(int x) { return x; }\n");
+    project.write(
+        "src/main.c",
+        "#include <stdio.h>\nint twice(int x);\nint plain(int x);\n\
+         int main(void) { printf(\"lto %d\\n\", twice(plain(21))); return 0; }\n",
+    );
+
+    let run = project.anvil(&["run", "app", "--release", "-v", "--toolchain", toolchain]);
+    run.success();
+    assert_eq!(program_output(&run).lines().last(), Some("lto 42"));
+
+    // The compiles: the library's own files only, but the one its file rule leaves out
+    let output = run.output();
+    let msvc = toolchain == "msvc";
+    let lto_flag = if msvc { "/GL" } else { "-flto" };
+    let words = |line: &str| -> Vec<String> { line.split(' ').map(|word| word.trim_matches('"').replace('\\', "/")).collect() };
+    let compile_of = |file: &str| {
+        output
+            .lines()
+            .find(|line| {
+                let words = words(line);
+                words.iter().any(|word| word == "/c" || word == "-c") && words.iter().any(|word| word.ends_with(file))
+            })
+            .unwrap_or_else(|| panic!("no compile of {file}\n{output}"))
+    };
+    assert!(compile_of("core/twice.c").contains(lto_flag), "{output}");
+    assert!(!compile_of("core/plain.c").contains(lto_flag), "{output}");
+    assert!(!compile_of("src/main.c").contains(lto_flag), "{output}");
+
+    // The link, and with MSVC the archive
+    let link = output
+        .lines()
+        .find(|line| {
+            let words = words(line);
+            let compiles = words.iter().any(|word| word == "/c" || word == "-c");
+            !compiles && words.iter().any(|word| word.ends_with("/app") || word.ends_with("app.exe"))
+        })
+        .unwrap_or_else(|| panic!("no link\n{output}"));
+    if msvc {
+        assert!(link.contains("/LTCG") && link.contains("/INCREMENTAL:NO"), "{link}");
+        let archive = output
+            .lines()
+            .find(|line| words(line).iter().any(|word| word.starts_with("/OUT:") && word.ends_with("core.lib")))
+            .unwrap_or_else(|| panic!("no archive\n{output}"));
+        assert!(archive.contains("/LTCG"), "{archive}");
+    } else {
+        assert!(link.contains("-flto"), "{link}");
+    }
+
+    // Unoptimized, it only slows the link
+    project
+        .anvil(&["build", "--toolchain", toolchain])
+        .success()
+        .contains("`core` has lto = true, but profile `debug` does not optimize");
+
+    // A headers target compiles nothing to optimize
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"ltotarget\"\n\n[target.api]\nkind = \"headers\"\nlto = true\n",
+    );
+    project
+        .anvil(&["build", "--toolchain", toolchain])
+        .code(1)
+        .contains("lto: a headers target compiles nothing");
+}
+
+#[test]
+#[cfg(windows)]
+fn lto_per_target_msvc() {
+    require!("msvc");
+    lto_per_target("msvc", "lto_target_msvc");
+}
+
+#[test]
+fn lto_per_target_gcc() {
+    require!("gcc");
+    lto_per_target("gcc", "lto_target_gcc");
+}
+
+#[test]
+#[cfg(unix)]
+fn lto_per_target_clang() {
+    require!("clang");
+    lto_per_target("clang", "lto_target_clang");
+}
+
+// 78. Test labels: `-L` picks the tests carrying any of them, `--exclude-label` leaves some out, both with the name
+//     filter and --rerun-failed; a label no test carries is an error; --list shows them, --list-labels counts them, and
+//     the JUnit report and `anvil targets --json` carry them
+
+#[test]
+fn test_labels_pick_tests() {
+    require!("default");
+    let project = Project::fixture("testkeys", "test_labels");
+
+    // Listed with their labels (a test target's from its preset too), and counted
+    project
+        .anvil(&["test", "--list"])
+        .success()
+        .contains("ok_print  [fast, print]")
+        .contains("selftest  [fast, target]")
+        .contains("m_beta  [matrix, slow]");
+    let counts = project.anvil(&["test", "--list-labels"]);
+    counts.success();
+    let lines: Vec<&str> = counts.stdout.lines().collect();
+    assert_eq!(
+        lines,
+        ["broken  4", "fast  3", "matrix  2", "order  2", "print  1", "slow  2", "target  1"],
+        "{}",
+        counts.stdout
+    );
+
+    // Any of the labels; less those excluded; with the name filter
+    project
+        .anvil(&["test", "-L", "fast"])
+        .success()
+        .contains("Passed 3 of 3")
+        .contains("test selftest ... ok");
+    project
+        .anvil(&["test", "-L", "order", "--label", "matrix", "--exclude-label", "slow"])
+        .success()
+        .contains("Passed 3 of 3")
+        .contains("test m_alpha ... ok")
+        .lacks("m_beta");
+    project.anvil(&["test", "ok_", "-L", "fast"]).success().contains("Passed 2 of 2");
+
+    // A typo is an error, not zero tests
+    project
+        .anvil(&["test", "-L", "fsat"])
+        .code(1)
+        .contains("no test carries the label `fsat` (did you mean `fast`?)");
+    project
+        .anvil(&["test", "--exclude-label", "nope"])
+        .code(1)
+        .contains("no test carries the label `nope`");
+
+    // The JUnit report carries them; --rerun-failed keeps to the labels too
+    project
+        .anvil(&["test", "-L", "broken", "-L", "print", "--junit", "report.xml"])
+        .code(1)
+        .contains("4 of 5 tests failed");
+    let report = project.read("report.xml");
+    assert!(
+        report.contains("<properties><property name=\"labels\" value=\"fast,print\"/></properties>"),
+        "{report}"
+    );
+    assert!(
+        report.contains("<properties><property name=\"labels\" value=\"broken\"/></properties>"),
+        "{report}"
+    );
+    project
+        .anvil(&["test", "--rerun-failed", "--exclude-label", "broken"])
+        .success()
+        .contains("no test failed last time");
+
+    // anvil targets --json
+    let json: serde_json::Value = serde_json::from_str(&project.anvil(&["targets", "--json"]).success().stdout).unwrap();
+    let selftest = json["tests"].as_array().unwrap().iter().find(|test| test["name"] == "selftest").unwrap();
+    assert_eq!(selftest["labels"], serde_json::json!(["fast", "target"]));
+
+    // A label is letters, digits, `_`, `.` and `-`
+    let bad = Project::empty("test_labels_bad");
+    bad.write(
+        "anvil.toml",
+        "[project]\nname = \"bad\"\n\n[[test]]\nname = \"t\"\ncommand = [\"x\"]\nlabels = [\"two words\"]\n",
+    );
+    bad.anvil(&["test", "--list"]).code(1).contains("labels: \"two words\" is not a label");
+}
+
+// 79. `anvil ide qtcreator` writes Qt Creator's workspace project: a build configuration per profile and a run target
+//     per program, merged into the user's file, refreshed by builds
+
+#[test]
+fn ide_qtcreator_writes_and_refreshes_its_entries() {
+    require!("default");
+    let project = Project::empty("ide_qtcreator");
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"qt\"\n\n[target.qt]\nkind = \"exe\"\n\n[target.unit]\nkind = \"test\"\nsources = [\"src/main.c\"]\nenv = { MODE = \"x\" }\n",
+    );
+    project.write("src/main.c", "int main(void) { return 0; }\n");
+
+    // A file of the user's: its name, exclude and target stay
+    project.write(
+        ".qtcreator/project.json",
+        "{\n    \"project.name\": \"Mine\",\n    \"files.exclude\": [\"build\"],\n    \"targets\": [\n        { \"name\": \"tool\", \"executable\": \"/bin/tool\" }\n    ]\n}\n",
+    );
+    project
+        .anvil(&["ide", "qtcreator"])
+        .success()
+        .contains("Wrote .qtcreator/project.json")
+        .contains("File > Open Workspace")
+        .contains("`anvil: unit` starts without MODE");
+    let read = || -> serde_json::Value { serde_json::from_str(&project.read(".qtcreator/project.json")).unwrap() };
+    let written = read();
+    assert_eq!(written["project.name"], "Mine");
+    assert_eq!(written["files.exclude"], serde_json::json!(["build", "out", ".anvil"]));
+    let names: Vec<&str> = written["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|target| target["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["tool", "anvil: qt", "anvil: unit"]);
+    let configurations = written["build.configuration"].as_array().unwrap();
+    assert_eq!(configurations[0]["name"], "anvil: debug");
+    assert_eq!(configurations[0]["buildDirectory"], "out/debug");
+    assert_eq!(configurations[1]["steps"][0]["arguments"], serde_json::json!(["build", "-p", "release"]));
+    assert!(project.read(".anvil/ide.toml").contains("\"qtcreator\""));
+
+    // A program gone and a new one: the next build replaces their targets, the user's stays
+    project.write(
+        "anvil.toml",
+        "[project]\nname = \"qt\"\n\n[target.qt]\nkind = \"exe\"\n\n[target.other]\nkind = \"exe\"\nsources = [\"src/main.c\"]\n",
+    );
+    project.anvil(&["build"]).success().contains("Updated .qtcreator/project.json");
+    let mut names: Vec<String> = read()["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|target| target["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["anvil: other", "anvil: qt", "tool"]);
+    project.anvil(&["build"]).success().lacks("Updated");
+}

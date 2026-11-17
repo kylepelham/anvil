@@ -130,13 +130,45 @@ pub fn run_setup(model: &Model, target: usize, here: &Path) -> Result<RunSetup> 
 }
 
 pub fn test(start_dir: &Path, build: &BuildArgs, options: &TestArgs) -> Result<i32> {
-    // --list only names the tests: nothing to fetch or install
-    let mut model = if options.list {
+    // --list and --list-labels only name the tests: nothing to fetch or install
+    let mut model = if options.list || options.list_labels {
         load_model_for_listing(start_dir, build)?
     } else {
         load_model(start_dir, build)?
     };
     model.collect_tests()?;
+
+    // Each label with how many tests carry it
+    let mut known_labels: Vec<(&str, usize)> = Vec::new();
+    for label in model.tests.iter().flat_map(|test| &test.labels) {
+        match known_labels.iter_mut().find(|(known, _)| known == label) {
+            Some((_, count)) => *count += 1,
+            None => known_labels.push((label, 1)),
+        }
+    }
+    known_labels.sort();
+    if options.list_labels {
+        if known_labels.is_empty() {
+            ui::status("Listed", "no labels (give tests `labels = [...]`)");
+        }
+        for (label, count) in &known_labels {
+            println!("{label}  {count}");
+        }
+        return Ok(0);
+    }
+
+    // A label no test carries is a typo, not a request for no tests
+    for label in options.labels.iter().chain(&options.exclude_labels) {
+        if !known_labels.iter().any(|(known, _)| known == label) {
+            let hint = util::did_you_mean(label, known_labels.iter().map(|(known, _)| *known));
+            let known = match known_labels.is_empty() {
+                true => "no test has labels".to_string(),
+                false => format!("labels: {}", known_labels.iter().map(|(known, _)| *known).collect::<Vec<_>>().join(", ")),
+            };
+            bail!("no test carries the label `{label}`{hint} ({known})");
+        }
+    }
+    let labelled = |test: &crate::project::TestCase, labels: &[String]| test.labels.iter().any(|label| labels.contains(label));
 
     // The tests asked for, and with --rerun-failed only those that failed last time
     let filter = options.filter.as_deref();
@@ -149,6 +181,8 @@ pub fn test(start_dir: &Path, build: &BuildArgs, options: &TestArgs) -> Result<i
         .tests
         .iter()
         .filter(|test| filter.is_none_or(|filter| test.name.contains(filter)))
+        .filter(|test| options.labels.is_empty() || labelled(test, &options.labels))
+        .filter(|test| !labelled(test, &options.exclude_labels))
         .filter(|test| !options.rerun_failed || failed.contains(&test.name))
         .cloned()
         .collect();
@@ -173,7 +207,10 @@ pub fn test(start_dir: &Path, build: &BuildArgs, options: &TestArgs) -> Result<i
 
     if options.list {
         for test in &tests {
-            println!("{}", test.name);
+            match test.labels.is_empty() {
+                true => println!("{}", test.name),
+                false => println!("{}  [{}]", test.name, test.labels.join(", ")),
+            }
         }
         return Ok(0);
     }

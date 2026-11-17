@@ -176,6 +176,23 @@ impl<'a> View<'a> {
         names
     }
 
+    /// The labels the project's tests carry, as its files write them; the document's `except` (the one being typed)
+    /// left out.
+    pub fn labels(&self, except: &std::ops::Range<usize>) -> Vec<String> {
+        let mut labels: Vec<String> = Vec::new();
+        for (position, file) in self.files.iter().enumerate() {
+            for token in &file.scan.tokens {
+                let typed = position == 0 && token.span == *except;
+                if token.kind == TokenKind::String && last_key(&token.path) == Some("labels") && !typed && !labels.contains(&token.text) {
+                    labels.push(token.text.clone());
+                }
+            }
+        }
+        labels.sort();
+
+        labels
+    }
+
     /// The package names of the project's other manifests.
     pub fn packages(&self) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();

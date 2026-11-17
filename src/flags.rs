@@ -79,6 +79,8 @@ pub struct CompileSpec<'a> {
     pub warnings: Warnings,
     pub werror: bool,
     pub arch: Option<Arch>,
+    /// Link-time optimization: the file's, its target's or the profile's `lto`.
+    pub lto: bool,
     pub defines: &'a [String],
     pub includes: &'a [PathBuf],
     pub system_includes: &'a [PathBuf],
@@ -109,6 +111,8 @@ pub struct LinkSpec<'a> {
     pub library_version: Option<&'a LibraryVersion>,
     /// DLLs loaded on the first call into them (`delay-load`): MSVC ABI only, other Windows toolchains are refused.
     pub delay_load: &'a [String],
+    /// Link-time optimization: some object it links (its own, or a static or object library's) was compiled for it.
+    pub lto: bool,
 }
 
 /// A versioned shared library's names and numbers: libfoo.so.1.2.3 (`file`, what the link writes) known as
@@ -440,13 +444,14 @@ impl Toolchain {
         }
     }
 
-    /// Arguments for creating a static library (program: `self.archiver`).
-    pub fn archive_args(&self, objects: &[PathBuf], output: &Path, profile: &Profile) -> Vec<String> {
+    /// Arguments for creating a static library (program: `self.archiver`); `lto` when objects were compiled for
+    /// link-time optimization.
+    pub fn archive_args(&self, objects: &[PathBuf], output: &Path, lto: bool) -> Vec<String> {
         let mut args = Vec::new();
 
         if self.archiver_is_lib_exe() {
             args.push("/nologo".into());
-            if profile.lto && self.family == Family::Msvc {
+            if lto && self.family == Family::Msvc {
                 args.push("/LTCG".into());
             }
             args.push(format!("/OUT:{}", path_text(output)));
@@ -664,7 +669,7 @@ impl Toolchain {
         }
 
         // Link-time optimization and sanitizers
-        if profile.lto {
+        if spec.lto {
             flags.push(if clang_cl { "-flto=thin" } else { "/GL" }.into());
         }
         for sanitizer in &profile.sanitize {
@@ -750,7 +755,7 @@ impl Toolchain {
         }
 
         // Link-time optimization, sanitizers, position independence
-        if profile.lto {
+        if spec.lto {
             flags.push(if self.family == Family::Clang { "-flto=thin" } else { "-flto=auto" }.into());
         }
         if !profile.sanitize.is_empty() {
@@ -804,7 +809,7 @@ impl Toolchain {
         let profile = spec.profile;
 
         // Unoptimized debug builds relink incrementally, much faster after small changes (not with ASan: LNK4300)
-        let incremental = profile.debug && profile.opt == Opt::None && !profile.lto && profile.sanitize.is_empty();
+        let incremental = profile.debug && profile.opt == Opt::None && !spec.lto && profile.sanitize.is_empty();
         let incremental_flag = if incremental { "/INCREMENTAL" } else { "/INCREMENTAL:NO" };
         let mut args: Vec<String> = vec!["/nologo".into(), incremental_flag.into(), format!("/OUT:{}", path_text(spec.output))];
 
@@ -825,7 +830,7 @@ impl Toolchain {
                 args.extend(["/OPT:REF".into(), "/OPT:ICF".into()]);
             }
         }
-        if profile.lto && self.family == Family::Msvc {
+        if spec.lto && self.family == Family::Msvc {
             args.push("/LTCG".into());
         }
 
@@ -908,7 +913,7 @@ impl Toolchain {
         if windows_clang {
             args.push(clang_ms_runtime_flag(profile));
         }
-        if profile.lto {
+        if spec.lto {
             args.push(if self.family == Family::Clang { "-flto=thin" } else { "-flto=auto" }.into());
             if self.family == Family::Clang && self.lld {
                 args.push("-fuse-ld=lld".into());
@@ -1393,6 +1398,7 @@ mod tests {
             cxx: true,
             library_version: None,
             delay_load: &[],
+            lto: false,
         };
         toolchain.link_args(&spec)
     }
@@ -1439,6 +1445,7 @@ mod tests {
             cxx: true,
             library_version: None,
             delay_load: &delay_load,
+            lto: false,
         };
         let delayed = |toolchain: &Toolchain| -> Vec<String> {
             let args = toolchain.link_args(&spec);
@@ -1518,6 +1525,7 @@ mod tests {
             cxx: true,
             library_version: None,
             delay_load: &[],
+            lto: false,
         };
 
         let linux = Toolchain::for_tests(Family::Gcc, platform(Cpu::X64, Os::Linux), false);
@@ -1593,6 +1601,7 @@ mod tests {
             cxx: true,
             library_version: None,
             delay_load: &[],
+            lto: false,
         };
         let args = linux.link_args(&spec);
         let position = |wanted: &str| args.iter().position(|arg| arg == wanted).unwrap();
@@ -1646,5 +1655,74 @@ mod tests {
         assert_eq!(raised_standard("c++20", 2017), None);
         assert_eq!(raised_standard("c99", 2011).as_deref(), Some("c11"));
         assert_eq!(raised_standard("gnu17", 1999), None);
+    }
+
+    #[test]
+    fn link_time_optimization_follows_the_specs_not_the_profile() {
+        let profile = Profile::resolve("debug", &Default::default()).unwrap();
+        assert!(!profile.lto);
+        let compile = |toolchain: &Toolchain, lto: bool| {
+            let spec = CompileSpec {
+                language: Language::Cxx,
+                standard: "c++17",
+                profile: &profile,
+                opt: Opt::None,
+                warnings: Warnings::Default,
+                werror: false,
+                arch: None,
+                lto,
+                defines: &[],
+                includes: &[],
+                system_includes: &[],
+                flags: &[],
+                position_independent: false,
+            };
+            toolchain.compile_args(&spec, Path::new("a.cpp"), Path::new("a.o"), Path::new("a.d")).0
+        };
+        let link = |toolchain: &Toolchain, lto: bool| {
+            let spec = LinkSpec {
+                profile: &profile,
+                shared: false,
+                gui: Gui::Off,
+                exports: false,
+                uses_program_exports: false,
+                objects: &[PathBuf::from("main.o")],
+                libs: &[],
+                whole: &[],
+                lib_dirs: &[],
+                flags: &[],
+                output: Path::new("app"),
+                import_lib: None,
+                cxx: true,
+                library_version: None,
+                delay_load: &[],
+                lto,
+            };
+            toolchain.link_args(&spec)
+        };
+        let has = |args: &[String], wanted: &str| args.iter().any(|arg| arg == wanted);
+
+        // cl: /GL on compiles, lib /LTCG, /LTCG on the link, which then cannot be incremental
+        let mut msvc = Toolchain::for_tests(Family::Msvc, platform(Cpu::X64, Os::Windows), true);
+        msvc.archiver = PathBuf::from("lib.exe");
+        assert!(has(&compile(&msvc, true), "/GL") && !has(&compile(&msvc, false), "/GL"));
+        assert!(has(&msvc.archive_args(&[], Path::new("a.lib"), true), "/LTCG"));
+        assert!(!has(&msvc.archive_args(&[], Path::new("a.lib"), false), "/LTCG"));
+        let linked = link(&msvc, true);
+        assert!(has(&linked, "/LTCG") && has(&linked, "/INCREMENTAL:NO"), "{linked:?}");
+        assert!(has(&link(&msvc, false), "/INCREMENTAL"));
+
+        // clang-cl: ThinLTO, which lld-link reads without /LTCG
+        let clang_cl = Toolchain::for_tests(Family::ClangCl, platform(Cpu::X64, Os::Windows), true);
+        assert!(has(&compile(&clang_cl, true), "-flto=thin"));
+        assert!(!has(&link(&clang_cl, true), "/LTCG"));
+
+        // clang ThinLTO, gcc's with as many jobs as there are cores, on compiles and links alike
+        let clang = Toolchain::for_tests(Family::Clang, platform(Cpu::X64, Os::Linux), false);
+        assert!(has(&compile(&clang, true), "-flto=thin") && has(&link(&clang, true), "-flto=thin"));
+        assert!(!has(&compile(&clang, false), "-flto=thin") && !has(&link(&clang, false), "-flto=thin"));
+        let gcc = Toolchain::for_tests(Family::Gcc, platform(Cpu::X64, Os::Linux), false);
+        assert!(has(&compile(&gcc, true), "-flto=auto") && has(&link(&gcc, true), "-flto=auto"));
+        assert!(!has(&compile(&gcc, false), "-flto=auto") && !has(&link(&gcc, false), "-flto=auto"));
     }
 }
